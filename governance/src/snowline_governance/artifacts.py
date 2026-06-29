@@ -463,6 +463,91 @@ def _resolve_list_limit(limit: int | None, default: int = 50, cap: int = 500) ->
     return max(1, min(int(limit), cap))
 
 
+def _governs_for_artifacts(
+    session: Session, artifact_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, list[str]]:
+    """`_governs` for a SET of artifacts in ONE query (issue #14): artifact_id →
+    its governed scope slugs, sorted (the same deterministic per-artifact shape
+    `_governs` returns). Missing/ungoverned artifacts map to an empty list."""
+    out: dict[uuid.UUID, list[str]] = {aid: [] for aid in artifact_ids}
+    if not artifact_ids:
+        return out
+    for art_id, slug in session.execute(
+        select(ArtifactGoverns.artifact_id, ArtifactGoverns.scope_slug)
+        .where(ArtifactGoverns.artifact_id.in_(artifact_ids))
+        .order_by(ArtifactGoverns.scope_slug.asc())
+    ):
+        out.setdefault(art_id, []).append(slug)
+    return out
+
+
+def _version_counts_for_artifacts(
+    session: Session, artifact_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, int]:
+    """Total version count per artifact for a SET of artifacts in ONE grouped
+    query (issue #14). Missing artifacts map to 0."""
+    out: dict[uuid.UUID, int] = {aid: 0 for aid in artifact_ids}
+    if not artifact_ids:
+        return out
+    for art_id, n in session.execute(
+        select(ArtifactVersion.artifact_id, func.count())
+        .where(ArtifactVersion.artifact_id.in_(artifact_ids))
+        .group_by(ArtifactVersion.artifact_id)
+    ):
+        out[art_id] = n
+    return out
+
+
+def _leaf_counts_for_artifacts(
+    session: Session, artifact_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, int]:
+    """Current-leaf count per artifact for a SET of artifacts in ONE grouped query
+    (issue #14) — the `is_branched` signal (leaf_count > 1). A leaf is a
+    non-`superseded` structural leaf; supersession is intra-artifact, so the leaf
+    filter's sub-select scopes safely to the whole id set (`artifact_id IN (:ids)`)
+    and resolves exactly as the per-artifact filter does. Missing artifacts → 0."""
+    out: dict[uuid.UUID, int] = {aid: 0 for aid in artifact_ids}
+    if not artifact_ids:
+        return out
+    for art_id, n in session.execute(
+        select(ArtifactVersion.artifact_id, func.count())
+        .where(
+            ArtifactVersion.artifact_id.in_(artifact_ids),
+            ArtifactVersion.status != "superseded",
+            branching.leaf_filter(
+                ArtifactVersion.id,
+                ArtifactVersion.supersedes_id,
+                ArtifactVersion.artifact_id.in_(artifact_ids),
+            ),
+        )
+        .group_by(ArtifactVersion.artifact_id)
+    ):
+        out[art_id] = n
+    return out
+
+
+def _compact_row_from_signals(
+    a: Artifact,
+    *,
+    version_count: int,
+    leaf_count: int,
+    governs: list[str],
+) -> dict:
+    """Build the `_artifact_compact_row` shape from PRE-FETCHED signals — the
+    batched read path's per-artifact assembler (no DB queries). Identical shape to
+    `_artifact_compact_row`."""
+    return {
+        "id": str(a.id),
+        "doc_kind": a.doc_kind,
+        "backend": a.backend,
+        "maturity": a.maturity,
+        "governs": governs,
+        "governs_all": a.governs_all,
+        "version_count": version_count or 0,
+        "is_branched": (leaf_count or 0) > 1,
+    }
+
+
 def _artifact_compact_row(session: Session, a: Artifact) -> dict:
     """A small artifact header for `list_artifacts`: identity + lifecycle + the
     two cheap derived signals a sweep needs (`version_count`, `is_branched`),
@@ -573,10 +658,13 @@ def applicable_artifacts(
     id_depth = {sid: i for i, sid in enumerate(chain_ids)}
 
     seen: set[uuid.UUID] = set()
-    collected: list[dict] = []
+    # (artifact_id, from_scope_tag) in final order: edge matches nearest-first,
+    # then governs_all (catch-all). The from_scope tag is None for own-scope
+    # edge matches, the ancestor slug for inherited edges, '*' for governs_all.
+    ordered: list[tuple[uuid.UUID, str | None]] = []
 
     if chain_ids:
-        # Artifacts with a governs edge to any chain scope, nearest-first.
+        # ONE query: artifacts with a governs edge to any chain scope.
         edge_rows = session.execute(
             select(ArtifactGoverns.artifact_id, ArtifactGoverns.scope_id)
             .where(ArtifactGoverns.scope_id.in_(chain_ids))
@@ -588,25 +676,48 @@ def applicable_artifacts(
             if art_id not in nearest or d < nearest[art_id]:
                 nearest[art_id] = d
         for art_id, depth in sorted(nearest.items(), key=lambda kv: kv[1]):
-            a = session.get(Artifact, art_id)
-            if a is None:
-                continue
             seen.add(art_id)
-            row = _artifact_compact_row(session, a)
-            if depth != 0:
-                row["from_scope"] = depth_slug[depth]
-            collected.append(row)
+            ordered.append((art_id, None if depth == 0 else depth_slug[depth]))
 
-    # `governs_all` artifacts apply everywhere — tagged from_scope='*'.
-    for a in session.scalars(
-        select(Artifact)
+    # ONE query: `governs_all` artifacts apply everywhere — tagged from_scope='*'.
+    for art_id in session.scalars(
+        select(Artifact.id)
         .where(Artifact.governs_all.is_(True))
         .order_by(Artifact.created_at.desc(), Artifact.id.desc())
     ):
-        if a.id in seen:
+        if art_id in seen:
             continue
-        row = _artifact_compact_row(session, a)
-        row["from_scope"] = "*"
+        seen.add(art_id)
+        ordered.append((art_id, "*"))
+
+    # Batch-load the Artifact rows + the three compact-row signals for the WHOLE
+    # matched set in a bounded number of queries (issue #14: was ~3 queries +
+    # a session.get PER matched artifact). Assemble rows from the pre-fetched
+    # signals — no per-item DB round-trips.
+    art_ids = [aid for aid, _ in ordered]
+    arts: dict[uuid.UUID, Artifact] = {
+        a.id: a
+        for a in session.scalars(
+            select(Artifact).where(Artifact.id.in_(art_ids))
+        )
+    } if art_ids else {}
+    version_counts = _version_counts_for_artifacts(session, art_ids)
+    leaf_counts = _leaf_counts_for_artifacts(session, art_ids)
+    governs_map = _governs_for_artifacts(session, art_ids)
+
+    collected: list[dict] = []
+    for art_id, from_scope in ordered:
+        a = arts.get(art_id)
+        if a is None:  # edge/flag row whose artifact vanished — skip defensively
+            continue
+        row = _compact_row_from_signals(
+            a,
+            version_count=version_counts.get(art_id, 0),
+            leaf_count=leaf_counts.get(art_id, 0),
+            governs=governs_map.get(art_id, []),
+        )
+        if from_scope is not None:
+            row["from_scope"] = from_scope
         collected.append(row)
 
     total = len(collected)

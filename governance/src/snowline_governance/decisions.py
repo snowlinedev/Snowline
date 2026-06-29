@@ -107,6 +107,51 @@ def _leaves_for_one_scope(
     return list(session.scalars(stmt))
 
 
+def _leaves_for_scopes(
+    session: Session,
+    scope_ids: list[uuid.UUID],
+    *,
+    include_superseded: bool,
+    limit: int,
+) -> dict[uuid.UUID, list[Decision]]:
+    """The newest `limit` decisions PER scope for a whole set of scopes, in ONE
+    query — the batched form of `_leaves_for_one_scope` for the ancestor-inherited
+    walk (issue #14: avoid a per-ancestor query storm).
+
+    Supersession is strictly intra-scope (a superseding leaf carries the SAME
+    `scope_id` as the row it supersedes), so the leaf filter's "is some sibling's
+    supersedes target" sub-select can be scoped to the WHOLE set
+    (`scope_id IN (:ids)`) and still resolve exactly as the per-scope filter does:
+    a row only appears in the sub-select via a same-scope superseder. Rows are
+    fetched newest-first across all scopes, then grouped in Python and each
+    scope's group clamped to `limit` — identical to N separate per-scope queries
+    each `ORDER BY recorded_at DESC LIMIT limit`.
+    """
+    by_scope: dict[uuid.UUID, list[Decision]] = {sid: [] for sid in scope_ids}
+    if not scope_ids:
+        return by_scope
+    stmt = (
+        select(Decision)
+        .where(Decision.scope_id.in_(scope_ids))
+        .order_by(Decision.recorded_at.desc(), Decision.id.desc())
+    )
+    if not include_superseded:
+        stmt = stmt.where(
+            branching.leaf_filter(
+                Decision.id,
+                Decision.supersedes_id,
+                Decision.scope_id.in_(scope_ids),
+            )
+        )
+    for d in session.scalars(stmt):
+        bucket = by_scope.get(d.scope_id)
+        if bucket is None:  # defensive; every chain id is pre-seeded above
+            bucket = by_scope[d.scope_id] = []
+        if len(bucket) < limit:  # per-scope LIMIT, applied in Python
+            bucket.append(d)
+    return by_scope
+
+
 # --- writes -----------------------------------------------------------------
 
 
@@ -343,15 +388,21 @@ def applicable_decisions(
     slug the platform now serves drives `from_scope` (display) only (#11).
     """
     chain = scope_client.ancestors(scope_slug)
+    chain_ids = [uuid.UUID(str(sc["id"])) for sc in chain]
+    # ONE query for every chain scope's leaves (issue #14), then group + tag in
+    # Python — preserving the walk's own-first / nearest-ancestor-next order and
+    # the per-scope LIMIT (supersession is intra-scope, so the batched leaf filter
+    # is exactly the per-scope one).
+    by_scope = _leaves_for_scopes(
+        session,
+        chain_ids,
+        include_superseded=include_superseded,
+        limit=limit,
+    )
     collected: list[dict] = []
-    for depth, sc in enumerate(chain):
+    for depth, (sc, sid) in enumerate(zip(chain, chain_ids)):
         sc_slug = sc["slug"]
-        for d in _leaves_for_one_scope(
-            session,
-            sc["id"],
-            include_superseded=include_superseded,
-            limit=limit,
-        ):
+        for d in by_scope.get(sid, ()):
             collected.append(
                 _decision_row(d, from_scope=None if depth == 0 else sc_slug)
             )

@@ -10,11 +10,33 @@ the SAME per-slug id `StubScopeClient` serves.
 
 from __future__ import annotations
 
+import contextlib
 import uuid
 
 import pytest
+from sqlalchemy import event
 
 from snowline_governance import artifacts
+from snowline_governance.db import get_engine
+
+
+@contextlib.contextmanager
+def _count_selects():
+    """Count SELECT statements issued on the governance engine within the block —
+    the fan-out metric issue #14 is about (the read paths under test do no
+    writes). Yields a one-element list; read `counter[0]` after the block."""
+    counter = [0]
+
+    def _before(conn, cursor, statement, params, context, executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            counter[0] += 1
+
+    engine = get_engine()
+    event.listen(engine, "before_cursor_execute", _before)
+    try:
+        yield counter
+    finally:
+        event.remove(engine, "before_cursor_execute", _before)
 
 
 def _sid(slug: str) -> uuid.UUID:
@@ -262,3 +284,63 @@ def test_applicable_artifacts_halts_at_isolated(db_session, stub_scope_client):
     out = artifacts.applicable_artifacts(db_session, "acme/widget/feat", stub)
     got = {a["id"] for a in out["artifacts"]}
     assert got == {feat["id"], repo["id"]}  # org artifact NOT inherited
+
+
+def _deep_artifact_tree(db_session, depth: int):
+    """Register one artifact governing each of `depth` chained scopes
+    acme/0/1/.../n-1, plus one `governs_all`. Returns (leaf_slug, tree) for a
+    StubScopeClient — the ancestor chain from the leaf has length `depth`."""
+    tree: dict[str, str | None] = {}
+    parent: str | None = None
+    slug = ""
+    for i in range(depth):
+        slug = "acme" if i == 0 else f"{slug}/{i}"
+        artifacts.register_artifact(
+            db_session, body=f"doc {i}", governs=slug,
+            resolved_scopes=_resolved(slug),
+        )
+        tree[slug] = parent
+        parent = slug
+    artifacts.register_artifact(db_session, body="everywhere", governs="*")
+    return slug, tree
+
+
+def test_applicable_artifacts_is_batched(db_session, stub_scope_client):
+    """Issue #14: `applicable_artifacts` must NOT scale its DB query count with
+    the number of inherited artifacts (the prior per-item `session.get` +
+    version/leaf/governs subqueries). A 3-deep and a 6-deep chain return the
+    correctly merged + ordered + tagged result AND issue the SAME bounded number
+    of SELECTs."""
+
+    def run(depth: int) -> tuple[dict, int]:
+        import sqlalchemy as sa
+
+        db_session.execute(
+            sa.text(
+                "TRUNCATE artifacts, artifact_versions, artifact_governs "
+                "RESTART IDENTITY CASCADE"
+            )
+        )
+        leaf, tree = _deep_artifact_tree(db_session, depth)
+        stub = stub_scope_client(tree=tree)
+        with _count_selects() as counter:
+            out = artifacts.applicable_artifacts(db_session, leaf, stub)
+        return out, counter[0]
+
+    shallow, shallow_q = run(3)
+    deep, deep_q = run(6)
+
+    # Behavior preserved: own-first (untagged), nearest-ancestor-next (tagged),
+    # then governs_all tagged '*'; every level merged.
+    deep_arts = deep["artifacts"]
+    assert deep["items_total"] == 7  # 6 edge matches + 1 governs_all
+    assert "from_scope" not in deep_arts[0]  # own scope
+    assert deep_arts[-1]["from_scope"] == "*"  # governs_all last
+    inherited_tags = [a.get("from_scope") for a in deep_arts[1:-1]]
+    assert all(t is not None and t != "*" for t in inherited_tags)
+    # Compact-row signals are intact (built from the batched fetch).
+    assert all(a["version_count"] == 1 for a in deep_arts)
+    assert all(a["is_branched"] is False for a in deep_arts)
+
+    # The query count does NOT grow with the inherited-artifact count (#14).
+    assert shallow_q == deep_q
