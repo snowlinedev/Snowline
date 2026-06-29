@@ -92,14 +92,19 @@ def create_app(
     async def health() -> dict:
         return {"status": "ok", "plugin": registration.PLUGIN_NAME}
 
-    # Mount the `main` MCP surface (streamable HTTP) at /mcp and the `shadow`
-    # surface at /shadow/mcp — the paths the manifest maps onto the platform's
-    # `main` / `shadow` named-surfaces. The shadow surface is a SEPARATE mount
-    # (its own FastMCP instance), so the real-write verbs it omits are physically
-    # unreachable from a speculation session (decision 8a7f0a11). More-specific
-    # /shadow/mcp is mounted BEFORE /mcp so Starlette matches it first.
-    app.mount("/shadow/mcp", shadow_surface.streamable_http_app())
-    app.mount("/mcp", main_surface.streamable_http_app())
+    # Mount the FastMCP surfaces so the served endpoints are exactly the paths the
+    # manifest advertises: `/mcp` (main) and `/shadow/mcp` (shadow). FastMCP's
+    # `streamable_http_app()` ALREADY serves at its own internal
+    # `streamable_http_path` (default `/mcp`), so we mount at the PREFIX, not the
+    # full path — the monolith pattern (`app.mount("/", root)`, `app.mount("/core",
+    # core)`). Mounting main at `/mcp` would double to `/mcp/mcp`; instead main →
+    # `/` (serves `/mcp`) and shadow → `/shadow` (serves `/shadow/mcp`). The shadow
+    # surface is a SEPARATE FastMCP instance, so the real-write verbs it omits are
+    # physically unreachable from a speculation session (decision 8a7f0a11).
+    # More-specific `/shadow` is mounted BEFORE `/` so Starlette matches it first;
+    # `/health` is a route registered above, so it still wins over the `/` mount.
+    app.mount("/shadow", shadow_surface.streamable_http_app())
+    app.mount("/", main_surface.streamable_http_app())
 
     return app
 
