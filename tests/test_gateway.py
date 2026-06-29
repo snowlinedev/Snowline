@@ -146,6 +146,142 @@ def test_call_to_down_plugin_route_arounds():
     assert anyio.run(gw.list_tools) == []
 
 
+def test_multi_path_on_one_surface_rejects_duplicate(caplog):
+    """Issue #22: a plugin mapping TWO paths onto the SAME surface is a config
+    error — discovery keeps the lexicographically-first path, drops the rest with
+    a warning, so list_tools never advertises unroutable tools (policy (a))."""
+    import logging
+
+    reg = _registry(
+        PluginManifest(
+            name="dup",
+            base_url="http://dup",
+            # Both paths map to `main`; namespace is keyed by plugin only, so the
+            # two are indistinguishable + only one is routable.
+            surfaces={"/mcp": "main", "/admin": "main"},
+        )
+    )
+    with caplog.at_level(logging.WARNING, logger="snowline_platform.gateway"):
+        ups = discover_upstreams(reg, "main")
+
+    # Exactly one upstream survives — the lexicographically-first path.
+    assert [(u.plugin_name, u.plugin_path) for u in ups] == [("dup", "/admin")]
+    # And it was loud about it.
+    assert any(
+        "maps multiple paths" in rec.message and "main" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_multi_path_no_silent_misroute_end_to_end():
+    """Issue #22, behavior: with the dup path rejected, every tool list_tools
+    advertises is routable by call_tool (no GatewayError for an advertised
+    tool) — the foot-gun is closed, not just warned about."""
+    # `/admin` (kept path) carries `ping`; `/mcp` (dropped path) carries `secret`.
+    admin = make_stub_plugin("dup", ["ping"])
+    mcp = make_stub_plugin("dup", ["secret"])
+    reg = _registry(
+        PluginManifest(
+            name="dup",
+            base_url="http://dup",
+            surfaces={"/mcp": "main", "/admin": "main"},
+        )
+    )
+    connector = InMemoryConnector(
+        {"http://dup/admin": admin, "http://dup/mcp": mcp}
+    )
+    gw = SurfaceGateway(reg, "main", connector)
+
+    advertised = {t.name for t in anyio.run(gw.list_tools)}
+    # Only the KEPT path's tool is advertised — the dropped path's `secret` is not.
+    assert advertised == {"dup__ping"}
+    # And the one advertised tool routes cleanly (no silent misroute / error).
+    res = anyio.run(gw.call_tool, "dup__ping", {"value": "ok"})
+    assert res.isError is not True
+
+
+def test_list_tools_concurrent_merges_all():
+    """Issue #23: list_tools fans out concurrently and merges ALL upstreams'
+    tools in stable name-sorted order."""
+    a = make_stub_plugin("alpha", ["a1", "a2"])
+    b = make_stub_plugin("beta", ["b1"])
+    c = make_stub_plugin("gamma", ["c1", "c2", "c3"])
+    reg = _registry(
+        PluginManifest(name="alpha", base_url="http://a", surfaces={"/mcp": "main"}),
+        PluginManifest(name="beta", base_url="http://b", surfaces={"/mcp": "main"}),
+        PluginManifest(name="gamma", base_url="http://g", surfaces={"/mcp": "main"}),
+    )
+    connector = InMemoryConnector(
+        {"http://a/mcp": a, "http://b/mcp": b, "http://g/mcp": c}
+    )
+    gw = SurfaceGateway(reg, "main", connector)
+
+    tools = anyio.run(gw.list_tools)
+    names = [t.name for t in tools]
+    # Stable order: upstreams are name-sorted, tools in each upstream's own order.
+    assert names == [
+        "alpha__a1",
+        "alpha__a2",
+        "beta__b1",
+        "gamma__c1",
+        "gamma__c2",
+        "gamma__c3",
+    ]
+
+
+def test_list_tools_one_failing_upstream_does_not_blank_others():
+    """Issue #23: one upstream raising on connect/list is route-around-ed in its
+    own task — the others' tools still merge (no blanked surface)."""
+    good = make_stub_plugin("good", ["ok"])
+    reg = _registry(
+        PluginManifest(name="good", base_url="http://good", surfaces={"/mcp": "main"}),
+        PluginManifest(name="bad", base_url="http://bad", surfaces={"/mcp": "main"}),
+    )
+    # `bad`'s URL is absent from the connector map -> InMemoryConnector raises
+    # ConnectionError on connect, standing in for an unreachable upstream.
+    connector = InMemoryConnector({"http://good/mcp": good})
+    gw = SurfaceGateway(reg, "main", connector)
+
+    names = {t.name for t in anyio.run(gw.list_tools)}
+    assert names == {"good__ok"}
+
+
+def test_list_tools_slow_upstream_times_out_and_others_succeed():
+    """Issue #23: a slow (not DOWN) upstream is bounded by LIST_TIMEOUT and
+    route-around-ed; the fast upstream still returns. With concurrency the slow
+    one doesn't block the fast one."""
+    from contextlib import asynccontextmanager
+
+    fast = make_stub_plugin("fast", ["go"])
+
+    class _SlowOrFast(InMemoryConnector):
+        @asynccontextmanager
+        async def connect(self, upstream):
+            if upstream.plugin_name == "slow":
+                # Hang well past LIST_TIMEOUT; fail_after must cancel us.
+                await anyio.sleep(60)
+                raise AssertionError("slow upstream should have been cancelled")
+                yield  # pragma: no cover
+            else:
+                async with super().connect(upstream) as session:
+                    yield session
+
+    reg = _registry(
+        PluginManifest(name="fast", base_url="http://fast", surfaces={"/mcp": "main"}),
+        PluginManifest(name="slow", base_url="http://slow", surfaces={"/mcp": "main"}),
+    )
+    connector = _SlowOrFast({"http://fast/mcp": fast})
+    gw = SurfaceGateway(reg, "main", connector)
+    gw.LIST_TIMEOUT = 0.1  # keep the test fast
+
+    async def _run():
+        with anyio.fail_after(5):  # the WHOLE list must not hang on the slow one
+            return await gw.list_tools()
+
+    names = {t.name for t in anyio.run(_run)}
+    assert names == {"fast__go"}
+
+
 def test_isolation_by_composition():
     """A tool a plugin maps ONLY onto `main` is absent from `shadow` — purely by
     composition (the gateway does no per-tool filtering)."""

@@ -27,11 +27,15 @@ and talks to each plugin only over MCP/streamable-HTTP at ``base_url + plugin``
     surface carrying it onto that named surface; ``record_decision`` lands on
     `main` and is absent from `shadow` purely by composition (decision 8a7f0a11).
 
-Connections are PER-REQUEST (open `ClientSession`, list/call, close) — correct
-first cut; pooling/caching is a deferred perf follow-up (gateway.md pragmatics).
-The upstream connection is abstracted behind `UpstreamConnector` so tests can
-wire an in-memory MCP plugin without standing up HTTP, while production uses the
-streamable-HTTP client.
+Connections are PER-REQUEST (open `ClientSession`, list/call, close). `list_tools`
+fans the per-upstream connect+list out CONCURRENTLY with a bounded per-upstream
+timeout (issue #23) so a surface with N plugins costs ~one round-trip window and a
+slow upstream can't stall the surface. Connection POOLING/caching of upstream
+sessions is still a deferred perf follow-up (gateway.md pragmatics) — the
+per-request connect+initialize handshake remains; pooling was left out to keep
+this change focused on the concurrency+timeout win. The upstream connection is
+abstracted behind `UpstreamConnector` so tests can wire an in-memory MCP plugin
+without standing up HTTP, while production uses the streamable-HTTP client.
 """
 
 from __future__ import annotations
@@ -42,6 +46,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Protocol
 
+import anyio
 import mcp.types as types
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
@@ -176,8 +181,29 @@ def discover_upstreams(
     declares no surfaces still composes onto `main`. `UNKNOWN` is routable (the
     poller that promotes to `UP` is a later PR); only an explicit `DOWN` is
     skipped, so the gateway route-arounds a dead upstream instead of hanging on
-    it. Ordered by plugin name for a stable merged tool list."""
+    it. Ordered by plugin name for a stable merged tool list.
+
+    **Duplicate-plugin guard (issue #22, policy (a) "reject the duplicate"):** a
+    plugin that maps TWO distinct plugin-paths onto the SAME named surface (e.g.
+    ``{"/mcp": "main", "/admin": "main"}``) would have both paths' tools
+    aggregated by `list_tools` but namespaced IDENTICALLY (``<plugin>__<tool>`` —
+    the namespace is keyed by plugin name only, not plugin+path), and `call_tool`
+    builds its routing map keyed by `plugin_name`, so only ONE path is reachable —
+    the other path's tools silently misroute. Because the namespace itself can't
+    distinguish the two paths, there is no safe routable form under the v1
+    name-by-plugin model, so we REJECT the extra path(s): keep the
+    lexicographically-first plugin_path for that ``(plugin, surface)`` pair, drop
+    the rest, and `log.warning` it as a configuration error. This keeps
+    `list_tools` from advertising unroutable tools (it never sees the dropped
+    path) and matches the call_tool routing key, so the two stay consistent. The
+    cleaner fix — namespacing by plugin+path — is deferred until a plugin actually
+    needs multi-path-per-surface; today none do."""
     upstreams: list[Upstream] = []
+    # Track the path already accepted for each (plugin, surface) so a second path
+    # onto the same surface is rejected with a warning (issue #22). We sort each
+    # manifest's surface map by path first so the KEPT path is deterministic
+    # (lexicographically-first) regardless of dict insertion order.
+    accepted_path: dict[str, str] = {}
     for entry in registry.list():
         if entry.status is PluginStatus.DOWN:
             log.info(
@@ -188,15 +214,31 @@ def discover_upstreams(
             continue
         manifest = entry.manifest
         surface_map = manifest.surfaces or {manifest.mcp_path: "main"}
-        for plugin_path, named in surface_map.items():
-            if named == surface:
-                upstreams.append(
-                    Upstream(
-                        plugin_name=manifest.name,
-                        base_url=manifest.base_url,
-                        plugin_path=plugin_path,
-                    )
+        for plugin_path in sorted(surface_map):
+            if surface_map[plugin_path] != surface:
+                continue
+            kept = accepted_path.get(manifest.name)
+            if kept is not None:
+                log.warning(
+                    "gateway: plugin %r maps multiple paths (%r and %r) onto "
+                    "surface %r — rejecting %r as a config error; its tools "
+                    "would be unroutable (namespace is keyed by plugin only). "
+                    "Map one path per surface, or split into distinct plugins.",
+                    manifest.name,
+                    kept,
+                    plugin_path,
+                    surface,
+                    plugin_path,
                 )
+                continue
+            accepted_path[manifest.name] = plugin_path
+            upstreams.append(
+                Upstream(
+                    plugin_name=manifest.name,
+                    base_url=manifest.base_url,
+                    plugin_path=plugin_path,
+                )
+            )
     upstreams.sort(key=lambda u: (u.plugin_name, u.plugin_path))
     return upstreams
 
@@ -209,6 +251,13 @@ class SurfaceGateway:
     registered/unregistered/marked-down at runtime is reflected on the next
     request without a restart (hot-plug, architecture §3). Discovery is live, so
     the health-aware route-around is too."""
+
+    # Per-upstream connect+list_tools budget (issue #23), SEPARATE from the
+    # connector's 30s call timeout. `list_tools` fans out concurrently, so this
+    # bounds the WHOLE surface's list latency to one such window even if an
+    # upstream is UNKNOWN-but-wedged (a slow upstream, not yet marked DOWN by the
+    # poller): it's route-around-ed on timeout instead of stalling the surface.
+    LIST_TIMEOUT: float = 5.0
 
     def __init__(
         self,
@@ -226,15 +275,37 @@ class SurfaceGateway:
 
     async def list_tools(self) -> list[types.Tool]:
         """Merged union of the upstreams' tool lists, each tool NAMESPACED by its
-        owning plugin. A per-upstream failure is logged + skipped (route-around)
-        rather than failing the whole list — one dead plugin doesn't blank the
-        surface."""
-        merged: list[types.Tool] = []
-        for upstream in discover_upstreams(self._registry, self._surface):
+        owning plugin.
+
+        The per-upstream connect+`tools/list` runs CONCURRENTLY (issue #23): a
+        surface with N plugins costs ~one round-trip window, not ~N×T. Each
+        upstream is fetched in its own task with its own try/except + a bounded
+        `LIST_TIMEOUT`, so a failing OR slow upstream is logged and skipped
+        (route-around) without failing or stalling the whole list — one dead/wedged
+        plugin doesn't blank the surface. Results are merged in the upstreams'
+        discovery order (already plugin-name-sorted) by collecting per-upstream
+        slices and concatenating them by index, so the merged order is STABLE and
+        independent of task-completion order."""
+        upstreams = discover_upstreams(self._registry, self._surface)
+        # One result slot per upstream, filled by its task; concatenated in
+        # discovery (name-sorted) order so the merged list is deterministic
+        # regardless of which task finishes first.
+        slices: list[list[types.Tool]] = [[] for _ in upstreams]
+
+        async def _fetch(index: int, upstream: Upstream) -> None:
             try:
-                async with self._connector.connect(upstream) as session:
-                    result = await session.list_tools()
-            except Exception as exc:  # route-around a failing upstream
+                with anyio.fail_after(self.LIST_TIMEOUT):
+                    async with self._connector.connect(upstream) as session:
+                        result = await session.list_tools()
+            except Exception as exc:
+                # Route-around a failing OR slow upstream. `fail_after` converts
+                # its scope's timeout into a plain `TimeoutError` on exit (caught
+                # here), so a slow upstream is dropped after LIST_TIMEOUT rather
+                # than stalling the surface. We deliberately do NOT catch the
+                # cancelled-exc class: a real cancellation of the parent task
+                # group (lifespan shutdown) must propagate, not be swallowed as a
+                # per-upstream failure. Dropping THIS upstream never cancels its
+                # siblings — each runs in its own task.
                 log.warning(
                     "gateway: list_tools failed for upstream %s on surface %r: "
                     "%s",
@@ -242,9 +313,19 @@ class SurfaceGateway:
                     self._surface,
                     exc,
                 )
-                continue
-            for tool in result.tools:
-                merged.append(_namespace_tool(upstream.plugin_name, tool))
+                return
+            slices[index] = [
+                _namespace_tool(upstream.plugin_name, tool)
+                for tool in result.tools
+            ]
+
+        async with anyio.create_task_group() as tg:
+            for index, upstream in enumerate(upstreams):
+                tg.start_soon(_fetch, index, upstream)
+
+        merged: list[types.Tool] = []
+        for s in slices:
+            merged.extend(s)
         return merged
 
     async def call_tool(
