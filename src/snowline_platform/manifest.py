@@ -34,11 +34,34 @@ class PluginManifest(BaseModel):
         default="/health",
         description="the plugin's health endpoint, relative to base_url",
     )
+    surfaces: dict[str, str] = Field(
+        default_factory=dict,
+        description="map of the plugin's own MCP path -> platform named-surface "
+        "(gateway.md §2), e.g. {'/mcp': 'main', '/shadow/mcp': 'shadow'}. The "
+        "gateway aggregates every plugin-path mapped to a named surface into the "
+        "single surface a client sees; a tool appears on a surface only because a "
+        "plugin mapped it there. Empty defaults to {mcp_path: 'main'} (most "
+        "plugins map their one surface onto 'main').",
+    )
     scopes: list[str] = Field(
         default_factory=list,
         description="declared scope-namespace dependencies (advisory until the "
         "platform's scope service exists)",
     )
+
+    @field_validator("surfaces")
+    @classmethod
+    def _valid_surfaces(cls, v: dict[str, str]) -> dict[str, str]:
+        for plugin_path, named in v.items():
+            if not plugin_path.startswith("/"):
+                raise ValueError(
+                    f"surface key {plugin_path!r} must be a path starting with '/'"
+                )
+            if not named:
+                raise ValueError(
+                    f"surface {plugin_path!r} maps to an empty platform surface name"
+                )
+        return v
 
     @field_validator("name")
     @classmethod
