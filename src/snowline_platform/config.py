@@ -15,6 +15,11 @@ DEFAULT_TRUSTED_CIDRS = "100.64.0.0/10"
 # monolith's substrate config. Scopes are the platform's first persisted data.
 DEFAULT_DATABASE_URL = "postgresql+psycopg:///snowline_platform"
 
+# Health poller cadence (health.md): poll every plugin every INTERVAL seconds,
+# each check bounded by TIMEOUT so one slow plugin can't stall the round.
+DEFAULT_HEALTH_POLL_INTERVAL = 15.0
+DEFAULT_HEALTH_POLL_TIMEOUT = 5.0
+
 
 def trusted_cidrs() -> list[str]:
     raw = os.environ.get("SNOWLINE_TRUSTED_CIDRS", DEFAULT_TRUSTED_CIDRS)
@@ -23,3 +28,19 @@ def trusted_cidrs() -> list[str]:
 
 def database_url() -> str:
     return os.environ.get("SNOWLINE_PLATFORM_DATABASE_URL", DEFAULT_DATABASE_URL)
+
+
+def health_poll_interval() -> float:
+    return float(
+        os.environ.get(
+            "SNOWLINE_HEALTH_POLL_INTERVAL", DEFAULT_HEALTH_POLL_INTERVAL
+        )
+    )
+
+
+def health_poll_timeout() -> float:
+    return float(
+        os.environ.get(
+            "SNOWLINE_HEALTH_POLL_TIMEOUT", DEFAULT_HEALTH_POLL_TIMEOUT
+        )
+    )
