@@ -66,6 +66,15 @@ def create_app(
         async with contextlib.AsyncExitStack() as stack:
             await stack.enter_async_context(main_surface.session_manager.run())
             await stack.enter_async_context(shadow_surface.session_manager.run())
+            # The decision-event EMIT delivery loop (spec §7) rides the lifespan
+            # in a task group, mirroring how the monolith runs its delivery /
+            # reconcile loops. It drains the transactional-outbox deliveries on a
+            # timer and signs+POSTs them; disable via SNOWLINE_WEBHOOK_DISABLED.
+            # The scope is cancelled on exit so the loop tears down cleanly.
+            from snowline_governance.replication import webhook_delivery_loop
+
+            tg = await stack.enter_async_context(anyio.create_task_group())
+            tg.start_soon(webhook_delivery_loop)
             if getattr(app.state, "register_on_startup", True):
                 # Best-effort (never raises, so a down platform can't crash boot)
                 # AND off the event loop (the POST is blocking httpx with a
@@ -73,6 +82,7 @@ def create_app(
                 # delay /health coming up).
                 await anyio.to_thread.run_sync(registration.register_with_platform)
             yield
+            tg.cancel_scope.cancel()
 
     app = FastAPI(title="Snowline Governance", lifespan=_lifespan)
     app.state.migrate_on_startup = migrate_on_startup

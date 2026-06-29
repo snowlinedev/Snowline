@@ -39,8 +39,10 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
+    DateTime,
     ForeignKey,
     Index,
     Integer,
@@ -48,6 +50,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
     text,
+    true,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -424,4 +427,104 @@ class ShadowConversationEvent(Base):
 
     __table_args__ = (
         UniqueConstraint("branch_id", "seq", name="uq_shadow_conv_branch_seq"),
+    )
+
+
+# --- the WEBHOOK BUS (spec §7) — the EMIT side ------------------------------
+#
+# Governance emits signed `decision.recorded` / `decision.superseded` events on a
+# webhook bus (HMAC-SHA256 over the raw body; `contract_version` in the payload;
+# a transactional outbox + async delivery with a per-subscription monotonic
+# `seq`). Carried (functionality-first, NOT imported) from the frozen monolith's
+# `snowline_substrate.models_core` (`WebhookSubscription` / `WebhookDelivery`),
+# schema-compatible so monolith rows migrate cleanly later (spec §9). The
+# delivery machinery itself lives in `replication.py` (httpx is kept out of the
+# model layer, mirroring the monolith's substrate/server split).
+#
+# THE ONE STRUCTURAL DELTA from the monolith, mirroring `Decision`: the
+# subscription's optional `scope_id` filter is a SOFT scope reference (no
+# `ForeignKey("scopes.id")`) — scopes are platform-owned and live in another DB.
+# The filter matches on the STABLE `scope_id` (the decision-keying lesson #11),
+# so a platform-side slug rename can't make a pre-rename subscription stop
+# matching its scope's decisions.
+
+
+class WebhookSubscription(Base):
+    """A registered webhook subscriber for decision events (spec §7).
+
+    A receiver registers a `target_url` + a shared `secret` (the HMAC-SHA256
+    signing key) and the `event_types` it wants (the published set:
+    `snowline_governance.contract.EVENT_TYPES`). `scope_id` NULL means GLOBAL —
+    every decision matches; a set `scope_id` restricts matching to decisions
+    recorded in that one scope (a private scope's decisions need not flow out).
+    The filter is a SOFT scope reference matched on the stable `scope_id` (no
+    cross-service FK — scopes are platform-owned). Managed PROGRAMMATICALLY (no
+    MCP tool / CLI — remote registration is out-of-band v1, per the SDK's
+    `events.py` note); see `replication.create_subscription`.
+    """
+
+    __tablename__ = "webhook_subscriptions"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    target_url: Mapped[str] = mapped_column(String, nullable=False)
+    # The HMAC-SHA256 signing key — every delivery to this subscriber carries an
+    # `X-Snowline-Signature: sha256=<hmac>` header the receiver verifies.
+    secret: Mapped[str] = mapped_column(String, nullable=False)
+    # The event types this subscriber wants — a JSONB list[str].
+    event_types: Mapped[list] = mapped_column(JSONB, nullable=False)
+    # NULL = global (matches every decision); set = only this scope's decisions.
+    # A SOFT scope reference (no FK across the service/DB boundary), matched on
+    # the stable id so a platform-side slug rename can't orphan it (#11).
+    scope_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=true()
+    )
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class WebhookDelivery(Base):
+    """A single decision-event delivery — the transactional outbox AND the
+    delivery log (spec §7).
+
+    A `WebhookDelivery` row is written in the SAME transaction as the decision it
+    carries (transactional outbox: atomic with `record_decision` /
+    `supersede_decision`) — but with `seq` still NULL. `seq` is a PER-SUBSCRIPTION
+    MONOTONIC, contiguous sequence the receiver orders by (a supersession can't be
+    applied before the decision it supersedes), allocated at DELIVERY time by the
+    background loop (`max(seq)+1` over this subscription's rows), NOT in the
+    decision transaction. That placement is deliberate: the delivery loop is the
+    genuine single writer of `seq` (one tick at a time), so `max(seq)+1` is
+    race-free THERE — whereas allocating it in the decision txn would couple a seq
+    collision to a `record_decision` ROLLBACK. The `(subscription_id, seq)`
+    unique constraint makes any gap-or-dup loud, per subscriber.
+    """
+
+    __tablename__ = "webhook_deliveries"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    subscription_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("webhook_subscriptions.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    # Per-subscription monotonic sequence (the receiver's ordering key). NULL
+    # until the delivery loop allocates it at send time — see the class docstring
+    # + `replication.deliver_pending`.
+    seq: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    event_type: Mapped[str] = mapped_column(String, nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    # pending | delivered | failed
+    status: Mapped[str] = mapped_column(
+        String, nullable=False, default="pending", server_default="pending"
+    )
+    attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    last_error: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "subscription_id", "seq", name="uq_webhook_delivery_subscription_seq"
+        ),
     )

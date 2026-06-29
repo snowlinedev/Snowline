@@ -124,7 +124,8 @@ def clean_db(migrated_db):
             sa.text(
                 "TRUNCATE decisions, artifacts, artifact_versions, "
                 "artifact_governs, shadow_branches, shadow_nodes, "
-                "shadow_node_citations, shadow_conversation_events "
+                "shadow_node_citations, shadow_conversation_events, "
+                "webhook_subscriptions, webhook_deliveries "
                 "RESTART IDENTITY CASCADE"
             )
         )
