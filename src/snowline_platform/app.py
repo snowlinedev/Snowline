@@ -15,6 +15,12 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 
 from snowline_platform import config, plugins_routes, scopes_routes
+from snowline_platform.gateway import UpstreamConnector
+from snowline_platform.gateway_app import (
+    build_surface_mounts,
+    gateway_lifespan,
+    mount_gateway,
+)
 from snowline_platform.middleware import TrustMiddleware
 from snowline_platform.registry import PluginRegistry
 from snowline_platform.trust import CidrTrustProvider, TrustResolver
@@ -45,17 +51,23 @@ def _migrate_to_head() -> None:
 async def _lifespan(app: FastAPI):
     if getattr(app.state, "migrate_on_startup", True):
         _migrate_to_head()
-    yield
+    # Enter every aggregated MCP surface's streamable-HTTP session manager for the
+    # app lifespan (the gateway, gateway.md §2). The surfaces are mounted at
+    # create_app time; their managers' run() is the required-for-lifespan context.
+    async with gateway_lifespan(app.state.gateway_mounts):
+        yield
 
 
 def create_app(
     resolver: TrustResolver | None = None,
     registry: PluginRegistry | None = None,
     migrate_on_startup: bool = True,
+    connector: UpstreamConnector | None = None,
 ) -> FastAPI:
     """Build the platform app. `resolver`/`registry` are injectable for tests;
     `migrate_on_startup=False` skips the lifespan boot-migrate (tests provision
-    their own schema)."""
+    their own schema); `connector` injects the gateway's upstream connector
+    (defaults to streamable-HTTP; tests pass an in-memory one)."""
     app = FastAPI(title="Snowline Platform", lifespan=_lifespan)
     app.state.registry = registry or PluginRegistry()
     app.state.migrate_on_startup = migrate_on_startup
@@ -66,6 +78,14 @@ def create_app(
     )
     app.include_router(plugins_routes.router)
     app.include_router(scopes_routes.router)
+
+    # The gateway: aggregate registered plugins' MCP surfaces onto the platform's
+    # named surfaces and mount each as a streamable-HTTP endpoint (e.g. /mcp,
+    # /shadow/mcp), behind the trust gate. Mounts share the app's registry, so a
+    # plugin registered at runtime is composed without a restart.
+    mounts = build_surface_mounts(app.state.registry, connector=connector)
+    app.state.gateway_mounts = mounts
+    mount_gateway(app, mounts)
 
     @app.get("/health")
     async def health() -> dict:
