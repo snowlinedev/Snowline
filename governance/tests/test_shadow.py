@@ -36,6 +36,10 @@ class _NoopScopeClient:
 _REAL_WRITE_VERBS = {
     "record_decision",
     "supersede_decision",
+    # graduation mints a REAL decision (shadow → real), so it's a real-write verb
+    # that MUST live on `main` and be ABSENT from shadow (the principal split,
+    # decision 99b92e1d): the shadow agent drafts, the principal on main executes.
+    "graduate",
     "register_artifact",
     "revise_artifact",
     "resolve_artifact",
