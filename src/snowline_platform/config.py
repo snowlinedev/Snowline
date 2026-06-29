@@ -11,7 +11,15 @@ import os
 # Tailscale's tailnet (CGNAT) range — the default trusted network.
 DEFAULT_TRUSTED_CIDRS = "100.64.0.0/10"
 
+# Local libpq defaults: unix socket, current OS user, no password — mirrors the
+# monolith's substrate config. Scopes are the platform's first persisted data.
+DEFAULT_DATABASE_URL = "postgresql+psycopg:///snowline_platform"
+
 
 def trusted_cidrs() -> list[str]:
     raw = os.environ.get("SNOWLINE_TRUSTED_CIDRS", DEFAULT_TRUSTED_CIDRS)
     return [c.strip() for c in raw.split(",") if c.strip()]
+
+
+def database_url() -> str:
+    return os.environ.get("SNOWLINE_PLATFORM_DATABASE_URL", DEFAULT_DATABASE_URL)
