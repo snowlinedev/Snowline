@@ -25,7 +25,7 @@ import anyio
 from fastapi import FastAPI
 
 from snowline_governance import config, registration
-from snowline_governance.mcp_surface import build_main_surface
+from snowline_governance.mcp_surface import build_main_surface, build_shadow_surface
 from snowline_governance.scope_client import ScopeClient
 
 
@@ -54,15 +54,18 @@ def create_app(
     schema); `register_on_startup=False` skips the platform registration POST
     (tests assert registration separately, against a stubbed platform)."""
     main_surface = build_main_surface(scope_client=scope_client)
+    shadow_surface = build_shadow_surface(scope_client=scope_client)
 
     @asynccontextmanager
     async def _lifespan(app: FastAPI):
         if getattr(app.state, "migrate_on_startup", True):
             _migrate_to_head()
-        # The FastMCP surface owns a session manager that must be entered for the
-        # app lifespan (the monolith pattern).
+        # Each FastMCP surface owns a session manager that must be entered for the
+        # app lifespan (the monolith pattern). Both the `main` and `shadow`
+        # surfaces run for the whole app lifespan.
         async with contextlib.AsyncExitStack() as stack:
             await stack.enter_async_context(main_surface.session_manager.run())
+            await stack.enter_async_context(shadow_surface.session_manager.run())
             if getattr(app.state, "register_on_startup", True):
                 # Best-effort (never raises, so a down platform can't crash boot)
                 # AND off the event loop (the POST is blocking httpx with a
@@ -79,8 +82,13 @@ def create_app(
     async def health() -> dict:
         return {"status": "ok", "plugin": registration.PLUGIN_NAME}
 
-    # Mount the `main` MCP surface (streamable HTTP) at /mcp — the path the
-    # manifest maps onto the platform's `main` named-surface.
+    # Mount the `main` MCP surface (streamable HTTP) at /mcp and the `shadow`
+    # surface at /shadow/mcp — the paths the manifest maps onto the platform's
+    # `main` / `shadow` named-surfaces. The shadow surface is a SEPARATE mount
+    # (its own FastMCP instance), so the real-write verbs it omits are physically
+    # unreachable from a speculation session (decision 8a7f0a11). More-specific
+    # /shadow/mcp is mounted BEFORE /mcp so Starlette matches it first.
+    app.mount("/shadow/mcp", shadow_surface.streamable_http_app())
     app.mount("/mcp", main_surface.streamable_http_app())
 
     return app

@@ -1,22 +1,35 @@
-"""The governance `main` MCP surface — the decision + artifact tools.
+"""The governance MCP surfaces — the `main` (real-write) surface and the `shadow`
+(speculation) surface.
 
-Mirrors the frozen monolith's FastMCP registration pattern (`mcp_server.py`, the
-`core_mcp` surface is the closest analog): a `FastMCP` instance with the
-governance tools registered on it, served over streamable HTTP, mounted on the
-governance app at `/mcp`. This increment carries the 5 decision tools —
-`record_decision`, `supersede_decision`, `get_decision`, `list_decisions`,
-`applicable_decisions` — plus the artifact tools (`register_artifact`,
-`revise_artifact`, `resolve_artifact`, `get_artifact`, `list_artifacts`,
-`set_governs`, `set_maturity`, `applicable_artifacts`). The separate `shadow`
-surface lands in a later increment.
+Mirrors the frozen monolith's FastMCP registration pattern (`mcp_server.py`):
+
+  - `build_main_surface` — the REAL-WRITE governance surface, mounted at `/mcp`.
+    The 5 decision tools (`record_decision`, `supersede_decision`, `get_decision`,
+    `list_decisions`, `applicable_decisions`) + the artifact tools
+    (`register_artifact`, `revise_artifact`, `resolve_artifact`, `get_artifact`,
+    `list_artifacts`, `set_governs`, `set_maturity`, `applicable_artifacts`).
+
+  - `build_shadow_surface` — the SPECULATION surface, mounted at `/shadow/mcp`.
+    The 8 shadow-WRITE tools (`create_branch`, `list_branches`, `get_branch`,
+    `set_narrative_notes`, `add_node`, `add_citation`, `list_citations`,
+    `shadow_corpus_search`) PLUS the read-real grounding tools (the decision +
+    artifact READS) so a speculation agent can ground in the real graph — and NO
+    real-write verb. That absence IS the isolation guarantee (decision 8a7f0a11,
+    mirroring the monolith's `/shadow/mcp`): a speculation session physically
+    cannot mutate the real graph, because `record_decision` / `supersede_decision`
+    / the artifact writes are not registered on this surface.
+
+The read-real grounding half is shared by REGISTERING the same handlers on both
+surfaces (`_register_read_tools` — one source of truth per tool, the monolith's
+re-registration pattern), so the two surfaces can't drift on what a "read" means.
 
 Each tool runs its blocking DB work in a thread (the monolith's
 `anyio.to_thread.run_sync` pattern) so the async transport isn't blocked. The
 scope dependency is resolved through an injectable `ScopeClient` —
-`build_main_surface(scope_client=...)` lets a test pass a stub; production builds
-the real `HttpScopeClient`. The artifact governs tools resolve each scope slug →
-`(id, slug)` against the platform BEFORE the DB write (the soft-reference pattern
-the decision tools use), so a governs edge keys on the STABLE `scope_id`.
+`build_*_surface(scope_client=...)` lets a test pass a stub; production builds the
+real `HttpScopeClient`. The governs/scope-bearing tools resolve each scope slug →
+`(id, slug)` against the platform BEFORE the DB write (the soft-reference pattern),
+so a stored edge keys on the STABLE `scope_id`.
 """
 
 from __future__ import annotations
@@ -25,7 +38,7 @@ import anyio
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-from snowline_governance import artifacts, decisions
+from snowline_governance import artifacts, decisions, shadow
 from snowline_governance.db import session_scope
 from snowline_governance.scope_client import (
     HttpScopeClient,
@@ -49,10 +62,164 @@ by the platform; governance references them by slug and reads the scope tree \
 from the platform to compute applicability.\
 """
 
+_SHADOW_INSTRUCTIONS = """\
+This is the Snowline SPECULATION (shadow) surface (decision 8a7f0a11): a place to \
+explore rival design directions in ISOLATION from the real governance graph, \
+until a line is explicitly graduated. You hold WRITE-SHADOW + READ-REAL tools \
+only. Write-shadow: `create_branch` (a named speculation line per scope, \
+addressed `<scope>:<name>`), `list_branches`, `get_branch`, \
+`set_narrative_notes` (the running reasoning thread), `add_node` (a \
+not-yet-real decision), `add_citation` (inward-only: a node may cite another \
+node in its OWN branch, or a real decision — never the reverse), \
+`list_citations`, and `shadow_corpus_search` (full-text over the shadow content \
++ the real decisions backlinked to a shadow line). Read-real grounding: \
+`get_decision`, `list_decisions`, `applicable_decisions`, `get_artifact`, \
+`list_artifacts`, `applicable_artifacts` — read the real graph freely to ground \
+your speculation. It deliberately exposes NO real-write verb — `record_decision`, \
+`supersede_decision`, and the artifact write verbs are ABSENT by construction, on \
+the separate `main` surface only. This ensures a speculation session physically \
+cannot misfire a real decision into the graph (the write-isolation safety \
+property). Scopes are owned by the platform; governance references them by slug.\
+"""
+
 # DNS-rebinding protection on the streamable-HTTP transport (the monolith's
 # default). Hosts/origins can be widened via env in a later increment if needed;
 # behind the platform trust gate the plugin is reached on the tailnet.
 _SECURITY = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+
+def _register_read_tools(mcp: FastMCP, client: ScopeClient) -> None:
+    """Register the READ-REAL governance tools on `mcp` — the decision reads
+    (`get_decision`, `list_decisions`, `applicable_decisions`) + the artifact
+    reads (`get_artifact`, `list_artifacts`, `applicable_artifacts`). Shared by
+    BOTH the `main` surface (its read half) and the `shadow` surface (its
+    read-real grounding half), so the two surfaces register the SAME handlers —
+    one source of truth per tool. Pure-read: no write verb is registered here, so
+    a surface that wants only grounding (shadow) gets exactly that."""
+
+    def _get_decision_sync(decision_id: str):
+        with session_scope() as session:
+            return decisions.get_decision(session, decision_id)
+
+    @mcp.tool()
+    async def get_decision(decision_id: str) -> dict:
+        """Read one decision's FULL body — statement + rationale + lineage
+        (`supersedes`/`superseded_by`) — by id. The on-demand expansion of a
+        header echoed in the list/applicable read surfaces. Read-only.
+        """
+        return await anyio.to_thread.run_sync(_get_decision_sync, decision_id)
+
+    def _list_decisions_sync(
+        scope: str, limit: int | None, include_superseded: bool
+    ):
+        sc = client.resolve(scope)
+        if sc is None:
+            raise ScopeNotFoundError(
+                f"no scope with slug {scope!r} — register it on the platform first"
+            )
+        with session_scope() as session:
+            return decisions.list_decisions(
+                session,
+                scope_id=sc["id"],
+                scope_slug=sc["slug"],
+                limit=limit,
+                include_superseded=include_superseded,
+            )
+
+    @mcp.tool()
+    async def list_decisions(
+        scope: str, limit: int | None = None, include_superseded: bool = False
+    ) -> dict:
+        """Browse a scope's EXACT-scope decision history — headers (id, one-line
+        summary, recorded `at`, supersedes/superseded_by lineage), newest-first,
+        capped. By default returns only current leaves; `include_superseded=True`
+        exposes full chains for audit. Expand any row via `get_decision(id)`.
+        """
+        return await anyio.to_thread.run_sync(
+            _list_decisions_sync, scope, limit, include_superseded
+        )
+
+    def _applicable_decisions_sync(
+        scope: str, include_superseded: bool, limit: int
+    ):
+        with session_scope() as session:
+            return decisions.applicable_decisions(
+                session,
+                scope,
+                client,
+                include_superseded=include_superseded,
+                limit=limit,
+            )
+
+    @mcp.tool()
+    async def applicable_decisions(
+        scope: str, include_superseded: bool = False, limit: int = 50
+    ) -> dict:
+        """Decisions APPLICABLE at a scope, ANCESTOR-INHERITED — the full
+        governance a reader at `scope` inherits, not just its own. Reads the scope
+        tree from the platform, walking UPWARD and HALTING at the first isolated
+        ancestor + the forest root; each inherited row carries `from_scope` (the
+        ancestor slug it came from), absent on the scope's OWN decisions. This is
+        the UPWARD applicability view (vs `list_decisions`, exact-scope).
+        """
+        return await anyio.to_thread.run_sync(
+            _applicable_decisions_sync, scope, include_superseded, limit
+        )
+
+    def _get_artifact_sync(artifact_id):
+        with session_scope() as session:
+            return artifacts.get_artifact(session, artifact_id)
+
+    @mcp.tool()
+    async def get_artifact(artifact_id: str) -> dict:
+        """Read one artifact's full record by id — identity, doc_kind, maturity,
+        governs, the current leaf + all competing leaves + branch points. The
+        on-demand expansion of a `list_artifacts` header. Read-only."""
+        return await anyio.to_thread.run_sync(_get_artifact_sync, artifact_id)
+
+    def _list_artifacts_sync(governs, limit):
+        governs_scope_id = None
+        if governs is not None:
+            sc = client.resolve(governs)
+            governs_scope_id = sc["id"] if sc is not None else None
+        with session_scope() as session:
+            return artifacts.list_artifacts(
+                session,
+                governs=governs,
+                governs_scope_id=governs_scope_id,
+                limit=limit,
+            )
+
+    @mcp.tool()
+    async def list_artifacts(
+        governs: str | None = None, limit: int | None = None
+    ) -> dict:
+        """List registered artifacts as compact rows (id, doc_kind, backend,
+        maturity, governs, version_count, is_branched), newest-first, capped.
+        `governs` (a scope slug, resolved against the platform) narrows to
+        artifacts governing that scope — by an association row OR `governs_all`.
+        Expand any row via `get_artifact(id)`. Read-only."""
+        return await anyio.to_thread.run_sync(
+            _list_artifacts_sync, governs, limit
+        )
+
+    def _applicable_artifacts_sync(scope, limit):
+        with session_scope() as session:
+            return artifacts.applicable_artifacts(
+                session, scope, client, limit=limit
+            )
+
+    @mcp.tool()
+    async def applicable_artifacts(scope: str, limit: int = 50) -> dict:
+        """Artifacts APPLICABLE at a scope, ANCESTOR-INHERITED — the governing
+        docs a reader at `scope` inherits, not just its own. Reads the scope tree
+        from the platform, walking UPWARD and HALTING at the first isolated
+        ancestor + the forest root; each inherited row carries `from_scope` (the
+        ancestor slug it matched), and a `governs_all` artifact carries
+        `from_scope='*'`. The artifact analog of `applicable_decisions`."""
+        return await anyio.to_thread.run_sync(
+            _applicable_artifacts_sync, scope, limit
+        )
 
 
 def build_main_surface(scope_client: ScopeClient | None = None) -> FastMCP:
@@ -127,76 +294,11 @@ def build_main_surface(scope_client: ScopeClient | None = None) -> FastMCP:
             _supersede_decision_sync, prior_decision_id, decision, rationale, scope
         )
 
-    def _get_decision_sync(decision_id: str):
-        with session_scope() as session:
-            return decisions.get_decision(session, decision_id)
+    # --- decision + artifact READ tools (shared with the shadow surface) ----
+    # The read-real grounding set; the same handlers register on `shadow`.
+    _register_read_tools(mcp, client)
 
-    @mcp.tool()
-    async def get_decision(decision_id: str) -> dict:
-        """Read one decision's FULL body — statement + rationale + lineage
-        (`supersedes`/`superseded_by`) — by id. The on-demand expansion of a
-        header echoed in the list/applicable read surfaces. Read-only.
-        """
-        return await anyio.to_thread.run_sync(_get_decision_sync, decision_id)
-
-    def _list_decisions_sync(
-        scope: str, limit: int | None, include_superseded: bool
-    ):
-        sc = client.resolve(scope)
-        if sc is None:
-            raise ScopeNotFoundError(
-                f"no scope with slug {scope!r} — register it on the platform first"
-            )
-        with session_scope() as session:
-            return decisions.list_decisions(
-                session,
-                scope_id=sc["id"],
-                scope_slug=sc["slug"],
-                limit=limit,
-                include_superseded=include_superseded,
-            )
-
-    @mcp.tool()
-    async def list_decisions(
-        scope: str, limit: int | None = None, include_superseded: bool = False
-    ) -> dict:
-        """Browse a scope's EXACT-scope decision history — headers (id, one-line
-        summary, recorded `at`, supersedes/superseded_by lineage), newest-first,
-        capped. By default returns only current leaves; `include_superseded=True`
-        exposes full chains for audit. Expand any row via `get_decision(id)`.
-        """
-        return await anyio.to_thread.run_sync(
-            _list_decisions_sync, scope, limit, include_superseded
-        )
-
-    def _applicable_decisions_sync(
-        scope: str, include_superseded: bool, limit: int
-    ):
-        with session_scope() as session:
-            return decisions.applicable_decisions(
-                session,
-                scope,
-                client,
-                include_superseded=include_superseded,
-                limit=limit,
-            )
-
-    @mcp.tool()
-    async def applicable_decisions(
-        scope: str, include_superseded: bool = False, limit: int = 50
-    ) -> dict:
-        """Decisions APPLICABLE at a scope, ANCESTOR-INHERITED — the full
-        governance a reader at `scope` inherits, not just its own. Reads the scope
-        tree from the platform, walking UPWARD and HALTING at the first isolated
-        ancestor + the forest root; each inherited row carries `from_scope` (the
-        ancestor slug it came from), absent on the scope's OWN decisions. This is
-        the UPWARD applicability view (vs `list_decisions`, exact-scope).
-        """
-        return await anyio.to_thread.run_sync(
-            _applicable_decisions_sync, scope, include_superseded, limit
-        )
-
-    # --- artifact tools -----------------------------------------------------
+    # --- artifact WRITE tools (main surface only — ABSENT from shadow) -------
 
     def _resolve_governs(governs) -> dict[str, dict]:
         """Resolve every scope slug in a `governs` argument against the platform,
@@ -301,43 +403,6 @@ def build_main_surface(scope_client: ScopeClient | None = None) -> FastMCP:
             _resolve_artifact_sync, artifact_id, version_id
         )
 
-    def _get_artifact_sync(artifact_id):
-        with session_scope() as session:
-            return artifacts.get_artifact(session, artifact_id)
-
-    @mcp.tool()
-    async def get_artifact(artifact_id: str) -> dict:
-        """Read one artifact's full record by id — identity, doc_kind, maturity,
-        governs, the current leaf + all competing leaves + branch points. The
-        on-demand expansion of a `list_artifacts` header. Read-only."""
-        return await anyio.to_thread.run_sync(_get_artifact_sync, artifact_id)
-
-    def _list_artifacts_sync(governs, limit):
-        governs_scope_id = None
-        if governs is not None:
-            sc = client.resolve(governs)
-            governs_scope_id = sc["id"] if sc is not None else None
-        with session_scope() as session:
-            return artifacts.list_artifacts(
-                session,
-                governs=governs,
-                governs_scope_id=governs_scope_id,
-                limit=limit,
-            )
-
-    @mcp.tool()
-    async def list_artifacts(
-        governs: str | None = None, limit: int | None = None
-    ) -> dict:
-        """List registered artifacts as compact rows (id, doc_kind, backend,
-        maturity, governs, version_count, is_branched), newest-first, capped.
-        `governs` (a scope slug, resolved against the platform) narrows to
-        artifacts governing that scope — by an association row OR `governs_all`.
-        Expand any row via `get_artifact(id)`. Read-only."""
-        return await anyio.to_thread.run_sync(
-            _list_artifacts_sync, governs, limit
-        )
-
     def _set_governs_sync(artifact_id, governs):
         resolved = _resolve_governs(governs)
         with session_scope() as session:
@@ -368,22 +433,189 @@ def build_main_surface(scope_client: ScopeClient | None = None) -> FastMCP:
             _set_maturity_sync, artifact_id, maturity
         )
 
-    def _applicable_artifacts_sync(scope, limit):
+    return mcp
+
+
+def build_shadow_surface(scope_client: ScopeClient | None = None) -> FastMCP:
+    """Build the `shadow` FastMCP surface — the SPECULATION surface (decision
+    8a7f0a11), mounted on the governance app at `/shadow/mcp`.
+
+    A SECOND FastMCP instance, mirroring the monolith's `/shadow` + `/core/shadow`:
+    the 8 shadow-WRITE tools (`create_branch`, `list_branches`, `get_branch`,
+    `set_narrative_notes`, `add_node`, `add_citation`, `list_citations`,
+    `shadow_corpus_search`) PLUS the read-real grounding tools (the SAME decision
+    + artifact READ handlers the `main` surface registers, via
+    `_register_read_tools`) so a speculation agent can ground in the real graph.
+
+    NO real-write verb is registered here — `record_decision`, `supersede_decision`,
+    `register_artifact`, `revise_artifact`, `resolve_artifact`, `set_governs`,
+    `set_maturity` are ABSENT by construction. That absence IS the isolation: a
+    speculation session connecting to `/shadow/mcp` physically cannot mutate the
+    real graph.
+
+    `scope_client` is injectable (tests pass a stub); defaults to the real
+    `HttpScopeClient`. The scope-bearing shadow tools resolve the slug →
+    `(id, slug)` against the platform BEFORE the DB write (the soft-reference
+    pattern), so a branch anchors on the STABLE `scope_id`.
+    """
+    client: ScopeClient = scope_client or HttpScopeClient()
+
+    mcp = FastMCP(
+        "snowline-governance-shadow",
+        stateless_http=True,
+        transport_security=_SECURITY,
+        instructions=_SHADOW_INSTRUCTIONS,
+    )
+
+    def _resolve_scope(scope: str) -> dict:
+        sc = client.resolve(scope)
+        if sc is None:
+            raise ScopeNotFoundError(
+                f"no scope with slug {scope!r} — register it on the platform first"
+            )
+        return sc
+
+    def _create_branch_sync(scope, name, narrative_notes):
+        sc = _resolve_scope(scope)
         with session_scope() as session:
-            return artifacts.applicable_artifacts(
-                session, scope, client, limit=limit
+            return shadow.create_branch(
+                session, sc["slug"], sc["id"], name, narrative_notes
             )
 
     @mcp.tool()
-    async def applicable_artifacts(scope: str, limit: int = 50) -> dict:
-        """Artifacts APPLICABLE at a scope, ANCESTOR-INHERITED — the governing
-        docs a reader at `scope` inherits, not just its own. Reads the scope tree
-        from the platform, walking UPWARD and HALTING at the first isolated
-        ancestor + the forest root; each inherited row carries `from_scope` (the
-        ancestor slug it matched), and a `governs_all` artifact carries
-        `from_scope='*'`. The artifact analog of `applicable_decisions`."""
+    async def create_branch(
+        scope: str, name: str, narrative_notes: str | None = None
+    ) -> dict:
+        """Open a new speculative branch in `scope` (a Snowline slug, resolved
+        against the platform), addressed `<scope>:<name>` (name unique within the
+        scope). Optionally seed its narrative-notes doc. Shadow-only: invisible to
+        the real graph, and nothing real may cite it."""
         return await anyio.to_thread.run_sync(
-            _applicable_artifacts_sync, scope, limit
+            _create_branch_sync, scope, name, narrative_notes
         )
+
+    def _list_branches_sync(scope, include_done):
+        sc = _resolve_scope(scope)
+        with session_scope() as session:
+            return {
+                "branches": shadow.list_branches(
+                    session, sc["slug"], sc["id"], include_done
+                )
+            }
+
+    @mcp.tool()
+    async def list_branches(scope: str, include_done: bool = False) -> dict:
+        """List speculative branches in `scope`, newest first. Archived branches
+        are hidden by default — they represent concluded speculation. Pass
+        `include_done=True` to reveal them."""
+        return await anyio.to_thread.run_sync(
+            _list_branches_sync, scope, include_done
+        )
+
+    def _get_branch_sync(scope, name):
+        with session_scope() as session:
+            return shadow.get_branch(session, scope, name)
+
+    @mcp.tool()
+    async def get_branch(scope: str, name: str) -> dict:
+        """A branch with its nodes (the verdicts) and narrative notes (the
+        reasoning) — the re-entry surface for a speculation line."""
+        return await anyio.to_thread.run_sync(_get_branch_sync, scope, name)
+
+    def _set_narrative_notes_sync(scope, name, narrative_notes):
+        with session_scope() as session:
+            return shadow.set_narrative_notes(
+                session, scope, name, narrative_notes
+            )
+
+    @mcp.tool()
+    async def set_narrative_notes(
+        scope: str, name: str, narrative_notes: str | None
+    ) -> dict:
+        """Replace a branch's narrative-notes doc — the running thread that
+        reconstructs the reasoning on re-entry."""
+        return await anyio.to_thread.run_sync(
+            _set_narrative_notes_sync, scope, name, narrative_notes
+        )
+
+    def _add_node_sync(scope, name, statement, rationale):
+        with session_scope() as session:
+            return shadow.add_node(session, scope, name, statement, rationale)
+
+    @mcp.tool()
+    async def add_node(
+        scope: str, name: str, statement: str, rationale: str | None = None
+    ) -> dict:
+        """Add a speculative-decision node to a branch: `statement` is the
+        not-yet-real decision, `rationale` its crisp why. Individually addressable
+        so a future graduation can cherry-pick it."""
+        return await anyio.to_thread.run_sync(
+            _add_node_sync, scope, name, statement, rationale
+        )
+
+    def _add_citation_sync(node_id, cited_node_id, cited_decision_id):
+        with session_scope() as session:
+            return shadow.add_citation(
+                session,
+                node_id,
+                cited_node_id=cited_node_id,
+                cited_decision_id=cited_decision_id,
+            )
+
+    @mcp.tool()
+    async def add_citation(
+        node_id: str,
+        cited_node_id: str | None = None,
+        cited_decision_id: str | None = None,
+    ) -> dict:
+        """Record a citation FROM a shadow node: exactly one target — another node
+        in the SAME branch (`cited_node_id`, the cherry-pick dependency) XOR a real
+        decision (`cited_decision_id`, the permitted inward reference). The reverse
+        never exists: nothing real may cite shadow."""
+        return await anyio.to_thread.run_sync(
+            _add_citation_sync, node_id, cited_node_id, cited_decision_id
+        )
+
+    def _list_citations_sync(node_id):
+        with session_scope() as session:
+            return {"citations": shadow.list_citations(session, node_id)}
+
+    @mcp.tool()
+    async def list_citations(node_id: str) -> dict:
+        """The citations a node makes (its outgoing inward references) — the
+        dependency set a future graduation's cherry-pick closure walks."""
+        return await anyio.to_thread.run_sync(_list_citations_sync, node_id)
+
+    def _corpus_search_sync(query, scope, limit):
+        scope_id = None
+        scope_slug = None
+        if scope is not None:
+            sc = _resolve_scope(scope)
+            scope_id, scope_slug = sc["id"], sc["slug"]
+        with session_scope() as session:
+            return shadow.corpus_search(
+                session, query, scope_id=scope_id, scope_slug=scope_slug,
+                limit=limit,
+            )
+
+    @mcp.tool()
+    async def shadow_corpus_search(
+        query: str, scope: str | None = None, limit: int | None = None
+    ) -> dict:
+        """Shadow-scoped corpus search: full-text across the speculation surface's
+        own content — shadow branches (active AND archived), their nodes,
+        narrative-notes — bundled with the REAL decisions backlinked to a shadow
+        line. Ranked headers merged across corpora; kinds: `shadow_branch`,
+        `shadow_node`, `decision`. Pass `scope` (resolved against the platform) to
+        narrow each corpus to that scope; omit it to search all shadow content.
+        Raises on a blank query or unknown scope slug."""
+        return await anyio.to_thread.run_sync(
+            _corpus_search_sync, query, scope, limit
+        )
+
+    # Read-real grounding — the SAME decision + artifact READ handlers the `main`
+    # surface registers (one source of truth). NO real-write verb is registered
+    # on this surface; that absence IS the isolation guarantee (decision 8a7f0a11).
+    _register_read_tools(mcp, client)
 
     return mcp

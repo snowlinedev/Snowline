@@ -3,9 +3,10 @@
 A plugin joins the platform by POSTing its manifest to `POST /plugins` (the
 platform registry, architecture §2). Governance declares: its name (`governance`),
 its `base_url`, its `mcp_path` (`/mcp`), its `health_path` (`/health`), and its
-SURFACE MAPPING — `/mcp -> main` (the real-write decision + read tools land on the
-platform's composed `main` surface). The `/shadow/mcp -> shadow` mapping comes in
-the shadow increment.
+SURFACE MAPPING — `/mcp -> main` (the real-write decision + artifact tools + the
+reads land on the platform's composed `main` surface) AND `/shadow/mcp -> shadow`
+(the speculation write tools + read-real grounding, NO real-write — the isolation
+property, decision 8a7f0a11).
 
 Registration is BEST-EFFORT and RETRYABLE (architecture §3: hot-pluggable, no
 platform restart). The platform may be briefly down when this plugin boots; that
@@ -35,10 +36,12 @@ def build_manifest(base_url: str | None = None) -> dict:
         "base_url": (base_url or config.base_url()),
         "mcp_path": "/mcp",
         "health_path": "/health",
-        # Plugin-path -> platform named-surface (gateway.md §2): the decision
-        # tools on `/mcp` compose onto the platform's `main` surface. `/shadow/mcp
-        # -> shadow` is added in the shadow increment.
-        "surfaces": {"/mcp": "main"},
+        # Plugin-path -> platform named-surface (gateway.md §2): the real-write
+        # decision + artifact tools on `/mcp` compose onto the platform's `main`
+        # surface; the speculation surface on `/shadow/mcp` (shadow writes +
+        # read-real grounding, NO real-write) composes onto `shadow` — the
+        # isolation mirrors the MCP isolation (decision 8a7f0a11).
+        "surfaces": {"/mcp": "main", "/shadow/mcp": "shadow"},
     }
 
 

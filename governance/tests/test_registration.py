@@ -36,7 +36,7 @@ def test_register_posts_the_right_manifest():
     assert m["mcp_path"] == "/mcp"
     assert m["health_path"] == "/health"
     # The surface mapping: /mcp -> the platform's `main` named surface.
-    assert m["surfaces"] == {"/mcp": "main"}
+    assert m["surfaces"] == {"/mcp": "main", "/shadow/mcp": "shadow"}
 
 
 def test_register_idempotent_on_conflict():
@@ -79,4 +79,4 @@ def test_manifest_is_accepted_by_the_platform_model():
 
     m = PluginManifest(**registration.build_manifest("http://gov.example:8801"))
     assert m.name == "governance"
-    assert m.surfaces == {"/mcp": "main"}
+    assert m.surfaces == {"/mcp": "main", "/shadow/mcp": "shadow"}

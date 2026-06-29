@@ -123,7 +123,9 @@ def clean_db(migrated_db):
         s.execute(
             sa.text(
                 "TRUNCATE decisions, artifacts, artifact_versions, "
-                "artifact_governs RESTART IDENTITY CASCADE"
+                "artifact_governs, shadow_branches, shadow_nodes, "
+                "shadow_node_citations, shadow_conversation_events "
+                "RESTART IDENTITY CASCADE"
             )
         )
     yield
