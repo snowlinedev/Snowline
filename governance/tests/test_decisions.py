@@ -7,11 +7,36 @@ always a stub — these unit tests never require a running platform.
 
 from __future__ import annotations
 
+import contextlib
 import uuid
 
 import pytest
+from sqlalchemy import event
 
 from snowline_governance import decisions
+from snowline_governance.db import get_engine
+
+
+@contextlib.contextmanager
+def _count_selects():
+    """Count SELECT statements issued on the governance engine within the block.
+
+    A list with a single int (so the inner closure can mutate it); yields that
+    list so the caller reads `counter[0]` after the block. Counts SELECTs only —
+    the read paths under test issue no writes — so the assertion tracks exactly
+    the query fan-out issue #14 is about."""
+    counter = [0]
+
+    def _before(conn, cursor, statement, params, context, executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            counter[0] += 1
+
+    engine = get_engine()
+    event.listen(engine, "before_cursor_execute", _before)
+    try:
+        yield counter
+    finally:
+        event.remove(engine, "before_cursor_execute", _before)
 
 
 def _sid(slug: str) -> uuid.UUID:
@@ -226,3 +251,52 @@ def test_decision_survives_slug_rename(db_session, stub_scope_client):
     listed = decisions.list_decisions(db_session, sc["id"], sc["slug"])
     assert listed["scope"] == new_slug
     assert {d["id"] for d in listed["decisions"]} == {rec["id"]}
+
+
+def _deep_decision_tree(db_session, depth: int) -> tuple[str, dict[str, str | None]]:
+    """Record one decision at each of `depth` chained scopes acme/0/1/.../n-1 and
+    return (leaf_slug, tree) for a StubScopeClient. Each scope is the child of the
+    previous, so the ancestor chain from the leaf has length `depth`."""
+    tree: dict[str, str | None] = {}
+    parent: str | None = None
+    slug = ""
+    for i in range(depth):
+        slug = "acme" if i == 0 else f"{slug}/{i}"
+        decisions.record_decision(db_session, slug, _sid(slug), f"policy {i}")
+        tree[slug] = parent
+        parent = slug
+    return slug, tree
+
+
+def test_applicable_decisions_is_batched(db_session, stub_scope_client):
+    """Issue #14: `applicable_decisions` must NOT scale its DB query count with
+    ancestor depth. A 3-deep and a 6-deep chain return the correctly merged +
+    ordered + tagged result AND issue the SAME (bounded) number of SELECTs."""
+
+    def run(depth: int) -> tuple[list[dict], int]:
+        # Fresh tables per depth so the two runs are independent.
+        import sqlalchemy as sa
+
+        db_session.execute(sa.text("TRUNCATE decisions RESTART IDENTITY CASCADE"))
+        leaf, tree = _deep_decision_tree(db_session, depth)
+        stub = stub_scope_client(tree=tree)
+        with _count_selects() as counter:
+            out = decisions.applicable_decisions(db_session, leaf, stub)
+        return out["decisions"], counter[0]
+
+    shallow, shallow_q = run(3)
+    deep, deep_q = run(6)
+
+    # Behavior preserved: own-first, nearest-ancestor-next, all levels merged.
+    assert [d["decision"] for d in shallow] == ["policy 2", "policy 1", "policy 0"]
+    assert [d["decision"] for d in deep] == [
+        f"policy {i}" for i in range(5, -1, -1)
+    ]
+    # Own-scope row untagged; each inherited row tagged with its ancestor slug.
+    assert "from_scope" not in deep[0]
+    assert all("from_scope" in d for d in deep[1:])
+
+    # The query count does NOT grow with depth (the N+1 fix): doubling the chain
+    # depth leaves the SELECT count unchanged and small.
+    assert shallow_q == deep_q
+    assert deep_q <= 2  # one ancestors() is the stub (no DB); leaves batch in one
