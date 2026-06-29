@@ -75,18 +75,20 @@ def _decision_row(d: Decision, *, from_scope: str | None = None) -> dict:
 
 def _leaves_for_one_scope(
     session: Session,
-    scope_slug: str,
+    scope_id: uuid.UUID | str,
     *,
     include_superseded: bool,
     limit: int,
 ) -> list[Decision]:
-    """The newest `limit` decisions in exactly ONE scope (matched by the soft
-    `scope_slug` reference), leaves-only unless `include_superseded`. Supersession
-    is intra-scope, so the leaf filter is applied PER scope — the unit the
-    inherited walk collects once per ancestor."""
+    """The newest `limit` decisions in exactly ONE scope (matched by the STABLE
+    `scope_id` soft reference — survives a platform-side slug rename), leaves-only
+    unless `include_superseded`. Supersession is intra-scope, so the leaf filter
+    is applied PER scope — the unit the inherited walk collects once per ancestor.
+    """
+    sid = scope_id if isinstance(scope_id, uuid.UUID) else uuid.UUID(str(scope_id))
     stmt = (
         select(Decision)
-        .where(Decision.scope_slug == scope_slug)
+        .where(Decision.scope_id == sid)
         .order_by(Decision.recorded_at.desc())
         .limit(limit)
     )
@@ -95,7 +97,7 @@ def _leaves_for_one_scope(
             branching.leaf_filter(
                 Decision.id,
                 Decision.supersedes_id,
-                Decision.scope_slug == scope_slug,
+                Decision.scope_id == sid,
             )
         )
     return list(session.scalars(stmt))
@@ -224,27 +226,33 @@ def _resolve_list_limit(limit: int | None, default: int = 50, cap: int = 500) ->
 
 def list_decisions(
     session: Session,
+    scope_id: uuid.UUID | str,
     scope_slug: str,
     limit: int | None = None,
     include_superseded: bool = False,
 ) -> dict:
     """Browse a scope's decision history — headers only (id, one-line summary,
     recorded `at`, supersedes/superseded_by lineage markers), newest-first,
-    payload-capped. EXACT-scope (matched by `scope_slug`).
+    payload-capped. EXACT-scope, matched by the STABLE `scope_id` (the caller
+    resolves the slug against the platform first); `scope_slug` is carried for the
+    response's display `scope` field only.
 
     By default (`include_superseded=False`) returns only chain leaves — the
     current decisions; `include_superseded=True` exposes full chains for audit.
     Capped at `limit` (default 50, max 500) with `items_total` carrying the true
     depth. Expand any row's full body via `get_decision(id)`. Read-only.
 
-    NOTE: this increment scopes by `scope_slug` (the soft reference stored on the
-    row). The monolith's `subtree=True` descendant span needs the platform's
-    scope tree and lands when artifact governs-matching does (a later increment).
+    Keying on `scope_id` (not the mutable slug) keeps pre-rename decisions visible
+    after a platform-side slug rename — the slug changes, the id survives (#11).
+
+    NOTE: the monolith's `subtree=True` descendant span needs the platform's scope
+    tree and lands when artifact governs-matching does (a later increment).
     """
+    sid = scope_id if isinstance(scope_id, uuid.UUID) else uuid.UUID(str(scope_id))
     lim = _resolve_list_limit(limit)
     stmt = (
         select(Decision)
-        .where(Decision.scope_slug == scope_slug)
+        .where(Decision.scope_id == sid)
         .order_by(Decision.recorded_at.desc(), Decision.id.desc())
     )
     if not include_superseded:
@@ -252,7 +260,7 @@ def list_decisions(
             branching.leaf_filter(
                 Decision.id,
                 Decision.supersedes_id,
-                Decision.scope_slug == scope_slug,
+                Decision.scope_id == sid,
             )
         )
     rows = list(session.scalars(stmt))
@@ -260,7 +268,7 @@ def list_decisions(
     if include_superseded:
         for prior_id, succ_id in session.execute(
             select(Decision.supersedes_id, Decision.id).where(
-                Decision.scope_slug == scope_slug,
+                Decision.scope_id == sid,
                 Decision.supersedes_id.is_not(None),
             )
         ):
@@ -312,7 +320,11 @@ def applicable_decisions(
     WITHIN each scope, capped at `limit` — so the cap never truncates the
     reader's own current decisions in favour of a fresher ancestor's (#651
     review). `scope_client` is injectable so tests stub it without a running
-    platform; the chain ROWS carry `slug` (the platform's `to_row` shape).
+    platform; the chain ROWS carry `id` + `slug` (the platform's `to_row` shape).
+
+    Leaves are collected by each chain scope's STABLE `id` (not its slug), so a
+    platform-side slug rename can't make pre-rename governance invisible — the
+    slug the platform now serves drives `from_scope` (display) only (#11).
     """
     chain = scope_client.ancestors(scope_slug)
     collected: list[dict] = []
@@ -320,7 +332,7 @@ def applicable_decisions(
         sc_slug = sc["slug"]
         for d in _leaves_for_one_scope(
             session,
-            sc_slug,
+            sc["id"],
             include_superseded=include_superseded,
             limit=limit,
         ):
