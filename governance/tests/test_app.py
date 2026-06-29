@@ -42,6 +42,8 @@ def test_main_surface_exposes_the_decision_and_artifact_tools():
         "get_decision",
         "list_decisions",
         "applicable_decisions",
+        # graduation (shadow → real) — a real write, main-only (decision 99b92e1d)
+        "graduate",
         # artifacts
         "register_artifact",
         "revise_artifact",

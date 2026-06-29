@@ -38,7 +38,7 @@ import anyio
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-from snowline_governance import artifacts, decisions, shadow
+from snowline_governance import artifacts, decisions, graduation, shadow
 from snowline_governance.db import session_scope
 from snowline_governance.scope_client import (
     HttpScopeClient,
@@ -292,6 +292,70 @@ def build_main_surface(scope_client: ScopeClient | None = None) -> FastMCP:
         """
         return await anyio.to_thread.run_sync(
             _supersede_decision_sync, prior_decision_id, decision, rationale, scope
+        )
+
+    # --- graduation (shadow → real) — a REAL write, MAIN surface only --------
+    # The ONE explicit crossing from shadow into the real graph (decision
+    # 99b92e1d "the principal split"): the shadow agent on `/shadow/mcp` drafts /
+    # proposes, the ratifying principal HERE on `main` executes. It mints a real
+    # `record_decision`, so it lives with the real-write verbs and is ABSENT from
+    # the shadow surface — surface placement IS the principal split.
+
+    def _graduate_sync(
+        node_id: str,
+        dest_scope: str | None,
+        decision: str | None,
+        rationale: str | None,
+        promote_closure: bool,
+    ):
+        # Default to the node's cradle scope (resolved inside the service from the
+        # branch's soft scope ref); an explicit `dest_scope` is resolved against
+        # the platform first (the soft-reference contract) before any DB write.
+        dest_slug = None
+        dest_id = None
+        if dest_scope is not None:
+            sc = client.resolve(dest_scope)
+            if sc is None:
+                raise ScopeNotFoundError(
+                    f"no scope with slug {dest_scope!r} — register it on the "
+                    "platform first"
+                )
+            dest_slug, dest_id = sc["slug"], sc["id"]
+        with session_scope() as session:
+            return graduation.graduate_node(
+                session,
+                node_id,
+                dest_scope_slug=dest_slug,
+                dest_scope_id=dest_id,
+                decision=decision,
+                rationale=rationale,
+                promote_closure=promote_closure,
+            )
+
+    @mcp.tool()
+    async def graduate(
+        node_id: str,
+        dest_scope: str | None = None,
+        decision: str | None = None,
+        rationale: str | None = None,
+        promote_closure: bool = True,
+    ) -> dict:
+        """GRADUATE a shadow node into a REAL decision — the one explicit crossing
+        from speculation into the real graph (the human-ratified write the shadow
+        agent does NOT hold). Translates the node's `statement → decision` /
+        `rationale → rationale` (override either with a ratified edit via
+        `decision`/`rationale`), records it, and stamps bidirectional provenance
+        (the decision's shadow origin + the node's `graduated_decision_id`).
+
+        `dest_scope` (a slug, resolved against the platform) chooses the scope; it
+        defaults to the node's CRADLE scope (its branch's anchor). Idempotent:
+        re-graduating an already-graduated node returns the existing decision.
+        `promote_closure` (default true) graduates the node's un-graduated
+        shadow-cited ancestors first, in dependency order, so the referenced
+        reasoning comes along."""
+        return await anyio.to_thread.run_sync(
+            _graduate_sync,
+            node_id, dest_scope, decision, rationale, promote_closure,
         )
 
     # --- decision + artifact READ tools (shared with the shadow surface) ----
