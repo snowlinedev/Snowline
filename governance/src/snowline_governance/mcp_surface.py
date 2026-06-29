@@ -132,9 +132,18 @@ def build_main_surface(scope_client: ScopeClient | None = None) -> FastMCP:
     def _list_decisions_sync(
         scope: str, limit: int | None, include_superseded: bool
     ):
+        sc = client.resolve(scope)
+        if sc is None:
+            raise ScopeNotFoundError(
+                f"no scope with slug {scope!r} — register it on the platform first"
+            )
         with session_scope() as session:
             return decisions.list_decisions(
-                session, scope, limit=limit, include_superseded=include_superseded
+                session,
+                scope_id=sc["id"],
+                scope_slug=sc["slug"],
+                limit=limit,
+                include_superseded=include_superseded,
             )
 
     @mcp.tool()
