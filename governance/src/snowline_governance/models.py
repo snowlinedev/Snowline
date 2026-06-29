@@ -38,7 +38,18 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, ForeignKey, Index, String, func, text
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    UniqueConstraint,
+    func,
+    text,
+)
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 # --- artifact value sets (single source of truth, carried from the monolith's
@@ -54,6 +65,12 @@ ARTIFACT_VERSION_STATUSES = ("proposed", "superseded")
 ARTIFACT_RELATIONS = ("refines", "pivot")
 DEFAULT_ARTIFACT_MATURITY = "draft"
 DEFAULT_ARTIFACT_VERSION_STATUS = "proposed"
+
+# --- shadow value sets (carried from the monolith's `models_core`; §4 / §6.4).
+# A branch is archived (a status flip that KEEPS the row, listable) — never
+# expired/deleted.
+SHADOW_BRANCH_STATUSES = ("active", "archived")
+DEFAULT_SHADOW_BRANCH_STATUS = "active"
 
 
 class Base(DeclarativeBase):
@@ -205,3 +222,206 @@ class ArtifactGoverns(Base):
     # the stable id; the slug is denormalized for display.
     scope_id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
     scope_slug: Mapped[str] = mapped_column(String, nullable=False)
+
+
+# --- the SHADOW / speculation graph (spec §4 / §5 / §6.4) -------------------
+#
+# A second governance subgraph: named speculative branches per scope, speculative
+# decision nodes, the inward-only citation edge, and a durable per-branch
+# conversation log. Carried (functionality-first, NOT imported) from the frozen
+# monolith's `models_core` (`ShadowBranch` / `ShadowNode` / `ShadowNodeCitation` /
+# `ShadowConversationEvent`), schema-compatible so existing shadow rows migrate
+# cleanly later.
+#
+# THE STRUCTURAL ISOLATION INVARIANT (spec §6.4, decision 8a7f0a11 — "inward
+# only"): references flow ONE WAY only. A shadow row may reference a real
+# `decisions` row, but NOTHING real ever references a shadow row. Two structural
+# deltas from the monolith carry this here:
+#
+#   1. `ShadowBranch.scope_id` is a SOFT scope reference (`scope_id` +
+#      denormalized `scope_slug`), NOT a `ForeignKey("scopes.id")` — scopes are
+#      platform-owned and live in another DB (mirrors `Decision`/`ArtifactGoverns`).
+#
+#   2. `ShadowNodeCitation.cited_decision_id` and `ShadowNode.graduated_decision_id`
+#      store the real decision's id as a PLAIN VALUE — NO `ForeignKey("decisions.id")`.
+#      The monolith FKs these (a shadow→real FK is the permitted inward direction
+#      there), but here the inward-only invariant is held STRUCTURALLY: there is
+#      NO foreign key from any shadow table to a real `decisions`/`artifacts` row
+#      in either direction, so the real graph is provably independent of shadow at
+#      the schema level. The target's existence is validated at the SERVICE layer
+#      (`shadow.add_citation`) instead of by an FK. Intra-shadow FKs
+#      (branch→node→citation) remain, since those are within the shadow subgraph.
+
+
+class ShadowBranch(Base):
+    """A named speculative branch within a scope (spec §4 / §6.4).
+
+    Multiple rival branches may be held per scope ("auth as X" vs "auth as Y"),
+    each killable independently. Addressed `<scope>:<name>` — the name is unique
+    WITHIN its scope (the `uq_shadow_branch_scope_name` constraint), no global
+    namespace. Carries a running `narrative_notes` doc (the reasoning thread that
+    reconstructs *how we got here* on re-entry) and a set of `ShadowNode`s.
+
+    Schema-compatible with the monolith's `ShadowBranch`, with the ONE delta
+    mirroring `Decision`: `scope_id` is a SOFT reference to a platform-owned scope
+    (`scope_id` + denormalized `scope_slug`), NOT a `ForeignKey("scopes.id")`.
+    """
+
+    __tablename__ = "shadow_branches"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    # SOFT scope reference (platform-owned scope; no cross-service FK). Keyed on
+    # the stable id; the slug is denormalized so a read labels the branch without
+    # a round-trip to the platform.
+    scope_id: Mapped[uuid.UUID] = mapped_column(nullable=False, index=True)
+    scope_slug: Mapped[str] = mapped_column(String, nullable=False)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    # The per-branch narrative-notes doc: a single mutable body, NULL until first
+    # written. Nodes are the verdicts; the notes are the curated reasoning thread.
+    narrative_notes: Mapped[str | None] = mapped_column(String, nullable=True)
+    # The Agent SDK session id backing this branch's conversation — persisted so a
+    # later visit resumes the same agent context. NULL until the first turn runs.
+    agent_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String, nullable=False,
+        server_default=DEFAULT_SHADOW_BRANCH_STATUS,
+        default=DEFAULT_SHADOW_BRANCH_STATUS,
+    )  # see SHADOW_BRANCH_STATUSES
+    # When the branch was first archived (the active→archived transition, §6.4).
+    # NULL while active; pinned to the original archival across an idempotent
+    # re-archive (deliberately NOT `updated_at`).
+    archived_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("scope_id", "name", name="uq_shadow_branch_scope_name"),
+    )
+
+
+class ShadowNode(Base):
+    """A speculative-decision node within a shadow branch (spec §4).
+
+    The unit of speculation stays the decision; a node is a not-yet-real decision
+    carrying its own crisp `rationale`, individually addressable so a later
+    graduation can cherry-pick ONE node. The field shape mirrors `Decision`
+    (`statement` ↔ `Decision.decision`, `rationale`) so graduation's translation
+    into a real decision is a straight copy. Deleting the branch cascades.
+
+    Schema-compatible with the monolith's `ShadowNode`, with the STRUCTURAL DELTA:
+    `graduated_decision_id` stores the real decision's id as a PLAIN VALUE, NOT a
+    `ForeignKey("decisions.id")` — the inward-only invariant held structurally (no
+    shadow→real FK in this DB). NULL while the node is still speculative;
+    graduation (a later PR) sets it. The branch FK is intra-shadow and stays.
+    """
+
+    __tablename__ = "shadow_nodes"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    branch_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("shadow_branches.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    statement: Mapped[str] = mapped_column(String, nullable=False)
+    rationale: Mapped[str | None] = mapped_column(String, nullable=True)
+    # The real decision this node graduated into (§4), or NULL while speculative.
+    # A PLAIN VALUE, not an FK — the inward-only invariant is structural here (no
+    # shadow→real FK), unlike the monolith's `ForeignKey("decisions.id")`.
+    # Graduation (a later PR) populates it.
+    graduated_decision_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ShadowNodeCitation(Base):
+    """A citation FROM a shadow node (spec §4 / §6.4) — the structural carrier of
+    the inward-only rule.
+
+    Exactly one target (XOR, the `ck_shadow_citation_one_target` check): another
+    shadow node in the SAME branch (`cited_node_id` — a within-shadow dependency)
+    OR a real decision (`cited_decision_id` — the permitted INWARD reference).
+    There is deliberately no citation edge running the other way anywhere in the
+    schema; that asymmetry IS the inward-only isolation invariant (§6.4).
+
+    THE STRUCTURAL DELTA from the monolith: `cited_decision_id` stores the real
+    decision's id as a PLAIN VALUE, NOT a `ForeignKey("decisions.id")` — NO shadow
+    table FKs into a real row, in either direction. The real decision's existence
+    is validated at the SERVICE layer (`shadow.add_citation`). `cited_node_id`
+    stays an intra-shadow FK (within the shadow subgraph). De-duplication of
+    (node → target) pairs is enforced by partial unique indexes (a plain
+    UniqueConstraint can't, since NULLs compare distinct).
+    """
+
+    __tablename__ = "shadow_node_citations"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    node_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("shadow_nodes.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    # Inward target A: another shadow node (within-shadow dependency). Intra-shadow
+    # FK — stays, it points within the shadow subgraph.
+    cited_node_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("shadow_nodes.id", ondelete="CASCADE"), nullable=True
+    )
+    # Inward target B: a real decision (shadow→real is the permitted direction;
+    # the reverse never is). A PLAIN VALUE, NOT an FK — the inward-only invariant
+    # is structural (no shadow→real FK). Existence validated in `add_citation`.
+    cited_decision_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "(cited_node_id IS NULL) <> (cited_decision_id IS NULL)",
+            name="ck_shadow_citation_one_target",
+        ),
+        Index(
+            "uq_shadow_citation_node",
+            "node_id", "cited_node_id",
+            unique=True,
+            postgresql_where=text("cited_node_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_shadow_citation_decision",
+            "node_id", "cited_decision_id",
+            unique=True,
+            postgresql_where=text("cited_decision_id IS NOT NULL"),
+        ),
+    )
+
+
+class ShadowConversationEvent(Base):
+    """One event in a branch's DURABLE, append-only conversation log (spec §4).
+
+    A turn's `user` message and each agent event is a row, ordered by a per-branch
+    monotonic `seq` (which doubles as the SSE resume cursor). The turn runs
+    server-side and appends here, so the conversation outlives any single client
+    connection. Cascades with the branch.
+
+    Isolated by construction like the rest of the shadow tables: nothing real
+    references it (no real→shadow FK). Carried for schema-compat; this increment
+    does not yet run agent turns (the conversation/turn machinery is a later PR).
+    """
+
+    __tablename__ = "shadow_conversation_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    branch_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("shadow_branches.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    # Per-branch monotonic sequence — ordering AND the SSE resume cursor.
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    # The event's `type` — a plain string, unschematized like the payload.
+    kind: Mapped[str] = mapped_column(String, nullable=False)
+    # The full normalized event dict the surface renders (untyped JSONB).
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("branch_id", "seq", name="uq_shadow_conv_branch_seq"),
+    )

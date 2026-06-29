@@ -1,0 +1,483 @@
+"""The shadow / speculation substrate — data access over the shadow subgraph.
+
+Carried (functionality-first, NOT imported) from the frozen monolith's
+`snowline_server.shadow`: named speculative branches per scope, speculative
+decision nodes, the inward-only citation edge, and a full-text corpus search over
+the shadow content. The deliberately *not-yet-real* inverse of `record_decision`.
+
+TWO STRUCTURAL CHANGES from the monolith, both flowing from the platform owning
+scopes + the inward-only isolation invariant (spec §3 / §6.4):
+
+  - **Soft scope refs.** Scopes live in the PLATFORM, so a `create_branch`/
+    `list_branches`/`get_branch` call takes the scope as a soft reference the
+    CALLER resolved against the platform (`scope_slug` + `scope_id`), exactly as
+    `decisions.record_decision` does — there is no local scope table to look up,
+    and a branch is anchored by the STABLE `scope_id` (#11). `corpus_search`
+    narrows to the EXACT resolved `scope_id` (the monolith narrowed to the scope
+    SUBTREE via the in-process scope tree, which lives in the platform now — an
+    exact-scope narrowing keeps this module import-pure; subtree narrowing can
+    ride the `ScopeClient` in a later increment if needed).
+
+  - **Citation-to-real is validated, not FK'd.** The inward-only invariant is
+    held STRUCTURALLY in the schema (no shadow→real FK anywhere — `add_citation`
+    enforces it: a node may cite another node in its OWN branch, or a real
+    decision, and the real decision's existence is checked here against the
+    `decisions` table; the reverse never exists). A cross-branch citation and a
+    real→shadow direction both raise.
+
+This module is plain functions over a `Session`, mirroring `decisions.py`'s
+style. It does NOT touch any MCP surface — the `shadow` FastMCP surface
+(`mcp_surface.build_shadow_surface`) wraps these. GRADUATION (shadow node → real
+decision) is a separate follow-up PR; this layer never writes the real graph.
+"""
+
+from __future__ import annotations
+
+import uuid
+
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from snowline_governance.models import (
+    DEFAULT_SHADOW_BRANCH_STATUS,
+    Decision,
+    ShadowBranch,
+    ShadowConversationEvent,
+    ShadowNode,
+    ShadowNodeCitation,
+)
+
+# Corpus search limit budget — local constants (the monolith shares search.py's
+# SEARCH_* budget; governance has no real `search` surface, so they live here).
+CORPUS_SEARCH_DEFAULT_LIMIT = 20
+CORPUS_SEARCH_MAX_LIMIT = 100
+_TS_CONFIG = "english"
+
+# kind → corpus order (ties in rank stay deterministic). Branches before their
+# nodes; attached real decisions last.
+_CORPUS_KIND_ORDER = ("shadow_branch", "shadow_node", "decision")
+
+
+class DuplicateBranchError(Exception):
+    """A branch with that name already exists in the scope. Branch names are
+    unique within a scope (§4 addressing `<scope>:<name>`)."""
+
+
+class BranchNotFoundError(Exception):
+    """No shadow branch with the given `<scope>:<name>` address."""
+
+
+class NodeNotFoundError(Exception):
+    """No shadow node with the given id."""
+
+
+class CitationTargetError(Exception):
+    """A citation must have exactly one target — another shadow node in the SAME
+    branch XOR a real decision (§6.4) — and the target must exist."""
+
+
+# --- serializers -----------------------------------------------------------
+
+
+def _branch_dict(branch: ShadowBranch, *, nodes=None) -> dict:
+    out = {
+        "id": str(branch.id),
+        "scope": branch.scope_slug,
+        "name": branch.name,
+        # The addressable handle (§4): `<scope>:<branch>`, no global namespace.
+        "address": f"{branch.scope_slug}:{branch.name}",
+        "status": branch.status,
+        "narrative_notes": branch.narrative_notes,
+        "archived_at": (
+            branch.archived_at.isoformat() if branch.archived_at else None
+        ),
+        "created_at": branch.created_at.isoformat() if branch.created_at else None,
+        "updated_at": branch.updated_at.isoformat() if branch.updated_at else None,
+    }
+    if nodes is not None:
+        out["nodes"] = [_node_dict(n) for n in nodes]
+    return out
+
+
+def _node_dict(node: ShadowNode) -> dict:
+    return {
+        "id": str(node.id),
+        "branch_id": str(node.branch_id),
+        "statement": node.statement,
+        "rationale": node.rationale,
+        # The real decision this node graduated into (§4), or None while still
+        # speculative. Graduation is a later PR; this stays None for now.
+        "graduated_decision_id": (
+            str(node.graduated_decision_id) if node.graduated_decision_id else None
+        ),
+        "created_at": node.created_at.isoformat() if node.created_at else None,
+        "updated_at": node.updated_at.isoformat() if node.updated_at else None,
+    }
+
+
+def _citation_dict(c: ShadowNodeCitation) -> dict:
+    return {
+        "id": str(c.id),
+        "node_id": str(c.node_id),
+        # Exactly one of these is set (§6.4 XOR): a within-shadow dependency, or
+        # the permitted inward reference to a real decision.
+        "cited_node_id": str(c.cited_node_id) if c.cited_node_id else None,
+        "cited_decision_id": (
+            str(c.cited_decision_id) if c.cited_decision_id else None
+        ),
+        "created_at": c.created_at.isoformat() if c.created_at else None,
+    }
+
+
+# --- internal helpers ------------------------------------------------------
+
+
+def _parse_uuid(value, err: type[Exception], label: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(str(value))
+    except (ValueError, AttributeError) as exc:
+        raise err(f"not a valid {label}: {value!r}") from exc
+
+
+def _get_branch_row(
+    session: Session, scope_slug: str, name: str
+) -> ShadowBranch:
+    """The branch row addressed by `<scope>:<name>` (matched by the soft
+    `scope_slug` reference)."""
+    branch = session.scalar(
+        select(ShadowBranch).where(
+            ShadowBranch.scope_slug == scope_slug, ShadowBranch.name == name
+        )
+    )
+    if branch is None:
+        raise BranchNotFoundError(f"no shadow branch {scope_slug}:{name!r}")
+    return branch
+
+
+def _branch_nodes(session: Session, branch_id: uuid.UUID) -> list[ShadowNode]:
+    return list(
+        session.scalars(
+            select(ShadowNode)
+            .where(ShadowNode.branch_id == branch_id)
+            .order_by(ShadowNode.created_at, ShadowNode.id)
+        )
+    )
+
+
+def _resolve_list_limit(
+    limit: int | None, default: int, maximum: int
+) -> int:
+    if limit is None:
+        return default
+    return max(1, min(int(limit), maximum))
+
+
+# --- branches --------------------------------------------------------------
+
+
+def create_branch(
+    session: Session,
+    scope_slug: str,
+    scope_id: uuid.UUID | str,
+    name: str,
+    narrative_notes: str | None = None,
+) -> dict:
+    """Open a new speculative branch in a scope. The caller resolves the scope
+    against the PLATFORM first (governance has no local scope table) and passes
+    the soft reference (`scope_slug` + `scope_id`). Branch names are unique within
+    the scope — a clash raises `DuplicateBranchError` (the DB unique constraint is
+    the backstop)."""
+    sid = scope_id if isinstance(scope_id, uuid.UUID) else uuid.UUID(str(scope_id))
+    existing = session.scalar(
+        select(ShadowBranch).where(
+            ShadowBranch.scope_id == sid, ShadowBranch.name == name
+        )
+    )
+    if existing is not None:
+        raise DuplicateBranchError(
+            f"shadow branch {scope_slug}:{name!r} already exists"
+        )
+    branch = ShadowBranch(
+        scope_id=sid,
+        scope_slug=scope_slug,
+        name=name,
+        narrative_notes=narrative_notes,
+    )
+    session.add(branch)
+    session.flush()
+    return _branch_dict(branch, nodes=[])
+
+
+def list_branches(
+    session: Session,
+    scope_slug: str,
+    scope_id: uuid.UUID | str,
+    include_done: bool = False,
+) -> list[dict]:
+    """Branches in a scope, newest first (matched by the STABLE `scope_id`). Done
+    (archived) branches are hidden by default (§6.4) — they represent concluded
+    speculation, not active work. Pass `include_done=True` to reveal them.
+    `get_branch` (single fetch) always fetches regardless of status."""
+    sid = scope_id if isinstance(scope_id, uuid.UUID) else uuid.UUID(str(scope_id))
+    stmt = select(ShadowBranch).where(ShadowBranch.scope_id == sid)
+    if not include_done:
+        stmt = stmt.where(ShadowBranch.status == DEFAULT_SHADOW_BRANCH_STATUS)
+    stmt = stmt.order_by(ShadowBranch.created_at.desc(), ShadowBranch.id)
+    return [_branch_dict(b) for b in session.scalars(stmt)]
+
+
+def get_branch(session: Session, scope_slug: str, name: str) -> dict:
+    """A branch with its nodes (the verdicts) and narrative notes (the
+    reasoning) — the re-entry surface for a speculation line (§4). Raises
+    `BranchNotFoundError` if the address is unknown."""
+    branch = _get_branch_row(session, scope_slug, name)
+    nodes = _branch_nodes(session, branch.id)
+    return _branch_dict(branch, nodes=nodes)
+
+
+def set_narrative_notes(
+    session: Session, scope_slug: str, name: str, narrative_notes: str | None
+) -> dict:
+    """Replace a branch's narrative-notes doc — the running thread that
+    reconstructs the reasoning on re-entry (§4)."""
+    branch = _get_branch_row(session, scope_slug, name)
+    branch.narrative_notes = narrative_notes
+    session.flush()
+    return _branch_dict(branch)
+
+
+# --- nodes -----------------------------------------------------------------
+
+
+def add_node(
+    session: Session,
+    scope_slug: str,
+    name: str,
+    statement: str,
+    rationale: str | None = None,
+) -> dict:
+    """Add a speculative-decision node to a branch. `statement` is the
+    not-yet-real decision; `rationale` its crisp why. Individually addressable so
+    graduation can later cherry-pick it (§4)."""
+    branch = _get_branch_row(session, scope_slug, name)
+    node = ShadowNode(
+        branch_id=branch.id, statement=statement, rationale=rationale
+    )
+    session.add(node)
+    session.flush()
+    return _node_dict(node)
+
+
+def get_node(session: Session, node_id: str) -> ShadowNode:
+    node = session.get(
+        ShadowNode, _parse_uuid(node_id, NodeNotFoundError, "node id")
+    )
+    if node is None:
+        raise NodeNotFoundError(f"no shadow node with id {node_id!r}")
+    return node
+
+
+# --- citations -------------------------------------------------------------
+
+
+def add_citation(
+    session: Session,
+    node_id: str,
+    *,
+    cited_node_id: str | None = None,
+    cited_decision_id: str | None = None,
+) -> dict:
+    """Record a citation FROM `node_id`. Exactly one target (§6.4): another shadow
+    node in the SAME branch (`cited_node_id` — a within-shadow dependency) XOR a
+    real decision (`cited_decision_id` — the permitted INWARD reference). The
+    reverse direction does not exist in the schema: nothing real may ever cite a
+    shadow node, and there is no shadow→real FK — the real decision's existence is
+    validated HERE against the `decisions` table, not by a foreign key."""
+    if (cited_node_id is None) == (cited_decision_id is None):
+        raise CitationTargetError(
+            "a citation needs exactly one target: cited_node_id XOR "
+            "cited_decision_id"
+        )
+    node = get_node(session, node_id)
+
+    cited_node_uuid = None
+    cited_decision_uuid = None
+    if cited_node_id is not None:
+        # The target must exist AND live in the SAME branch: branches are rival
+        # lines killed independently (§4), so a cross-branch edge would couple
+        # lines that must stay separable.
+        cited = get_node(session, cited_node_id)
+        if cited.branch_id != node.branch_id:
+            raise CitationTargetError(
+                "a node may only cite another node in the SAME branch "
+                "(cross-branch citation would couple rival lines)"
+            )
+        cited_node_uuid = cited.id
+    else:
+        # The inward reference to a real decision. No FK carries this (the
+        # inward-only invariant is structural); the decision's existence is
+        # validated against the real `decisions` table here. A reverse
+        # (real→shadow) citation is impossible — there is no such direction.
+        cited_decision_uuid = _parse_uuid(
+            cited_decision_id, CitationTargetError, "decision id"
+        )
+        if session.get(Decision, cited_decision_uuid) is None:
+            raise CitationTargetError(
+                f"no real decision with id {cited_decision_id!r}"
+            )
+
+    citation = ShadowNodeCitation(
+        node_id=node.id,
+        cited_node_id=cited_node_uuid,
+        cited_decision_id=cited_decision_uuid,
+    )
+    session.add(citation)
+    session.flush()
+    return _citation_dict(citation)
+
+
+def list_citations(session: Session, node_id: str) -> list[dict]:
+    """The citations a node makes (its outgoing inward references), oldest
+    first — the dependency set a future graduation's cherry-pick closure walks."""
+    node = get_node(session, node_id)
+    rows = session.scalars(
+        select(ShadowNodeCitation)
+        .where(ShadowNodeCitation.node_id == node.id)
+        .order_by(ShadowNodeCitation.created_at, ShadowNodeCitation.id)
+    )
+    return [_citation_dict(c) for c in rows]
+
+
+# --- shadow-scoped corpus search (spec §5) ---------------------------------
+#
+# The speculation surface's discovery read: full-text search across shadow
+# content — branches (active AND archived), nodes, narrative-notes — bundled with
+# the REAL decisions backlinked to a shadow line
+# (`Decision.shadow_origin_label IS NOT NULL`). A SEPARATE surface from any real
+# search (governance has no real `search`); the attached decisions ARE the
+# inward-only overlap (shadow cites real). It uses Postgres inline FTS
+# (`websearch_to_tsquery` + `ts_rank` + `ts_headline`), no stored FTS column.
+
+
+def corpus_search(
+    session: Session,
+    query: str,
+    scope_id: uuid.UUID | str | None = None,
+    scope_slug: str | None = None,
+    limit: int | None = None,
+) -> dict:
+    """Shadow-scoped full-text search (spec §5) over three corpora: shadow
+    branches (name + narrative-notes, BOTH active and archived — that breadth is
+    the point), shadow nodes (statement + rationale), and the REAL decisions
+    backlinked to a shadow line (`shadow_origin_label IS NOT NULL`). Ranked
+    headers merged across corpora, `{kind, id, scope, snippet, rank}`.
+
+    When `scope_id` is given (the caller resolved the slug against the platform)
+    each corpus narrows to that EXACT scope (branch.scope_id / node→branch.scope_id
+    / decision.scope_id); omitted, it searches all shadow content. Raises
+    `ValueError` on a blank query. (The monolith narrowed to the scope SUBTREE via
+    its in-process scope tree — which is the platform's now; an exact-scope
+    narrowing keeps this import-pure.)"""
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("`query` must be a non-empty string")
+
+    sid = None
+    if scope_id is not None:
+        sid = (
+            scope_id if isinstance(scope_id, uuid.UUID)
+            else uuid.UUID(str(scope_id))
+        )
+
+    lim = _resolve_list_limit(
+        limit, CORPUS_SEARCH_DEFAULT_LIMIT, CORPUS_SEARCH_MAX_LIMIT
+    )
+
+    # The query is ALWAYS a bound parameter (func args bind), never interpolated.
+    tsq = func.websearch_to_tsquery(_TS_CONFIG, query)
+
+    rows: list[dict] = []
+    total = 0
+    for kind in _CORPUS_KIND_ORDER:
+        text, id_col, scope_col, count_from, joins, filters = _corpus_search_spec(
+            kind, sid
+        )
+        vec = func.to_tsvector(_TS_CONFIG, text)
+        match = vec.op("@@")(tsq)
+        rank = func.ts_rank(vec, tsq)
+        snippet = func.ts_headline(_TS_CONFIG, text, tsq)
+        stmt = select(id_col, scope_col, snippet, rank)
+        for join in joins:
+            stmt = stmt.join(*join)
+        stmt = (
+            stmt.where(match, *filters)
+            .order_by(rank.desc(), id_col.asc())
+            .limit(lim)  # top-lim per kind ⊇ the merged top-lim
+        )
+        rows.extend(
+            {"kind": kind,
+             "id": str(rid),
+             "scope": rscope,
+             "snippet": rsnippet,
+             "rank": float(rrank)}
+            for rid, rscope, rsnippet, rrank in session.execute(stmt)
+        )
+        cstmt = select(func.count()).select_from(count_from)
+        for join in joins:
+            cstmt = cstmt.join(*join)
+        total += session.scalar(cstmt.where(match, *filters)) or 0
+
+    order = {k: i for i, k in enumerate(_CORPUS_KIND_ORDER)}
+    rows.sort(key=lambda r: (-r["rank"], order[r["kind"]], r["id"]))
+    return {
+        "query": query,
+        "scope": scope_slug if sid is not None else None,
+        "kinds": list(_CORPUS_KIND_ORDER),
+        "results": rows[:lim],
+        "results_total": total,
+    }
+
+
+def _corpus_search_spec(kind: str, scope_id: uuid.UUID | None):
+    """One corpus = (text expr, id col, scope expr, count-from model, join list,
+    narrowing filters). `concat_ws` skips NULLs so an optional column never nulls
+    the vector. `scope_id` is None for an unscoped (all-shadow) search; otherwise
+    each corpus narrows to that exact scope on its scope-bearing column. The scope
+    label comes from the denormalized `scope_slug` (branches) / the row's own
+    `scope_slug` (decisions) — no scope-table join (scopes are platform-owned)."""
+    if kind == "shadow_branch":
+        # Active AND archived — NO status filter (that breadth is the point §5).
+        text = func.concat_ws(
+            " ", ShadowBranch.name, ShadowBranch.narrative_notes
+        )
+        filters = (
+            [] if scope_id is None else [ShadowBranch.scope_id == scope_id]
+        )
+        return (
+            text, ShadowBranch.id, ShadowBranch.scope_slug, ShadowBranch,
+            [], filters,
+        )
+    if kind == "shadow_node":
+        # Scope rides through the node's branch (nodes carry no scope of their
+        # own — the branch is anchored at the cradle scope §4).
+        text = func.concat_ws(
+            " ", ShadowNode.statement, ShadowNode.rationale
+        )
+        filters = (
+            [] if scope_id is None else [ShadowBranch.scope_id == scope_id]
+        )
+        return (
+            text, ShadowNode.id, ShadowBranch.scope_slug, ShadowNode,
+            [(ShadowBranch, ShadowBranch.id == ShadowNode.branch_id)],
+            filters,
+        )
+    if kind == "decision":
+        # The REAL decisions backlinked to a shadow line (the inward overlap),
+        # gated to those (`shadow_origin_label IS NOT NULL`).
+        text = func.concat_ws(" ", Decision.decision, Decision.rationale)
+        filters = [Decision.shadow_origin_label.is_not(None)]
+        if scope_id is not None:
+            filters.append(Decision.scope_id == scope_id)
+        return (
+            text, Decision.id, Decision.scope_slug, Decision, [], filters,
+        )
+    raise AssertionError(f"unhandled corpus kind {kind!r}")  # caller-guarded
