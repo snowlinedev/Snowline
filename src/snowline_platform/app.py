@@ -10,8 +10,10 @@ this registry.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
 
+import anyio
 from fastapi import FastAPI, Request
 
 from snowline_platform import config, plugins_routes, scopes_routes
@@ -21,6 +23,7 @@ from snowline_platform.gateway_app import (
     gateway_lifespan,
     mount_gateway,
 )
+from snowline_platform.health import health_poll_loop
 from snowline_platform.middleware import TrustMiddleware
 from snowline_platform.registry import PluginRegistry
 from snowline_platform.trust import CidrTrustProvider, TrustResolver
@@ -55,7 +58,28 @@ async def _lifespan(app: FastAPI):
     # app lifespan (the gateway, gateway.md §2). The surfaces are mounted at
     # create_app time; their managers' run() is the required-for-lifespan context.
     async with gateway_lifespan(app.state.gateway_mounts):
-        yield
+        # The health poller (health.md): a background task that marks each plugin
+        # UP/DOWN so the gateway routes around dead ones. Off by default (the
+        # test-friendly factory) — the production singleton opts in. Cancelled on
+        # shutdown by tearing down its task group.
+        if getattr(app.state, "poll_health", False):
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(
+                    partial(
+                        health_poll_loop,
+                        app.state.registry,
+                        interval=config.health_poll_interval(),
+                        timeout=config.health_poll_timeout(),
+                    )
+                )
+                try:
+                    yield
+                finally:
+                    # Cancel the poller even if serving raised; the task group
+                    # absorbs its own-scope cancellation, so shutdown stays clean.
+                    tg.cancel_scope.cancel()
+        else:
+            yield
 
 
 def create_app(
@@ -63,14 +87,18 @@ def create_app(
     registry: PluginRegistry | None = None,
     migrate_on_startup: bool = True,
     connector: UpstreamConnector | None = None,
+    poll_health: bool = False,
 ) -> FastAPI:
     """Build the platform app. `resolver`/`registry` are injectable for tests;
     `migrate_on_startup=False` skips the lifespan boot-migrate (tests provision
     their own schema); `connector` injects the gateway's upstream connector
-    (defaults to streamable-HTTP; tests pass an in-memory one)."""
+    (defaults to streamable-HTTP; tests pass an in-memory one). `poll_health`
+    starts the background health poller — OFF by default so unit tests don't spawn
+    network traffic or race on status; the production singleton opts in."""
     app = FastAPI(title="Snowline Platform", lifespan=_lifespan)
     app.state.registry = registry or PluginRegistry()
     app.state.migrate_on_startup = migrate_on_startup
+    app.state.poll_health = poll_health
     app.add_middleware(
         TrustMiddleware,
         resolver=resolver or build_resolver(),
@@ -99,4 +127,5 @@ def create_app(
     return app
 
 
-app = create_app()
+# The production singleton: boot-migrate, gateway, AND the health poller on.
+app = create_app(poll_health=True)
