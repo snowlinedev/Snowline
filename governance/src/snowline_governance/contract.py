@@ -1,0 +1,36 @@
+"""Plugin-contract event registry — the published contract governance EMITs
+(governance-plugin spec §7).
+
+These constants are a deliberate, self-contained COPY of the monolith's
+`snowline_substrate.contract` (#663) / the `snowline-plugin-sdk`'s vendored
+`snowline_plugin_sdk.contract` (#666, decision 3fa71698). Governance is the
+PRODUCER; the SDK is the CONSUMER. Both vendor the SAME literals so the wire
+contract is byte-compatible, while neither imports the other at runtime:
+
+  - Governance must NOT import the SDK at runtime — it is an independent plugin
+    (import-purity: `snowline_governance` pulls no monolith/substrate code, and
+    the SDK is a separate dev-only round-trip dependency, spec §10).
+  - The SDK must NOT import substrate (it is the light dependency external
+    plugins install).
+
+So the registry is VENDORED in three places and pinned EQUAL by drift-guard
+tests. Governance's guard (`tests/test_contract_drift.py`, a dev-only dep on the
+SDK) asserts THIS copy equals `snowline_plugin_sdk.contract`'s, so the producer
+and consumer can never silently fork.
+
+Pure constants — no imports beyond stdlib.
+"""
+
+from __future__ import annotations
+
+EVENT_DECISION_RECORDED: str = "decision.recorded"
+EVENT_DECISION_SUPERSEDED: str = "decision.superseded"
+
+EVENT_TYPES: frozenset[str] = frozenset(
+    {EVENT_DECISION_RECORDED, EVENT_DECISION_SUPERSEDED}
+)
+
+# The published contract version, stamped into every emitted payload. A consumer
+# (the SDK) refuses a payload whose `contract_version` is NEWER than it
+# understands; bumping this is a deliberate major contract change.
+CONTRACT_VERSION: int = 1

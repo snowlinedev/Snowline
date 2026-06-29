@@ -30,7 +30,11 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from snowline_governance import branching
+from snowline_governance import branching, replication
+from snowline_governance.contract import (
+    EVENT_DECISION_RECORDED,
+    EVENT_DECISION_SUPERSEDED,
+)
 from snowline_governance.models import Decision
 from snowline_governance.scope_client import ScopeClient
 
@@ -128,6 +132,12 @@ def record_decision(
     )
     session.add(row)
     session.flush()
+    # EMIT (spec §7): write a pending WebhookDelivery per matching subscriber IN
+    # this same transaction (transactional outbox) — a near-zero-cost no-op when
+    # nobody is subscribed. The delivery loop signs + POSTs it asynchronously.
+    replication.emit_decision_event(
+        session, EVENT_DECISION_RECORDED, row, scope_slug
+    )
     return {
         "id": str(row.id),
         "scope": scope_slug,
@@ -175,6 +185,12 @@ def supersede_decision(
     )
     session.add(row)
     session.flush()
+    # EMIT (spec §7): the superseding leaf is itself a decision event — emit
+    # `decision.superseded` for it (transactional outbox, same txn). Its payload's
+    # `supersedes_id` carries the prior link a receiver orders by.
+    replication.emit_decision_event(
+        session, EVENT_DECISION_SUPERSEDED, row, prior.scope_slug
+    )
     return {
         "id": str(row.id),
         "scope": prior.scope_slug,
