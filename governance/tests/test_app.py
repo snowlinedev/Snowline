@@ -32,13 +32,23 @@ def test_health_ok():
     assert body["plugin"] == "governance"
 
 
-def test_main_surface_exposes_the_five_decision_tools():
+def test_main_surface_exposes_the_decision_and_artifact_tools():
     surface = build_main_surface(scope_client=_NoopScopeClient())
     tools = {t.name for t in anyio.run(surface.list_tools)}
     assert tools == {
+        # decisions
         "record_decision",
         "supersede_decision",
         "get_decision",
         "list_decisions",
         "applicable_decisions",
+        # artifacts
+        "register_artifact",
+        "revise_artifact",
+        "resolve_artifact",
+        "get_artifact",
+        "list_artifacts",
+        "set_governs",
+        "set_maturity",
+        "applicable_artifacts",
     }

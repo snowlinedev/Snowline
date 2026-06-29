@@ -111,14 +111,21 @@ def migrated_db() -> str:
 
 @pytest.fixture()
 def clean_db(migrated_db):
-    """Truncate the decisions table before each test (so writes a test makes are
-    visible across the separate sessions a tool opens — mirroring production)."""
+    """Truncate the governance tables before each test (so writes a test makes are
+    visible across the separate sessions a tool opens — mirroring production).
+    Lists every root table explicitly; CASCADE clears the dependent version/govern
+    rows."""
     import sqlalchemy as sa
 
     from snowline_governance.db import session_scope
 
     with session_scope() as s:
-        s.execute(sa.text("TRUNCATE decisions RESTART IDENTITY CASCADE"))
+        s.execute(
+            sa.text(
+                "TRUNCATE decisions, artifacts, artifact_versions, "
+                "artifact_governs RESTART IDENTITY CASCADE"
+            )
+        )
     yield
 
 
