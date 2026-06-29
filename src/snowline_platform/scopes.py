@@ -302,8 +302,13 @@ def update(
 
 
 def to_row(scope: Scope) -> dict:
-    """A scope as a flat JSON row (the read API's `GET /scopes/{slug}` shape)."""
+    """A scope as a flat JSON row (the read API's `GET /scopes/{slug}` shape).
+
+    Carries `id` (the scope's UUID, stringified) so an out-of-process plugin can
+    capture it as a SOFT reference on its own rows (governance stores `scope_id`
+    on each decision for monolith schema-compat) without a second round-trip."""
     return {
+        "id": str(scope.id),
         "slug": scope.slug,
         "name": scope.name,
         "kind": scope.kind,

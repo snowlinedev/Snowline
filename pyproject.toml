@@ -12,7 +12,12 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=8.0", "httpx>=0.27"]
+# `snowline-governance` is a workspace MEMBER, not a runtime dependency of the
+# platform (dependency direction: the platform depends on NO plugin —
+# architecture §2). It rides the dev group so a plain `uv sync` from the repo
+# root installs it for development + the combined test run, without coupling the
+# platform's runtime to a plugin.
+dev = ["pytest>=8.0", "httpx>=0.27", "snowline-governance"]
 
 [build-system]
 requires = ["hatchling"]
@@ -21,5 +26,22 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/snowline_platform"]
 
+# The repo is a uv workspace: the platform stays the ROOT package (at the repo
+# root, src/snowline_platform), and each plugin is a workspace member under its
+# own directory. The first member is `governance` — the flagship plugin, its own
+# package + DB + alembic chain. `uv sync` resolves the whole workspace at once.
+[tool.uv.workspace]
+members = ["governance"]
+
+[tool.uv.sources]
+snowline-governance = { workspace = true }
+
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+# Run both the platform's tests (tests/) and the governance member's
+# (governance/tests/) in one `uv run python -m pytest` from the repo root.
+testpaths = ["tests", "governance/tests"]
+# importlib mode: the two test trees each have a `conftest.py` and a
+# `test_import_purity.py` (same basename, different dir). The default prepend
+# import mode collides on the basename / package name; importlib imports each by
+# file path, so the two trees coexist without `__init__.py` gymnastics.
+addopts = "--import-mode=importlib"
