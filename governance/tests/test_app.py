@@ -42,8 +42,11 @@ def test_main_surface_exposes_the_decision_and_artifact_tools():
         "get_decision",
         "list_decisions",
         "applicable_decisions",
-        # graduation (shadow → real) — a real write, main-only (decision 99b92e1d)
+        # graduation (shadow → real) — real writes, main-only (decision 99b92e1d).
+        # Node-level + branch-level (graduate_branch / record_branch_rejection).
         "graduate",
+        "graduate_branch",
+        "record_branch_rejection",
         # artifacts
         "register_artifact",
         "revise_artifact",

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import uuid
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from snowline_governance import decisions, shadow
@@ -195,4 +196,189 @@ def graduate_node(
         "address": address,
         "already_graduated": False,
         "closure_promoted": promoted,
+    }
+
+
+# === Branch-level, agent-curated graduation + rejection ======================
+# Graduate (or reject) a speculation AS A WHOLE: a drafting agent synthesizes the
+# conversation into one END DECISION and curates which nodes support it; the human
+# ratifies; the confirm records the end decision + the kept nodes. Both crossings
+# are REAL writes — they mint real `Decision` rows — so they live HERE on the
+# crossing layer and register on the `main` (real-write) MCP surface, never on
+# `/shadow/mcp` (decision 99b92e1d "the principal split"). Carried, behavior-not-
+# imports, from the frozen monolith's branch-graduation machinery (decisions
+# 0c26be5c branch graduation, be803a2b the `shadow_origin_kind` discriminator).
+
+
+def _record_and_stamp_branch(
+    session: Session,
+    dest_scope_slug: str,
+    dest_scope_id: uuid.UUID | str,
+    address: str,
+    statement: str,
+    rationale: str | None,
+    kind: str,
+) -> str:
+    """Record a BRANCH-LEVEL real decision (a graduation END decision or a §7
+    rejection) and stamp it with the branch address as origin — NO single
+    `node_id` — plus the discriminating `kind`. The `kind` is what keeps the two
+    otherwise identical branch-level markers from being read back as each other.
+    Returns the new real decision id."""
+    rec = decisions.record_decision(
+        session, dest_scope_slug, dest_scope_id, statement, rationale
+    )
+    dec = session.get(Decision, uuid.UUID(rec["id"]))
+    dec.shadow_origin_label = address  # node_id stays NULL (branch-level)
+    dec.shadow_origin_kind = kind
+    session.flush()
+    return rec["id"]
+
+
+def _existing_branch_decision(session: Session, address: str, kind: str):
+    """The existing branch-level decision of `kind` for this address, if any — the
+    natural-key idempotency lookup shared by graduation and rejection. A branch-
+    level marker is `label == address AND node_id IS NULL`; `kind` disambiguates
+    graduation from rejection. Legacy graduation decisions predating the `kind`
+    column carry NULL, so a "graduation" lookup also accepts NULL (anything not
+    explicitly a rejection) — only the rejection lookup is strict."""
+    cond = (
+        Decision.shadow_origin_kind == "rejection"
+        if kind == "rejection"
+        else Decision.shadow_origin_kind.is_distinct_from("rejection")
+    )
+    return session.scalar(
+        select(Decision).where(
+            Decision.shadow_origin_label == address,
+            Decision.shadow_origin_node_id.is_(None),
+            cond,
+        )
+    )
+
+
+def graduate_branch(
+    session: Session,
+    scope_slug: str,
+    name: str,
+    dest_scope_slug: str,
+    dest_scope_id: uuid.UUID | str,
+    end_statement: str,
+    end_rationale: str | None,
+    include_node_ids: list[str],
+) -> dict:
+    """The human-ratified BRANCH graduation (decision 0c26be5c): record the
+    synthesized END DECISION + each kept supporting node as real decisions, all
+    provenance-linked to the branch. Un-selected nodes stay in shadow (the caller
+    archives the branch separately if it wants to — graduation never auto-archives,
+    since un-graduated nodes remain live speculation). The end decision carries the
+    branch address as its origin with NO single node.
+
+    SCOPE BINDING (the platform-owns-scopes carve): the destination scope is a SOFT
+    reference the CALLER resolved against the platform (`dest_scope_slug` +
+    `dest_scope_id`), mirroring `graduate_node` / `record_decision`; the caller
+    defaults it to the branch's own cradle scope. The branch is addressed by its
+    `scope_slug` + `name` (the `_get_branch_row` soft lookup).
+
+    IDEMPOTENT: a branch-synthesized end decision is the ONE graduation decision
+    carrying this branch's address as its origin label with NO `node_id`. If one
+    already exists, this branch was already graduated — its end decision is returned
+    rather than a SECOND competing one (a double-submit / retry guard). The `kind`
+    filter keeps this from matching a rejection decision on the same branch
+    (be803a2b): the two branch-level markers are otherwise identical in shape.
+    """
+    branch = shadow._get_branch_row(session, scope_slug, name)  # raises if unknown
+    address = f"{branch.scope_slug}:{branch.name}"
+
+    existing = _existing_branch_decision(session, address, "graduation")
+    if existing is not None:
+        return {
+            "address": address,
+            "scope": branch.scope_slug,
+            "end_decision_id": str(existing.id),
+            "promoted_node_ids": [],
+            "already_graduated": True,
+        }
+
+    # The synthesized end decision — origin is the whole branch, not one node.
+    end_decision_id = _record_and_stamp_branch(
+        session, dest_scope_slug, dest_scope_id, address,
+        end_statement, end_rationale, "graduation",
+    )
+
+    promoted: list[str] = []
+    for nid in include_node_ids:
+        try:
+            key = uuid.UUID(str(nid))
+        except (ValueError, TypeError):
+            continue  # a malformed id is skipped, not a 500
+        node = session.get(ShadowNode, key)
+        # Only promote real, in-this-branch, not-yet-graduated nodes.
+        if node is None or node.branch_id != branch.id or node.graduated_decision_id:
+            continue
+        promoted.append(
+            _record_and_stamp(
+                session, dest_scope_slug, dest_scope_id,
+                node, node.statement, node.rationale,
+            )
+        )
+    return {
+        "address": address,
+        "scope": dest_scope_slug,
+        "end_decision_id": end_decision_id,
+        "promoted_node_ids": promoted,
+        "already_graduated": False,
+    }
+
+
+def record_branch_rejection(
+    session: Session,
+    scope_slug: str,
+    scope_id: uuid.UUID | str,
+    name: str,
+    statement: str,
+    rationale: str | None,
+) -> dict:
+    """Record the REJECTION of a whole speculation as a REAL decision in the
+    branch's CRADLE scope (spec §7) — "we considered this line and chose against
+    it", so the reasoning survives the line being shelved. The inverse facet of
+    branch graduation; like graduation it crosses into the real graph (a real
+    `record_decision`), so it lives HERE, not in the pure-shadow
+    `shadow.archive_branch` (the flow "reject + archive a line" is
+    `record_branch_rejection` here THEN `shadow.archive_branch`).
+
+    Stamps the branch address as the decision's `shadow_origin_label` with NO
+    `node_id` and a `shadow_origin_kind` of "rejection" — the kind is what
+    distinguishes it from a graduation end decision on the same branch (be803a2b).
+
+    SCOPE BINDING: the cradle scope is the BRANCH'S OWN scope — the caller resolves
+    it against the platform and passes the soft reference (`scope_slug` +
+    `scope_id`), exactly as it resolves the address lookup. (The rejection always
+    lands in the cradle scope where the line was speculated; there is no broader/org
+    override, unlike graduation's `dest_scope`.)
+
+    IDEMPOTENT: a rejection decision already on this address (kind-filtered, so a
+    graduation end decision on the same branch is NOT mistaken for one) is returned
+    rather than recording a SECOND competing rejection.
+    """
+    branch = shadow._get_branch_row(session, scope_slug, name)  # raises if unknown
+    address = f"{branch.scope_slug}:{branch.name}"
+
+    existing = _existing_branch_decision(session, address, "rejection")
+    if existing is not None:
+        return {
+            "address": address,
+            "scope": branch.scope_slug,
+            "rejection_decision_id": str(existing.id),
+            "already_recorded": True,
+        }
+
+    # The rejection decision — origin is the whole branch, not one node. Recorded
+    # in the cradle scope (the line was speculated there); node_id stays NULL.
+    rejection_decision_id = _record_and_stamp_branch(
+        session, scope_slug, scope_id, address, statement, rationale, "rejection",
+    )
+    return {
+        "address": address,
+        "scope": scope_slug,
+        "rejection_decision_id": rejection_decision_id,
+        "already_recorded": False,
     }

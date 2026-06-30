@@ -171,6 +171,245 @@ def test_graduate_node_closure_off(db_session):
     assert n1_row.graduated_decision_id is None
 
 
+# === branch-level graduation =================================================
+
+
+def test_graduate_branch_records_end_decision_and_promotes_selected(db_session):
+    """Branch graduation records a synthesized END decision (kind='graduation',
+    origin = the branch ADDRESS, NULL node_id) AND promotes each SELECTED node to a
+    real decision; un-selected nodes stay un-graduated."""
+    slug = "acme/widget"
+    shadow.create_branch(db_session, slug, _sid(slug), "auth-line", "exploring")
+    keep = shadow.add_node(db_session, slug, "auth-line", "use rs256", "asymmetric")
+    keep2 = shadow.add_node(db_session, slug, "auth-line", "rotate keys", "hygiene")
+    drop = shadow.add_node(db_session, slug, "auth-line", "a tangent", "dead end")
+
+    out = graduation.graduate_branch(
+        db_session,
+        scope_slug=slug,
+        name="auth-line",
+        dest_scope_slug=slug,
+        dest_scope_id=_sid(slug),
+        end_statement="adopt asymmetric JWT auth",
+        end_rationale="synthesized from the line",
+        include_node_ids=[keep["id"], keep2["id"]],
+    )
+    assert out["already_graduated"] is False
+    assert out["address"] == "acme/widget:auth-line"
+    assert out["scope"] == slug
+    assert len(out["promoted_node_ids"]) == 2
+
+    # The END decision: branch-level marker (address origin, NO node_id, kind).
+    end = db_session.get(Decision, uuid.UUID(out["end_decision_id"]))
+    assert end.decision == "adopt asymmetric JWT auth"
+    assert end.shadow_origin_label == "acme/widget:auth-line"
+    assert end.shadow_origin_node_id is None
+    assert end.shadow_origin_kind == "graduation"
+    assert end.scope_id == _sid(slug)
+
+    # The selected nodes became real, stamped graduated.
+    for n in (keep, keep2):
+        row = db_session.get(ShadowNode, uuid.UUID(n["id"]))
+        assert row.graduated_decision_id is not None
+    # The un-selected node stays speculative.
+    drop_row = db_session.get(ShadowNode, uuid.UUID(drop["id"]))
+    assert drop_row.graduated_decision_id is None
+
+
+def test_graduate_branch_is_idempotent(db_session):
+    """A second graduate_branch call returns the SAME end decision and writes no
+    second competing one."""
+    slug = "acme/widget"
+    shadow.create_branch(db_session, slug, _sid(slug), "line-a")
+    node = shadow.add_node(db_session, slug, "line-a", "a node")
+
+    first = graduation.graduate_branch(
+        db_session, scope_slug=slug, name="line-a",
+        dest_scope_slug=slug, dest_scope_id=_sid(slug),
+        end_statement="the conclusion", end_rationale=None,
+        include_node_ids=[node["id"]],
+    )
+    assert first["already_graduated"] is False
+
+    before = db_session.query(Decision).count()
+    second = graduation.graduate_branch(
+        db_session, scope_slug=slug, name="line-a",
+        dest_scope_slug=slug, dest_scope_id=_sid(slug),
+        end_statement="a different conclusion", end_rationale=None,
+        include_node_ids=[node["id"]],
+    )
+    after = db_session.query(Decision).count()
+
+    assert second["already_graduated"] is True
+    assert second["end_decision_id"] == first["end_decision_id"]
+    assert after == before  # no second end decision, no re-promote
+
+
+def test_graduate_branch_skips_malformed_node_id(db_session):
+    """A malformed id in `include_node_ids` is skipped, not a 500."""
+    slug = "acme/widget"
+    shadow.create_branch(db_session, slug, _sid(slug), "line-a")
+    good = shadow.add_node(db_session, slug, "line-a", "good node")
+
+    out = graduation.graduate_branch(
+        db_session, scope_slug=slug, name="line-a",
+        dest_scope_slug=slug, dest_scope_id=_sid(slug),
+        end_statement="end", end_rationale=None,
+        include_node_ids=["not-a-uuid", good["id"]],
+    )
+    assert out["promoted_node_ids"] == [
+        str(db_session.get(ShadowNode, uuid.UUID(good["id"])).graduated_decision_id)
+    ]
+
+
+def test_graduate_branch_at_explicit_dest_scope(db_session):
+    """An explicit `dest_scope_*` (broader/org) lands the end + node decisions
+    THERE, while the provenance address still names the cradle branch."""
+    cradle = "acme/widget"
+    org = "acme"
+    shadow.create_branch(db_session, cradle, _sid(cradle), "line-a")
+    node = shadow.add_node(db_session, cradle, "line-a", "org-wide call")
+
+    out = graduation.graduate_branch(
+        db_session, scope_slug=cradle, name="line-a",
+        dest_scope_slug=org, dest_scope_id=_sid(org),
+        end_statement="org decision", end_rationale=None,
+        include_node_ids=[node["id"]],
+    )
+    end = db_session.get(Decision, uuid.UUID(out["end_decision_id"]))
+    assert end.scope_id == _sid(org)
+    assert end.shadow_origin_label == "acme/widget:line-a"  # cradle address
+    promoted = db_session.get(Decision, uuid.UUID(out["promoted_node_ids"][0]))
+    assert promoted.scope_id == _sid(org)
+
+
+# === branch-level rejection ==================================================
+
+
+def test_record_branch_rejection_in_cradle_scope(db_session):
+    """A rejection records a REAL decision in the branch's CRADLE scope, kind=
+    'rejection', address origin, NULL node_id."""
+    slug = "acme/widget"
+    shadow.create_branch(db_session, slug, _sid(slug), "rejected-line", "nope")
+
+    out = graduation.record_branch_rejection(
+        db_session, scope_slug=slug, scope_id=_sid(slug), name="rejected-line",
+        statement="we will NOT pursue this", rationale="too costly",
+    )
+    assert out["already_recorded"] is False
+    assert out["address"] == "acme/widget:rejected-line"
+
+    dec = db_session.get(Decision, uuid.UUID(out["rejection_decision_id"]))
+    assert dec.decision == "we will NOT pursue this"
+    assert dec.scope_id == _sid(slug)  # cradle scope
+    assert dec.shadow_origin_label == "acme/widget:rejected-line"
+    assert dec.shadow_origin_node_id is None
+    assert dec.shadow_origin_kind == "rejection"
+
+
+def test_record_branch_rejection_is_idempotent(db_session):
+    """A second rejection on the same branch returns the existing one."""
+    slug = "acme/widget"
+    shadow.create_branch(db_session, slug, _sid(slug), "line-a")
+
+    first = graduation.record_branch_rejection(
+        db_session, scope_slug=slug, scope_id=_sid(slug), name="line-a",
+        statement="rejected", rationale=None,
+    )
+    before = db_session.query(Decision).count()
+    second = graduation.record_branch_rejection(
+        db_session, scope_slug=slug, scope_id=_sid(slug), name="line-a",
+        statement="rejected differently", rationale=None,
+    )
+    after = db_session.query(Decision).count()
+
+    assert second["already_recorded"] is True
+    assert second["rejection_decision_id"] == first["rejection_decision_id"]
+    assert after == before
+
+
+def test_graduation_and_rejection_kinds_stay_distinct(db_session):
+    """The `kind` filter keeps a graduation end decision and a rejection decision on
+    the SAME branch address from being mistaken for each other (be803a2b)."""
+    slug = "acme/widget"
+    shadow.create_branch(db_session, slug, _sid(slug), "line-a")
+
+    grad = graduation.graduate_branch(
+        db_session, scope_slug=slug, name="line-a",
+        dest_scope_slug=slug, dest_scope_id=_sid(slug),
+        end_statement="graduated end", end_rationale=None, include_node_ids=[],
+    )
+    rej = graduation.record_branch_rejection(
+        db_session, scope_slug=slug, scope_id=_sid(slug), name="line-a",
+        statement="and also a rejection facet", rationale=None,
+    )
+    # Two DISTINCT decisions on the same address — neither idempotency lookup
+    # collapses onto the other.
+    assert grad["end_decision_id"] != rej["rejection_decision_id"]
+    assert grad["already_graduated"] is False
+    assert rej["already_recorded"] is False
+
+    # Re-running each returns its OWN prior decision, not the other.
+    grad2 = graduation.graduate_branch(
+        db_session, scope_slug=slug, name="line-a",
+        dest_scope_slug=slug, dest_scope_id=_sid(slug),
+        end_statement="x", end_rationale=None, include_node_ids=[],
+    )
+    rej2 = graduation.record_branch_rejection(
+        db_session, scope_slug=slug, scope_id=_sid(slug), name="line-a",
+        statement="y", rationale=None,
+    )
+    assert grad2["end_decision_id"] == grad["end_decision_id"]
+    assert rej2["rejection_decision_id"] == rej["rejection_decision_id"]
+
+
+# === archive_branch (pure shadow status flip) ================================
+
+
+def test_archive_branch_flips_status_and_is_idempotent(db_session):
+    """archive_branch flips active→archived and sets archived_at; a re-archive is a
+    no-op that pins the original archived_at."""
+    slug = "acme/widget"
+    created = shadow.create_branch(db_session, slug, _sid(slug), "line-a")
+    assert created["status"] == "active"
+    assert created["archived_at"] is None
+
+    out = shadow.archive_branch(db_session, slug, "line-a")
+    assert out["status"] == "archived"
+    assert out["archived_at"] is not None
+    first_archived_at = out["archived_at"]
+
+    # Hidden from the default list, visible with include_done.
+    assert shadow.list_branches(db_session, slug, _sid(slug)) == []
+    listed = shadow.list_branches(db_session, slug, _sid(slug), include_done=True)
+    assert [b["id"] for b in listed] == [created["id"]]
+
+    # Idempotent: re-archive keeps the SAME archived_at.
+    again = shadow.archive_branch(db_session, slug, "line-a")
+    assert again["status"] == "archived"
+    assert again["archived_at"] == first_archived_at
+
+
+def test_reject_then_archive_flow(db_session):
+    """The full §7 flow: record WHY (real rejection on main) THEN archive the line
+    (pure shadow). The two are separable facets of shelving a speculation."""
+    slug = "acme/widget"
+    shadow.create_branch(db_session, slug, _sid(slug), "line-a", "explored")
+
+    rej = graduation.record_branch_rejection(
+        db_session, scope_slug=slug, scope_id=_sid(slug), name="line-a",
+        statement="chose against it", rationale="better path found",
+    )
+    archived = shadow.archive_branch(db_session, slug, "line-a")
+
+    # The rejection decision survives (the reasoning is kept) …
+    assert db_session.get(
+        Decision, uuid.UUID(rej["rejection_decision_id"])
+    ) is not None
+    # … and the line is shelved.
+    assert archived["status"] == "archived"
+
+
 # === surface placement — graduate is MAIN-only (the principal split) ==========
 
 
@@ -189,3 +428,24 @@ def test_graduate_is_on_main_absent_from_shadow():
 
     assert "graduate" in main
     assert "graduate" not in sh
+
+
+def test_branch_graduation_and_rejection_are_main_only():
+    """`graduate_branch` + `record_branch_rejection` mint real decisions → on
+    `main`, ABSENT from shadow; `archive_branch` is a pure shadow op → on shadow,
+    ABSENT from main (the principal split, 99b92e1d)."""
+    import anyio
+
+    def _names(surface) -> set[str]:
+        return {t.name for t in anyio.run(surface.list_tools)}
+
+    main = _names(build_main_surface(scope_client=_NoopScopeClient()))
+    sh = _names(build_shadow_surface(scope_client=_NoopScopeClient()))
+
+    # Real writes — main only.
+    for verb in ("graduate_branch", "record_branch_rejection"):
+        assert verb in main
+        assert verb not in sh
+    # Pure shadow status flip — shadow only.
+    assert "archive_branch" in sh
+    assert "archive_branch" not in main

@@ -199,8 +199,72 @@ def test_shadow_surface_excludes_real_write(governance_db):
     # Shadow write + read-real grounding present...
     assert "governance__create_branch" in names
     assert "governance__add_node" in names
+    assert "governance__archive_branch" in names  # pure shadow op
     assert "governance__list_decisions" in names  # read-real grounding
     # ...but the real-write verb is ABSENT by composition (decision 8a7f0a11).
     assert "governance__record_decision" not in names
     assert "governance__supersede_decision" not in names
     assert "governance__register_artifact" not in names
+    # branch-level graduation + rejection mint real decisions → main only, ABSENT
+    # from shadow (the principal split, 99b92e1d).
+    assert "governance__graduate_branch" not in names
+    assert "governance__record_branch_rejection" not in names
+
+
+def test_graduate_branch_routes_through_gateway_main_and_is_isolated(governance_db):
+    """A whole-branch graduation routed THROUGH the gateway's main surface mints
+    real decisions in governance's DB — and the verb is ABSENT from the shadow
+    surface (the principal split, by composition over the wire)."""
+    main_gw = _gateway_for("main")
+    shadow_gw = _gateway_for("shadow")
+
+    # graduate_branch is a real write → present on main, absent from shadow.
+    main_names = {t.name for t in anyio.run(main_gw.list_tools)}
+    shadow_names = {t.name for t in anyio.run(shadow_gw.list_tools)}
+    assert "governance__graduate_branch" in main_names
+    assert "governance__graduate_branch" not in shadow_names
+
+    # Build a branch + a node on the SHADOW surface (the speculation half) …
+    anyio.run(
+        shadow_gw.call_tool,
+        "governance__create_branch",
+        {"scope": "acme/widget", "name": "wire-line", "narrative_notes": "explored"},
+    )
+    node_res = anyio.run(
+        shadow_gw.call_tool,
+        "governance__add_node",
+        {"scope": "acme/widget", "name": "wire-line", "statement": "a kept node"},
+    )
+    node_id = json.loads(node_res.content[0].text)["id"]
+
+    # … then graduate the whole branch on MAIN (the real write).
+    grad = anyio.run(
+        main_gw.call_tool,
+        "governance__graduate_branch",
+        {
+            "scope": "acme/widget",
+            "name": "wire-line",
+            "end_statement": "adopt the wire line",
+            "end_rationale": "synthesized",
+            "include_node_ids": [node_id],
+        },
+    )
+    assert grad.isError is not True, grad.content
+    payload = json.loads(grad.content[0].text)
+    assert payload["already_graduated"] is False
+    assert payload["address"] == "acme/widget:wire-line"
+    assert node_id in payload["promoted_node_ids"] or len(
+        payload["promoted_node_ids"]
+    ) == 1
+
+    # Prove the END decision actually landed in governance's DB: read it back
+    # through the gateway's get_decision route.
+    read = anyio.run(
+        main_gw.call_tool,
+        "governance__get_decision",
+        {"decision_id": payload["end_decision_id"]},
+    )
+    assert read.isError is not True
+    back = json.loads(read.content[0].text)
+    assert back["decision"] == "adopt the wire line"
+    assert back["shadow_origin"]["label"] == "acme/widget:wire-line"
