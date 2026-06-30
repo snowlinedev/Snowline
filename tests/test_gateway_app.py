@@ -21,7 +21,7 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
 from snowline_platform.app import create_app
-from snowline_platform.gateway_app import gateway_lifespan
+from snowline_platform.gateway_app import build_surface_mounts, gateway_lifespan
 from snowline_platform.manifest import PluginManifest
 from snowline_platform.registry import PluginRegistry
 from snowline_platform.trust import Principal, TrustResolver
@@ -150,3 +150,85 @@ def test_non_mcp_routes_still_work():
     client = TestClient(app)
     assert client.get("/health").status_code == 200
     assert client.get("/plugins").json() == {"plugins": []}
+
+
+# --- Configurable surface set + prefix-specific mount ordering (#25) ----------
+
+
+def test_config_surfaces_env_override_adds_surface_route(monkeypatch):
+    """`SNOWLINE_SURFACES` drives the mounted surface set: an env-added surface
+    gets its `/X/mcp` route, and the default is the documented (main, shadow)."""
+    from snowline_platform import config
+
+    monkeypatch.delenv("SNOWLINE_SURFACES", raising=False)
+    assert config.surfaces() == ("main", "shadow")
+
+    monkeypatch.setenv("SNOWLINE_SURFACES", "main,shadow,audit")
+    assert config.surfaces() == ("main", "shadow", "audit")
+
+    mounts = build_surface_mounts(PluginRegistry(), InMemoryConnector({}))
+    routes = {m.route for m in mounts}
+    assert routes == {"/mcp", "/shadow/mcp", "/audit/mcp"}
+
+
+def test_config_surfaces_main_always_present(monkeypatch):
+    """The root surface is always included even when the env omits it — it's the
+    daily-driver root at `/mcp`. The list is also deduped, order-preserving."""
+    from snowline_platform import config
+    from snowline_platform.gateway_app import ROOT_SURFACE
+
+    monkeypatch.setenv("SNOWLINE_SURFACES", "shadow,audit")
+    result = config.surfaces()
+    assert ROOT_SURFACE in result
+    assert result == ("main", "shadow", "audit")
+
+    monkeypatch.setenv("SNOWLINE_SURFACES", "main,main,shadow,shadow,audit")
+    assert config.surfaces() == ("main", "shadow", "audit")
+
+
+def test_root_surface_constant_honored(monkeypatch):
+    """`surface_route` routes the ROOT_SURFACE to the bare `/mcp` and every other
+    surface to `/X/mcp` — the root magic lives only in the constant."""
+    from snowline_platform.gateway_app import ROOT_SURFACE, surface_route
+
+    assert surface_route(ROOT_SURFACE) == "/mcp"
+    assert surface_route("shadow") == "/shadow/mcp"
+    assert surface_route("audit") == "/audit/mcp"
+
+
+def test_mount_ordering_is_prefix_specific_not_len():
+    """A route that is a path-PREFIX of another must be mounted AFTER it, so it
+    can't shadow the deeper route under Starlette's first-match. This is the case
+    `len(route)`-sort gets wrong: `/a/b/mcp` (len 8) must precede `/aa/mcp`
+    (len 7) by length, but the real hazard is `/a/mcp` (a prefix of `/a/b/mcp`),
+    which segment-depth ordering puts last where length ties would not."""
+    from snowline_platform.gateway_app import mount_gateway
+
+    class _RecordingApp:
+        def __init__(self):
+            self.mounted: list[str] = []
+
+        def mount(self, route, app):
+            self.mounted.append(route)
+
+    # Surfaces "a" -> /a/mcp and "a/b" -> /a/b/mcp: /a/mcp is a string-prefix of
+    # /a/b/mcp. The deeper (more path segments) route must mount first.
+    mounts = build_surface_mounts(
+        PluginRegistry(),
+        InMemoryConnector({}),
+        surfaces=("a", "a/b"),
+    )
+    app = _RecordingApp()
+    mount_gateway(app, mounts)
+    assert app.mounted.index("/a/b/mcp") < app.mounted.index("/a/mcp")
+
+    # And the bare root surface (/mcp, fewest segments) is mounted last.
+    mounts = build_surface_mounts(
+        PluginRegistry(),
+        InMemoryConnector({}),
+        surfaces=("main", "shadow", "a/b"),
+    )
+    app = _RecordingApp()
+    mount_gateway(app, mounts)
+    assert app.mounted[-1] == "/mcp"
+    assert app.mounted.index("/a/b/mcp") < app.mounted.index("/shadow/mcp")
