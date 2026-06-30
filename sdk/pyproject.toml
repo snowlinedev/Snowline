@@ -1,0 +1,20 @@
+[project]
+name = "snowline-plugin-sdk"
+version = "0.1.0"
+description = "Snowline plugin SDK — the published contract dependency: signed-event verification + the vendored event-type/contract-version registry"
+requires-python = ">=3.12"
+# No runtime third-party dependency: verify_event needs only the stdlib
+# (`hmac`/`hashlib`/`json`). The typed MCP request/response client (`client.py`
+# in the frozen monolith, which depends on `mcp`) is DEFERRED — the platform's
+# surfaces differ from the monolith's `/core`, so the typed client is a follow-up.
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/snowline_plugin_sdk"]
