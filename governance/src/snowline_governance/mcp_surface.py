@@ -71,7 +71,9 @@ addressed `<scope>:<name>`), `list_branches`, `get_branch`, \
 `set_narrative_notes` (the running reasoning thread), `add_node` (a \
 not-yet-real decision), `add_citation` (inward-only: a node may cite another \
 node in its OWN branch, or a real decision — never the reverse), \
-`list_citations`, and `shadow_corpus_search` (full-text over the shadow content \
+`list_citations`, `archive_branch` (the active→archived status flip — a pure \
+shadow op; record WHY first via the main surface's `record_branch_rejection`), \
+and `shadow_corpus_search` (full-text over the shadow content \
 + the real decisions backlinked to a shadow line). Read-real grounding: \
 `get_decision`, `list_decisions`, `applicable_decisions`, `get_artifact`, \
 `list_artifacts`, `applicable_artifacts` — read the real graph freely to ground \
@@ -358,6 +360,115 @@ def build_main_surface(scope_client: ScopeClient | None = None) -> FastMCP:
             node_id, dest_scope, decision, rationale, promote_closure,
         )
 
+    # --- branch-level graduation + rejection (shadow → real) — REAL writes,
+    # MAIN surface only ------------------------------------------------------
+    # Promote (or reject) a whole speculation as a UNIT (decisions 0c26be5c branch
+    # graduation, be803a2b the `shadow_origin_kind` discriminator). Both mint real
+    # `Decision` rows, so they're real-write verbs that live HERE on `main` and are
+    # ABSENT from `/shadow/mcp` (the principal split, 99b92e1d): the shadow agent
+    # drafts/proposes, the ratifying principal on `main` executes. Archiving the
+    # line afterwards is a PURE shadow op (`archive_branch`) on the shadow surface.
+
+    def _graduate_branch_sync(
+        scope: str,
+        name: str,
+        end_statement: str,
+        end_rationale: str | None,
+        include_node_ids: list[str] | None,
+        dest_scope: str | None,
+    ):
+        branch_sc = client.resolve(scope)
+        if branch_sc is None:
+            raise ScopeNotFoundError(
+                f"no scope with slug {scope!r} — register it on the platform first"
+            )
+        # The destination defaults to the branch's CRADLE scope; an explicit
+        # `dest_scope` (broader/org) is resolved against the platform first (the
+        # soft-reference contract) before any DB write.
+        if dest_scope is None:
+            dest_slug, dest_id = branch_sc["slug"], branch_sc["id"]
+        else:
+            dest_sc = client.resolve(dest_scope)
+            if dest_sc is None:
+                raise ScopeNotFoundError(
+                    f"no scope with slug {dest_scope!r} — register it on the "
+                    "platform first"
+                )
+            dest_slug, dest_id = dest_sc["slug"], dest_sc["id"]
+        with session_scope() as session:
+            return graduation.graduate_branch(
+                session,
+                scope_slug=branch_sc["slug"],
+                name=name,
+                dest_scope_slug=dest_slug,
+                dest_scope_id=dest_id,
+                end_statement=end_statement,
+                end_rationale=end_rationale,
+                include_node_ids=include_node_ids or [],
+            )
+
+    @mcp.tool()
+    async def graduate_branch(
+        scope: str,
+        name: str,
+        end_statement: str,
+        end_rationale: str | None = None,
+        include_node_ids: list[str] | None = None,
+        dest_scope: str | None = None,
+    ) -> dict:
+        """GRADUATE a whole speculation branch into the real graph — the
+        human-ratified branch crossing (the principal split, 99b92e1d): the shadow
+        agent drafts an end decision + curates the supporting nodes, the principal
+        HERE confirms. Records the synthesized `end_statement`/`end_rationale` as
+        one real decision whose origin is the branch ADDRESS (`<scope>:<name>`, no
+        single node), then promotes each id in `include_node_ids` (in-this-branch,
+        not-yet-graduated) to a real decision too. Un-selected nodes stay in shadow
+        (archive the line separately via `archive_branch` if desired).
+
+        `scope`/`name` address the branch; `dest_scope` (a slug, resolved against
+        the platform) chooses where the decisions land, defaulting to the branch's
+        CRADLE scope. Idempotent: a branch already graduated returns its existing
+        end decision rather than writing a second one."""
+        return await anyio.to_thread.run_sync(
+            _graduate_branch_sync,
+            scope, name, end_statement, end_rationale, include_node_ids, dest_scope,
+        )
+
+    def _record_branch_rejection_sync(
+        scope: str, name: str, statement: str, rationale: str | None
+    ):
+        sc = client.resolve(scope)
+        if sc is None:
+            raise ScopeNotFoundError(
+                f"no scope with slug {scope!r} — register it on the platform first"
+            )
+        with session_scope() as session:
+            return graduation.record_branch_rejection(
+                session,
+                scope_slug=sc["slug"],
+                scope_id=sc["id"],
+                name=name,
+                statement=statement,
+                rationale=rationale,
+            )
+
+    @mcp.tool()
+    async def record_branch_rejection(
+        scope: str, name: str, statement: str, rationale: str | None = None
+    ) -> dict:
+        """RECORD THE REJECTION of a whole speculation as a REAL decision in the
+        branch's cradle `scope` (spec §7) — "we considered this line and chose
+        against it", so the reasoning survives the line being shelved. The inverse
+        facet of `graduate_branch`: the decision's origin is the branch ADDRESS
+        (`<scope>:<name>`, no single node) and it's marked a rejection (kept
+        distinct from a graduation end decision on the same branch). A real write,
+        so it's here on `main`; archiving the line is the separate pure-shadow
+        `archive_branch`. Idempotent: an existing rejection on this branch is
+        returned rather than recorded twice."""
+        return await anyio.to_thread.run_sync(
+            _record_branch_rejection_sync, scope, name, statement, rationale
+        )
+
     # --- decision + artifact READ tools (shared with the shadow surface) ----
     # The read-real grounding set; the same handlers register on `shadow`.
     _register_read_tools(mcp, client)
@@ -600,6 +711,23 @@ def build_shadow_surface(scope_client: ScopeClient | None = None) -> FastMCP:
         reconstructs the reasoning on re-entry."""
         return await anyio.to_thread.run_sync(
             _set_narrative_notes_sync, scope, name, narrative_notes
+        )
+
+    def _archive_branch_sync(scope, name):
+        with session_scope() as session:
+            return shadow.archive_branch(session, scope, name)
+
+    @mcp.tool()
+    async def archive_branch(scope: str, name: str) -> dict:
+        """Archive a speculation branch — the active→archived status flip: a KEPT
+        row (still listable via `list_branches(include_done=True)`), not a delete.
+        A PURE shadow op — it writes nothing in the real graph — so it lives on this
+        shadow surface. To record WHY a line was rejected as a real decision, the
+        principal calls the main surface's `record_branch_rejection` FIRST, then
+        archives the line here. Idempotent: re-archiving pins the original
+        `archived_at`."""
+        return await anyio.to_thread.run_sync(
+            _archive_branch_sync, scope, name
         )
 
     def _add_node_sync(scope, name, statement, rationale):

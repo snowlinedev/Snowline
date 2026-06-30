@@ -34,6 +34,7 @@ decision) is a separate follow-up PR; this layer never writes the real graph.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -243,6 +244,29 @@ def set_narrative_notes(
     branch = _get_branch_row(session, scope_slug, name)
     branch.narrative_notes = narrative_notes
     session.flush()
+    return _branch_dict(branch)
+
+
+def archive_branch(session: Session, scope_slug: str, name: str) -> dict:
+    """Archive a branch — the active→archived status flip (§6.4): a KEPT row
+    (listable via `include_done`), not a delete. A PURE shadow operation (no real
+    write), so it lives in this module and registers on the SHADOW surface — the
+    inverse of `graduation.record_branch_rejection` (which mints a real decision and
+    lives on `main`). The flow "reject + archive a line" pairs the two:
+    `record_branch_rejection` records WHY (real), then `archive_branch` shelves the
+    line (shadow). Graduation does NOT auto-archive — un-selected nodes stay live
+    speculation.
+
+    Idempotent: re-archiving an already-archived branch is a no-op that returns it,
+    PINNING `archived_at` to the original archival (deliberately not refreshed)."""
+    branch = _get_branch_row(session, scope_slug, name)
+    if branch.status != "archived":
+        branch.status = "archived"
+        # The timestamp columns in this schema are naive UTC (server `func.now()`),
+        # so stamp a naive UTC value — a tz-aware one would round-trip differently
+        # than the naive value a later read returns.
+        branch.archived_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        session.flush()
     return _branch_dict(branch)
 
 

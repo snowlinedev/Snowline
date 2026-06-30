@@ -40,6 +40,10 @@ _REAL_WRITE_VERBS = {
     # that MUST live on `main` and be ABSENT from shadow (the principal split,
     # decision 99b92e1d): the shadow agent drafts, the principal on main executes.
     "graduate",
+    # branch-level graduation + rejection also mint real decisions (decisions
+    # 0c26be5c / be803a2b) — same principal split, so also main-only.
+    "graduate_branch",
+    "record_branch_rejection",
     "register_artifact",
     "revise_artifact",
     "resolve_artifact",
@@ -56,6 +60,9 @@ _SHADOW_WRITE_TOOLS = {
     "add_citation",
     "list_citations",
     "shadow_corpus_search",
+    # archive_branch is a PURE shadow op (active→archived status flip, no real
+    # write), so it lives on the shadow surface alongside the other shadow writes.
+    "archive_branch",
 }
 
 _READ_REAL_GROUNDING = {
@@ -73,7 +80,7 @@ def _tool_names(surface) -> set[str]:
 
 
 def test_shadow_surface_is_isolated_no_real_write():
-    """THE KEY isolation test: the shadow surface's tool set is EXACTLY the 8
+    """THE KEY isolation test: the shadow surface's tool set is EXACTLY the 9
     shadow writes + the 6 read-real grounding tools — and contains ZERO real-write
     verbs. The absence of record_decision / supersede / register / revise /
     resolve / set_governs / set_maturity IS the isolation (decision 8a7f0a11)."""
