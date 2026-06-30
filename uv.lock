@@ -12,6 +12,7 @@ resolution-markers = [
 members = [
     "snowline-governance",
     "snowline-platform",
+    "snowline-plugin-sdk",
 ]
 
 [[package]]
@@ -906,6 +907,7 @@ dev = [
     { name = "httpx" },
     { name = "pytest" },
     { name = "snowline-governance" },
+    { name = "snowline-plugin-sdk" },
 ]
 
 [package.metadata]
@@ -922,7 +924,23 @@ dev = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "snowline-governance", editable = "governance" },
+    { name = "snowline-plugin-sdk", editable = "sdk" },
 ]
+
+[[package]]
+name = "snowline-plugin-sdk"
+version = "0.1.0"
+source = { editable = "sdk" }
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
+[package.metadata]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=8.0" }]
 
 [[package]]
 name = "sqlalchemy"
