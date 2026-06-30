@@ -7,10 +7,24 @@ between `gateway.build_surface_server` (the per-surface low-level MCP server) an
 the FastAPI/Starlette app: it builds a `StreamableHTTPSessionManager` per surface
 and mounts it at the surface's platform route, behind the existing trust gate.
 
-Surface → route convention: ``main`` is the daily-driver surface at ``/mcp``;
-every other named surface ``X`` is mounted at ``/X/mcp`` (so ``shadow`` → matches
-``/shadow/mcp``, mirroring how the governance plugin lays out its own paths).
-More-specific routes are mounted before ``/mcp`` so Starlette matches them first.
+Surface → route convention: the ROOT_SURFACE (``main``) is the daily-driver
+surface at ``/mcp``; every other named surface ``X`` is mounted at ``/X/mcp``
+(so ``shadow`` → matches ``/shadow/mcp``, mirroring how the governance plugin
+lays out its own paths). Routes are mounted MOST-SPECIFIC first — by path-segment
+depth, then length — so a route that is a path-prefix of another (e.g. ``/a/mcp``
+vs ``/a/b/mcp``) can never shadow the deeper one under Starlette's first-match.
+
+Configurable surface set, NOT manifest-derived. The surfaces are mounted at
+create_app time, but plugins register LATER (they POST ``/plugins`` on their own
+boot, after the platform is up), so at mount time the registry is empty — the
+live surface set cannot be derived from registered manifests at startup. And a
+``StreamableHTTPSessionManager.run()`` is once-per-instance, so a brand-new
+surface can't be added at runtime by re-entering a mount. The set is therefore
+read from config (`config.surfaces()` ← ``SNOWLINE_SURFACES``, default
+``"main,shadow"``): adding a surface is a config change + a restart, not a code
+edit. FUTURE: runtime dynamic-add of a surface (mount + a fresh lifespan-scoped
+session manager within the running app) is out of scope here, gated on the
+run()-once constraint.
 
 The session managers' `run()` is a required-for-lifespan async context (the
 StreamableHTTP manager owns the task group serving sessions); they are entered in
@@ -26,6 +40,7 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.types import Receive, Scope, Send
 
+from snowline_platform import config
 from snowline_platform.gateway import (
     StreamableHttpConnector,
     UpstreamConnector,
@@ -33,13 +48,12 @@ from snowline_platform.gateway import (
 )
 from snowline_platform.registry import PluginRegistry
 
-# The named surfaces the platform always exposes. `main` is the composed
-# daily-driver surface; `shadow` is the isolated speculation surface (decision
-# 8a7f0a11). A surface is mounted whether or not a plugin currently maps onto it
-# — an empty surface simply lists no tools — so the route exists before the first
-# plugin registers (hot-plug). More surfaces can be added here as plugins
-# introduce them.
-DEFAULT_SURFACES: tuple[str, ...] = ("main", "shadow")
+# The root surface: the composed daily-driver surface, served at the bare
+# ``/mcp`` (every other named surface ``X`` lives at ``/X/mcp``). This is the one
+# magic surface name — `surface_route` and `config.surfaces()` (which always
+# keeps it present) both reference THIS constant so the assumption lives in one
+# place.
+ROOT_SURFACE = "main"
 
 # DNS-rebinding protection off on the streamable-HTTP transport: the gateway sits
 # behind the platform trust gate (reached on the tailnet), matching the
@@ -49,9 +63,9 @@ _SECURITY = TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
 
 def surface_route(surface: str) -> str:
-    """The platform route a named surface is served at: ``main`` → ``/mcp``,
+    """The platform route a named surface is served at: ROOT_SURFACE → ``/mcp``,
     any other ``X`` → ``/X/mcp``."""
-    return "/mcp" if surface == "main" else f"/{surface}/mcp"
+    return "/mcp" if surface == ROOT_SURFACE else f"/{surface}/mcp"
 
 
 class _SurfaceMount:
@@ -87,23 +101,33 @@ class _SurfaceMount:
 def build_surface_mounts(
     registry: PluginRegistry,
     connector: UpstreamConnector | None = None,
-    surfaces: tuple[str, ...] = DEFAULT_SURFACES,
+    surfaces: tuple[str, ...] | None = None,
 ) -> list[_SurfaceMount]:
-    """One `_SurfaceMount` per named surface. `connector` defaults to the
-    production streamable-HTTP connector; tests inject an in-memory one."""
+    """One `_SurfaceMount` per named surface. `surfaces` defaults to the
+    configured set (`config.surfaces()` ← ``SNOWLINE_SURFACES``); `connector`
+    defaults to the production streamable-HTTP connector; tests inject an
+    in-memory one."""
     conn = connector or StreamableHttpConnector()
-    return [_SurfaceMount(s, registry, conn) for s in surfaces]
+    names = config.surfaces() if surfaces is None else surfaces
+    return [_SurfaceMount(s, registry, conn) for s in names]
 
 
 def mount_gateway(app, mounts: list[_SurfaceMount]) -> None:
     """Mount each surface's ASGI handler on the FastAPI/Starlette `app`.
 
-    Routes are added MOST-SPECIFIC first (e.g. ``/shadow/mcp`` before ``/mcp``)
-    so Starlette's first-match routing picks the right surface; ``/mcp`` (the
-    `main` surface) is mounted last. Mounting (vs a single route) lets the
-    streamable-HTTP transport own the sub-path (GET/POST/DELETE + the session
-    sub-routes it manages)."""
-    ordered = sorted(mounts, key=lambda m: len(m.route), reverse=True)
+    Routes are added MOST-SPECIFIC first so Starlette's first-match routing
+    picks the right surface; ``/mcp`` (the ROOT_SURFACE) is mounted last.
+    Specificity is PREFIX specificity — number of path segments desc, then length
+    desc — NOT raw `len(route)`: a route that is a path-prefix of another (e.g.
+    ``/a/mcp`` is a prefix of ``/a/b/mcp``) must be mounted AFTER it so it can't
+    shadow the deeper route, and segment count captures that where length does
+    not. Mounting (vs a single route) lets the streamable-HTTP transport own the
+    sub-path (GET/POST/DELETE + the session sub-routes it manages)."""
+    ordered = sorted(
+        mounts,
+        key=lambda m: (m.route.count("/"), len(m.route)),
+        reverse=True,
+    )
     for mount in ordered:
         app.mount(mount.route, mount.asgi)
 

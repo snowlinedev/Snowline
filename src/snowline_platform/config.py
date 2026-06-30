@@ -20,6 +20,15 @@ DEFAULT_DATABASE_URL = "postgresql+psycopg:///snowline_platform"
 DEFAULT_HEALTH_POLL_INTERVAL = 15.0
 DEFAULT_HEALTH_POLL_TIMEOUT = 5.0
 
+# The named MCP surfaces the gateway mounts at startup. `main` is the composed
+# daily-driver surface; `shadow` is the isolated speculation surface (decision
+# 8a7f0a11). Surfaces are mounted at create_app time (before any plugin has
+# registered), so the set is configuration, not derived from live manifests —
+# adding a surface is `SNOWLINE_SURFACES=...` + a restart, not a code edit. See
+# the `gateway_app` module docstring for why startup-mount + run()-once preclude
+# pure manifest-driven derivation.
+DEFAULT_SURFACES = "main,shadow"
+
 
 def trusted_cidrs() -> list[str]:
     raw = os.environ.get("SNOWLINE_TRUSTED_CIDRS", DEFAULT_TRUSTED_CIDRS)
@@ -44,3 +53,25 @@ def health_poll_timeout() -> float:
             "SNOWLINE_HEALTH_POLL_TIMEOUT", DEFAULT_HEALTH_POLL_TIMEOUT
         )
     )
+
+
+def surfaces() -> tuple[str, ...]:
+    """The named surfaces the gateway mounts, from `SNOWLINE_SURFACES`
+    (comma-separated, default `"main,shadow"`). Order-preserving + deduped;
+    `gateway_app.ROOT_SURFACE` is always included (it's the daily-driver root
+    at `/mcp`) even when the env omits it. Mounting (not derivation) is forced by
+    the startup boot order — see the `gateway_app` module docstring."""
+    from snowline_platform.gateway_app import ROOT_SURFACE
+
+    raw = os.environ.get("SNOWLINE_SURFACES", DEFAULT_SURFACES)
+    names = [s.strip() for s in raw.split(",") if s.strip()]
+    if ROOT_SURFACE not in names:
+        names.insert(0, ROOT_SURFACE)
+    # Dedupe, preserving first-seen order.
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            ordered.append(n)
+    return tuple(ordered)
