@@ -9,6 +9,7 @@ this registry.
 
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
@@ -27,6 +28,8 @@ from snowline_platform.health import health_poll_loop
 from snowline_platform.middleware import TrustMiddleware
 from snowline_platform.registry import PluginRegistry
 from snowline_platform.trust import CidrTrustProvider, TrustResolver
+
+log = logging.getLogger("snowline_platform.app")
 
 
 def build_resolver() -> TrustResolver:
@@ -58,6 +61,18 @@ async def _lifespan(app: FastAPI):
     # app lifespan (the gateway, gateway.md §2). The surfaces are mounted at
     # create_app time; their managers' run() is the required-for-lifespan context.
     async with gateway_lifespan(app.state.gateway_mounts):
+        # The registry is in-memory, so a restart boots it EMPTY and every mounted
+        # surface serves zero tools until the plugins' registration heartbeats
+        # re-upsert them (issue #39). That window is expected — but it must be
+        # LOUD, not silent: a crash-restart under launchd at 3am otherwise looks
+        # healthy while the whole gateway is hollow.
+        if app.state.gateway_mounts and not app.state.registry.list():
+            log.warning(
+                "boot: %d gateway surface(s) mounted but ZERO plugins registered "
+                "— composed surfaces serve no tools until plugin registration "
+                "heartbeats arrive (issue #39)",
+                len(app.state.gateway_mounts),
+            )
         # The health poller (health.md): a background task that marks each plugin
         # UP/DOWN so the gateway routes around dead ones. Off by default (the
         # test-friendly factory) — the production singleton opts in. Cancelled on

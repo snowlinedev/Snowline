@@ -83,7 +83,10 @@ async def poll_once(
         except Exception:
             log.exception("health: unexpected error checking %s", entry.manifest.name)
             status = PluginStatus.DOWN
-        registry.set_status(entry.manifest.name, status)
+        # `expected_entry` pins the write to the entry this round actually
+        # probed: if an `updated` upsert replaced it mid-round, the result
+        # describes the OLD address and must not mark the new entry (issue #39).
+        registry.set_status(entry.manifest.name, status, expected_entry=entry)
         results[entry.manifest.name] = status
 
     async with anyio.create_task_group() as tg:
@@ -109,10 +112,29 @@ async def health_poll_loop(
     client = client or httpx.AsyncClient(
         timeout=httpx.Timeout(timeout), follow_redirects=True
     )
+    empty_rounds = 0
     try:
         while True:
             try:
-                await poll_once(registry, client)
+                results = await poll_once(registry, client)
+                # The hollow-gateway detector (issue #39): right after a
+                # platform boot an empty registry is expected for ~one
+                # registration-heartbeat interval, but if it STAYS empty the
+                # plugins' heartbeats aren't arriving (wrong platform URL,
+                # plugins down) and every composed surface serves zero tools.
+                # Warn once when emptiness persists past the first round; go
+                # quiet until plugins appear so the log isn't flooded.
+                if results:
+                    empty_rounds = 0
+                else:
+                    empty_rounds += 1
+                    if empty_rounds == 2:
+                        log.warning(
+                            "health: registry still empty after %d poll rounds "
+                            "— no plugin registration heartbeats are arriving; "
+                            "composed surfaces serve no tools (issue #39)",
+                            empty_rounds,
+                        )
             except Exception:  # never let one bad round kill the poller
                 log.exception("health: poll round failed; continuing")
             await anyio.sleep(interval)

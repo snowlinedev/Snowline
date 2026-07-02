@@ -6,18 +6,23 @@ platform registry, architecture §2). Memory declares: its name (`memory`), its
 SURFACE MAPPING — `{"/mcp": "main"}` (one surface, composed onto the platform's
 `main` surface alongside governance's). Memory has no isolated surface.
 
-Registration is BEST-EFFORT and SINGLE-SHOT per boot (architecture §3:
-hot-pluggable, no platform restart). Mirrors governance's `registration.py`:
+Registration is BEST-EFFORT and RETRYABLE (architecture §3: hot-pluggable, no
+platform restart). Mirrors governance's `registration.py`:
 `register_with_platform` swallows transport errors and returns False (logging) so
-a briefly-down platform can't crash the plugin; a 409 (already registered) is
-treated as success. Nothing retries a False return within this boot — a restart
-(or redeploy) re-attempts; the standing retry/heartbeat design is platform#39.
+a briefly-down platform can't crash the plugin. The caller IS a loop:
+`registration_heartbeat` re-POSTs the manifest every beat for the app's whole
+lifespan (issue #39) — the platform's registry is in-memory, so a platform
+restart empties it and only a re-assert from this side heals the composed
+surfaces. The platform's `POST /plugins` is an idempotent upsert (200 on
+re-register); a 409 from an older platform is also treated as success.
 """
 
 from __future__ import annotations
 
 import logging
+from functools import partial
 
+import anyio
 import httpx
 
 from snowline_memory import config
@@ -51,9 +56,8 @@ def register_with_platform(
     """POST the manifest to the platform's `POST /plugins`. Best-effort: returns
     True on a successful register (201) or an idempotent 409 (already registered),
     False on any transport error or non-2xx/409 status — NEVER raises, so a
-    briefly-down platform can't crash the plugin. SINGLE-SHOT: no caller retries a
-    False return this boot (a restart re-attempts; platform#39 owns the
-    heartbeat/retry design).
+    briefly-down platform can't crash the plugin (the caller — the registration
+    heartbeat — just beats again next interval).
     """
     platform = (platform_url or config.platform_url()).rstrip("/")
     url = f"{platform}/plugins"
@@ -64,23 +68,69 @@ def register_with_platform(
         else:
             resp = httpx.post(url, json=manifest, timeout=timeout)
     except httpx.HTTPError as exc:
-        log.warning(
-            "plugin registration to %s failed (single-shot, not retried this "
-            "boot — restart to re-attempt): %s",
-            url,
-            exc,
-        )
+        log.warning("plugin registration to %s failed (will retry): %s", url, exc)
         return False
     if resp.status_code == httpx.codes.CONFLICT:
-        log.info("plugin %r already registered with the platform", PLUGIN_NAME)
+        # Only an OLDER (pre-upsert) platform returns 409 — but against one it
+        # is the heartbeat's per-beat steady state, so DEBUG like the 200 path.
+        log.debug("plugin %r already registered with the platform", PLUGIN_NAME)
         return True
-    if resp.is_success:
+    if resp.status_code == httpx.codes.CREATED:
         log.info("registered plugin %r with the platform at %s", PLUGIN_NAME, platform)
         return True
+    if resp.is_success:
+        # The heartbeat's steady state — a 200 re-assert (upsert unchanged/
+        # updated) every beat. DEBUG, or the log fills with a line per interval.
+        log.debug(
+            "re-asserted plugin %r with the platform at %s", PLUGIN_NAME, platform
+        )
+        return True
     log.warning(
-        "plugin registration to %s returned %s (single-shot, not retried this "
-        "boot — restart to re-attempt)",
-        url,
-        resp.status_code,
+        "plugin registration to %s returned %s (will retry)", url, resp.status_code
     )
     return False
+
+
+async def registration_heartbeat(
+    platform_url: str | None = None,
+    base_url: str | None = None,
+    *,
+    interval: float | None = None,
+    client: httpx.Client | None = None,
+) -> None:
+    """Re-assert this plugin's registration every `interval` seconds until
+    cancelled (issue #39) — the first beat fires immediately, so this loop IS
+    the boot registration too. The platform's registry is in-memory: a platform
+    restart empties it, and the next beat re-upserts this plugin, so a deploy
+    (or 3am crash-restart) heals within one interval instead of requiring this
+    plugin to also be kickstarted.
+
+    Each beat is `register_with_platform` (which never raises), run off the
+    event loop because it's a blocking httpx POST; the try/except backstops the
+    thread-dispatch machinery around it. `interval` defaults to
+    `config.registration_heartbeat_seconds()` (lenient — a malformed shared env
+    var must not kill the loop). A failed beat is already logged by
+    `register_with_platform`; the loop just keeps beating. Cancellation
+    (lifespan shutdown) unwinds cleanly through the `anyio.sleep`."""
+    beat_every = (
+        interval if interval is not None else config.registration_heartbeat_seconds()
+    )
+    own_client = client is None
+    if own_client:
+        # One long-lived client for the loop's lifetime — a per-beat client
+        # would re-load the CA bundle and re-handshake TCP every interval.
+        client = httpx.Client(timeout=10.0)
+    beat = partial(register_with_platform, platform_url, base_url, client=client)
+    try:
+        while True:
+            try:
+                # abandon_on_cancel: shutdown must not wait out a beat blocked
+                # on an unreachable platform (up to the POST timeout); the
+                # abandoned thread finishes harmlessly in the background.
+                await anyio.to_thread.run_sync(beat, abandon_on_cancel=True)
+            except Exception:  # backstop — one bad beat must not kill the loop
+                log.exception("registration heartbeat beat failed; continuing")
+            await anyio.sleep(beat_every)
+    finally:
+        if own_client:
+            client.close()

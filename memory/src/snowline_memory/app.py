@@ -4,11 +4,11 @@ A FastAPI app that:
   - serves the `main` MCP surface (the memory tools) over streamable HTTP at
     `/mcp`,
   - exposes `/health` (the platform supervisor polls this),
-  - REGISTERS with the platform on startup by POSTing its manifest to the
-    platform's `POST /plugins` — best-effort and single-shot, so a briefly-down
-    platform doesn't crash the plugin (architecture §3, hot-pluggable); a failed
-    registration is only re-attempted by a restart (platform#39 owns the
-    heartbeat/retry design).
+  - REGISTERS with the platform via a lifespan-long registration HEARTBEAT
+    (issue #39): the manifest is POSTed at boot and re-asserted every interval,
+    so a platform restart (in-memory registry, boots empty) self-heals. Each
+    beat is best-effort, so a briefly-down platform doesn't crash the plugin
+    (architecture §3, hot-pluggable).
 
 Memory has its OWN database; like governance it boot-migrates to the latest
 Alembic head in the lifespan (memory: server auto-migrates on boot), so a schema
@@ -20,6 +20,7 @@ the surface is up.
 from __future__ import annotations
 
 import contextlib
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -51,7 +52,12 @@ def create_app(
 ) -> FastAPI:
     """Build the memory app. `migrate_on_startup=False` skips the boot-migrate
     (tests provision their own schema); `register_on_startup=False` skips the
-    platform registration POST (tests assert registration separately)."""
+    platform registration heartbeat (tests assert registration separately)."""
+    # httpx logs every request at INFO — with the registration heartbeat that is
+    # one line per beat forever (defeating the DEBUG steady-state logging), so
+    # cap the httpx logger at WARNING; our own registration logs carry the
+    # signal.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     main_surface = build_main_surface()
 
     @asynccontextmanager
@@ -62,15 +68,18 @@ def create_app(
         # app lifespan (the monolith/governance pattern).
         async with contextlib.AsyncExitStack() as stack:
             await stack.enter_async_context(main_surface.session_manager.run())
+            # The registration HEARTBEAT (issue #39): first beat immediately
+            # (the boot registration), then a re-assert every interval so a
+            # platform restart — whose in-memory registry boots empty — heals
+            # without this plugin being kickstarted too. Each beat is
+            # best-effort and runs off the event loop; riding a task group
+            # means boot never blocks on a slow/down platform (governance's
+            # lifespan pattern).
+            tg = await stack.enter_async_context(anyio.create_task_group())
             if getattr(app.state, "register_on_startup", True):
-                # Single-shot, best-effort registration (never raises, so a down
-                # platform can't crash boot; no retry loop — platform#39 owns the
-                # heartbeat/retry design). The POST runs in a thread so it can't
-                # block the event loop, but the lifespan AWAITS it before
-                # yielding, so readiness (/health) waits up to the registration
-                # timeout (~10s) when the platform is slow or unreachable.
-                await anyio.to_thread.run_sync(registration.register_with_platform)
+                tg.start_soon(registration.registration_heartbeat)
             yield
+            tg.cancel_scope.cancel()
 
     app = FastAPI(title="Snowline Memory", lifespan=_lifespan)
     app.state.migrate_on_startup = migrate_on_startup

@@ -5,7 +5,6 @@ from pydantic import ValidationError
 
 from snowline_platform.manifest import PluginManifest
 from snowline_platform.registry import (
-    PluginAlreadyRegistered,
     PluginNotFound,
     PluginRegistry,
     PluginStatus,
@@ -42,22 +41,39 @@ def test_manifest_rejects_non_http_base_url():
 
 # --- registry ----------------------------------------------------------------
 
-def test_register_and_get_and_list():
+def test_upsert_and_get_and_list():
     reg = PluginRegistry()
-    entry = reg.register(_manifest())
+    entry, outcome = reg.upsert(_manifest())
+    assert outcome == "created"
     assert entry.status is PluginStatus.UNKNOWN
     assert reg.get("governance").manifest.name == "governance"
     assert [e.manifest.name for e in reg.list()] == ["governance"]
 
 
-def test_duplicate_register_raises_unless_replace():
+def test_upsert_creates_then_is_idempotent():
     reg = PluginRegistry()
-    reg.register(_manifest())
-    with pytest.raises(PluginAlreadyRegistered):
-        reg.register(_manifest())
-    # replace=True overwrites without error
-    reg.register(_manifest(base_url="http://127.0.0.1:9999"), replace=True)
-    assert reg.get("governance").manifest.base_url == "http://127.0.0.1:9999"
+    entry, outcome = reg.upsert(_manifest())
+    assert outcome == "created"
+    assert entry.status is PluginStatus.UNKNOWN
+    # Re-upserting an IDENTICAL manifest keeps the entry — including its health
+    # status, so a heartbeat can't flap a plugin back to UNKNOWN every beat.
+    reg.set_status("governance", PluginStatus.UP)
+    entry2, outcome2 = reg.upsert(_manifest())
+    assert outcome2 == "unchanged"
+    assert entry2 is reg.get("governance")
+    assert entry2.status is PluginStatus.UP
+
+
+def test_upsert_replaces_on_changed_manifest():
+    reg = PluginRegistry()
+    reg.upsert(_manifest())
+    reg.set_status("governance", PluginStatus.UP)
+    # A different manifest (a redeploy moved the plugin) replaces the entry and
+    # resets status — the old UP described a plugin at another address.
+    entry, outcome = reg.upsert(_manifest(base_url="http://127.0.0.1:9999"))
+    assert outcome == "updated"
+    assert entry.manifest.base_url == "http://127.0.0.1:9999"
+    assert entry.status is PluginStatus.UNKNOWN
 
 
 def test_get_and_unregister_missing_raise():
@@ -70,14 +86,28 @@ def test_get_and_unregister_missing_raise():
 
 def test_unregister_removes():
     reg = PluginRegistry()
-    reg.register(_manifest())
+    reg.upsert(_manifest())
     reg.unregister("governance")
     assert reg.list() == []
 
 
 def test_set_status_updates_and_is_noop_for_missing():
     reg = PluginRegistry()
-    reg.register(_manifest())
+    reg.upsert(_manifest())
     reg.set_status("governance", PluginStatus.UP)
     assert reg.get("governance").status is PluginStatus.UP
     reg.set_status("ghost", PluginStatus.UP)  # no-op, no raise
+
+
+def test_set_status_is_noop_for_replaced_entry():
+    # The health poller pins its write to the entry it probed: a result for an
+    # entry that an `updated` upsert replaced mid-round must not mark the new
+    # entry (the new address was never checked).
+    reg = PluginRegistry()
+    old_entry, _ = reg.upsert(_manifest())
+    new_entry, outcome = reg.upsert(_manifest(base_url="http://127.0.0.1:9999"))
+    assert outcome == "updated"
+    reg.set_status("governance", PluginStatus.DOWN, expected_entry=old_entry)
+    assert reg.get("governance").status is PluginStatus.UNKNOWN  # untouched
+    reg.set_status("governance", PluginStatus.UP, expected_entry=new_entry)
+    assert reg.get("governance").status is PluginStatus.UP

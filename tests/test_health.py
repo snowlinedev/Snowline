@@ -24,7 +24,7 @@ def _mock_client(handler) -> httpx.AsyncClient:
 def _reg(*manifests: PluginManifest) -> PluginRegistry:
     reg = PluginRegistry()
     for m in manifests:
-        reg.register(m)
+        reg.upsert(m)
     return reg
 
 
@@ -224,6 +224,35 @@ def test_app_lifespan_starts_poller_and_marks_unreachable_down():
         # context exit cancels the poller — if that hung, this test would too.
 
     assert anyio.run(go) is PluginStatus.DOWN
+
+
+def test_health_loop_warns_when_registry_stays_empty(caplog):
+    """The hollow-gateway detector (issue #39): a registry still empty on the
+    second poll round — one boot round of grace for the plugins' registration
+    heartbeats — warns loudly, exactly once per emptiness episode."""
+    import logging
+
+    reg = PluginRegistry()
+
+    async def go():
+        async with _mock_client(lambda req: httpx.Response(200)) as c:
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(
+                    lambda: health.health_poll_loop(
+                        reg, interval=0.01, timeout=1.0, client=c
+                    )
+                )
+                with anyio.move_on_after(2.0):
+                    while not any(
+                        "registry still empty" in r.message for r in caplog.records
+                    ):
+                        await anyio.sleep(0.005)
+                tg.cancel_scope.cancel()
+
+    with caplog.at_level(logging.WARNING, logger="snowline_platform.health"):
+        anyio.run(go)
+    warnings = [r for r in caplog.records if "registry still empty" in r.message]
+    assert len(warnings) == 1  # loud once, then quiet — not a line per round
 
 
 def test_health_loop_polls_then_cancels():

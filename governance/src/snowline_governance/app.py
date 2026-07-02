@@ -4,9 +4,11 @@ A FastAPI app that:
   - serves the `main` MCP surface (the decision tools) over streamable HTTP at
     `/mcp`,
   - exposes `/health` (the platform supervisor polls this),
-  - REGISTERS with the platform on startup by POSTing its manifest to the
-    platform's `POST /plugins` — best-effort/retryable, so a briefly-down
-    platform doesn't crash the plugin (architecture §3, hot-pluggable).
+  - REGISTERS with the platform via a lifespan-long registration HEARTBEAT
+    (issue #39): the manifest is POSTed at boot and re-asserted every interval,
+    so a platform restart (in-memory registry, boots empty) self-heals. Each
+    beat is best-effort, so a briefly-down platform doesn't crash the plugin
+    (architecture §3, hot-pluggable).
 
 Governance has its OWN database; like the platform it boot-migrates to the latest
 Alembic head in the lifespan (memory: server auto-migrates on boot), so a schema
@@ -18,6 +20,7 @@ the surface is up.
 from __future__ import annotations
 
 import contextlib
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -51,8 +54,14 @@ def create_app(
 ) -> FastAPI:
     """Build the governance app. `scope_client` is injectable (tests pass a stub);
     `migrate_on_startup=False` skips the boot-migrate (tests provision their own
-    schema); `register_on_startup=False` skips the platform registration POST
-    (tests assert registration separately, against a stubbed platform)."""
+    schema); `register_on_startup=False` skips the platform registration
+    heartbeat (tests assert registration separately, against a stubbed
+    platform)."""
+    # httpx logs every request at INFO — with the registration heartbeat that is
+    # one line per beat forever (defeating the DEBUG steady-state logging), so
+    # cap the httpx logger at WARNING; our own registration/webhook logs carry
+    # the signal.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     main_surface = build_main_surface(scope_client=scope_client)
     shadow_surface = build_shadow_surface(scope_client=scope_client)
 
@@ -76,11 +85,13 @@ def create_app(
             tg = await stack.enter_async_context(anyio.create_task_group())
             tg.start_soon(webhook_delivery_loop)
             if getattr(app.state, "register_on_startup", True):
-                # Best-effort (never raises, so a down platform can't crash boot)
-                # AND off the event loop (the POST is blocking httpx with a
-                # timeout — a slow-but-reachable platform must not stall startup /
-                # delay /health coming up).
-                await anyio.to_thread.run_sync(registration.register_with_platform)
+                # The registration HEARTBEAT (issue #39): first beat immediately
+                # (the boot registration), then a re-assert every interval so a
+                # platform restart — whose in-memory registry boots empty — heals
+                # without this plugin being kickstarted too. Each beat is
+                # best-effort and runs off the event loop; riding the task group
+                # means boot no longer blocks on a slow/down platform at all.
+                tg.start_soon(registration.registration_heartbeat)
             yield
             tg.cancel_scope.cancel()
 
