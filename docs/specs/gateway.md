@@ -72,6 +72,28 @@ aggregates), not a new model.
   `call_tool` routing on that surface. Registration, health, and the registry
   views are unchanged — this filters what a surface *composes*, not what is
   *registered*.
+- **Projection: an allowlisted surface composes ROOT_SURFACE mappings as the
+  fallback (issue #38).** An allowlist is an operator statement of composition
+  ("`core` = governance, without PM"), but no real plugin's manifest maps
+  anything onto an operator-invented surface name (governance maps only
+  `/mcp → main` + `/shadow/mcp → shadow`) — a pure filter over manifest
+  mappings therefore mounted an EMPTY `/core/mcp`, found live minutes after
+  the filter shipped. So a surface WITH an explicit allowlist composes, per
+  allowlisted plugin:
+  - the plugin's **native** mapping for that surface, when its manifest
+    declares one;
+  - **else** its `ROOT_SURFACE` (`main`) mapping — the plugin's daily-driver
+    tools, projected onto the constrained surface with no plugin-side manifest
+    change;
+  - **else** (neither mapping) nothing — the plugin simply doesn't contribute.
+
+  A native mapping wins *outright*: the `main` mapping is not also projected,
+  so projection never creates a duplicate `(plugin, surface)` path (the
+  issue-#22 duplicate-path guard stays reserved for genuine manifest errors).
+  A surface WITHOUT an allowlist never projects — membership stays purely
+  manifest-driven, byte-for-byte the pre-allowlist behavior — so `main` tools
+  can never leak onto an isolation surface like `shadow`. Projection is
+  strictly a property of the explicit allowlist.
 - **Interplay with `SNOWLINE_SURFACES` — list a constrained surface in BOTH
   envs.** `SNOWLINE_SURFACES` alone decides the mounted set; there is NO
   auto-include of allowlist-named surfaces. An allowlist naming an unmounted
@@ -88,8 +110,9 @@ aggregates), not a new model.
 
   `ROOT_SURFACE` (`main`) stays the one always-present magic name.
 
-Result: `http://<host>:8850/core/mcp` serves governance-without-PM over the
-tailnet while `/mcp` stays the full composed daily driver.
+Result: `http://<host>:8850/core/mcp` serves governance-without-PM — governance's
+projected `main` tools — over the tailnet while `/mcp` stays the full composed
+daily driver.
 
 ## 3. UI composition
 

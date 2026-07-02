@@ -142,36 +142,38 @@ def test_isolation_over_http_shadow_lacks_main_only_tool():
 
 
 def test_surface_allowlist_over_http_core_is_governance_only(monkeypatch):
-    """Issue #36 end-to-end over the REAL streamable-HTTP transport: with `core`
-    in BOTH envs (`SNOWLINE_SURFACES` mounts it, `SNOWLINE_SURFACE_PLUGINS`
-    constrains it — the documented two-line contract, no auto-include), the
-    mounted `/core/mcp` serves governance-only tools while `/mcp` serves BOTH
-    plugins."""
+    """Issues #36+#38 end-to-end over the REAL streamable-HTTP transport, with
+    REAL-shaped manifests (governance maps main+shadow, pm maps main — nothing
+    maps `core` natively; fake `/core/mcp: core` manifests are the exact shape
+    that masked #38): with `core` in BOTH envs (`SNOWLINE_SURFACES` mounts it,
+    `SNOWLINE_SURFACE_PLUGINS` constrains it — the documented two-line contract,
+    no auto-include), the mounted `/core/mcp` serves governance's PROJECTED main
+    tools (not zero tools), `/mcp` serves BOTH plugins, and `/shadow/mcp` (no
+    allowlist) still serves ONLY governance's native shadow tools — no
+    projection leak."""
     monkeypatch.setenv("SNOWLINE_SURFACES", "main,shadow,core")
     monkeypatch.setenv("SNOWLINE_SURFACE_PLUGINS", "core=governance")
 
-    gov = make_stub_plugin("governance", ["record_decision", "get_decision"])
+    gov_main = make_stub_plugin("governance", ["record_decision", "get_decision"])
+    gov_shadow = make_stub_plugin("governance", ["add_node", "get_decision"])
     pm = make_stub_plugin("pm", ["create_work_item"])
     reg = PluginRegistry()
     reg.register(
         PluginManifest(
             name="governance",
             base_url="http://gov",
-            surfaces={"/mcp": "main", "/core/mcp": "core"},
+            surfaces={"/mcp": "main", "/shadow/mcp": "shadow"},
         )
     )
     reg.register(
         PluginManifest(
-            name="pm",
-            base_url="http://pm",
-            surfaces={"/mcp": "main", "/core/mcp": "core"},
+            name="pm", base_url="http://pm", surfaces={"/mcp": "main"}
         )
     )
     servers = {
-        "http://gov/mcp": gov,
-        "http://gov/core/mcp": gov,
+        "http://gov/mcp": gov_main,
+        "http://gov/shadow/mcp": gov_shadow,
         "http://pm/mcp": pm,
-        "http://pm/core/mcp": pm,
     }
 
     async def _list(session):
@@ -198,15 +200,27 @@ def test_surface_allowlist_over_http_core_is_governance_only(monkeypatch):
             _list,
         ).tools
     }
+    shadow = {
+        t.name
+        for t in anyio.run(
+            _run_against_surface,
+            _app_with(reg, InMemoryConnector(servers)),
+            "/shadow/mcp",
+            _list,
+        ).tools
+    }
 
     # /mcp is the full composed daily driver — both plugins.
     assert "governance__record_decision" in main
     assert "pm__create_work_item" in main
-    # /core/mcp is governance-only — PM is physically absent.
-    assert "governance__record_decision" in core
-    assert "governance__get_decision" in core
-    assert "pm__create_work_item" not in core
+    # /core/mcp serves governance's PROJECTED main tools (issue #38: not empty)
+    # — PM is physically absent.
+    assert core == {"governance__record_decision", "governance__get_decision"}
     assert not any(name.startswith("pm__") for name in core)
+    # /shadow/mcp has NO allowlist — pure manifest semantics, native shadow
+    # tools only; governance's main tools must not leak here via projection.
+    assert shadow == {"governance__add_node", "governance__get_decision"}
+    assert "governance__record_decision" not in shadow
 
 
 @pytest.mark.parametrize(
