@@ -30,6 +30,43 @@ composes; it never imports plugin code (plugins are addressed by URL).
   surface only because a plugin mapped it there (`record_decision` never lands on
   `shadow`).
 
+## 2a. Per-surface plugin allowlists (config)
+
+The surface SET is configuration (`SNOWLINE_SURFACES`); surface MEMBERSHIP is
+manifest-driven — every plugin that maps a path onto a named surface lands there.
+`SNOWLINE_SURFACE_PLUGINS` lets the platform **subset** that membership per
+surface, so a surface can be composed **with or without** a given plugin without
+touching any plugin manifest. This is the product split's daily need: the public
+Snowline drives GitHub directly, while the private PM plugin is the owner's
+bespoke roadmap engine — a `core` surface must be able to express
+"governance-only, no PM" while `main` stays the full composed daily driver. It's
+an allowlist at the aggregation step (decision `70b415fd`: named surfaces, gateway
+aggregates), not a new model.
+
+- **Format:** `SNOWLINE_SURFACE_PLUGINS="main=*;core=governance"` — `;`-separated
+  surface entries, each `<surface>=<allowlist>`; the allowlist is `*` (every
+  plugin) or a `,`-separated list of plugin names. Whitespace is tolerated.
+- **Default = allow-all.** A surface with no entry (and the empty/unset env)
+  aggregates every plugin — fully backward compatible.
+- **Fail loud.** A malformed entry (no `=`, empty name/allowlist, duplicate
+  surface, stray comma, `*` mixed with names) raises at startup. This is
+  deliberate: the failure mode to avoid is a typo *silently widening* a surface
+  (e.g. leaving PM reachable on a governance-only surface), so a hard error is
+  safer than a best-effort parse.
+- **Aggregation-only.** The filter applies in `gateway.discover_upstreams` (by
+  plugin name), so a filtered plugin is absent from BOTH `list_tools` and
+  `call_tool` routing on that surface. Registration, health, and the registry
+  views are unchanged — this filters what a surface *composes*, not what is
+  *registered*.
+- **Interplay with `SNOWLINE_SURFACES`.** A surface must still be in the mounted
+  set to be served; as a convenience, any surface NAMED in an allowlist is
+  auto-included in the mounted set (an allowlist for an unmounted surface would be
+  dead config). `SNOWLINE_SURFACES` order wins; `ROOT_SURFACE` (`main`) stays the
+  one always-present magic name.
+
+Result: `http://<host>:8850/core/mcp` serves governance-without-PM over the
+tailnet while `/mcp` stays the full composed daily driver.
+
 ## 3. UI composition
 
 Each plugin's manifest declares its UI; the gateway serves/proxies it under the

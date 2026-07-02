@@ -52,6 +52,7 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server.lowlevel import Server
 
+from snowline_platform import config
 from snowline_platform.registry import PluginRegistry, PluginStatus
 
 log = logging.getLogger("snowline_platform.gateway")
@@ -197,7 +198,21 @@ def discover_upstreams(
     `list_tools` from advertising unroutable tools (it never sees the dropped
     path) and matches the call_tool routing key, so the two stay consistent. The
     cleaner fix — namespacing by plugin+path — is deferred until a plugin actually
-    needs multi-path-per-surface; today none do."""
+    needs multi-path-per-surface; today none do.
+
+    **Per-surface plugin allowlist (issue #36):** `SNOWLINE_SURFACE_PLUGINS` can
+    restrict which plugins a named surface aggregates (e.g. a governance-only
+    `core` surface without the private PM plugin). A plugin whose name is NOT in
+    this surface's allowlist is skipped here — at the aggregation step, so it is
+    absent from BOTH `list_tools` and `call_tool` routing (a filtered plugin's
+    tool is unroutable, surfaced as the same clear error as any not-on-this-surface
+    tool). A surface with no configured allowlist (the default) allows every
+    plugin, so this is fully backward compatible. Registration/health/registry
+    views are untouched — this filters aggregation only."""
+    # None => this surface has no allowlist => allow every plugin (the default,
+    # backward-compatible behavior). Read live per call so a config change is
+    # picked up on restart the same way the surface set is.
+    allowlist = config.surface_plugins().get(surface)
     upstreams: list[Upstream] = []
     # Track the path already accepted for each (plugin, surface) so a second path
     # onto the same surface is rejected with a warning (issue #22). We sort each
@@ -205,6 +220,9 @@ def discover_upstreams(
     # (lexicographically-first) regardless of dict insertion order.
     accepted_path: dict[str, str] = {}
     for entry in registry.list():
+        if allowlist is not None and entry.manifest.name not in allowlist:
+            # Filtered out by this surface's plugin allowlist (issue #36).
+            continue
         if entry.status is PluginStatus.DOWN:
             log.info(
                 "gateway: skipping down plugin %r for surface %r",

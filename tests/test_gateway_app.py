@@ -141,6 +141,72 @@ def test_isolation_over_http_shadow_lacks_main_only_tool():
     assert "governance__add_node" in shadow
 
 
+def test_surface_allowlist_over_http_core_is_governance_only(monkeypatch):
+    """Issue #36 end-to-end over the REAL streamable-HTTP transport: with
+    `SNOWLINE_SURFACE_PLUGINS="main=*;core=governance"`, the mounted `/core/mcp`
+    serves governance-only tools while `/mcp` serves BOTH plugins. `core` is
+    auto-included in the mounted set purely by being named in the allowlist."""
+    monkeypatch.setenv("SNOWLINE_SURFACE_PLUGINS", "main=*;core=governance")
+
+    gov = make_stub_plugin("governance", ["record_decision", "get_decision"])
+    pm = make_stub_plugin("pm", ["create_work_item"])
+    reg = PluginRegistry()
+    reg.register(
+        PluginManifest(
+            name="governance",
+            base_url="http://gov",
+            surfaces={"/mcp": "main", "/core/mcp": "core"},
+        )
+    )
+    reg.register(
+        PluginManifest(
+            name="pm",
+            base_url="http://pm",
+            surfaces={"/mcp": "main", "/core/mcp": "core"},
+        )
+    )
+    servers = {
+        "http://gov/mcp": gov,
+        "http://gov/core/mcp": gov,
+        "http://pm/mcp": pm,
+        "http://pm/core/mcp": pm,
+    }
+
+    async def _list(session):
+        return await session.list_tools()
+
+    # Fresh app per surface (a session manager's run() is once-per-instance). The
+    # allowlist env is read at create_app time by config.surfaces(), so `core` is
+    # mounted at /core/mcp.
+    main = {
+        t.name
+        for t in anyio.run(
+            _run_against_surface,
+            _app_with(reg, InMemoryConnector(servers)),
+            "/mcp",
+            _list,
+        ).tools
+    }
+    core = {
+        t.name
+        for t in anyio.run(
+            _run_against_surface,
+            _app_with(reg, InMemoryConnector(servers)),
+            "/core/mcp",
+            _list,
+        ).tools
+    }
+
+    # /mcp is the full composed daily driver — both plugins.
+    assert "governance__record_decision" in main
+    assert "pm__create_work_item" in main
+    # /core/mcp is governance-only — PM is physically absent.
+    assert "governance__record_decision" in core
+    assert "governance__get_decision" in core
+    assert "pm__create_work_item" not in core
+    assert not any(name.startswith("pm__") for name in core)
+
+
 def test_non_mcp_routes_still_work():
     """Mounting the gateway doesn't break /health, /plugins, /scopes."""
     from starlette.testclient import TestClient
