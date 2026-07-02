@@ -15,7 +15,10 @@ and talks to each plugin only over MCP/streamable-HTTP at ``base_url + plugin``
     ``manifest.surfaces`` maps one of its plugin-paths to that surface. A plugin
     whose registry ``status`` is ``DOWN`` is SKIPPED (health-aware route-around,
     §4); ``UNKNOWN`` is treated as routable (the health poller that sets ``UP``
-    is a later PR).
+    is a later PR). A surface with an explicit plugin ALLOWLIST additionally
+    PROJECTS each allowlisted plugin's `ROOT_SURFACE` mapping when the plugin
+    has no native mapping for that surface (issue #38 — see
+    `discover_upstreams`).
   - **list_tools** — the merged union of the upstreams' tool lists, with each
     tool NAMESPACED by its owning plugin (``governance.record_decision``). See
     `namespaced_name` for the collision policy.
@@ -55,6 +58,16 @@ from mcp.server.lowlevel import Server
 from snowline_platform.registry import PluginRegistry, PluginStatus
 
 log = logging.getLogger("snowline_platform.gateway")
+
+# The root surface: the composed daily-driver surface, served at the bare
+# ``/mcp``. Defined HERE (the bottom of the gateway import graph) because the
+# gateway itself needs it twice — the manifest surface-map default
+# (``{mcp_path: ROOT_SURFACE}``) and allowlist PROJECTION (issue #38, below) —
+# and `gateway_app` (which routes it to ``/mcp``) already imports from this
+# module, so defining it there would be an import cycle. `gateway_app` and
+# `config.surfaces()` re-use THIS constant, so the assumption still lives in
+# one place.
+ROOT_SURFACE = "main"
 
 # How a namespaced gateway tool name (``plugin__tool``) is split. We delimit with
 # a DOUBLE UNDERSCORE — the ``mcp__<server>__<tool>`` ecosystem convention — for a
@@ -213,7 +226,23 @@ def discover_upstreams(
     (`gateway_app.build_surface_mounts` ← `config.surface_plugins()`, fail-loud
     at boot) and handed down frozen — there is no per-request env re-parse.
     Registration/health/registry views are untouched — this filters aggregation
-    only."""
+    only.
+
+    **Projection onto allowlisted surfaces (issue #38):** an allowlist is an
+    operator statement of COMPOSITION ("`core` = governance's tools, without
+    PM"), but no real plugin's manifest maps anything onto an operator-invented
+    surface name (governance maps only ``/mcp → main`` + ``/shadow/mcp →
+    shadow``), so a pure filter over manifest mappings served an EMPTY surface
+    — found live, minutes after #37 deployed. So an allowlisted surface
+    COMPOSES, per allowlisted plugin: the plugin's NATIVE mapping for this
+    surface when its manifest declares one, ELSE its `ROOT_SURFACE` (``main``)
+    mapping — no plugin-side manifest change needed. A native mapping WINS
+    outright (the main mapping is not also projected, so projection can never
+    trip the issue-#22 duplicate-path guard by itself); an allowlisted plugin
+    with neither mapping contributes nothing. A surface WITHOUT an allowlist
+    (``None``) keeps pure manifest-driven semantics, unchanged — projection is
+    strictly a property of the explicit allowlist, so ``main`` tools can never
+    leak onto e.g. ``shadow``."""
     upstreams: list[Upstream] = []
     # Track the path already accepted for each (plugin, surface) so a second path
     # onto the same surface is rejected with a warning (issue #22). We sort each
@@ -232,9 +261,18 @@ def discover_upstreams(
             )
             continue
         manifest = entry.manifest
-        surface_map = manifest.surfaces or {manifest.mcp_path: "main"}
+        surface_map = manifest.surfaces or {manifest.mcp_path: ROOT_SURFACE}
+        # Projection (issue #38): on an ALLOWLISTED surface, a plugin with no
+        # native mapping for this surface contributes its ROOT_SURFACE mapping
+        # instead. `target` stays `surface` whenever a native mapping exists
+        # (native wins — the main mapping is never ALSO iterated, so projection
+        # cannot introduce a duplicate path for the #22 guard) and always for
+        # allowlist-less surfaces (pure manifest-driven semantics, unchanged).
+        target = surface
+        if allowlist is not None and surface not in surface_map.values():
+            target = ROOT_SURFACE
         for plugin_path in sorted(surface_map):
-            if surface_map[plugin_path] != surface:
+            if surface_map[plugin_path] != target:
                 continue
             kept = accepted_path.get(manifest.name)
             if kept is not None:
@@ -434,6 +472,7 @@ def build_surface_server(
 
 # The handler factory is also exposed for tests that drive the Server directly.
 __all__ = [
+    "ROOT_SURFACE",
     "Upstream",
     "UpstreamConnector",
     "StreamableHttpConnector",

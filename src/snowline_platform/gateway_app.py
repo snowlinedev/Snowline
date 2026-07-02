@@ -42,18 +42,26 @@ from starlette.types import Receive, Scope, Send
 
 from snowline_platform import config
 from snowline_platform.gateway import (
+    ROOT_SURFACE,
     StreamableHttpConnector,
     UpstreamConnector,
     build_surface_server,
 )
 from snowline_platform.registry import PluginRegistry
 
-# The root surface: the composed daily-driver surface, served at the bare
-# ``/mcp`` (every other named surface ``X`` lives at ``/X/mcp``). This is the one
-# magic surface name — `surface_route` and `config.surfaces()` (which always
-# keeps it present) both reference THIS constant so the assumption lives in one
-# place.
-ROOT_SURFACE = "main"
+# ROOT_SURFACE — the composed daily-driver surface, served at the bare ``/mcp``
+# (every other named surface ``X`` lives at ``/X/mcp``). It is DEFINED in
+# `gateway` (the bottom of the import graph — discovery needs it for the
+# manifest default and issue-#38 projection) and re-exported here, where
+# `surface_route` and `config.surfaces()` (which always keeps it present)
+# reference it — one constant, one assumption.
+__all__ = [
+    "ROOT_SURFACE",
+    "surface_route",
+    "build_surface_mounts",
+    "mount_gateway",
+    "gateway_lifespan",
+]
 
 # DNS-rebinding protection off on the streamable-HTTP transport: the gateway sits
 # behind the platform trust gate (reached on the tailnet), matching the

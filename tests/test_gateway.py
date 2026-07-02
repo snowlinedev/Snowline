@@ -81,21 +81,28 @@ def test_default_surface_is_main_when_unmapped():
     assert discover_upstreams(reg, "shadow") == []
 
 
-# --- Per-surface plugin allowlists (issue #36) --------------------------------
+# --- Per-surface plugin allowlists (issues #36 + #38) -------------------------
+#
+# REAL-shaped manifests throughout (governance maps main+shadow, pm maps main —
+# nothing maps a `core` surface natively): issue #38 was masked by fake
+# `{"/core/mcp": "core"}` manifests, a shape no real plugin has, so the #37
+# tests passed while the live `/core/mcp` served ZERO tools.
+
+_GOV_SURFACES = {"/mcp": "main", "/shadow/mcp": "shadow"}
+_PM_SURFACES = {"/mcp": "main"}
 
 
 def test_allowlist_filters_discovery_by_plugin_name():
-    """A surface handed an allowlist aggregates ONLY the listed plugins; a
+    """A surface handed an allowlist aggregates ONLY the listed plugins (pm is
+    filtered out even though it, too, maps `main` — the projection source); a
     surface handed None (no allowlist — the default) still allows all. The
     allowlist arrives as a frozen argument (parsed once at mount time by
     `build_surface_mounts`), never re-read from the env here."""
     reg = _registry(
         PluginManifest(
-            name="governance", base_url="http://gov", surfaces={"/mcp": "main", "/core/mcp": "core"}
+            name="governance", base_url="http://gov", surfaces=_GOV_SURFACES
         ),
-        PluginManifest(
-            name="pm", base_url="http://pm", surfaces={"/mcp": "main", "/core/mcp": "core"}
-        ),
+        PluginManifest(name="pm", base_url="http://pm", surfaces=_PM_SURFACES),
     )
 
     # `core` is constrained to governance; pm is filtered out.
@@ -108,6 +115,80 @@ def test_allowlist_filters_discovery_by_plugin_name():
         "governance",
         "pm",
     }
+
+
+def test_allowlisted_surface_projects_root_surface_mapping():
+    """Issue #38, the live bug: `core=governance` with the REAL manifest shape
+    (governance maps only main+shadow — nothing maps `core` natively) must
+    project governance's ROOT_SURFACE (`main`) mapping onto `core`, not serve an
+    empty surface. The projected upstream is governance's `/mcp` plugin-path."""
+    from snowline_platform.gateway import ROOT_SURFACE
+
+    reg = _registry(
+        PluginManifest(
+            name="governance", base_url="http://gov", surfaces=_GOV_SURFACES
+        ),
+        PluginManifest(name="pm", base_url="http://pm", surfaces=_PM_SURFACES),
+    )
+
+    ups = discover_upstreams(reg, "core", frozenset({"governance"}))
+    assert [(u.plugin_name, u.plugin_path) for u in ups] == [
+        ("governance", "/mcp")
+    ]
+    # The projection source is the plugin's ROOT_SURFACE mapping, by constant.
+    assert _GOV_SURFACES["/mcp"] == ROOT_SURFACE
+
+
+def test_allowlisted_plugin_with_native_mapping_prefers_it():
+    """A plugin that DOES declare a native mapping for the allowlisted surface
+    keeps it — projection is the fallback, not an override — and its main
+    mapping is NOT also projected (no duplicate upstream, so the issue-#22
+    duplicate-path guard is never tripped by projection)."""
+    reg = _registry(
+        PluginManifest(
+            name="governance",
+            base_url="http://gov",
+            surfaces={"/mcp": "main", "/core/mcp": "core"},
+        ),
+    )
+
+    ups = discover_upstreams(reg, "core", frozenset({"governance"}))
+    # Exactly ONE upstream: the native /core/mcp — /mcp (main) is not projected.
+    assert [(u.plugin_name, u.plugin_path) for u in ups] == [
+        ("governance", "/core/mcp")
+    ]
+
+
+def test_allowlisted_plugin_with_neither_mapping_contributes_nothing():
+    """An allowlisted plugin with NEITHER a native mapping for the surface NOR a
+    ROOT_SURFACE mapping simply contributes nothing — no error, no phantom
+    upstream."""
+    reg = _registry(
+        PluginManifest(
+            name="shadowonly",
+            base_url="http://so",
+            surfaces={"/shadow/mcp": "shadow"},
+        ),
+    )
+    assert discover_upstreams(reg, "core", frozenset({"shadowonly"})) == []
+
+
+def test_unallowlisted_surface_keeps_pure_manifest_semantics():
+    """CRITICAL isolation property: a surface WITHOUT an allowlist (None) never
+    projects — `shadow` serves ONLY native shadow mappings. Governance's main
+    mapping must not leak onto shadow via any projection path, and pm (which
+    maps only main) contributes nothing to shadow at all."""
+    reg = _registry(
+        PluginManifest(
+            name="governance", base_url="http://gov", surfaces=_GOV_SURFACES
+        ),
+        PluginManifest(name="pm", base_url="http://pm", surfaces=_PM_SURFACES),
+    )
+
+    shadow = discover_upstreams(reg, "shadow", None)
+    assert [(u.plugin_name, u.plugin_path) for u in shadow] == [
+        ("governance", "/shadow/mcp")
+    ]
 
 
 def test_allowlist_star_parses_to_allow_all(monkeypatch):
@@ -127,40 +208,44 @@ def test_allowlist_star_parses_to_allow_all(monkeypatch):
     } == {"governance", "pm"}
 
 
-def test_allowlist_filters_tools_and_routing_end_to_end():
-    """The filter applies at aggregation, so a filtered plugin's tools are absent
-    from list_tools AND its calls are unroutable on that surface — while the
-    unfiltered surface keeps both plugins. The allowlist is the frozen ctor arg
-    (mount-time contract), not env state."""
+def test_allowlist_projection_tools_and_routing_end_to_end():
+    """Issues #36+#38 at the tool level, with REAL-shaped manifests: on
+    `core=governance` the gateway serves governance's projected MAIN tools
+    (record_decision reaches the real /mcp upstream), pm's tools are absent AND
+    unroutable, `main` (no allowlist) keeps both plugins, and `shadow` (no
+    allowlist) serves ONLY governance's native shadow tools — main tools do not
+    leak there via projection."""
     import pytest
 
     from snowline_platform.gateway import GatewayError
 
-    gov = make_stub_plugin("governance", ["record_decision"])
+    gov_main = make_stub_plugin("governance", ["record_decision"])
+    gov_shadow = make_stub_plugin("governance", ["add_node"])
     pm = make_stub_plugin("pm", ["create_work_item"])
     reg = _registry(
         PluginManifest(
-            name="governance",
-            base_url="http://gov",
-            surfaces={"/mcp": "main", "/core/mcp": "core"},
+            name="governance", base_url="http://gov", surfaces=_GOV_SURFACES
         ),
-        PluginManifest(
-            name="pm",
-            base_url="http://pm",
-            surfaces={"/mcp": "main", "/core/mcp": "core"},
-        ),
+        PluginManifest(name="pm", base_url="http://pm", surfaces=_PM_SURFACES),
     )
     connector = InMemoryConnector(
         {
-            "http://gov/mcp": gov,
-            "http://gov/core/mcp": gov,
+            "http://gov/mcp": gov_main,
+            "http://gov/shadow/mcp": gov_shadow,
             "http://pm/mcp": pm,
-            "http://pm/core/mcp": pm,
         }
     )
     core = SurfaceGateway(reg, "core", connector, frozenset({"governance"}))
     core_tools = {t.name for t in anyio.run(core.list_tools)}
+    # Projection: governance's MAIN tools appear on core; nothing pm__.
     assert core_tools == {"governance__record_decision"}
+    # And a call routes to the real main upstream (the projected plugin-path).
+    res = anyio.run(core.call_tool, "governance__record_decision", {"value": "x"})
+    assert res.isError is not True
+    import json
+
+    payload = json.loads(res.content[0].text)
+    assert payload == {"plugin": "governance", "tool": "record_decision", "echo": "x"}
     # pm's tool is unroutable on `core` (filtered) -> clear error, not a misroute.
     with pytest.raises(GatewayError):
         anyio.run(core.call_tool, "pm__create_work_item", {})
@@ -169,6 +254,12 @@ def test_allowlist_filters_tools_and_routing_end_to_end():
     main = SurfaceGateway(reg, "main", connector, None)
     main_tools = {t.name for t in anyio.run(main.list_tools)}
     assert main_tools == {"governance__record_decision", "pm__create_work_item"}
+
+    # `shadow` (no allowlist) is UNCHANGED: native shadow tools only — no
+    # projected main tools, nothing from pm.
+    shadow = SurfaceGateway(reg, "shadow", connector, None)
+    shadow_tools = {t.name for t in anyio.run(shadow.list_tools)}
+    assert shadow_tools == {"governance__add_node"}
 
 
 def test_aggregates_two_plugins_on_main():
