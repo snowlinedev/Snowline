@@ -60,6 +60,32 @@ def test_duplicate_register_raises_unless_replace():
     assert reg.get("governance").manifest.base_url == "http://127.0.0.1:9999"
 
 
+def test_upsert_creates_then_is_idempotent():
+    reg = PluginRegistry()
+    entry, outcome = reg.upsert(_manifest())
+    assert outcome == "created"
+    assert entry.status is PluginStatus.UNKNOWN
+    # Re-upserting an IDENTICAL manifest keeps the entry — including its health
+    # status, so a heartbeat can't flap a plugin back to UNKNOWN every beat.
+    reg.set_status("governance", PluginStatus.UP)
+    entry2, outcome2 = reg.upsert(_manifest())
+    assert outcome2 == "unchanged"
+    assert entry2 is reg.get("governance")
+    assert entry2.status is PluginStatus.UP
+
+
+def test_upsert_replaces_on_changed_manifest():
+    reg = PluginRegistry()
+    reg.upsert(_manifest())
+    reg.set_status("governance", PluginStatus.UP)
+    # A different manifest (a redeploy moved the plugin) replaces the entry and
+    # resets status — the old UP described a plugin at another address.
+    entry, outcome = reg.upsert(_manifest(base_url="http://127.0.0.1:9999"))
+    assert outcome == "updated"
+    assert entry.manifest.base_url == "http://127.0.0.1:9999"
+    assert entry.status is PluginStatus.UNKNOWN
+
+
 def test_get_and_unregister_missing_raise():
     reg = PluginRegistry()
     with pytest.raises(PluginNotFound):

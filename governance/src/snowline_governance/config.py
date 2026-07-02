@@ -12,6 +12,11 @@ Env vars:
   SNOWLINE_GOVERNANCE_BASE_URL     — where THIS plugin runs, the `base_url` it
                                      hands the platform at registration so the
                                      gateway can proxy to it.
+  SNOWLINE_REGISTRATION_HEARTBEAT_SECONDS — how often the registration heartbeat
+                                     re-asserts this plugin with the platform
+                                     (issue #39). Shared (unprefixed) across
+                                     plugins, like SNOWLINE_PLATFORM_URL — one
+                                     deploy knob tunes every plugin's cadence.
 """
 
 import os
@@ -28,6 +33,10 @@ DEFAULT_PLATFORM_URL = "http://127.0.0.1:8848"
 # Where this plugin advertises itself to the platform (the manifest `base_url`).
 DEFAULT_BASE_URL = "http://127.0.0.1:8801"
 
+# Registration heartbeat cadence (issue #39) — matches the platform's health-poll
+# default, so a platform restart heals in roughly one health round.
+DEFAULT_REGISTRATION_HEARTBEAT_SECONDS = 15.0
+
 
 def database_url() -> str:
     return os.environ.get("SNOWLINE_GOVERNANCE_DATABASE_URL", DEFAULT_DATABASE_URL)
@@ -39,3 +48,12 @@ def platform_url() -> str:
 
 def base_url() -> str:
     return os.environ.get("SNOWLINE_GOVERNANCE_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+
+
+def registration_heartbeat_seconds() -> float:
+    return float(
+        os.environ.get(
+            "SNOWLINE_REGISTRATION_HEARTBEAT_SECONDS",
+            DEFAULT_REGISTRATION_HEARTBEAT_SECONDS,
+        )
+    )

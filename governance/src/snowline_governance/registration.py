@@ -11,14 +11,20 @@ property, decision 8a7f0a11).
 Registration is BEST-EFFORT and RETRYABLE (architecture §3: hot-pluggable, no
 platform restart). The platform may be briefly down when this plugin boots; that
 must NOT crash the plugin. `register_with_platform` swallows transport errors and
-returns False (logging), so the app starts regardless; a caller can retry on a
-loop. A 409 (already registered) is treated as success (idempotent rejoin).
+returns False (logging), so the app starts regardless. The caller IS a loop:
+`registration_heartbeat` re-POSTs the manifest every beat for the app's whole
+lifespan (issue #39) — the platform's registry is in-memory, so a platform
+restart empties it and only a re-assert from this side heals the composed
+surfaces. The platform's `POST /plugins` is an idempotent upsert (200 on
+re-register); a 409 from an older platform is also treated as success.
 """
 
 from __future__ import annotations
 
 import logging
+from functools import partial
 
+import anyio
 import httpx
 
 from snowline_governance import config
@@ -71,10 +77,48 @@ def register_with_platform(
     if resp.status_code == httpx.codes.CONFLICT:
         log.info("plugin %r already registered with the platform", PLUGIN_NAME)
         return True
-    if resp.is_success:
+    if resp.status_code == httpx.codes.CREATED:
         log.info("registered plugin %r with the platform at %s", PLUGIN_NAME, platform)
+        return True
+    if resp.is_success:
+        # The heartbeat's steady state — a 200 re-assert (upsert unchanged/
+        # updated) every beat. DEBUG, or the log fills with a line per interval.
+        log.debug(
+            "re-asserted plugin %r with the platform at %s", PLUGIN_NAME, platform
+        )
         return True
     log.warning(
         "plugin registration to %s returned %s (will retry)", url, resp.status_code
     )
     return False
+
+
+async def registration_heartbeat(
+    platform_url: str | None = None,
+    base_url: str | None = None,
+    *,
+    interval: float | None = None,
+    client: httpx.Client | None = None,
+) -> None:
+    """Re-assert this plugin's registration every `interval` seconds until
+    cancelled (issue #39) — the first beat fires immediately, so this loop IS
+    the boot registration too. The platform's registry is in-memory: a platform
+    restart empties it, and the next beat re-upserts this plugin, so a deploy
+    (or 3am crash-restart) heals within one interval instead of requiring this
+    plugin to also be kickstarted.
+
+    Each beat is `register_with_platform` (never raises), run off the event loop
+    because it's a blocking httpx POST. `interval` defaults to
+    `config.registration_heartbeat_seconds()`. A failed beat is already logged
+    by `register_with_platform`; the loop just keeps beating. Cancellation
+    (lifespan shutdown) unwinds cleanly through the `anyio.sleep`."""
+    beat_every = (
+        interval if interval is not None else config.registration_heartbeat_seconds()
+    )
+    beat = partial(register_with_platform, platform_url, base_url, client=client)
+    while True:
+        try:
+            await anyio.to_thread.run_sync(beat)
+        except Exception:  # backstop — one bad beat must not kill the heartbeat
+            log.exception("registration heartbeat beat failed; continuing")
+        await anyio.sleep(beat_every)

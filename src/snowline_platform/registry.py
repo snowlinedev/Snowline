@@ -3,8 +3,10 @@
 Registration is how a plugin joins the platform WITHOUT a restart — the gateway
 and the health checker read this registry to compose and monitor plugins. Each
 entry pairs a plugin's manifest with its runtime status (set by the health
-checker). In-memory is fine for a single platform process; persistence can come
-later if the platform itself needs to survive restarts with its plugin set.
+checker). In-memory is fine for a single platform process BECAUSE plugins
+re-assert membership on a registration heartbeat (issue #39): a platform restart
+empties the registry, and every plugin re-upserts itself within one beat.
+Persistence can still come later if that window ever matters.
 """
 
 from __future__ import annotations
@@ -52,6 +54,27 @@ class PluginRegistry:
             entry = RegisteredPlugin(manifest=manifest)
             self._plugins[manifest.name] = entry
             return entry
+
+    def upsert(self, manifest: PluginManifest) -> tuple[RegisteredPlugin, str]:
+        """Idempotent register — the heartbeat verb (issue #39).
+
+        Returns ``(entry, outcome)`` where outcome is:
+          * ``"created"``   — first registration; fresh entry, status UNKNOWN.
+          * ``"unchanged"`` — an identical manifest is already registered; the
+            existing entry is KEPT, so the health poller's status survives the
+            beat (a heartbeat must not flap UP back to UNKNOWN every interval).
+          * ``"updated"``   — the name is registered with a DIFFERENT manifest
+            (a redeploy changed base_url/surfaces/...); the entry is replaced
+            and status resets to UNKNOWN — the old status described a plugin
+            that may now live elsewhere.
+        """
+        with self._lock:
+            existing = self._plugins.get(manifest.name)
+            if existing is not None and existing.manifest == manifest:
+                return existing, "unchanged"
+            entry = RegisteredPlugin(manifest=manifest)
+            self._plugins[manifest.name] = entry
+            return entry, ("updated" if existing is not None else "created")
 
     def unregister(self, name: str) -> None:
         with self._lock:

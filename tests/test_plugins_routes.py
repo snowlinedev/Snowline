@@ -37,10 +37,23 @@ def test_register_list_delete_roundtrip():
     assert client.get("/plugins").json()["plugins"] == []
 
 
-def test_duplicate_register_conflicts():
+def test_reregister_is_idempotent_upsert():
+    # POST is the registration heartbeat's verb (issue #39): re-POSTing the same
+    # manifest is a 200 no-op, and a CHANGED manifest replaces the entry (a
+    # redeploy that moved a plugin takes effect without an unregister).
     client = _trusted_client()
     assert client.post("/plugins", json=_MANIFEST).status_code == 201
-    assert client.post("/plugins", json=_MANIFEST).status_code == 409
+
+    r = client.post("/plugins", json=_MANIFEST)
+    assert r.status_code == 200, r.text
+    assert r.json()["outcome"] == "unchanged"
+
+    moved = _MANIFEST | {"base_url": "http://127.0.0.1:9999"}
+    r = client.post("/plugins", json=moved)
+    assert r.status_code == 200, r.text
+    assert r.json()["outcome"] == "updated"
+    listed = client.get("/plugins").json()["plugins"]
+    assert [p["manifest"]["base_url"] for p in listed] == ["http://127.0.0.1:9999"]
 
 
 def test_delete_missing_is_404():
