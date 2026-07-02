@@ -26,6 +26,8 @@ Early. Building the platform foundation first:
   so local or cross-tailnet).
 - [ ] Scope namespace (the shared spine plugins reference).
 - [ ] First plugin: **governance** (decisions + shadow/speculation + specs).
+- [ ] **memory** plugin (cross-folder agent session memory — remember / recall /
+  digest, over its own store).
 
 ## License
 
