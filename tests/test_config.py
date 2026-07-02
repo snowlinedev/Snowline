@@ -1,9 +1,10 @@
 """`config.surface_plugins()` — the per-surface plugin-allowlist parser (#36).
 
 Covers the default (empty → allow-all), `*`, subsets, whitespace tolerance, the
-fail-loud malformed cases, and the `surfaces()` auto-include interplay. The
-allowlist is env-only, so each test drives `SNOWLINE_SURFACE_PLUGINS` via
-`monkeypatch`."""
+fail-loud malformed cases (shape, surface-name slugs, plugin-token slugs), and
+the mounted-set cross-check (`validate_surface_plugins` — a constrained surface
+is listed in BOTH envs, no auto-include). The allowlist is env-only, so each
+test drives `SNOWLINE_SURFACE_PLUGINS` via `monkeypatch`."""
 
 from __future__ import annotations
 
@@ -67,6 +68,17 @@ def test_whitespace_tolerant(monkeypatch):
         "core=governance,",  # stray trailing comma -> empty token
         "core=,governance",  # stray leading comma -> empty token
         "core=governance,*",  # '*' mixed with names
+        # -- surface (LEFT-hand) names must be url-safe slugs ------------------
+        "*=governance",  # '*' is only legal on the RIGHT side
+        "Core=governance",  # uppercase
+        "co er=governance",  # inner whitespace
+        "core/mcp=governance",  # '/' (would break the /X/mcp route)
+        "-core=governance",  # must start alphanumeric
+        # -- plugin (RIGHT-hand) tokens must match the manifest name rule ------
+        "core=Governance",  # uppercase — could never name a plugin
+        "core=gov ernance",  # inner whitespace
+        "core=gov/x",  # '/'
+        "core=_governance",  # charset violation (underscore)
     ],
 )
 def test_malformed_fails_loud(monkeypatch, raw):
@@ -77,18 +89,35 @@ def test_malformed_fails_loud(monkeypatch, raw):
         config.surface_plugins()
 
 
-def test_surfaces_auto_includes_allowlist_named_surface(monkeypatch):
-    """A surface named ONLY in the allowlist is auto-included in the mounted set
-    (nice-to-have), appended after the `SNOWLINE_SURFACES` order; ROOT_SURFACE
-    stays present and first."""
+def test_surfaces_does_not_auto_include_allowlist_named_surface(monkeypatch):
+    """`SNOWLINE_SURFACES` ALONE decides the mounted set — a surface named only
+    in the allowlist is NOT auto-included (that convenience is gone: it turned
+    a left-hand typo into a silently-mounted dead surface while the real one
+    stayed allow-all). The mismatch is instead rejected at mount time by
+    `validate_surface_plugins`."""
     monkeypatch.setenv("SNOWLINE_SURFACES", "main,shadow")
     monkeypatch.setenv("SNOWLINE_SURFACE_PLUGINS", "core=governance")
-    assert config.surfaces() == ("main", "shadow", "core")
+    assert config.surfaces() == ("main", "shadow")
 
 
-def test_surfaces_auto_include_deduped(monkeypatch):
-    """A surface named in BOTH envs isn't duplicated, and SNOWLINE_SURFACES order
-    wins for it."""
-    monkeypatch.setenv("SNOWLINE_SURFACES", "main,core,shadow")
-    monkeypatch.setenv("SNOWLINE_SURFACE_PLUGINS", "core=governance;main=*")
-    assert config.surfaces() == ("main", "core", "shadow")
+def test_validate_rejects_allowlist_for_unmounted_surface(monkeypatch):
+    """Naming an unmounted surface in the allowlist is a boot-time ConfigError —
+    the `coer=governance` typo case: with auto-include it would mount a dead
+    /coer/mcp while `core` stayed allow-all. Operators list a constrained
+    surface in BOTH envs."""
+    monkeypatch.setenv("SNOWLINE_SURFACE_PLUGINS", "coer=governance")
+    with pytest.raises(ConfigError, match="coer"):
+        config.validate_surface_plugins(
+            config.surface_plugins(), ("main", "shadow", "core")
+        )
+
+
+def test_validate_accepts_allowlist_named_in_both_envs(monkeypatch):
+    """The documented shape — the constrained surface present in BOTH envs —
+    validates cleanly (and the empty allowlist trivially so)."""
+    monkeypatch.setenv("SNOWLINE_SURFACES", "main,shadow,core")
+    monkeypatch.setenv("SNOWLINE_SURFACE_PLUGINS", "main=*;core=governance")
+    config.validate_surface_plugins(config.surface_plugins(), config.surfaces())
+
+    monkeypatch.delenv("SNOWLINE_SURFACE_PLUGINS")
+    config.validate_surface_plugins(config.surface_plugins(), config.surfaces())

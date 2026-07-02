@@ -48,21 +48,45 @@ aggregates), not a new model.
   plugin) or a `,`-separated list of plugin names. Whitespace is tolerated.
 - **Default = allow-all.** A surface with no entry (and the empty/unset env)
   aggregates every plugin — fully backward compatible.
-- **Fail loud.** A malformed entry (no `=`, empty name/allowlist, duplicate
-  surface, stray comma, `*` mixed with names) raises at startup. This is
-  deliberate: the failure mode to avoid is a typo *silently widening* a surface
-  (e.g. leaving PM reachable on a governance-only surface), so a hard error is
-  safer than a best-effort parse.
+- **Fail loud — the env is fully validated at boot.** This is an EXCLUSION
+  boundary, so a config mistake must kill startup, never silently widen a
+  surface (e.g. leave PM reachable on a governance-only surface). `create_app`
+  (via `build_surface_mounts` → `config.surface_plugins()` +
+  `config.validate_surface_plugins()`) raises `ConfigError` for ALL of:
+  - malformed shape — no `=`, empty name/allowlist, duplicate surface, stray
+    comma, `*` mixed with names;
+  - a bad SURFACE name — left-hand names must be lowercase url-safe slugs
+    (`[a-z0-9][a-z0-9-]*`, the shape `/X/mcp` routes need); `*` is only legal
+    on the RIGHT side;
+  - a bad PLUGIN token — right-hand names must match the manifest name rule
+    (`manifest.PLUGIN_NAME_RE`); `core=Governance` could never match a
+    registered plugin and would silently empty the surface, so it's rejected;
+  - an allowlist naming a surface NOT in the mounted set (see interplay below).
+- **Parsed once, at mount time.** `build_surface_mounts` parses + validates the
+  env once and hands each surface its FROZEN allowlist; `discover_upstreams`
+  never re-reads the env. Fail-at-boot is structural: there is no per-request
+  re-parse and no mid-run `ConfigError` path. A config change is a restart,
+  same as the surface set itself.
 - **Aggregation-only.** The filter applies in `gateway.discover_upstreams` (by
   plugin name), so a filtered plugin is absent from BOTH `list_tools` and
   `call_tool` routing on that surface. Registration, health, and the registry
   views are unchanged — this filters what a surface *composes*, not what is
   *registered*.
-- **Interplay with `SNOWLINE_SURFACES`.** A surface must still be in the mounted
-  set to be served; as a convenience, any surface NAMED in an allowlist is
-  auto-included in the mounted set (an allowlist for an unmounted surface would be
-  dead config). `SNOWLINE_SURFACES` order wins; `ROOT_SURFACE` (`main`) stays the
-  one always-present magic name.
+- **Interplay with `SNOWLINE_SURFACES` — list a constrained surface in BOTH
+  envs.** `SNOWLINE_SURFACES` alone decides the mounted set; there is NO
+  auto-include of allowlist-named surfaces. An allowlist naming an unmounted
+  surface raises `ConfigError` at boot instead. Rationale: auto-include turned a
+  left-hand typo (`coer=governance` while `SNOWLINE_SURFACES` has `core`) into a
+  silently-mounted dead `/coer/mcp` while the real `core` stayed ALLOW-ALL —
+  exactly the silent widening this feature exists to prevent. The cost is one
+  extra line of config:
+
+  ```sh
+  SNOWLINE_SURFACES="main,shadow,core"
+  SNOWLINE_SURFACE_PLUGINS="core=governance"
+  ```
+
+  `ROOT_SURFACE` (`main`) stays the one always-present magic name.
 
 Result: `http://<host>:8850/core/mcp` serves governance-without-PM over the
 tailnet while `/mcp` stays the full composed daily driver.

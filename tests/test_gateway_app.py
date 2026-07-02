@@ -142,11 +142,13 @@ def test_isolation_over_http_shadow_lacks_main_only_tool():
 
 
 def test_surface_allowlist_over_http_core_is_governance_only(monkeypatch):
-    """Issue #36 end-to-end over the REAL streamable-HTTP transport: with
-    `SNOWLINE_SURFACE_PLUGINS="main=*;core=governance"`, the mounted `/core/mcp`
-    serves governance-only tools while `/mcp` serves BOTH plugins. `core` is
-    auto-included in the mounted set purely by being named in the allowlist."""
-    monkeypatch.setenv("SNOWLINE_SURFACE_PLUGINS", "main=*;core=governance")
+    """Issue #36 end-to-end over the REAL streamable-HTTP transport: with `core`
+    in BOTH envs (`SNOWLINE_SURFACES` mounts it, `SNOWLINE_SURFACE_PLUGINS`
+    constrains it — the documented two-line contract, no auto-include), the
+    mounted `/core/mcp` serves governance-only tools while `/mcp` serves BOTH
+    plugins."""
+    monkeypatch.setenv("SNOWLINE_SURFACES", "main,shadow,core")
+    monkeypatch.setenv("SNOWLINE_SURFACE_PLUGINS", "core=governance")
 
     gov = make_stub_plugin("governance", ["record_decision", "get_decision"])
     pm = make_stub_plugin("pm", ["create_work_item"])
@@ -175,9 +177,9 @@ def test_surface_allowlist_over_http_core_is_governance_only(monkeypatch):
     async def _list(session):
         return await session.list_tools()
 
-    # Fresh app per surface (a session manager's run() is once-per-instance). The
-    # allowlist env is read at create_app time by config.surfaces(), so `core` is
-    # mounted at /core/mcp.
+    # Fresh app per surface (a session manager's run() is once-per-instance).
+    # Both envs are read ONCE at create_app time (build_surface_mounts), so
+    # `core` is mounted at /core/mcp with its frozen governance-only allowlist.
     main = {
         t.name
         for t in anyio.run(
@@ -205,6 +207,29 @@ def test_surface_allowlist_over_http_core_is_governance_only(monkeypatch):
     assert "governance__get_decision" in core
     assert "pm__create_work_item" not in core
     assert not any(name.startswith("pm__") for name in core)
+
+
+@pytest.mark.parametrize(
+    ("raw", "why"),
+    [
+        ("main", "malformed syntax (no '=')"),
+        ("core=governance", "allowlist for a surface not in the mounted set"),
+        ("*=governance", "'*' as a surface name ('*' is right-side only)"),
+        ("main=Governance", "plugin token violating the manifest name rule"),
+    ],
+)
+def test_create_app_fails_loud_at_boot_on_bad_allowlist(monkeypatch, raw, why):
+    """Issue #36 review: a bad `SNOWLINE_SURFACE_PLUGINS` must kill boot —
+    `create_app` itself raises `ConfigError` (parse + mounted-set cross-check
+    happen once in `build_surface_mounts`, synchronously at app build), so a
+    config mistake can never silently widen or dead-mount a surface. `why`
+    exists to label each parametrized case."""
+    from snowline_platform.config import ConfigError
+
+    monkeypatch.setenv("SNOWLINE_SURFACES", "main,shadow")
+    monkeypatch.setenv("SNOWLINE_SURFACE_PLUGINS", raw)
+    with pytest.raises(ConfigError):
+        _app_with(PluginRegistry(), InMemoryConnector({}))
 
 
 def test_non_mcp_routes_still_work():

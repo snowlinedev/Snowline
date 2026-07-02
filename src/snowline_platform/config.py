@@ -7,6 +7,7 @@ or to add ranges. Trust is configuration, never hardcoded into the request path.
 """
 
 import os
+import re
 
 # Tailscale's tailnet (CGNAT) range — the default trusted network.
 DEFAULT_TRUSTED_CIDRS = "100.64.0.0/10"
@@ -50,6 +51,15 @@ class ConfigError(ValueError):
     intended, so the parser validates strictly."""
 
 
+# Surface names ride in routes (`/<surface>/mcp`, gateway_app.surface_route), so
+# they carry the SAME url-safe-slug shape plugin names do (manifest.py
+# PLUGIN_NAME_RE): lowercase alphanumerics + hyphens, starting alphanumeric. In
+# particular no `/`, no whitespace, and no `*` — on the LEFT side of a
+# SNOWLINE_SURFACE_PLUGINS entry `*` is a config error, it is only legal as the
+# RIGHT-hand allow-all sentinel.
+_SURFACE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+
 def trusted_cidrs() -> list[str]:
     raw = os.environ.get("SNOWLINE_TRUSTED_CIDRS", DEFAULT_TRUSTED_CIDRS)
     return [c.strip() for c in raw.split(",") if c.strip()]
@@ -82,21 +92,20 @@ def surfaces() -> tuple[str, ...]:
     at `/mcp`) even when the env omits it. Mounting (not derivation) is forced by
     the startup boot order — see the `gateway_app` module docstring.
 
-    Interplay with `SNOWLINE_SURFACE_PLUGINS` (issue #36): any surface NAMED in
-    an allowlist is auto-included in the mounted set (an allowlist for an
-    unmounted surface would be dead config). `SNOWLINE_SURFACES` order wins;
-    surfaces that appear only in an allowlist are appended after it. ROOT_SURFACE
-    stays the one magic name — always present regardless of either env."""
+    Interplay with `SNOWLINE_SURFACE_PLUGINS` (issue #36): THIS env alone decides
+    the mounted set — a surface named in an allowlist is NOT auto-included. An
+    operator composing a constrained surface lists it in BOTH envs; naming an
+    unmounted surface in the allowlist is rejected at boot
+    (`validate_surface_plugins`, called from `build_surface_mounts`) so a typo'd
+    left-hand name fails loud instead of mounting a dead surface while the real
+    one stays allow-all. ROOT_SURFACE stays the one magic name — always present
+    regardless of the env."""
     from snowline_platform.gateway_app import ROOT_SURFACE
 
     raw = os.environ.get("SNOWLINE_SURFACES", DEFAULT_SURFACES)
     names = [s.strip() for s in raw.split(",") if s.strip()]
     if ROOT_SURFACE not in names:
         names.insert(0, ROOT_SURFACE)
-    # Auto-include surfaces referenced only by an allowlist (issue #36
-    # nice-to-have): naming a surface in SNOWLINE_SURFACE_PLUGINS pulls it into
-    # the mounted set so the allowlist has something to constrain.
-    names.extend(surface_plugins().keys())
     # Dedupe, preserving first-seen order.
     seen: set[str] = set()
     ordered: list[str] = []
@@ -123,9 +132,22 @@ def surface_plugins() -> dict[str, frozenset[str] | None]:
     health, and the registry views are untouched.
 
     Malformed input raises `ConfigError` (see its docstring for the fail-loud
-    rationale). Malformed means: an entry without exactly one ``=``; an empty
-    surface name; a surface listed twice; an empty allowlist or a stray comma
-    (an empty plugin name); or ``*`` mixed with explicit names."""
+    rationale). Malformed means: an entry without exactly one ``=``; a surface
+    name that is empty or not a url-safe slug (``*`` is only legal on the RIGHT
+    side); a surface listed twice; an empty allowlist or a stray comma (an empty
+    plugin name); a plugin token that violates the manifest name rule
+    (manifest.py `PLUGIN_NAME_RE` — a token like ``Governance`` could never name
+    a registered plugin, so it would silently empty the surface); or ``*`` mixed
+    with explicit names.
+
+    This validates the env's SHAPE only. The cross-check that every named
+    surface is actually in the mounted set is `validate_surface_plugins`, run
+    once at mount time (`gateway_app.build_surface_mounts`) where the surface
+    set is known."""
+    # The plugin tokens must be able to name a registered plugin, so they are
+    # held to the manifest's own name rule (a deliberate import, not a copy —
+    # if the manifest rule evolves, the allowlist rule follows).
+    from snowline_platform.manifest import PLUGIN_NAME_RE
     raw = os.environ.get("SNOWLINE_SURFACE_PLUGINS", DEFAULT_SURFACE_PLUGINS)
     mapping: dict[str, frozenset[str] | None] = {}
     for segment in raw.split(";"):
@@ -143,6 +165,13 @@ def surface_plugins() -> dict[str, frozenset[str] | None]:
         if not name:
             raise ConfigError(
                 f"SNOWLINE_SURFACE_PLUGINS entry {entry!r} has an empty surface name"
+            )
+        if not _SURFACE_NAME_RE.match(name):
+            raise ConfigError(
+                f"SNOWLINE_SURFACE_PLUGINS entry {entry!r} has an invalid surface "
+                f"name {name!r} — surface names must be lowercase url-safe slugs "
+                f"([a-z0-9][a-z0-9-]*); '*' is only legal on the right-hand side "
+                f"(as in 'main=*')"
             )
         if name in mapping:
             raise ConfigError(
@@ -163,5 +192,40 @@ def surface_plugins() -> dict[str, frozenset[str] | None]:
                 f"SNOWLINE_SURFACE_PLUGINS allowlist for surface {name!r} mixes '*' "
                 f"with explicit plugin names — '*' must stand alone"
             )
+        for token in tokens:
+            if not PLUGIN_NAME_RE.match(token):
+                raise ConfigError(
+                    f"SNOWLINE_SURFACE_PLUGINS allowlist for surface {name!r} has "
+                    f"an invalid plugin name {token!r} — plugin names are "
+                    f"lowercase url-safe slugs ([a-z0-9][a-z0-9-]*, the manifest "
+                    f"name rule), so this token could never match a registered "
+                    f"plugin and would silently leave the surface empty"
+                )
         mapping[name] = frozenset(tokens)
     return mapping
+
+
+def validate_surface_plugins(
+    surface_plugins_map: dict[str, frozenset[str] | None],
+    mounted_surfaces: tuple[str, ...],
+) -> None:
+    """Cross-check the parsed allowlists against the MOUNTED surface set — every
+    surface named in `SNOWLINE_SURFACE_PLUGINS` must be in `SNOWLINE_SURFACES`
+    (operators list a constrained surface in BOTH envs; issue #36 review).
+
+    Raises `ConfigError` for an allowlist naming an unmounted surface. This is
+    the typo guard on the LEFT-hand side: with auto-include, ``coer=governance``
+    (misspelled ``core``) would mount a dead `/coer/mcp` while the real `core`
+    surface stayed ALLOW-ALL — the silent-widening failure mode this feature
+    exists to prevent. Called once at mount time (`build_surface_mounts`), where
+    the surface set is known, so a bad config kills boot."""
+    unmounted = [s for s in surface_plugins_map if s not in mounted_surfaces]
+    if unmounted:
+        raise ConfigError(
+            f"SNOWLINE_SURFACE_PLUGINS names surface(s) "
+            f"{', '.join(repr(s) for s in sorted(unmounted))} not present in the "
+            f"mounted surface set {tuple(mounted_surfaces)!r} — an allowlist for "
+            f"an unmounted surface constrains nothing (a typo here would leave "
+            f"the real surface allow-all). Add the surface to SNOWLINE_SURFACES "
+            f"(a constrained surface is listed in BOTH envs) or fix the name."
+        )

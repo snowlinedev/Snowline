@@ -13,7 +13,10 @@ from pydantic import BaseModel, Field, field_validator
 
 # Plugin names are used in gateway routes (/<name>/mcp/...), so keep them a
 # url-safe slug: lowercase alphanumerics and hyphens, starting alphanumeric.
-_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+# PUBLIC: `config.surface_plugins()` validates the plugin tokens of
+# `SNOWLINE_SURFACE_PLUGINS` against THIS rule, so a token that could never
+# name a registered plugin fails at boot instead of silently matching nothing.
+PLUGIN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 
 class PluginManifest(BaseModel):
@@ -66,7 +69,7 @@ class PluginManifest(BaseModel):
     @field_validator("name")
     @classmethod
     def _valid_name(cls, v: str) -> str:
-        if not _NAME_RE.match(v):
+        if not PLUGIN_NAME_RE.match(v):
             raise ValueError(
                 f"plugin name {v!r} must be a lowercase url-safe slug "
                 "([a-z0-9][a-z0-9-]*)"
