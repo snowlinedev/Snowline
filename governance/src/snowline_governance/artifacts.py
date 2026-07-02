@@ -540,6 +540,8 @@ def _compact_row_from_signals(
         "id": str(a.id),
         "doc_kind": a.doc_kind,
         "backend": a.backend,
+        "repo": a.repo,
+        "path": a.path,
         "maturity": a.maturity,
         "governs": governs,
         "governs_all": a.governs_all,
@@ -549,10 +551,11 @@ def _compact_row_from_signals(
 
 
 def _artifact_compact_row(session: Session, a: Artifact) -> dict:
-    """A small artifact header for `list_artifacts`: identity + lifecycle + the
-    two cheap derived signals a sweep needs (`version_count`, `is_branched`),
-    WITHOUT the full leaves / current_version / branch_points. Expand any row via
-    `get_artifact(id)`."""
+    """A small artifact header for `list_artifacts`: identity (id + `repo`/`path`,
+    the human-readable identity a reader needs to tell one governing doc from
+    another) + lifecycle + the two cheap derived signals a sweep needs
+    (`version_count`, `is_branched`), WITHOUT the full leaves / current_version /
+    branch_points. Expand any row via `get_artifact(id)`."""
     version_count = session.scalar(
         select(func.count())
         .select_from(ArtifactVersion)
@@ -575,6 +578,8 @@ def _artifact_compact_row(session: Session, a: Artifact) -> dict:
         "id": str(a.id),
         "doc_kind": a.doc_kind,
         "backend": a.backend,
+        "repo": a.repo,
+        "path": a.path,
         "maturity": a.maturity,
         "governs": _governs(session, a.id),
         "governs_all": a.governs_all,

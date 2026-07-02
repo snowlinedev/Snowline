@@ -300,3 +300,31 @@ def test_applicable_decisions_is_batched(db_session, stub_scope_client):
     # depth leaves the SELECT count unchanged and small.
     assert shallow_q == deep_q
     assert deep_q <= 2  # one ancestors() is the stub (no DB); leaves batch in one
+
+
+def test_applicable_decisions_own_scope_never_truncated_by_ancestor(
+    db_session, stub_scope_client
+):
+    """The monolith's #657 review catch, carried over the carve: under the cap the
+    reader's OWN current decisions come first and are NEVER crowded out by a
+    fresher ancestor's. The child records THREE decisions, then the org records
+    TWO LATER ones (newer `recorded_at` — they'd sort ahead if ordering were
+    global recency). With `limit=3`, all three returned rows are the child's own,
+    none tagged `from_scope`, and `items_total` reports the true pre-cap depth."""
+    decisions.record_decision(db_session, "org/repo", _sid("org/repo"), "own a")
+    decisions.record_decision(db_session, "org/repo", _sid("org/repo"), "own b")
+    decisions.record_decision(db_session, "org/repo", _sid("org/repo"), "own c")
+    # Recorded AFTER the child's → strictly newer recorded_at.
+    decisions.record_decision(db_session, "org", _sid("org"), "org x")
+    decisions.record_decision(db_session, "org", _sid("org"), "org y")
+
+    stub = stub_scope_client(tree={"org": None, "org/repo": "org"})
+    out = decisions.applicable_decisions(
+        db_session, "org/repo", stub, limit=3
+    )
+
+    got = [d["decision"] for d in out["decisions"]]
+    assert len(got) == 3
+    assert set(got) == {"own a", "own b", "own c"}  # own rows, not the org's
+    assert all("from_scope" not in d for d in out["decisions"])  # all own-scope
+    assert out["items_total"] == 5  # true pre-cap depth (3 own + 2 org)
