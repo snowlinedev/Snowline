@@ -6,10 +6,12 @@ platform registry, architecture §2). Memory declares: its name (`memory`), its
 SURFACE MAPPING — `{"/mcp": "main"}` (one surface, composed onto the platform's
 `main` surface alongside governance's). Memory has no isolated surface.
 
-Registration is BEST-EFFORT and RETRYABLE (architecture §3: hot-pluggable, no
-platform restart). Mirrors governance's `registration.py`: `register_with_platform`
-swallows transport errors and returns False (logging) so a briefly-down platform
-can't crash the plugin; a 409 (already registered) is treated as success.
+Registration is BEST-EFFORT and SINGLE-SHOT per boot (architecture §3:
+hot-pluggable, no platform restart). Mirrors governance's `registration.py`:
+`register_with_platform` swallows transport errors and returns False (logging) so
+a briefly-down platform can't crash the plugin; a 409 (already registered) is
+treated as success. Nothing retries a False return within this boot — a restart
+(or redeploy) re-attempts; the standing retry/heartbeat design is platform#39.
 """
 
 from __future__ import annotations
@@ -49,7 +51,9 @@ def register_with_platform(
     """POST the manifest to the platform's `POST /plugins`. Best-effort: returns
     True on a successful register (201) or an idempotent 409 (already registered),
     False on any transport error or non-2xx/409 status — NEVER raises, so a
-    briefly-down platform can't crash the plugin (the caller retries).
+    briefly-down platform can't crash the plugin. SINGLE-SHOT: no caller retries a
+    False return this boot (a restart re-attempts; platform#39 owns the
+    heartbeat/retry design).
     """
     platform = (platform_url or config.platform_url()).rstrip("/")
     url = f"{platform}/plugins"
@@ -60,7 +64,12 @@ def register_with_platform(
         else:
             resp = httpx.post(url, json=manifest, timeout=timeout)
     except httpx.HTTPError as exc:
-        log.warning("plugin registration to %s failed (will retry): %s", url, exc)
+        log.warning(
+            "plugin registration to %s failed (single-shot, not retried this "
+            "boot — restart to re-attempt): %s",
+            url,
+            exc,
+        )
         return False
     if resp.status_code == httpx.codes.CONFLICT:
         log.info("plugin %r already registered with the platform", PLUGIN_NAME)
@@ -69,6 +78,9 @@ def register_with_platform(
         log.info("registered plugin %r with the platform at %s", PLUGIN_NAME, platform)
         return True
     log.warning(
-        "plugin registration to %s returned %s (will retry)", url, resp.status_code
+        "plugin registration to %s returned %s (single-shot, not retried this "
+        "boot — restart to re-attempt)",
+        url,
+        resp.status_code,
     )
     return False

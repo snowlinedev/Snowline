@@ -73,6 +73,39 @@ def test_remember_defaults_kind_to_project(db_session):
     assert row["kind"] == "project"
 
 
+def test_remember_normalizes_kind_case(db_session):
+    # `kind` is lowercased at the boundary — "Gotcha" and "gotcha" must not
+    # split the digest into two groups.
+    row = memory.remember(db_session, content="x", name="cased-kind", kind="Gotcha")
+    assert row["kind"] == "gotcha"
+
+    memory.remember(db_session, content="y", name="lower-kind", kind="gotcha")
+    out = memory.memory_digest(db_session)
+    assert [g["kind"] for g in out["groups"]] == ["gotcha"]  # ONE group
+    assert len(out["groups"][0]["entries"]) == 2
+
+
+def test_remember_identical_upsert_bumps_updated_at(clean_db):
+    # Spec §4: `updated_at` bumps on EVERY upsert — including an
+    # identical-content re-remember (SQLAlchemy would otherwise skip the no-op
+    # UPDATE and leave it stale). Separate transactions, as in production (one
+    # per MCP tool call), since now() is transaction-time.
+    from datetime import datetime
+
+    from snowline_memory.db import session_scope
+
+    with session_scope() as s:
+        first = memory.remember(s, content="same content", name="touched")
+    with session_scope() as s:
+        second = memory.remember(s, content="same content", name="touched")
+
+    assert second["created"] is False
+    assert datetime.fromisoformat(second["updated_at"]) > datetime.fromisoformat(
+        first["updated_at"]
+    )
+    assert second["created_at"] == first["created_at"]  # insert time is stable
+
+
 def test_remember_rejects_blank_content(db_session):
     with pytest.raises(ValueError):
         memory.remember(db_session, content="   ", name="x")
@@ -184,6 +217,22 @@ def test_digest_novel_kind_sorts_after_soft_enum(db_session):
     out = memory.memory_digest(db_session)
     kinds = [g["kind"] for g in out["groups"]]
     assert kinds == ["user", "zzz-custom"]  # novel kind after the soft enum
+
+
+# --- model/migration index parity (no DB) ------------------------------------
+
+
+def test_model_declares_the_migration_indexes():
+    # The model's __table_args__ must declare the same indexes (names and all)
+    # the genesis migration creates, so autogenerate can't propose dropping them.
+    from snowline_memory.models import Memory
+
+    idx = {i.name: i for i in Memory.__table__.indexes}
+    assert set(idx) == {"ix_memories_scope_slug", "ix_memories_search_vector"}
+    assert [c.name for c in idx["ix_memories_scope_slug"].columns] == ["scope_slug"]
+    gin = idx["ix_memories_search_vector"]
+    assert [c.name for c in gin.columns] == ["search_vector"]
+    assert gin.dialect_options["postgresql"]["using"] == "gin"
 
 
 # --- list + forget ----------------------------------------------------------

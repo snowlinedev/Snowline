@@ -5,8 +5,10 @@ A FastAPI app that:
     `/mcp`,
   - exposes `/health` (the platform supervisor polls this),
   - REGISTERS with the platform on startup by POSTing its manifest to the
-    platform's `POST /plugins` — best-effort/retryable, so a briefly-down
-    platform doesn't crash the plugin (architecture §3, hot-pluggable).
+    platform's `POST /plugins` — best-effort and single-shot, so a briefly-down
+    platform doesn't crash the plugin (architecture §3, hot-pluggable); a failed
+    registration is only re-attempted by a restart (platform#39 owns the
+    heartbeat/retry design).
 
 Memory has its OWN database; like governance it boot-migrates to the latest
 Alembic head in the lifespan (memory: server auto-migrates on boot), so a schema
@@ -61,10 +63,12 @@ def create_app(
         async with contextlib.AsyncExitStack() as stack:
             await stack.enter_async_context(main_surface.session_manager.run())
             if getattr(app.state, "register_on_startup", True):
-                # Best-effort (never raises, so a down platform can't crash boot)
-                # AND off the event loop (the POST is blocking httpx with a
-                # timeout — a slow-but-reachable platform must not stall startup /
-                # delay /health coming up).
+                # Single-shot, best-effort registration (never raises, so a down
+                # platform can't crash boot; no retry loop — platform#39 owns the
+                # heartbeat/retry design). The POST runs in a thread so it can't
+                # block the event loop, but the lifespan AWAITS it before
+                # yielding, so readiness (/health) waits up to the registration
+                # timeout (~10s) when the platform is slow or unreachable.
                 await anyio.to_thread.run_sync(registration.register_with_platform)
             yield
 

@@ -30,8 +30,10 @@ the supervisor health-checks. It:
 
 - **Registers** with the platform via a manifest declaring its `base_url`, its
   MCP surface, and its health endpoint (`{"/mcp": "main"}` — one surface, mapped
-  onto `main`). Registration is best-effort/retryable — a briefly-down platform
-  can't crash the plugin (architecture §3, hot-pluggable).
+  onto `main`). Registration is best-effort and single-shot per boot — a
+  briefly-down platform can't crash the plugin (architecture §3, hot-pluggable);
+  a failed registration is re-attempted on restart (the standing heartbeat/retry
+  design is platform#39).
 - **Maps one MCP surface onto `main`.** The verbs live alongside governance's on
   the composed `main` surface a client sees. Memory has no isolated (`shadow`)
   surface — every verb is a first-class working-memory op.
@@ -72,11 +74,14 @@ One table, `memories`:
 - `content` — text NOT NULL. The markdown body — the actual working note.
 - `kind` — text NOT NULL, a **soft enum**: `user` / `feedback` / `project` /
   `reference` / `gotcha` (unknown values are stored verbatim, defaulting to
-  `project`). Soft, so a new kind never needs a migration.
+  `project`). Soft, so a new kind never needs a migration. Lowercased at the
+  `remember` boundary (`Gotcha` ≡ `gotcha`) so case can't split the digest.
 - `scope_slug` — text NULL. A **soft** scope reference, validated against the
   platform slug grammar when present, stored **verbatim** (never resolved to a
   platform id, never a join). NULL ⇒ portfolio-wide (applies everywhere).
-- `created_at` / `updated_at` — timestamps; `updated_at` bumps on every upsert.
+- `created_at` / `updated_at` — timestamps; `updated_at` bumps on **every**
+  upsert, including an identical-content re-`remember` (the write is a
+  deliberate touch — recency reflects the last time the note was asserted).
 
 ### Full-text search
 
@@ -98,7 +103,8 @@ All verbs run their blocking DB work in a thread (the monolith's
   **Upsert by `name`**: writing the same name updates the row in place (bumping
   `updated_at`); a new name inserts. When `name` is omitted it's generated (kebab)
   from the description, else the content head. When `description` is omitted it's
-  derived from the content's first line. `kind` defaults to `project`; `scope` is
+  derived from the content's first line. `kind` defaults to `project` and is
+  lowercased at the boundary; `scope` is
   an optional slug (validated, stored verbatim). Save durable working context —
   conventions, gotchas, preferences, current focus — **not** things the repo/git
   already record.
@@ -132,9 +138,16 @@ tailnet (architecture §3).
 `scripts/import_claude_memories.py` ingests the existing Claude Code memory
 markdown files (`~/.claude/projects/*/memory/*.md`): frontmatter `name` /
 `description` / `metadata.type` (mapped `type → kind`, unknown → `project`) + the
-markdown body after the frontmatter as `content`. It **upserts** via the same
-`remember` semantics (idempotent — re-running updates in place, never
-duplicates), and prints a per-file report. ~40 memories migrate on day one. The
+markdown body after the frontmatter as `content`. Folded/literal YAML block
+scalars in the frontmatter (`description: >-` …) are joined/preserved — the bare
+indicator is never stored. It **upserts** via the same `remember` semantics
+(idempotent — re-running updates in place, never duplicates). Records are
+**validated at parse time** (name/scope grammar, kind normalization — the same
+checks `remember` applies), so `--dry-run` predicts live outcomes and previews
+each file's parsed name/kind/description. Live application is **per-file
+isolated** (a savepoint per record): one bad file is reported `failed` with its
+reason and the rest still import; the per-file report always prints and the exit
+code is nonzero when any file failed. ~40 memories migrate on day one. The
 orchestrator runs it at deploy against the live store; it is never run
 automatically.
 

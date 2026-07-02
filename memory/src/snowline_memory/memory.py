@@ -167,16 +167,19 @@ def remember(
 
     A blank `content` is rejected. `name` (kebab) is generated from the
     description/content head when omitted; `description` is derived from the
-    content's first line when omitted; `kind` defaults to `project`; `scope` is an
-    optional, validated, verbatim-stored slug. If a memory with `name` already
-    exists it is updated IN PLACE (content/description/kind/scope, bumping
-    `updated_at`); otherwise a new row is inserted. Returns the full row plus
-    `created` (True on insert, False on in-place update)."""
+    content's first line when omitted; `kind` defaults to `project` and is
+    LOWERCASED at this boundary (soft enum — `Gotcha` and `gotcha` are the same
+    kind, so the digest never splits on case); `scope` is an optional, validated,
+    verbatim-stored slug. If a memory with `name` already exists it is updated IN
+    PLACE (content/description/kind/scope), bumping `updated_at` on EVERY upsert
+    — including an identical-content re-remember (the write is a deliberate
+    touch). Returns the full row plus `created` (True on insert, False on
+    in-place update)."""
     if not content or not content.strip():
         raise ValueError("`content` must be a non-empty string")
     content = content.strip()
 
-    kind = (kind or DEFAULT_KIND).strip() or DEFAULT_KIND
+    kind = (kind or DEFAULT_KIND).strip().lower() or DEFAULT_KIND
     scope = validate_scope(scope)
     description = (description or "").strip() or _derive_description(content)
     if len(description) > _DESCRIPTION_MAX:
@@ -193,6 +196,11 @@ def remember(
         existing.description = description
         existing.kind = kind
         existing.scope_slug = scope
+        # Force the `updated_at` bump even when nothing changed: SQLAlchemy
+        # skips the UPDATE entirely for a no-net-change flush, which would leave
+        # `updated_at` stale and contradict "bumps on every upsert" (spec §4).
+        # Assigning the SQL expression marks the row dirty unconditionally.
+        existing.updated_at = func.now()
         session.flush()
         session.refresh(existing)
         row = _row(existing)

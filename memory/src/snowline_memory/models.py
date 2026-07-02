@@ -21,7 +21,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Computed, String, Text, func
+from sqlalchemy import Computed, Index, String, Text, func
 from sqlalchemy.dialects.postgresql import TSVECTOR
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -50,6 +50,13 @@ class Memory(Base):
     optional soft scope reference (NULL ⇒ portfolio-wide)."""
 
     __tablename__ = "memories"
+    __table_args__ = (
+        # Declared to MATCH the genesis migration's indexes exactly (names and
+        # all), so an autogenerate diff can't propose dropping them — the model
+        # and the DDL stay in parity.
+        Index("ix_memories_scope_slug", "scope_slug"),
+        Index("ix_memories_search_vector", "search_vector", postgresql_using="gin"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String, nullable=False, unique=True)
