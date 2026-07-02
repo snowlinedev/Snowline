@@ -344,3 +344,112 @@ def test_applicable_artifacts_is_batched(db_session, stub_scope_client):
 
     # The query count does NOT grow with the inherited-artifact count (#14).
     assert shallow_q == deep_q
+
+
+def _git_reference(db_session, *, repo: str, path: str, governs_slug: str):
+    """Construct a git-backed `reference` artifact governing `governs_slug`,
+    directly on the session — the PRODUCTION-FAITHFUL shape (#43/#40 lesson).
+
+    The migrated org reference docs (turtlesedge's `brand/guidelines.yaml`,
+    `TONE.md`) are `backend='git'` with `repo`/`path` set and a governs edge to
+    the ORG. `register_artifact` is inline-only (rejects git), so a
+    production-shaped fixture builds the row + version + governs edge itself,
+    keyed on the SAME stable `scope_id` the stub/`HttpScopeClient` chain serves."""
+    from snowline_governance.models import (
+        Artifact,
+        ArtifactGoverns,
+        ArtifactVersion,
+    )
+
+    art = Artifact(doc_kind="reference", backend="git", repo=repo, path=path)
+    db_session.add(art)
+    db_session.flush()
+    db_session.add(ArtifactVersion(artifact_id=art.id, body_snapshot=None))
+    db_session.add(
+        ArtifactGoverns(
+            artifact_id=art.id,
+            scope_id=_sid(governs_slug),
+            scope_slug=governs_slug,
+        )
+    )
+    db_session.flush()
+    return art
+
+
+def test_applicable_artifacts_inherited_row_carries_repo_path(
+    db_session, stub_scope_client
+):
+    """The #44 case, production-faithful: an org-registered git-backed reference
+    doc (repo/path set, `governs`=org) is inherited by a child repo scope, TAGGED
+    `from_scope`=org AND carrying its human-readable `repo`/`path` identity — the
+    field the live rows lacked, which made #44's verification "needlessly blind".
+    Mirrors the live turtlesedge→turtletracks shape.
+
+    The child's OWN inline spec carries `repo`/`path` KEYS too (None — an inline
+    substrate doc has no repo path), so a consumer always finds the fields."""
+    org_ref = _git_reference(
+        db_session, repo="Org/org-brand", path="brand/guidelines.yaml",
+        governs_slug="org",
+    )
+    own = artifacts.register_artifact(
+        db_session, body="repo spec",
+        governs="org/repo", resolved_scopes=_resolved("org/repo"),
+    )
+
+    stub = stub_scope_client(tree={"org": None, "org/repo": "org"})
+    out = artifacts.applicable_artifacts(db_session, "org/repo", stub)
+    by_id = {a["id"]: a for a in out["artifacts"]}
+
+    inherited = by_id[str(org_ref.id)]
+    assert inherited["from_scope"] == "org"  # org-inherited, not own
+    assert inherited["repo"] == "Org/org-brand"  # human-readable identity...
+    assert inherited["path"] == "brand/guidelines.yaml"  # ...the live rows lacked
+    assert inherited["backend"] == "git"
+
+    own_row = by_id[own["id"]]
+    assert "from_scope" not in own_row  # own scope
+    assert own_row["repo"] is None and own_row["path"] is None  # keys present
+
+
+def test_applicable_artifacts_over_real_http_transport(db_session):
+    """Real-transport inheritance case (#44): drive `applicable_artifacts`
+    end-to-end through the REAL `HttpScopeClient` over a genuine httpx round-trip
+    whose response is the platform's actual `GET /scopes/{slug}/ancestors` JSON
+    contract (`{"ancestors": [<to_row>, ...]}`, isolation-halting, org last) —
+    proving the walk composes with real HTTP + JSON parse, not just the in-memory
+    stub. Mirrors the org→repo shape #44 was found against."""
+    import httpx
+
+    from snowline_governance.scope_client import HttpScopeClient
+
+    org_id, repo_id = _sid("org"), _sid("org/repo")
+
+    def _row(slug, sid):
+        return {
+            "id": str(sid), "slug": slug, "name": slug,
+            "kind": "org" if "/" not in slug else "project",
+            "status": "active", "isolated": False,
+            "org": slug.split("/", 1)[0],
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/scopes/org/repo/ancestors"
+        return httpx.Response(
+            200,
+            json={"ancestors": [_row("org/repo", repo_id), _row("org", org_id)]},
+        )
+
+    client = HttpScopeClient(
+        "http://platform.example",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    org_ref = _git_reference(
+        db_session, repo="Org/org-brand", path="TONE.md", governs_slug="org",
+    )
+
+    out = artifacts.applicable_artifacts(db_session, "org/repo", client)
+    by_id = {a["id"]: a for a in out["artifacts"]}
+    assert str(org_ref.id) in by_id  # org reference inherited over the wire
+    inherited = by_id[str(org_ref.id)]
+    assert inherited["from_scope"] == "org"
+    assert inherited["path"] == "TONE.md"

@@ -197,7 +197,8 @@ def _register_read_tools(mcp: FastMCP, client: ScopeClient) -> None:
         governs: str | None = None, limit: int | None = None
     ) -> dict:
         """List registered artifacts as compact rows (id, doc_kind, backend,
-        maturity, governs, version_count, is_branched), newest-first, capped.
+        repo, path, maturity, governs, version_count, is_branched), newest-first,
+        capped.
         `governs` (a scope slug, resolved against the platform) narrows to
         artifacts governing that scope — by an association row OR `governs_all`.
         Expand any row via `get_artifact(id)`. Read-only."""
