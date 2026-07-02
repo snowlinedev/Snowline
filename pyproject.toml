@@ -21,6 +21,10 @@ dev = [
     "pytest>=8.0",
     "httpx>=0.27",
     "snowline-governance",
+    # `snowline-memory` is a workspace MEMBER too (same dependency direction:
+    # the platform depends on no plugin). It rides the dev group so a plain
+    # `uv sync` installs it for the combined test run.
+    "snowline-memory",
     # The published plugin SDK rides the dev group so governance's contract
     # drift-guard test (`governance/tests/test_contract_drift.py`) can import it
     # to pin the producer↔consumer wire contract. It is the published, light
@@ -40,16 +44,17 @@ packages = ["src/snowline_platform"]
 # own directory. The first member is `governance` — the flagship plugin, its own
 # package + DB + alembic chain. `uv sync` resolves the whole workspace at once.
 [tool.uv.workspace]
-members = ["governance", "sdk"]
+members = ["governance", "memory", "sdk"]
 
 [tool.uv.sources]
 snowline-governance = { workspace = true }
+snowline-memory = { workspace = true }
 snowline-plugin-sdk = { workspace = true }
 
 [tool.pytest.ini_options]
 # Run both the platform's tests (tests/) and the governance member's
 # (governance/tests/) in one `uv run python -m pytest` from the repo root.
-testpaths = ["tests", "governance/tests", "sdk/tests"]
+testpaths = ["tests", "governance/tests", "memory/tests", "sdk/tests"]
 # importlib mode: the two test trees each have a `conftest.py` and a
 # `test_import_purity.py` (same basename, different dir). The default prepend
 # import mode collides on the basename / package name; importlib imports each by

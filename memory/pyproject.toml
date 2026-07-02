@@ -1,0 +1,26 @@
+[project]
+name = "snowline-memory"
+version = "0.0.1"
+description = "Snowline memory plugin — cross-folder agent session memory (remember / recall / digest) as a registered MCP-server plugin over its own store."
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.1",
+    "alembic>=1.13",
+    # Registers with the platform over HTTP.
+    "httpx>=0.27",
+    # The MCP surface (FastMCP, streamable HTTP) — mirrors governance.
+    "mcp>=1.2",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/snowline_memory"]
