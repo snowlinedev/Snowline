@@ -1,0 +1,5 @@
+version: 1
+scope: snowlinedev/snowline
+name: Snowline Platform
+kind: project
+parent: snowlinedev
