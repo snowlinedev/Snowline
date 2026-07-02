@@ -77,10 +77,11 @@ class _SurfaceMount:
         surface: str,
         registry: PluginRegistry,
         connector: UpstreamConnector,
+        allowlist: frozenset[str] | None = None,
     ) -> None:
         self.surface = surface
         self.route = surface_route(surface)
-        server = build_surface_server(registry, surface, connector)
+        server = build_surface_server(registry, surface, connector, allowlist)
         # stateless=True: the gateway holds no per-session server state of its own
         # (each list/call re-discovers upstreams + opens a fresh upstream
         # session), so a stateless transport is the honest model and avoids
@@ -106,10 +107,22 @@ def build_surface_mounts(
     """One `_SurfaceMount` per named surface. `surfaces` defaults to the
     configured set (`config.surfaces()` ← ``SNOWLINE_SURFACES``); `connector`
     defaults to the production streamable-HTTP connector; tests inject an
-    in-memory one."""
+    in-memory one.
+
+    This is where `SNOWLINE_SURFACE_PLUGINS` is parsed + validated ONCE (issue
+    #36 review): `config.surface_plugins()` fail-louds on malformed shape, then
+    `config.validate_surface_plugins` rejects an allowlist naming a surface not
+    in the mounted set (operators list a constrained surface in BOTH envs — the
+    left-hand-typo guard). The per-surface allowlists are handed down FROZEN to
+    each surface's gateway; `discover_upstreams` never re-reads the env, so a
+    bad config is structurally a boot failure, never a mid-run surprise."""
     conn = connector or StreamableHttpConnector()
     names = config.surfaces() if surfaces is None else surfaces
-    return [_SurfaceMount(s, registry, conn) for s in names]
+    allowlists = config.surface_plugins()
+    config.validate_surface_plugins(allowlists, tuple(names))
+    return [
+        _SurfaceMount(s, registry, conn, allowlists.get(s)) for s in names
+    ]
 
 
 def mount_gateway(app, mounts: list[_SurfaceMount]) -> None:

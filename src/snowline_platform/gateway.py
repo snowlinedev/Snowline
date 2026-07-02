@@ -171,7 +171,9 @@ class GatewayError(Exception):
 
 
 def discover_upstreams(
-    registry: PluginRegistry, surface: str
+    registry: PluginRegistry,
+    surface: str,
+    allowlist: frozenset[str] | None = None,
 ) -> list[Upstream]:
     """Every registered plugin-surface mapped onto the named `surface`, SKIPPING
     plugins whose status is `DOWN` (health-aware route-around, gateway.md §4).
@@ -197,7 +199,21 @@ def discover_upstreams(
     `list_tools` from advertising unroutable tools (it never sees the dropped
     path) and matches the call_tool routing key, so the two stay consistent. The
     cleaner fix — namespacing by plugin+path — is deferred until a plugin actually
-    needs multi-path-per-surface; today none do."""
+    needs multi-path-per-surface; today none do.
+
+    **Per-surface plugin allowlist (issue #36):** `allowlist` is THIS surface's
+    plugin allowlist — ``None`` means no allowlist (allow every plugin, the
+    default, backward-compatible behavior); a `frozenset` restricts which
+    plugins the surface aggregates (e.g. a governance-only `core` surface
+    without the private PM plugin). A plugin whose name is NOT in the allowlist
+    is skipped here — at the aggregation step, so it is absent from BOTH
+    `list_tools` and `call_tool` routing (a filtered plugin's tool is
+    unroutable, surfaced as the same clear error as any not-on-this-surface
+    tool). The allowlist is parsed + validated ONCE at mount time
+    (`gateway_app.build_surface_mounts` ← `config.surface_plugins()`, fail-loud
+    at boot) and handed down frozen — there is no per-request env re-parse.
+    Registration/health/registry views are untouched — this filters aggregation
+    only."""
     upstreams: list[Upstream] = []
     # Track the path already accepted for each (plugin, surface) so a second path
     # onto the same surface is rejected with a warning (issue #22). We sort each
@@ -205,6 +221,9 @@ def discover_upstreams(
     # (lexicographically-first) regardless of dict insertion order.
     accepted_path: dict[str, str] = {}
     for entry in registry.list():
+        if allowlist is not None and entry.manifest.name not in allowlist:
+            # Filtered out by this surface's plugin allowlist (issue #36).
+            continue
         if entry.status is PluginStatus.DOWN:
             log.info(
                 "gateway: skipping down plugin %r for surface %r",
@@ -246,11 +265,14 @@ def discover_upstreams(
 class SurfaceGateway:
     """Aggregates the upstreams of ONE named surface into list/call handlers.
 
-    Stateless beyond its `registry` + `connector` + `surface` name: it
-    re-discovers upstreams on every `list_tools`/`call_tool`, so a plugin
-    registered/unregistered/marked-down at runtime is reflected on the next
-    request without a restart (hot-plug, architecture §3). Discovery is live, so
-    the health-aware route-around is too."""
+    Stateless beyond its `registry` + `connector` + `surface` name + frozen
+    `allowlist`: it re-discovers upstreams on every `list_tools`/`call_tool`, so
+    a plugin registered/unregistered/marked-down at runtime is reflected on the
+    next request without a restart (hot-plug, architecture §3). Discovery is
+    live, so the health-aware route-around is too. The plugin ALLOWLIST is the
+    one deliberately-static input: parsed + validated once at boot
+    (`build_surface_mounts`) and passed in frozen, so a config change is a
+    restart — never a mid-run reinterpretation (issue #36 review)."""
 
     # Per-upstream connect+list_tools budget (issue #23), SEPARATE from the
     # connector's 30s call timeout. `list_tools` fans out concurrently, so this
@@ -264,10 +286,12 @@ class SurfaceGateway:
         registry: PluginRegistry,
         surface: str,
         connector: UpstreamConnector,
+        allowlist: frozenset[str] | None = None,
     ) -> None:
         self._registry = registry
         self._surface = surface
         self._connector = connector
+        self._allowlist = allowlist
 
     @property
     def surface(self) -> str:
@@ -286,7 +310,9 @@ class SurfaceGateway:
         discovery order (already plugin-name-sorted) by collecting per-upstream
         slices and concatenating them by index, so the merged order is STABLE and
         independent of task-completion order."""
-        upstreams = discover_upstreams(self._registry, self._surface)
+        upstreams = discover_upstreams(
+            self._registry, self._surface, self._allowlist
+        )
         # One result slot per upstream, filled by its task; concatenated in
         # discovery (name-sorted) order so the merged list is deterministic
         # regardless of which task finishes first.
@@ -340,7 +366,9 @@ class SurfaceGateway:
         plugin_name, tool_name = split_namespaced(name)
         upstreams = {
             u.plugin_name: u
-            for u in discover_upstreams(self._registry, self._surface)
+            for u in discover_upstreams(
+                self._registry, self._surface, self._allowlist
+            )
         }
         upstream = upstreams.get(plugin_name)
         if upstream is None:
@@ -366,6 +394,7 @@ def build_surface_server(
     registry: PluginRegistry,
     surface: str,
     connector: UpstreamConnector,
+    allowlist: frozenset[str] | None = None,
 ) -> Server:
     """A low-level `mcp.server.lowlevel.Server` for one named surface, wired to a
     `SurfaceGateway`'s list/call handlers.
@@ -377,7 +406,7 @@ def build_surface_server(
     `CallToolResult` UNMODIFIED (FastMCP would re-wrap content/structured). The
     Server is served over streamable-HTTP by a `StreamableHTTPSessionManager`
     mounted on the platform app (see `gateway_app`)."""
-    gateway = SurfaceGateway(registry, surface, connector)
+    gateway = SurfaceGateway(registry, surface, connector, allowlist)
     server: Server = Server(f"snowline-{surface}")
 
     @server.list_tools()

@@ -81,6 +81,96 @@ def test_default_surface_is_main_when_unmapped():
     assert discover_upstreams(reg, "shadow") == []
 
 
+# --- Per-surface plugin allowlists (issue #36) --------------------------------
+
+
+def test_allowlist_filters_discovery_by_plugin_name():
+    """A surface handed an allowlist aggregates ONLY the listed plugins; a
+    surface handed None (no allowlist — the default) still allows all. The
+    allowlist arrives as a frozen argument (parsed once at mount time by
+    `build_surface_mounts`), never re-read from the env here."""
+    reg = _registry(
+        PluginManifest(
+            name="governance", base_url="http://gov", surfaces={"/mcp": "main", "/core/mcp": "core"}
+        ),
+        PluginManifest(
+            name="pm", base_url="http://pm", surfaces={"/mcp": "main", "/core/mcp": "core"}
+        ),
+    )
+
+    # `core` is constrained to governance; pm is filtered out.
+    assert {
+        u.plugin_name
+        for u in discover_upstreams(reg, "core", frozenset({"governance"}))
+    } == {"governance"}
+    # No allowlist (None) -> allow-all -> both plugins still compose.
+    assert {u.plugin_name for u in discover_upstreams(reg, "main", None)} == {
+        "governance",
+        "pm",
+    }
+
+
+def test_allowlist_star_parses_to_allow_all(monkeypatch):
+    """`main=*` parses to the None sentinel, which discovery treats exactly like
+    an unlisted surface — proving the parse→discover handoff for `*`."""
+    from snowline_platform import config
+
+    reg = _registry(
+        PluginManifest(name="governance", base_url="http://gov", surfaces={"/mcp": "main"}),
+        PluginManifest(name="pm", base_url="http://pm", surfaces={"/mcp": "main"}),
+    )
+    monkeypatch.setenv("SNOWLINE_SURFACE_PLUGINS", "main=*")
+    allowlist = config.surface_plugins()["main"]
+    assert allowlist is None
+    assert {
+        u.plugin_name for u in discover_upstreams(reg, "main", allowlist)
+    } == {"governance", "pm"}
+
+
+def test_allowlist_filters_tools_and_routing_end_to_end():
+    """The filter applies at aggregation, so a filtered plugin's tools are absent
+    from list_tools AND its calls are unroutable on that surface — while the
+    unfiltered surface keeps both plugins. The allowlist is the frozen ctor arg
+    (mount-time contract), not env state."""
+    import pytest
+
+    from snowline_platform.gateway import GatewayError
+
+    gov = make_stub_plugin("governance", ["record_decision"])
+    pm = make_stub_plugin("pm", ["create_work_item"])
+    reg = _registry(
+        PluginManifest(
+            name="governance",
+            base_url="http://gov",
+            surfaces={"/mcp": "main", "/core/mcp": "core"},
+        ),
+        PluginManifest(
+            name="pm",
+            base_url="http://pm",
+            surfaces={"/mcp": "main", "/core/mcp": "core"},
+        ),
+    )
+    connector = InMemoryConnector(
+        {
+            "http://gov/mcp": gov,
+            "http://gov/core/mcp": gov,
+            "http://pm/mcp": pm,
+            "http://pm/core/mcp": pm,
+        }
+    )
+    core = SurfaceGateway(reg, "core", connector, frozenset({"governance"}))
+    core_tools = {t.name for t in anyio.run(core.list_tools)}
+    assert core_tools == {"governance__record_decision"}
+    # pm's tool is unroutable on `core` (filtered) -> clear error, not a misroute.
+    with pytest.raises(GatewayError):
+        anyio.run(core.call_tool, "pm__create_work_item", {})
+
+    # `main` (no allowlist) keeps BOTH plugins' tools.
+    main = SurfaceGateway(reg, "main", connector, None)
+    main_tools = {t.name for t in anyio.run(main.list_tools)}
+    assert main_tools == {"governance__record_decision", "pm__create_work_item"}
+
+
 def test_aggregates_two_plugins_on_main():
     """Two plugins mapped to `main` -> their tools merge into one surface, each
     namespaced by plugin (collision policy)."""

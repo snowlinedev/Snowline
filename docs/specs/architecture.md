@@ -45,6 +45,11 @@ runtime**, the place where capabilities actually meet.
    their own surfaces onto them; the gateway aggregates per surface. A tool only
    appears on a surface a plugin explicitly placed it on — so e.g. `record_decision`
    is *physically* absent from `shadow`. Same idea for UIs (a separate shadow UI).
+   The surface SET is config (`SNOWLINE_SURFACES`), and per-surface plugin
+   membership can be subset with `SNOWLINE_SURFACE_PLUGINS` (e.g. `main=*;core=governance`)
+   so a surface can be composed with or without a given plugin — the split's
+   "governance-only, no PM" `core` surface alongside the full `main` — without
+   editing any plugin manifest (allowlist at the aggregation step; see `gateway.md`).
 5. **Trust is a pluggable gate.** A configurable trusted-CIDR network gate (the
    tailnet) today, OAuth as a drop-in provider later — behind one seam. The
    tailnet path stays zero-config (no per-client secrets).
