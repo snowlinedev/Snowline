@@ -25,7 +25,7 @@ from ._gateway_helpers import InMemoryConnector, make_stub_plugin
 def _registry(*manifests: PluginManifest) -> PluginRegistry:
     reg = PluginRegistry()
     for m in manifests:
-        reg.register(m)
+        reg.upsert(m)
     return reg
 
 

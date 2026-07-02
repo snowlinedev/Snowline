@@ -71,8 +71,8 @@ def test_two_plugins_merge_on_main_over_http():
     a = make_stub_plugin("alpha", ["read", "write"])
     b = make_stub_plugin("beta", ["ping"])
     reg = PluginRegistry()
-    reg.register(PluginManifest(name="alpha", base_url="http://alpha", surfaces={"/mcp": "main"}))
-    reg.register(PluginManifest(name="beta", base_url="http://beta", surfaces={"/mcp": "main"}))
+    reg.upsert(PluginManifest(name="alpha", base_url="http://alpha", surfaces={"/mcp": "main"}))
+    reg.upsert(PluginManifest(name="beta", base_url="http://beta", surfaces={"/mcp": "main"}))
     connector = InMemoryConnector({"http://alpha/mcp": a, "http://beta/mcp": b})
     app = _app_with(reg, connector)
 
@@ -87,7 +87,7 @@ def test_two_plugins_merge_on_main_over_http():
 def test_call_round_trips_over_http():
     a = make_stub_plugin("alpha", ["echo"])
     reg = PluginRegistry()
-    reg.register(PluginManifest(name="alpha", base_url="http://alpha", surfaces={"/mcp": "main"}))
+    reg.upsert(PluginManifest(name="alpha", base_url="http://alpha", surfaces={"/mcp": "main"}))
     connector = InMemoryConnector({"http://alpha/mcp": a})
     app = _app_with(reg, connector)
 
@@ -104,7 +104,7 @@ def test_isolation_over_http_shadow_lacks_main_only_tool():
     gov_main = make_stub_plugin("governance", ["record_decision", "get_decision"])
     gov_shadow = make_stub_plugin("governance", ["add_node", "get_decision"])
     reg = PluginRegistry()
-    reg.register(
+    reg.upsert(
         PluginManifest(
             name="governance",
             base_url="http://gov",
@@ -158,14 +158,14 @@ def test_surface_allowlist_over_http_core_is_governance_only(monkeypatch):
     gov_shadow = make_stub_plugin("governance", ["add_node", "get_decision"])
     pm = make_stub_plugin("pm", ["create_work_item"])
     reg = PluginRegistry()
-    reg.register(
+    reg.upsert(
         PluginManifest(
             name="governance",
             base_url="http://gov",
             surfaces={"/mcp": "main", "/shadow/mcp": "shadow"},
         )
     )
-    reg.register(
+    reg.upsert(
         PluginManifest(
             name="pm", base_url="http://pm", surfaces={"/mcp": "main"}
         )

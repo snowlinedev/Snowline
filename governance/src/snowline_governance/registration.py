@@ -61,7 +61,8 @@ def register_with_platform(
     """POST the manifest to the platform's `POST /plugins`. Best-effort: returns
     True on a successful register (201) or an idempotent 409 (already registered),
     False on any transport error or non-2xx/409 status — NEVER raises, so a
-    briefly-down platform can't crash the plugin (the caller retries).
+    briefly-down platform can't crash the plugin (the caller — the registration
+    heartbeat — just beats again next interval).
     """
     platform = (platform_url or config.platform_url()).rstrip("/")
     url = f"{platform}/plugins"
@@ -75,7 +76,9 @@ def register_with_platform(
         log.warning("plugin registration to %s failed (will retry): %s", url, exc)
         return False
     if resp.status_code == httpx.codes.CONFLICT:
-        log.info("plugin %r already registered with the platform", PLUGIN_NAME)
+        # Only an OLDER (pre-upsert) platform returns 409 — but against one it
+        # is the heartbeat's per-beat steady state, so DEBUG like the 200 path.
+        log.debug("plugin %r already registered with the platform", PLUGIN_NAME)
         return True
     if resp.status_code == httpx.codes.CREATED:
         log.info("registered plugin %r with the platform at %s", PLUGIN_NAME, platform)
@@ -107,18 +110,32 @@ async def registration_heartbeat(
     (or 3am crash-restart) heals within one interval instead of requiring this
     plugin to also be kickstarted.
 
-    Each beat is `register_with_platform` (never raises), run off the event loop
-    because it's a blocking httpx POST. `interval` defaults to
-    `config.registration_heartbeat_seconds()`. A failed beat is already logged
-    by `register_with_platform`; the loop just keeps beating. Cancellation
+    Each beat is `register_with_platform` (which never raises), run off the
+    event loop because it's a blocking httpx POST; the try/except backstops the
+    thread-dispatch machinery around it. `interval` defaults to
+    `config.registration_heartbeat_seconds()` (lenient — a malformed shared env
+    var must not kill the loop). A failed beat is already logged by
+    `register_with_platform`; the loop just keeps beating. Cancellation
     (lifespan shutdown) unwinds cleanly through the `anyio.sleep`."""
     beat_every = (
         interval if interval is not None else config.registration_heartbeat_seconds()
     )
+    own_client = client is None
+    if own_client:
+        # One long-lived client for the loop's lifetime — a per-beat client
+        # would re-load the CA bundle and re-handshake TCP every interval.
+        client = httpx.Client(timeout=10.0)
     beat = partial(register_with_platform, platform_url, base_url, client=client)
-    while True:
-        try:
-            await anyio.to_thread.run_sync(beat)
-        except Exception:  # backstop — one bad beat must not kill the heartbeat
-            log.exception("registration heartbeat beat failed; continuing")
-        await anyio.sleep(beat_every)
+    try:
+        while True:
+            try:
+                # abandon_on_cancel: shutdown must not wait out a beat blocked
+                # on an unreachable platform (up to the POST timeout); the
+                # abandoned thread finishes harmlessly in the background.
+                await anyio.to_thread.run_sync(beat, abandon_on_cancel=True)
+            except Exception:  # backstop — one bad beat must not kill the loop
+                log.exception("registration heartbeat beat failed; continuing")
+            await anyio.sleep(beat_every)
+    finally:
+        if own_client:
+            client.close()

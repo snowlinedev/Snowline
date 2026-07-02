@@ -20,6 +20,7 @@ the surface is up.
 from __future__ import annotations
 
 import contextlib
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -56,6 +57,11 @@ def create_app(
     schema); `register_on_startup=False` skips the platform registration
     heartbeat (tests assert registration separately, against a stubbed
     platform)."""
+    # httpx logs every request at INFO — with the registration heartbeat that is
+    # one line per beat forever (defeating the DEBUG steady-state logging), so
+    # cap the httpx logger at WARNING; our own registration/webhook logs carry
+    # the signal.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     main_surface = build_main_surface(scope_client=scope_client)
     shadow_surface = build_shadow_surface(scope_client=scope_client)
 

@@ -14,8 +14,11 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass
 from enum import Enum
+from typing import Literal
 
 from snowline_platform.manifest import PluginManifest
+
+UpsertOutcome = Literal["created", "unchanged", "updated"]
 
 
 class PluginStatus(str, Enum):
@@ -30,10 +33,6 @@ class RegisteredPlugin:
     status: PluginStatus = PluginStatus.UNKNOWN
 
 
-class PluginAlreadyRegistered(Exception):
-    """A plugin with this name is already registered (and replace was not set)."""
-
-
 class PluginNotFound(Exception):
     """No plugin is registered under this name."""
 
@@ -45,18 +44,9 @@ class PluginRegistry:
         self._plugins: dict[str, RegisteredPlugin] = {}
         self._lock = threading.Lock()
 
-    def register(
-        self, manifest: PluginManifest, *, replace: bool = False
-    ) -> RegisteredPlugin:
-        with self._lock:
-            if manifest.name in self._plugins and not replace:
-                raise PluginAlreadyRegistered(manifest.name)
-            entry = RegisteredPlugin(manifest=manifest)
-            self._plugins[manifest.name] = entry
-            return entry
-
-    def upsert(self, manifest: PluginManifest) -> tuple[RegisteredPlugin, str]:
-        """Idempotent register — the heartbeat verb (issue #39).
+    def upsert(self, manifest: PluginManifest) -> tuple[RegisteredPlugin, UpsertOutcome]:
+        """Idempotent register — the ONE write verb, and the heartbeat's verb
+        (issue #39).
 
         Returns ``(entry, outcome)`` where outcome is:
           * ``"created"``   — first registration; fresh entry, status UNKNOWN.
@@ -93,12 +83,25 @@ class PluginRegistry:
         with self._lock:
             return list(self._plugins.values())
 
-    def set_status(self, name: str, status: PluginStatus) -> None:
+    def set_status(
+        self,
+        name: str,
+        status: PluginStatus,
+        *,
+        expected_entry: RegisteredPlugin | None = None,
+    ) -> None:
         """Update a plugin's runtime status (used by the health checker).
 
         A no-op if the plugin was unregistered in the meantime — the health
-        checker shouldn't resurrect a removed entry."""
+        checker shouldn't resurrect a removed entry. When `expected_entry` is
+        given, also a no-op if the registered entry is a DIFFERENT object: a
+        health result probed against an old manifest must not be stamped onto
+        an entry that an `updated` upsert replaced mid-round (the new address
+        was never checked; the poller re-verifies it next round)."""
         with self._lock:
             entry = self._plugins.get(name)
-            if entry is not None:
-                entry.status = status
+            if entry is None:
+                return
+            if expected_entry is not None and entry is not expected_entry:
+                return
+            entry.status = status

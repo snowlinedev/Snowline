@@ -148,7 +148,7 @@ def _build_gov_surfaces():
 def _gateway_for(surface: str):
     main_srv, shadow_srv = _build_gov_surfaces()
     reg = PluginRegistry()
-    reg.register(
+    reg.upsert(
         PluginManifest(
             name="governance",
             base_url="http://gov",

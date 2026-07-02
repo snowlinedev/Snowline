@@ -20,6 +20,7 @@ Env vars:
                                  every plugin's cadence.
 """
 
+import logging
 import os
 
 # Local libpq defaults (unix socket, current OS user, no password) — mirrors the
@@ -53,9 +54,30 @@ def base_url() -> str:
 
 
 def registration_heartbeat_seconds() -> float:
-    return float(
-        os.environ.get(
-            "SNOWLINE_REGISTRATION_HEARTBEAT_SECONDS",
+    """The heartbeat cadence. LENIENT on a malformed/absurd value (warn + fall
+    back), unlike the platform's fail-loud config rule: the heartbeat is the
+    self-healing mechanism issue #39 exists for, so a typo in this shared env
+    var must not kill the loop (a dead heartbeat = a hollow gateway after the
+    next platform restart) — and a zero/negative value must not hot-loop POSTs."""
+    raw = os.environ.get("SNOWLINE_REGISTRATION_HEARTBEAT_SECONDS")
+    if raw is None:
+        return DEFAULT_REGISTRATION_HEARTBEAT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        logging.getLogger(__name__).warning(
+            "malformed SNOWLINE_REGISTRATION_HEARTBEAT_SECONDS=%r — using the "
+            "default %ss",
+            raw,
             DEFAULT_REGISTRATION_HEARTBEAT_SECONDS,
         )
-    )
+        return DEFAULT_REGISTRATION_HEARTBEAT_SECONDS
+    if value < 1.0:
+        logging.getLogger(__name__).warning(
+            "SNOWLINE_REGISTRATION_HEARTBEAT_SECONDS=%r is below the 1s floor "
+            "— clamping (the heartbeat cannot be disabled by env; stop the "
+            "plugin instead)",
+            raw,
+        )
+        return 1.0
+    return value

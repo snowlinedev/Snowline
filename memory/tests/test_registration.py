@@ -133,6 +133,22 @@ def test_heartbeat_outlives_failed_beats():
     assert _run_heartbeat_until(handler, beats=4) >= 4
 
 
+def test_heartbeat_interval_env_is_lenient(monkeypatch):
+    # A malformed or hot-looping value in the SHARED env var must not kill the
+    # heartbeat (a dead heartbeat = a hollow gateway after the next platform
+    # restart) — warn and fall back instead.
+    from snowline_memory import config
+
+    monkeypatch.delenv("SNOWLINE_REGISTRATION_HEARTBEAT_SECONDS", raising=False)
+    assert config.registration_heartbeat_seconds() == 15.0
+    monkeypatch.setenv("SNOWLINE_REGISTRATION_HEARTBEAT_SECONDS", "15s")
+    assert config.registration_heartbeat_seconds() == 15.0  # malformed → default
+    monkeypatch.setenv("SNOWLINE_REGISTRATION_HEARTBEAT_SECONDS", "0")
+    assert config.registration_heartbeat_seconds() == 1.0  # floored, no hot loop
+    monkeypatch.setenv("SNOWLINE_REGISTRATION_HEARTBEAT_SECONDS", "30")
+    assert config.registration_heartbeat_seconds() == 30.0
+
+
 def test_manifest_is_accepted_by_the_platform_model():
     """The manifest memory posts validates against the platform's manifest model —
     the contract both sides share. This is the only place memory touches a

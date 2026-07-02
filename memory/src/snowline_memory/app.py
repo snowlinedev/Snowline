@@ -20,6 +20,7 @@ the surface is up.
 from __future__ import annotations
 
 import contextlib
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -52,6 +53,11 @@ def create_app(
     """Build the memory app. `migrate_on_startup=False` skips the boot-migrate
     (tests provision their own schema); `register_on_startup=False` skips the
     platform registration heartbeat (tests assert registration separately)."""
+    # httpx logs every request at INFO — with the registration heartbeat that is
+    # one line per beat forever (defeating the DEBUG steady-state logging), so
+    # cap the httpx logger at WARNING; our own registration logs carry the
+    # signal.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     main_surface = build_main_surface()
 
     @asynccontextmanager

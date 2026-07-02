@@ -40,7 +40,7 @@ def test_boot_with_empty_registry_warns_loudly(caplog):
 
 def test_boot_with_registered_plugin_does_not_warn(caplog):
     reg = PluginRegistry()
-    reg.register(
+    reg.upsert(
         PluginManifest(
             name="governance",
             base_url="http://127.0.0.1:8801",
