@@ -1,6 +1,7 @@
 # UI shell — declarative widget & page composition
 
-> **Status: draft.** How Snowline gets a unified web UI: a single
+> **Status: exploratory** (phase 1 shipped — PR #56; governance artifact
+> `945a36ee`). How Snowline gets a unified web UI: a single
 > platform-owned dashboard shell that renders **declaratively registered**
 > widgets and pages from plugins. Plugins ship JSON, never JavaScript. The
 > composition model deliberately mirrors the MCP gateway (`gateway.md`): plugins
