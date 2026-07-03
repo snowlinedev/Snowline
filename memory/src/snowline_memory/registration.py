@@ -19,6 +19,7 @@ re-register); a 409 from an older platform is also treated as success.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from functools import partial
 
@@ -116,21 +117,45 @@ async def registration_heartbeat(
         interval if interval is not None else config.registration_heartbeat_seconds()
     )
     own_client = client is None
-    if own_client:
-        # One long-lived client for the loop's lifetime — a per-beat client
-        # would re-load the CA bundle and re-handshake TCP every interval.
-        client = httpx.Client(timeout=10.0)
-    beat = partial(register_with_platform, platform_url, base_url, client=client)
+    confirmed = False
     try:
         while True:
             try:
+                if own_client and client is None:
+                    # One long-lived client for the loop's lifetime — a per-beat
+                    # client would re-load the CA bundle and re-handshake TCP
+                    # every interval. Constructed INSIDE the backstop: this can
+                    # raise (e.g. a broken SSL_CERT_FILE), and the heartbeat
+                    # rides the lifespan task group — an escaped exception here
+                    # would cancel that task group for the process lifetime
+                    # while /health stays green.
+                    client = httpx.Client(timeout=10.0)
+                beat = partial(
+                    register_with_platform, platform_url, base_url, client=client
+                )
                 # abandon_on_cancel: shutdown must not wait out a beat blocked
-                # on an unreachable platform (up to the POST timeout); the
-                # abandoned thread finishes harmlessly in the background.
-                await anyio.to_thread.run_sync(beat, abandon_on_cancel=True)
+                # on an unreachable platform (up to the POST timeout).
+                ok = await anyio.to_thread.run_sync(beat, abandon_on_cancel=True)
+                if ok and not confirmed:
+                    # One guaranteed INFO confirmation per process boot. The
+                    # steady-state 200 re-assert logs at DEBUG, so without this
+                    # a restart against an already-up platform (200, not 201)
+                    # would log NO registration line at all — a healthy
+                    # heartbeat and one that never started would look identical.
+                    confirmed = True
+                    log.info(
+                        "plugin %r registration confirmed; heartbeat every %ss",
+                        PLUGIN_NAME,
+                        beat_every,
+                    )
             except Exception:  # backstop — one bad beat must not kill the loop
                 log.exception("registration heartbeat beat failed; continuing")
             await anyio.sleep(beat_every)
     finally:
-        if own_client:
-            client.close()
+        if own_client and client is not None:
+            # An abandoned in-flight beat may still hold this client when a
+            # shutdown cancel lands; closing under it makes that beat fail in
+            # the background (a stray shutdown-time WARNING at worst — noise,
+            # not data loss). Suppress close-time errors from the race.
+            with contextlib.suppress(Exception):
+                client.close()

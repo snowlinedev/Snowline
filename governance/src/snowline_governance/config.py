@@ -20,6 +20,7 @@ Env vars:
 """
 
 import logging
+import math
 import os
 
 # Local libpq defaults (unix socket, current OS user, no password) — mirrors the
@@ -65,6 +66,18 @@ def registration_heartbeat_seconds() -> float:
     except ValueError:
         logging.getLogger(__name__).warning(
             "malformed SNOWLINE_REGISTRATION_HEARTBEAT_SECONDS=%r — using the "
+            "default %ss",
+            raw,
+            DEFAULT_REGISTRATION_HEARTBEAT_SECONDS,
+        )
+        return DEFAULT_REGISTRATION_HEARTBEAT_SECONDS
+    if not math.isfinite(value):
+        # "inf"/"nan" parse as floats and slip past the < 1.0 floor, but
+        # anyio.sleep(inf/nan) never returns — a silent dead heartbeat, the
+        # exact failure this lenient parse exists to prevent. Treat like
+        # malformed input.
+        logging.getLogger(__name__).warning(
+            "non-finite SNOWLINE_REGISTRATION_HEARTBEAT_SECONDS=%r — using the "
             "default %ss",
             raw,
             DEFAULT_REGISTRATION_HEARTBEAT_SECONDS,

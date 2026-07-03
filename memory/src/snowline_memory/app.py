@@ -31,6 +31,19 @@ from snowline_memory import config, registration
 from snowline_memory.mcp_surface import build_main_surface
 
 
+class _HeartbeatHttpxLogFilter(logging.Filter):
+    """Drops httpx's per-request INFO line for the registration heartbeat's
+    `POST …/plugins` (one line per beat, forever) while letting every OTHER
+    httpx request trace through."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not ("POST" in msg and "/plugins" in msg)
+
+
+_HEARTBEAT_HTTPX_FILTER = _HeartbeatHttpxLogFilter()
+
+
 def _migrate_to_head() -> None:
     """Bring the memory DB to the latest Alembic head — the boot-migrate
     governance/the monolith do in their lifespan. Reads the same DB URL the app's
@@ -54,10 +67,11 @@ def create_app(
     (tests provision their own schema); `register_on_startup=False` skips the
     platform registration heartbeat (tests assert registration separately)."""
     # httpx logs every request at INFO — with the registration heartbeat that is
-    # one line per beat forever (defeating the DEBUG steady-state logging), so
-    # cap the httpx logger at WARNING; our own registration logs carry the
-    # signal.
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    # one line per beat forever (defeating the DEBUG steady-state logging).
+    # Capping the whole httpx logger at WARNING would mute other httpx traffic
+    # too, so instead drop ONLY the heartbeat's POST /plugins lines (idempotent
+    # — one module-level filter instance, and addFilter dedupes).
+    logging.getLogger("httpx").addFilter(_HEARTBEAT_HTTPX_FILTER)
     main_surface = build_main_surface()
 
     @asynccontextmanager
