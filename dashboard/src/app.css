@@ -93,6 +93,11 @@
   padding: var(--space-4);
 }
 
+.card-title {
+  margin: 0 0 var(--space-3);
+  font-size: var(--font-body);
+}
+
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
@@ -141,7 +146,12 @@
   font-size: var(--font-small);
 }
 
-/* kind: table */
+/* kind: table — wide tables scroll inside their own container (1.4.10:
+ * the page never scrolls horizontally; the data table may) */
+.table-scroll {
+  overflow-x: auto;
+}
+
 .kind-table {
   width: 100%;
   border-collapse: collapse;
@@ -195,15 +205,14 @@
 }
 
 /* scope tree */
-.tree,
 .tree ul {
   list-style: none;
   padding-left: var(--space-5);
   margin: 0;
 }
 
-.tree {
-  padding-left: 0;
+.tree > ul {
+  padding-left: 0; /* the root level sits flush; only NESTED levels indent */
 }
 
 .tree li > .node {
@@ -235,7 +244,39 @@
   padding: var(--space-4) 0;
 }
 
-.error-card {
-  border-color: var(--status-down);
+.state-error {
+  border-left: 3px solid var(--status-down);
+  padding-left: var(--space-3);
   color: var(--ink-secondary);
+}
+
+/* Reflow (1.4.10): at narrow widths / 400% zoom the shell stacks — nav
+ * becomes a wrapping top bar, content takes the full width. No page-level
+ * horizontal scrolling at 320 CSS px. */
+@media (max-width: 640px) {
+  .shell {
+    flex-direction: column;
+  }
+
+  .shell-nav {
+    width: auto;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    border-right: none;
+    border-bottom: 1px solid var(--hairline);
+  }
+
+  .shell-nav .brand {
+    margin-bottom: 0;
+    margin-right: var(--space-3);
+  }
+
+  .shell-main {
+    padding: var(--space-4);
+  }
+
+  .grid {
+    grid-template-columns: 1fr;
+  }
 }

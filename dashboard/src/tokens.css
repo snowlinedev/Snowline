@@ -7,8 +7,12 @@
  * Color tokens are density-independent and CI-validated for WCAG 2.2 AA
  * contrast by scripts/validate-tokens.mjs (a failing pair fails the build) —
  * keep that script's PAIRS list in sync when adding ink/surface tokens.
- * Comfortable sizing meets the 24px target-size minimum (2.5.8); compact is
- * the user-opted density trade documented in ACCESSIBILITY.md and is the ONLY
+ * Comfortable sizing satisfies 2.5.8 Target Size (Minimum): dedicated
+ * controls (--control-h: 32px) exceed the 24px minimum directly; inline links
+ * inside list/table rows are line-box sized and conform via the criterion's
+ * SPACING exception — the 40px --row-h guarantees a 24px-diameter circle
+ * centered on each row's target intersects no other target. Compact is the
+ * user-opted density trade documented in ACCESSIBILITY.md and is the ONLY
  * thing compact relaxes.
  *
  * Palette lineage: the validated reference instance from the dataviz method

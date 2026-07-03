@@ -7,6 +7,7 @@ or to add ranges. Trust is configuration, never hardcoded into the request path.
 """
 
 import os
+import pathlib
 import re
 
 # Tailscale's tailnet (CGNAT) range — the default trusted network.
@@ -65,11 +66,10 @@ def dashboard_dist() -> str | None:
 
     `SNOWLINE_DASHBOARD_DIST` overrides; the default is the repo checkout's
     `dashboard/dist` (the services run from the checkout via editable
-    installs). Returns None when the directory doesn't exist — the app then
-    simply doesn't serve `/ui` (dev environments and unit tests don't build
-    the frontend)."""
-    import pathlib
-
+    installs). Returns None when the directory doesn't exist — /ui then 404s
+    (dev environments and unit tests don't build the frontend). Resolved
+    PER-REQUEST by the /ui route, so a first build appears without a
+    restart."""
     raw = os.environ.get("SNOWLINE_DASHBOARD_DIST")
     path = (
         pathlib.Path(raw)

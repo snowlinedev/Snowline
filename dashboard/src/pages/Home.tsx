@@ -3,7 +3,13 @@
  * phase 2. */
 
 import { fetchPlugins, fetchSurfaces } from "../api";
-import { Card, KindList, StateNote, Stat, StatusChip } from "../kinds/kinds";
+import {
+  Card,
+  KindList,
+  PendingNote,
+  Stat,
+  StatusChip,
+} from "../kinds/kinds";
 import { Layout } from "../shell/Layout";
 import { useData } from "../useData";
 
@@ -26,16 +32,13 @@ export function Home() {
         </Card>
         <Card title="Plugin status">
           {plugins.state === "ready" ? (
-            <ul className="kind-list">
-              {plugins.data.map((p) => (
-                <li key={p.name}>
-                  {p.name}
-                  <span className="meta">
-                    <StatusChip status={p.status} />
-                  </span>
-                </li>
-              ))}
-            </ul>
+            <KindList
+              items={plugins.data.map((p) => ({
+                text: p.name,
+                meta: <StatusChip status={p.status} />,
+              }))}
+              empty="No plugins registered."
+            />
           ) : (
             <PendingNote loadable={plugins} />
           )}
@@ -56,15 +59,5 @@ export function Home() {
         </Card>
       </div>
     </Layout>
-  );
-}
-
-export function PendingNote(props: {
-  loadable: { state: "loading" } | { state: "error"; message: string };
-}) {
-  return props.loadable.state === "loading" ? (
-    <StateNote>Loading…</StateNote>
-  ) : (
-    <StateNote error>Failed to load: {props.loadable.message}</StateNote>
   );
 }

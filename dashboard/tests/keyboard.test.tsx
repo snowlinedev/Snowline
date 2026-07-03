@@ -54,4 +54,16 @@ describe("keyboard operability", () => {
     const link = await screen.findByRole("link", { name: "Plugins" });
     expect(link.getAttribute("aria-current")).toBe("page");
   });
+
+  it("retitles the document per route (2.4.2)", async () => {
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter initialEntries={["/"]}>
+        <App />
+      </MemoryRouter>,
+    );
+    expect(document.title).toBe("Home · Snowline");
+    await user.click(screen.getByRole("link", { name: "Surfaces" }));
+    expect(document.title).toBe("Surfaces · Snowline");
+  });
 });

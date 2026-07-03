@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { NavLink } from "react-router-dom";
 
 import {
@@ -21,6 +21,12 @@ const NATIVE_PAGES = [
 export function Layout(props: { title: string; children: ReactNode }) {
   const [theme, setTheme] = useState<Theme>(currentTheme);
   const [density, setDensity] = useState<Density>(currentDensity);
+
+  // Page titled (WCAG 2.4.2): SPA route changes must retitle the document —
+  // tabs, history, and screen readers all read this, not the <h1>.
+  useEffect(() => {
+    document.title = `${props.title} · Snowline`;
+  }, [props.title]);
 
   const setAndApply = (t: Theme, d: Density) => {
     setTheme(t);

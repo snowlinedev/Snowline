@@ -1,8 +1,8 @@
 import { fetchSurfaces } from "../api";
-import { Card, KindTable } from "../kinds/kinds";
+import { Card, KindTable, PendingNote } from "../kinds/kinds";
 import { Layout } from "../shell/Layout";
 import { useData } from "../useData";
-import { PendingNote } from "./Home";
+
 
 export function Surfaces() {
   const surfaces = useData(fetchSurfaces, 30);

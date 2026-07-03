@@ -1,8 +1,8 @@
 import { fetchPlugins } from "../api";
-import { Card, KindTable, StatusChip } from "../kinds/kinds";
+import { Card, KindTable, PendingNote, StatusChip } from "../kinds/kinds";
 import { Layout } from "../shell/Layout";
 import { useData } from "../useData";
-import { PendingNote } from "./Home";
+
 
 export function Plugins() {
   const plugins = useData(fetchPlugins, 10);

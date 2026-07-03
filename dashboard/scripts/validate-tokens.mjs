@@ -21,10 +21,6 @@ const css = readFileSync(
 );
 
 function themeBlock(theme) {
-  const re = new RegExp(
-    String.raw`:root(?:,\s*)?(?:\[data-theme="${theme}"\])?\s*\{([^}]*)\}`,
-    "g",
-  );
   // The light block is `:root, :root[data-theme="light"]`; dark is its own.
   const match = [...css.matchAll(/:root[^{]*\{[^}]*\}/g)]
     .map((m) => m[0])
@@ -34,7 +30,6 @@ function themeBlock(theme) {
   for (const [, name, value] of match.matchAll(/--([\w-]+):\s*([^;]+);/g)) {
     tokens[name] = value.trim();
   }
-  void re;
   return tokens;
 }
 

@@ -1,8 +1,8 @@
 import { fetchScopeTree, type ScopeNode } from "../api";
-import { Card, StateNote } from "../kinds/kinds";
+import { Card, PendingNote, StateNote } from "../kinds/kinds";
 import { Layout } from "../shell/Layout";
 import { useData } from "../useData";
-import { PendingNote } from "./Home";
+
 
 function TreeLevel(props: { nodes: ScopeNode[] }) {
   return (

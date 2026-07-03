@@ -86,3 +86,36 @@ def test_ui_serves_spa_with_fallback_and_traversal_guard(monkeypatch, tmp_path):
 def test_ui_absent_without_a_built_bundle(monkeypatch):
     monkeypatch.setenv("SNOWLINE_DASHBOARD_DIST", "/nonexistent-dist")
     assert TestClient(_app()).get("/ui").status_code == 404
+
+
+def test_ui_appears_after_a_late_first_build(monkeypatch, tmp_path):
+    # First-deploy ordering: the platform can boot BEFORE the dashboard's
+    # first build; the dist is resolved per-request, so /ui starts serving
+    # without a restart the moment the bundle lands.
+    dist = tmp_path / "dist"
+    monkeypatch.setenv("SNOWLINE_DASHBOARD_DIST", str(dist))
+    client = TestClient(_app())
+    assert client.get("/ui").status_code == 404
+    dist.mkdir()
+    (dist / "index.html").write_text("<html>late</html>")
+    assert client.get("/ui").text == "<html>late</html>"
+
+
+def test_ui_half_built_dist_is_404_not_500(monkeypatch, tmp_path):
+    # vite mid-rebuild / interrupted build: dist exists, index.html doesn't.
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    monkeypatch.setenv("SNOWLINE_DASHBOARD_DIST", str(dist))
+    resp = TestClient(_app()).get("/ui/plugins")
+    assert resp.status_code == 404
+    assert "rebuild" in resp.json()["detail"]
+
+
+def test_reserved_surface_names_fail_boot(monkeypatch):
+    import pytest
+
+    from snowline_platform.config import ConfigError
+
+    monkeypatch.setenv("SNOWLINE_SURFACES", "main,ui")
+    with pytest.raises(ConfigError, match="reserved"):
+        _app()

@@ -15,7 +15,8 @@ from functools import partial
 from pathlib import Path
 
 import anyio
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response, status
+from fastapi.responses import FileResponse, JSONResponse
 
 from snowline_platform import config, plugins_routes, scopes_routes, surfaces_routes
 from snowline_platform.gateway import UpstreamConnector
@@ -123,6 +124,17 @@ def create_app(
     app.include_router(scopes_routes.router)
     app.include_router(surfaces_routes.router)
 
+    # The dashboard owns the /ui and /ui-api route namespaces (ui-shell.md
+    # §5–§6); a gateway surface named after either would mount /<name>/mcp
+    # inside them and silently interleave MCP transport with SPA assets —
+    # fail loud at boot like every other surface-config error.
+    reserved = {"ui", "ui-api"} & set(config.surfaces())
+    if reserved:
+        raise config.ConfigError(
+            f"SNOWLINE_SURFACES uses reserved name(s) {sorted(reserved)!r} — "
+            f"'ui' and 'ui-api' are the dashboard's route namespaces"
+        )
+
     # The gateway: aggregate registered plugins' MCP surfaces onto the platform's
     # named surfaces and mount each as a streamable-HTTP endpoint (e.g. /mcp,
     # /shadow/mcp), behind the trust gate. Mounts share the app's registry, so a
@@ -130,6 +142,16 @@ def create_app(
     mounts = build_surface_mounts(app.state.registry, connector=connector)
     app.state.gateway_mounts = mounts
     mount_gateway(app, mounts)
+
+    # Freeze the surface config the moment the mounts are built: GET /surfaces
+    # reports THIS, not a per-request env re-parse — the view can't drift from
+    # what the gateway actually mounted, and a malformed env mutated after
+    # boot can't turn the route into a 500 (config errors stay a boot-time
+    # concern, per the fail-loud rule).
+    allowlists = config.surface_plugins()
+    app.state.surface_listing = [
+        (name, allowlists.get(name)) for name in config.surfaces()
+    ]
 
     @app.get("/health")
     async def health() -> dict:
@@ -145,28 +167,44 @@ def create_app(
     # later /ui/<plugin>/<route>) render index.html and the client router takes
     # over. Served at /ui — NOT / — so shell routes can mirror API names
     # without colliding with the JSON routes (/plugins vs /ui/plugins), and to
-    # pair with the phase-2 /ui-api data proxy. Skipped entirely (404s) when no
-    # built bundle exists (dev/test environments).
-    dist = config.dashboard_dist()
-    if dist is not None:
-        from fastapi.responses import FileResponse
-        from pathlib import Path as _Path
-
-        dist_dir = _Path(dist)
-
-        @app.get("/ui")
-        @app.get("/ui/{rest:path}")
-        async def ui(rest: str = "") -> FileResponse:
+    # pair with the phase-2 /ui-api data proxy. The dist dir is resolved
+    # PER-REQUEST, so a bundle built after the platform booted starts serving
+    # without a restart (first-deploy ordering), and environments with no
+    # bundle 404 cleanly.
+    @app.get("/ui")
+    @app.get("/ui/{rest:path}")
+    async def ui(rest: str = "") -> Response:
+        dist = config.dashboard_dist()
+        if dist is None:
+            return JSONResponse(
+                {"detail": "no dashboard bundle built"},
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+        dist_dir = Path(dist)
+        try:
             candidate = (dist_dir / rest).resolve()
-            # Traversal guard: only files inside the dist dir are servable;
-            # anything else (including client-side routes) gets the SPA shell.
-            if (
-                rest
-                and candidate.is_file()
-                and candidate.is_relative_to(dist_dir.resolve())
-            ):
-                return FileResponse(candidate)
-            return FileResponse(dist_dir / "index.html")
+        except (ValueError, OSError):
+            # e.g. an embedded NUL from a percent-encoded scanner URL — treat
+            # like any other non-file path and fall through to the shell.
+            candidate = None
+        # Traversal guard: only files inside the dist dir are servable;
+        # anything else (including client-side routes) gets the SPA shell.
+        if (
+            rest
+            and candidate is not None
+            and candidate.is_file()
+            and candidate.is_relative_to(dist_dir.resolve())
+        ):
+            return FileResponse(candidate)
+        index = dist_dir / "index.html"
+        if not index.is_file():
+            # A half-built dist (vite mid-rebuild, interrupted build) must
+            # read as "bundle missing", never as a 500 on every request.
+            return JSONResponse(
+                {"detail": "dashboard bundle incomplete — rebuild (npm run build)"},
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+        return FileResponse(index)
 
     return app
 
