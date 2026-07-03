@@ -4,7 +4,7 @@
 > invisible to live agent sessions, layered so each layer stands alone.
 > Layer 1 is ALREADY SHIPPED and is recorded here as standing posture;
 > layer 2 is the buildable v1 scope; layers 3–4 are deferred capabilities
-> with stated revisit triggers (issues #58, #59). Design session 2026-07-03
+> with stated revisit triggers (issues #59, #60). Design session 2026-07-03
 > (Sean); builds on the registration heartbeat (#39/#49).
 
 ## 1. The problem, precisely
@@ -49,7 +49,7 @@ statelessness is why a plugin restart costs only in-flight calls). Layer 2 is
 **mostly for them**: plugin kickstarts are the common deploy, and the gateway
 is the single place that can absorb them.
 
-## 3. Layer 2 — gateway connect-phase retry (the v1 build, issue #57)
+## 3. Layer 2 — gateway connect-phase retry (the v1 build, issue #58)
 
 When the gateway's per-request upstream connect fails, retry briefly before
 failing the call: the plugin is usually mid-kickstart and back within a
@@ -78,7 +78,7 @@ a WARNING only when retries were exhausted.
 invisible — a tool call issued mid-kickstart pauses ~a second instead of
 failing. Platform deploys remain visible (the socket itself; layer 3).
 
-## 4. Layer 3 — platform socket continuity (DEFERRED, issue #58)
+## 4. Layer 3 — platform socket continuity (DEFERRED, issue #59)
 
 Blue/green for the platform process so even its restarts drop zero
 connections. Sketch (decide at implementation): a tiny reverse proxy (Caddy)
@@ -92,7 +92,7 @@ option-2 persistence — which this layer would finally justify).
 layers 1–2; OR a second daily-driver user appears; OR the platform moves to a
 Linux host (where the proxy pattern is the native idiom anyway).
 
-## 5. Layer 4 — expand/contract migration discipline (DEFERRED, issue #59)
+## 5. Layer 4 — expand/contract migration discipline (DEFERRED, issue #60)
 
 Boot-migrate means a new process migrates the DB while the old one still
 serves. Zero-downtime overlap therefore requires migrations be
