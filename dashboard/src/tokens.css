@@ -1,0 +1,121 @@
+/* Snowline dashboard design tokens (ui-shell.md §7).
+ *
+ * TWO independent axes, each one attribute swap on <html>:
+ *   [data-theme="light"|"dark"]          — color tokens only
+ *   [data-density="comfortable"|"compact"] — spacing/size tokens only
+ *
+ * Color tokens are density-independent and CI-validated for WCAG 2.2 AA
+ * contrast by scripts/validate-tokens.mjs (a failing pair fails the build) —
+ * keep that script's PAIRS list in sync when adding ink/surface tokens.
+ * Comfortable sizing satisfies 2.5.8 Target Size (Minimum): dedicated
+ * controls (--control-h: 32px) exceed the 24px minimum directly; inline links
+ * inside list/table rows are line-box sized and conform via the criterion's
+ * SPACING exception — the 40px --row-h guarantees a 24px-diameter circle
+ * centered on each row's target intersects no other target. Compact is the
+ * user-opted density trade documented in ACCESSIBILITY.md and is the ONLY
+ * thing compact relaxes.
+ *
+ * Palette lineage: the validated reference instance from the dataviz method
+ * (surfaces, ink, status roles), with --ink-muted darkened past the reference
+ * chart-muted so it holds 4.5:1 as body text on both surfaces. Status colors
+ * are reserved for state, never series/decoration, and never appear without
+ * an icon/dot + text label.
+ */
+
+:root,
+:root[data-theme="light"] {
+  --surface-page: #f9f9f7;
+  --surface-card: #fcfcfb;
+  --ink-primary: #0b0b0b;
+  --ink-secondary: #52514e;
+  --ink-muted: #676660;
+  --hairline: #e1e0d9;
+  --border-ring: rgba(11, 11, 11, 0.1);
+  --accent: #256abf;        /* interactive: links, active nav, focus */
+  --accent-ink: #ffffff;    /* text on accent fills */
+  --status-up: #0ca30c;
+  --status-down: #d03b3b;
+  --status-unknown: #676660;
+  --focus-ring: #256abf;
+}
+
+:root[data-theme="dark"] {
+  --surface-page: #0d0d0d;
+  --surface-card: #1a1a19;
+  --ink-primary: #ffffff;
+  --ink-secondary: #c3c2b7;
+  --ink-muted: #98968f;
+  --hairline: #2c2c2a;
+  --border-ring: rgba(255, 255, 255, 0.1);
+  --accent: #6da7ec;
+  --accent-ink: #0b0b0b;
+  --status-up: #0ca30c;
+  --status-down: #e66767;
+  --status-unknown: #98968f;
+  --focus-ring: #6da7ec;
+}
+
+:root,
+:root[data-density="comfortable"] {
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --control-h: 32px;      /* interactive controls: >= 24px target (2.5.8) */
+  --row-h: 40px;          /* table/list rows */
+  --font-body: 14px;
+  --font-small: 12.5px;
+  --font-stat: 28px;
+}
+
+:root[data-density="compact"] {
+  /* The user-opted density trade (ACCESSIBILITY.md): sizing minimums only —
+   * color, focus, semantics are the SAME tokens as comfortable. */
+  --space-1: 2px;
+  --space-2: 4px;
+  --space-3: 8px;
+  --space-4: 10px;
+  --space-5: 16px;
+  --control-h: 22px;
+  --row-h: 26px;
+  --font-body: 12.5px;
+  --font-small: 11.5px;
+  --font-stat: 22px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--surface-page);
+  color: var(--ink-primary);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: var(--font-body);
+  line-height: 1.45;
+}
+
+a {
+  color: var(--accent);
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+}
