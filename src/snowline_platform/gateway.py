@@ -39,15 +39,24 @@ per-request connect+initialize handshake remains; pooling was left out to keep
 this change focused on the concurrency+timeout win. The upstream connection is
 abstracted behind `UpstreamConnector` so tests can wire an in-memory MCP plugin
 without standing up HTTP, while production uses the streamable-HTTP client.
+
+**Connect-phase retry (issue #58, deploy-continuity.md §3 — layer 2):** a plugin
+kickstart (deploy/restart) makes the per-request upstream connect fail for the
+sub-second-to-few-seconds the plugin process is down. The gateway retries ONLY
+the connect+initialize phase — the safety line is that a tool call is not
+idempotent in general, so nothing past the point `call_tool` is written to the
+wire may ever be retried. See `_retry_transient` + its two call sites
+(`SurfaceGateway.call_tool` retries only the connect step; `list_tools` retries
+the whole read since it's idempotent) for the structural boundary.
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 import anyio
 import mcp.types as types
@@ -58,6 +67,16 @@ from mcp.server.lowlevel import Server
 from snowline_platform.registry import PluginRegistry, PluginStatus
 
 log = logging.getLogger("snowline_platform.gateway")
+
+_T = TypeVar("_T")
+
+# Connect-phase retry policy (issue #58 / deploy-continuity.md §3). Module-level
+# so tests can `monkeypatch.setattr` it down to near-zero for fast retry tests.
+# Length is load-bearing: attempts made = len(CONNECT_RETRY_BACKOFFS) + 1 (the
+# first try plus one retry per backoff) — "2 retries, ~250ms then ~750ms" is
+# expressed as the tuple itself, not a separate retry-count constant, so the two
+# can never drift apart.
+CONNECT_RETRY_BACKOFFS: tuple[float, ...] = (0.25, 0.75)
 
 # The root surface: the composed daily-driver surface, served at the bare
 # ``/mcp``. Defined HERE (the bottom of the gateway import graph) because the
@@ -181,6 +200,54 @@ class GatewayError(Exception):
     """A composition/routing failure the gateway surfaces as a clear MCP error
     rather than hanging (e.g. a tool routed to a plugin not on this surface, or
     a down/unreachable upstream)."""
+
+
+async def _retry_transient(
+    attempt: Callable[[], Awaitable[_T]],
+    *,
+    upstream: Upstream,
+    surface: str,
+    what: str,
+) -> _T:
+    """Call `attempt()` up to ``len(CONNECT_RETRY_BACKOFFS) + 1`` times total,
+    sleeping the next `CONNECT_RETRY_BACKOFFS` entry between attempts, on ANY
+    exception (issue #58 / deploy-continuity.md §3). Re-raises the last
+    exception once retries are exhausted — the CALLER decides what that means
+    (a WARNING + `GatewayError` for `call_tool`'s connect step; a route-around
+    for `list_tools`'s whole read) because the two sites have different
+    failure semantics, not because retrying itself differs.
+
+    This is deliberately NOT exception-type-aware: whether a failure is safe to
+    retry is decided STRUCTURALLY by what `attempt` closes over, not by
+    inspecting the exception. `SurfaceGateway.call_tool` passes an `attempt`
+    that does ONLY the connect+initialize (so only that step is ever retried,
+    and a `call_tool` write — issued outside this function, exactly once — is
+    never re-run). `list_tools` passes an `attempt` that does connect+list
+    together, because the whole thing is a read and safe to retry in full.
+    Cancellation (`BaseException`, not `Exception` — e.g. a `fail_after`
+    timeout firing) is never caught here and propagates immediately, so a
+    bounding deadline around a retry loop still cuts it off promptly."""
+    for i in range(len(CONNECT_RETRY_BACKOFFS) + 1):
+        try:
+            return await attempt()
+        except Exception as exc:
+            if i >= len(CONNECT_RETRY_BACKOFFS):
+                raise
+            backoff = CONNECT_RETRY_BACKOFFS[i]
+            log.debug(
+                "gateway: %s to upstream %s (plugin %r) on surface %r failed "
+                "(attempt %d/%d), retrying in %.2fs: %s",
+                what,
+                upstream.url,
+                upstream.plugin_name,
+                surface,
+                i + 1,
+                len(CONNECT_RETRY_BACKOFFS),
+                backoff,
+                exc,
+            )
+            await anyio.sleep(backoff)
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def discover_upstreams(
@@ -347,7 +414,12 @@ class SurfaceGateway:
         plugin doesn't blank the surface. Results are merged in the upstreams'
         discovery order (already plugin-name-sorted) by collecting per-upstream
         slices and concatenating them by index, so the merged order is STABLE and
-        independent of task-completion order."""
+        independent of task-completion order.
+
+        `list_tools` is read-only, so — unlike `call_tool` — connect-phase retry
+        (issue #58) covers the WHOLE per-upstream attempt (connect+initialize AND
+        the `tools/list` read itself): `_retry_transient` wraps `_attempt` below
+        in full, still bounded overall by `LIST_TIMEOUT`."""
         upstreams = discover_upstreams(
             self._registry, self._surface, self._allowlist
         )
@@ -357,19 +429,30 @@ class SurfaceGateway:
         slices: list[list[types.Tool]] = [[] for _ in upstreams]
 
         async def _fetch(index: int, upstream: Upstream) -> None:
+            async def _attempt() -> types.ListToolsResult:
+                async with self._connector.connect(upstream) as session:
+                    return await session.list_tools()
+
             try:
                 with anyio.fail_after(self.LIST_TIMEOUT):
-                    async with self._connector.connect(upstream) as session:
-                        result = await session.list_tools()
+                    result = await _retry_transient(
+                        _attempt,
+                        upstream=upstream,
+                        surface=self._surface,
+                        what="list_tools",
+                    )
             except Exception as exc:
-                # Route-around a failing OR slow upstream. `fail_after` converts
-                # its scope's timeout into a plain `TimeoutError` on exit (caught
-                # here), so a slow upstream is dropped after LIST_TIMEOUT rather
-                # than stalling the surface. We deliberately do NOT catch the
-                # cancelled-exc class: a real cancellation of the parent task
-                # group (lifespan shutdown) must propagate, not be swallowed as a
-                # per-upstream failure. Dropping THIS upstream never cancels its
-                # siblings — each runs in its own task.
+                # Route-around a failing OR slow upstream, after retries (above)
+                # were exhausted. `fail_after` converts its scope's timeout into
+                # a plain `TimeoutError` on exit (caught here), so a slow
+                # upstream is dropped after LIST_TIMEOUT rather than stalling
+                # the surface. We deliberately do NOT catch the cancelled-exc
+                # class: a real cancellation of the parent task group (lifespan
+                # shutdown) must propagate, not be swallowed as a per-upstream
+                # failure — `_retry_transient` only catches `Exception`, so a
+                # cancellation firing mid-retry still passes straight through.
+                # Dropping THIS upstream never cancels its siblings — each runs
+                # in its own task.
                 log.warning(
                     "gateway: list_tools failed for upstream %s on surface %r: "
                     "%s",
@@ -400,7 +483,22 @@ class SurfaceGateway:
         preserved). The owning plugin is resolved from the namespace prefix and
         must be a live (non-down) upstream of THIS surface — so a tool the plugin
         only mapped onto another surface (e.g. `record_decision` on `main`) is
-        unroutable here, which is the isolation property surfaced as an error."""
+        unroutable here, which is the isolation property surfaced as an error.
+
+        **Connect-phase retry (issue #58) — the safety line is STRUCTURAL, not
+        exception-type-based.** The `_retry_transient` call below retries ONLY
+        `stack.enter_async_context(self._connector.connect(upstream))` — i.e.
+        opening + initializing the per-request upstream session. Once that
+        returns a `session`, `session.call_tool(...)` is issued exactly ONCE,
+        outside the retry, and its exceptions propagate un-retried: a tool call
+        is not idempotent in general, so nothing past the point the call was
+        written to the wire may ever be replayed. `AsyncExitStack` (rather than
+        a plain `async with`) is what makes the boundary expressible this way —
+        a fresh `connector.connect(upstream)` context manager is created and
+        entered on `stack` per retry attempt (one that raised before yielding is
+        exhausted and can't be re-entered), and once one succeeds its teardown
+        is deferred to the `stack`'s own exit, which still runs whether
+        `call_tool` below returns normally or raises."""
         plugin_name, tool_name = split_namespaced(name)
         upstreams = {
             u.plugin_name: u
@@ -414,7 +512,35 @@ class SurfaceGateway:
                 f"no live plugin {plugin_name!r} on surface {self._surface!r} "
                 f"for tool {name!r} (unregistered, down, or not mapped here)"
             )
-        async with self._connector.connect(upstream) as session:
+
+        async with AsyncExitStack() as stack:
+            try:
+                session = await _retry_transient(
+                    lambda: stack.enter_async_context(
+                        self._connector.connect(upstream)
+                    ),
+                    upstream=upstream,
+                    surface=self._surface,
+                    what="connect",
+                )
+            except Exception as exc:
+                log.warning(
+                    "gateway: call_tool %r — upstream %s (plugin %r) on "
+                    "surface %r unreachable after %d connect retries, giving "
+                    "up: %s",
+                    name,
+                    upstream.url,
+                    plugin_name,
+                    self._surface,
+                    len(CONNECT_RETRY_BACKOFFS),
+                    exc,
+                )
+                raise GatewayError(
+                    f"upstream {plugin_name!r} on surface {self._surface!r} "
+                    f"unreachable for tool {name!r}: {exc}"
+                ) from exc
+
+            # Exactly one call_tool — no retry past this line (see docstring).
             return await session.call_tool(tool_name, arguments or {})
 
 
