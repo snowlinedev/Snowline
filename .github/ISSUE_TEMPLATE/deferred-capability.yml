@@ -1,0 +1,31 @@
+name: Deferred capability
+description: Work gated on a stated trigger — not to be started until it fires.
+title: "Deferred capability — "
+labels: ["deferred"]
+body:
+  - type: textarea
+    id: trigger
+    attributes:
+      label: Revisit trigger
+      description: >
+        The observable condition that makes this work worth starting. Read it
+        before writing code; if it hasn't fired in observed work, don't ship
+        blind — the trigger is the design evidence the implementation needs.
+      placeholder: "e.g. a platform deploy interrupts real agent work despite layers 1–2; OR a second daily-driver user appears."
+    validations:
+      required: true
+  - type: textarea
+    id: sketch
+    attributes:
+      label: Design sketch
+      description: >
+        Enough shape to start from when the trigger fires — spec section
+        reference, options considered, decisions explicitly left for
+        implementation time.
+    validations:
+      required: true
+  - type: input
+    id: spec
+    attributes:
+      label: Governing spec / artifact
+      placeholder: "docs/specs/<name>.md §N (artifact <id>)"
