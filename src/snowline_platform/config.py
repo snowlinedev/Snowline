@@ -60,6 +60,25 @@ class ConfigError(ValueError):
 _SURFACE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 
+def dashboard_dist() -> str | None:
+    """Where the dashboard's built static bundle lives (ui-shell.md §6).
+
+    `SNOWLINE_DASHBOARD_DIST` overrides; the default is the repo checkout's
+    `dashboard/dist` (the services run from the checkout via editable
+    installs). Returns None when the directory doesn't exist — the app then
+    simply doesn't serve `/ui` (dev environments and unit tests don't build
+    the frontend)."""
+    import pathlib
+
+    raw = os.environ.get("SNOWLINE_DASHBOARD_DIST")
+    path = (
+        pathlib.Path(raw)
+        if raw
+        else pathlib.Path(__file__).resolve().parents[2] / "dashboard" / "dist"
+    )
+    return str(path) if path.is_dir() else None
+
+
 def trusted_cidrs() -> list[str]:
     raw = os.environ.get("SNOWLINE_TRUSTED_CIDRS", DEFAULT_TRUSTED_CIDRS)
     return [c.strip() for c in raw.split(",") if c.strip()]

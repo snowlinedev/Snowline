@@ -17,7 +17,7 @@ from pathlib import Path
 import anyio
 from fastapi import FastAPI, Request
 
-from snowline_platform import config, plugins_routes, scopes_routes
+from snowline_platform import config, plugins_routes, scopes_routes, surfaces_routes
 from snowline_platform.gateway import UpstreamConnector
 from snowline_platform.gateway_app import (
     build_surface_mounts,
@@ -121,6 +121,7 @@ def create_app(
     )
     app.include_router(plugins_routes.router)
     app.include_router(scopes_routes.router)
+    app.include_router(surfaces_routes.router)
 
     # The gateway: aggregate registered plugins' MCP surfaces onto the platform's
     # named surfaces and mount each as a streamable-HTTP endpoint (e.g. /mcp,
@@ -138,6 +139,34 @@ def create_app(
     async def whoami(request: Request) -> dict:
         principal = request.state.principal
         return {"id": principal.id, "source": principal.source}
+
+    # The dashboard shell (ui-shell.md §6): the built static bundle served at
+    # /ui, with an SPA fallback so deep links (/ui/plugins, /ui/scopes, and
+    # later /ui/<plugin>/<route>) render index.html and the client router takes
+    # over. Served at /ui — NOT / — so shell routes can mirror API names
+    # without colliding with the JSON routes (/plugins vs /ui/plugins), and to
+    # pair with the phase-2 /ui-api data proxy. Skipped entirely (404s) when no
+    # built bundle exists (dev/test environments).
+    dist = config.dashboard_dist()
+    if dist is not None:
+        from fastapi.responses import FileResponse
+        from pathlib import Path as _Path
+
+        dist_dir = _Path(dist)
+
+        @app.get("/ui")
+        @app.get("/ui/{rest:path}")
+        async def ui(rest: str = "") -> FileResponse:
+            candidate = (dist_dir / rest).resolve()
+            # Traversal guard: only files inside the dist dir are servable;
+            # anything else (including client-side routes) gets the SPA shell.
+            if (
+                rest
+                and candidate.is_file()
+                and candidate.is_relative_to(dist_dir.resolve())
+            ):
+                return FileResponse(candidate)
+            return FileResponse(dist_dir / "index.html")
 
     return app
 

@@ -1,0 +1,241 @@
+/* Shell + kind-component styles. Everything sizes/spaces off the density
+ * tokens and colors off the theme tokens — no raw hex, no raw px for
+ * anything density-relevant (that is what makes compact uniform by
+ * construction, ui-shell.md §7). */
+
+.shell {
+  display: flex;
+  min-height: 100vh;
+}
+
+.shell-nav {
+  width: 200px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--hairline);
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.shell-nav .brand {
+  font-weight: 700;
+  font-size: var(--font-body);
+  margin-bottom: var(--space-4);
+}
+
+.shell-nav a {
+  display: flex;
+  align-items: center;
+  min-height: var(--control-h);
+  padding: 0 var(--space-3);
+  border-radius: 6px;
+  color: var(--ink-secondary);
+  text-decoration: none;
+}
+
+.shell-nav a:hover {
+  background: var(--surface-card);
+  color: var(--ink-primary);
+}
+
+.shell-nav a[aria-current="page"] {
+  background: var(--surface-card);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.shell-main {
+  flex: 1;
+  min-width: 0;
+  padding: var(--space-5);
+}
+
+.shell-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--space-5);
+  gap: var(--space-3);
+}
+
+.shell-header h1 {
+  font-size: calc(var(--font-body) + 4px);
+  margin: 0;
+}
+
+.toggles {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.toggles button {
+  min-height: var(--control-h);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  background: var(--surface-card);
+  color: var(--ink-secondary);
+  font-size: var(--font-small);
+  cursor: pointer;
+}
+
+.toggles button[aria-pressed="true"] {
+  color: var(--accent);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+
+.card {
+  background: var(--surface-card);
+  border: 1px solid var(--border-ring);
+  border-radius: 8px;
+  padding: var(--space-4);
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: var(--space-4);
+}
+
+.grid > .span-2 {
+  grid-column: span 2;
+}
+
+/* kind: stat */
+.stat .stat-value {
+  font-size: var(--font-stat);
+  font-weight: 700;
+  line-height: 1.1;
+}
+
+.stat .stat-label {
+  color: var(--ink-muted);
+  font-size: var(--font-small);
+  margin-top: var(--space-1);
+}
+
+/* kind: list */
+.kind-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.kind-list li {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--row-h);
+  border-bottom: 1px solid var(--hairline);
+}
+
+.kind-list li:last-child {
+  border-bottom: none;
+}
+
+.kind-list .meta {
+  margin-left: auto;
+  color: var(--ink-muted);
+  font-size: var(--font-small);
+}
+
+/* kind: table */
+.kind-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.kind-table th {
+  text-align: left;
+  color: var(--ink-muted);
+  font-size: var(--font-small);
+  font-weight: 600;
+  border-bottom: 1px solid var(--hairline);
+  padding: var(--space-2) var(--space-3);
+}
+
+.kind-table td {
+  border-bottom: 1px solid var(--hairline);
+  padding: 0 var(--space-3);
+  height: var(--row-h);
+  font-variant-numeric: tabular-nums;
+}
+
+.kind-table tr:last-child td {
+  border-bottom: none;
+}
+
+/* status chip: dot + text label, never color alone */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--ink-secondary);
+}
+
+.chip .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.chip.up .dot {
+  background: var(--status-up);
+}
+
+.chip.down .dot {
+  background: var(--status-down);
+}
+
+.chip.unknown .dot {
+  background: var(--status-unknown);
+}
+
+/* scope tree */
+.tree,
+.tree ul {
+  list-style: none;
+  padding-left: var(--space-5);
+  margin: 0;
+}
+
+.tree {
+  padding-left: 0;
+}
+
+.tree li > .node {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--row-h);
+}
+
+.tree .slug {
+  color: var(--ink-muted);
+  font-size: var(--font-small);
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.state-note {
+  color: var(--ink-muted);
+  padding: var(--space-4) 0;
+}
+
+.error-card {
+  border-color: var(--status-down);
+  color: var(--ink-secondary);
+}
