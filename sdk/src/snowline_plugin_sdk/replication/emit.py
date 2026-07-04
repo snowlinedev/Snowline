@@ -525,16 +525,40 @@ def requeue_rejected(session: Session, row_id: str) -> dict:
 
 async def replication_delivery_loop(
     session_scope: Callable[[], AbstractContextManager[Session]],
+    *,
+    enabled: bool = True,
 ) -> None:
     """Background loop draining the replication outbox on a timer
     (`SNOWLINE_REPLICATION_INTERVAL`, default 30s) — the plugin runs it in its
     app lifespan next to its other loops, passing its own `session_scope`.
     Mirrors governance's `webhook_delivery_loop`: one session + one client per
     tick, per-tick exceptions swallowed/logged so a transient outage can never
-    kill the loop. Disable with `SNOWLINE_REPLICATION_DISABLED`."""
+    kill the loop.
+
+    `enabled` is the SDK's first-class defer/gate seam (issue #91): the loop
+    used to fire its first tick immediately with no built-in way to keep a
+    freshly booted app quiet, so every adopter re-invented the same
+    app-level boolean purely to keep test-app boots from doing real DB/network
+    activity — the platform's `replicate` flag on `create_app` (mirroring its
+    pre-existing `poll_health` switch), memory's `replicate_on_startup`. Pass
+    `enabled=False` (typically by forwarding the adopter's own opt-in flag
+    straight through) and the coroutine returns immediately without touching
+    the session or the network — same convention as `poll_health`. Defaults to
+    `True` so a bare `tg.start_soon(replication_delivery_loop, session_scope)`
+    keeps ticking exactly as it always has; no existing caller's behavior
+    changes.
+
+    `SNOWLINE_REPLICATION_DISABLED` remains a supported, blunter, process-wide
+    version of the same gate (an operator killswitch, or a test suite that
+    pins the env var instead of threading a parameter — e.g. governance's
+    autouse fixture); either one disables the loop, so migrating to `enabled`
+    is opt-in, not required."""
     import anyio
     import httpx
 
+    if not enabled:
+        log.info("replication delivery disabled (enabled=False)")
+        return
     if os.environ.get("SNOWLINE_REPLICATION_DISABLED"):
         log.info("replication delivery disabled via SNOWLINE_REPLICATION_DISABLED")
         return

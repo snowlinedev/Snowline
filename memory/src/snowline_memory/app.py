@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import contextlib
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
 
 import anyio
@@ -64,7 +65,9 @@ def create_app(
     platform registration heartbeat (tests assert registration separately);
     `replicate_on_startup=False` skips the replication DELIVERY loop (tests
     without a store, or that drive delivery by hand, turn it off — the ingest +
-    admin ROUTES are always mounted; they touch the store only per request)."""
+    admin ROUTES are always mounted; they touch the store only per request),
+    forwarded straight through as the SDK loop's own `enabled` seam
+    (issue #91)."""
     # Drop ONLY the heartbeat's per-beat `POST …/plugins` INFO line from the
     # httpx logger (idempotent; rationale lives with the filter in the SDK).
     install_heartbeat_httpx_filter()
@@ -89,11 +92,19 @@ def create_app(
             # The replication DELIVERY loop (replication-continuity §3, #80)
             # drains memory's transactional outbox — `memory.set` /
             # `memory.forgotten` events — to paired peers on a timer, mirroring
-            # the registration heartbeat's best-effort task-group placement. It
-            # self-gates OFF via SNOWLINE_REPLICATION_DISABLED and no-ops with no
-            # subscriptions, so an unpaired instance just ticks quietly.
-            if getattr(app.state, "replicate_on_startup", True):
-                tg.start_soon(replication_delivery_loop, session_scope)
+            # the registration heartbeat's best-effort task-group placement.
+            # `replicate_on_startup` is forwarded straight through as the
+            # SDK loop's own `enabled` defer/gate seam (issue #91) rather than
+            # memory deciding locally whether to start the loop; it also still
+            # no-ops with no subscriptions, so an unpaired instance just ticks
+            # quietly.
+            tg.start_soon(
+                partial(
+                    replication_delivery_loop,
+                    session_scope,
+                    enabled=getattr(app.state, "replicate_on_startup", True),
+                )
+            )
             if getattr(app.state, "register_on_startup", True):
                 tg.start_soon(registration.registration_heartbeat)
             yield

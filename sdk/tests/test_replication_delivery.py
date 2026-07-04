@@ -8,8 +8,10 @@ dead-letter class).
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 
+import anyio
 import httpx
 import pytest
 from sqlalchemy import select
@@ -321,3 +323,90 @@ def test_requeue_rejected_resumes_the_wedged_stream(session):
     assert _deliver(session, healed, now=now) == 2
     posts = [r for r in healed.requests if r.method == "POST"]
     assert [json.loads(p.content)["seq"] for p in posts] == [1, 2]
+
+
+# --- the `enabled` defer/gate seam (issue #91) --------------------------------
+#
+# `replication_delivery_loop` used to fire its first tick immediately with no
+# built-in way to keep a freshly booted app quiet, so the platform, memory, and
+# governance each hand-rolled (or, for governance, leaned on the blunter
+# process-wide env var) their own app-level on/off switch. These tests pin the
+# seam itself: disabled does zero DB/network activity, the default stays
+# byte-for-byte the pre-#91 "tick immediately" behavior, and the pre-existing
+# `SNOWLINE_REPLICATION_DISABLED` escape hatch still works alongside it.
+
+
+def test_enabled_false_never_touches_session_scope_or_network():
+    """The seam's whole point: `enabled=False` must be a pure no-op — it must
+    return without ever calling `session_scope` (so a disabled loop on a test
+    boot can never open a session, let alone hit the network)."""
+
+    def session_scope():
+        raise AssertionError(
+            "session_scope must never be called while enabled=False"
+        )
+
+    async def main():
+        # If the loop failed to return early this would hang rather than
+        # fail cleanly, so bound it.
+        with anyio.fail_after(2):
+            await emit.replication_delivery_loop(session_scope, enabled=False)
+
+    anyio.run(main)
+
+
+def test_enabled_true_default_still_ticks_immediately(session, monkeypatch):
+    """The default (`enabled` omitted, matching every existing bare
+    `tg.start_soon(replication_delivery_loop, session_scope)` call) must keep
+    behaving exactly as it did before the seam existed: the first tick fires
+    immediately, not after waiting out the delivery interval."""
+    _setup(session)
+    emit.emit_event(session, "thing.recorded", {})
+    transport = PeerTransport(_ok)
+
+    class _TestClient(httpx.Client):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = transport
+            super().__init__(*args, **kwargs)
+
+    @contextmanager
+    def session_scope():
+        yield session
+
+    async def main():
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(emit.replication_delivery_loop, session_scope)
+            # A huge interval: if the first tick waited for it instead of
+            # firing immediately, this test would time out below rather than
+            # false-pass.
+            with anyio.fail_after(2):
+                while not any(r.method == "POST" for r in transport.requests):
+                    await anyio.sleep(0.01)
+            tg.cancel_scope.cancel()
+
+    monkeypatch.setattr(httpx, "Client", _TestClient)
+    monkeypatch.setenv("SNOWLINE_REPLICATION_INTERVAL", "999")
+    anyio.run(main)
+
+    assert _rows(session)[0].status == "delivered"
+
+
+def test_replication_disabled_env_var_still_works_alongside_enabled(
+    session, monkeypatch
+):
+    """The pre-#91 escape hatch (`SNOWLINE_REPLICATION_DISABLED`, still used by
+    e.g. governance's autouse test fixture) keeps disabling the loop even when
+    the caller leaves the new `enabled` parameter at its default `True` — the
+    two gates are additive (either one disables), not a replacement."""
+    monkeypatch.setenv("SNOWLINE_REPLICATION_DISABLED", "1")
+
+    def session_scope():
+        raise AssertionError(
+            "session_scope must never be called while the env var is set"
+        )
+
+    async def main():
+        with anyio.fail_after(2):
+            await emit.replication_delivery_loop(session_scope)
+
+    anyio.run(main)
