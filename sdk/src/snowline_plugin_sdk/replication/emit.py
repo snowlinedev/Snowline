@@ -46,7 +46,7 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from snowline_plugin_sdk.replication import ingest as _ingest
@@ -536,8 +536,14 @@ def _guard_active_subscription(
     """Issue #108's guard: refuse a requeue targeting a retired subscription.
     Rotation is retain-not-refuse (the retired row and its delivery log stay,
     ee5794e), so the successor — when unambiguous — is discoverable and named
-    in the refusal; the operator's fix is to requeue against the successor
-    (or re-pair) instead of onto a stream nothing serves."""
+    in the refusal AS CONTEXT: the rows belong to the retired stream forever
+    (there is no retarget API), so the real remedy is re-pair + re-seed (§7
+    step 5), which carries the domain state forward under a fresh epoch.
+
+    CALLERS MUST LOAD `sub` WITH `with_for_update=True`: under READ COMMITTED
+    a concurrent retire committing between a plain read and the row flip
+    would recreate the exact limbo this guard exists to kill — the FOR UPDATE
+    lock serializes the guard read against retire's `active=False` write."""
     if sub.active:
         return
     successor = _find_active_successor(session, sub)
@@ -548,19 +554,19 @@ def _guard_active_subscription(
         "epoch": sub.epoch,
         "retired_at": sub.retired_at.isoformat() if sub.retired_at else None,
     }
+    message = (
+        f"outbound subscription {sub.id} ({sub.source_id}/{sub.epoch}) is "
+        "retired; its rejected rows cannot be requeued — no delivery loop "
+        "serves a retired stream. Re-pair (and re-seed if the peer diverged, "
+        "spec §7 step 5) to carry this state forward under a fresh epoch"
+    )
     if successor is not None:
         detail["successor_subscription_id"] = str(successor.id)
         detail["successor_epoch"] = successor.epoch
-        message = (
-            f"outbound subscription {sub.id} ({sub.source_id}/{sub.epoch}) is "
-            f"retired; requeue against its successor {successor.id} "
-            f"({successor.source_id}/{successor.epoch}) instead"
-        )
-    else:
-        message = (
-            f"outbound subscription {sub.id} ({sub.source_id}/{sub.epoch}) is "
-            "retired and no single active successor exists for this peer — "
-            "re-pair before requeueing"
+        message += (
+            f" (an active successor {successor.id} "
+            f"({successor.source_id}/{successor.epoch}) already exists for "
+            "this peer)"
         )
     raise RequeueRefusedError(message, detail=detail)
 
@@ -613,7 +619,13 @@ def requeue_rejected(session: Session, row_id: str) -> dict:
         raise ValueError(
             f"outbox row {row_id!r} is {row.status!r}, not 'rejected'"
         )
-    sub = session.get(ReplicationSubscription, row.subscription_id)
+    # FOR UPDATE (no-op on SQLite, real on Postgres): serialize the guard read
+    # against a concurrent retire — a plain read could pass the guard, the
+    # retire commit, and the flip land on a now-retired stream (the #108 limbo
+    # recreated through the guarded path).
+    sub = session.get(
+        ReplicationSubscription, row.subscription_id, with_for_update=True
+    )
     if sub is None:
         raise ValueError(
             f"outbox row {row_id!r} has no subscription {row.subscription_id!r}"
@@ -648,34 +660,66 @@ def requeue_rejected_bulk(
     was considered and rejected: a bulk call that silently requeues 0 of N
     rows onto a retired target reads as "nothing needed action" instead of
     "your target moved," which is exactly the silent-limbo failure mode this
-    guard exists to kill. Refuse loudly, once, for the whole set."""
-    sub = session.get(ReplicationSubscription, _as_uuid(subscription_id))
+    guard exists to kill. Refuse loudly, once, for the whole set.
+
+    `reason` is validated against the CLOSED `REJECTION_REASONS` vocabulary
+    (only those three values can ever appear on a rejected row) — a typo'd
+    reason answering `{"requeued": 0}` would read as "already handled", the
+    same silent failure shape in a different coat. `event_type` is
+    deliberately NOT validated: it's open vocabulary per adopter, so a
+    zero-match filter there is a legitimate answer, not a typo verdict."""
+    if reason is not None and reason not in REJECTION_REASONS:
+        raise ValueError(
+            f"unknown rejection reason {reason!r}; expected one of "
+            f"{sorted(REJECTION_REASONS)}"
+        )
+    # FOR UPDATE for the same race as requeue_rejected: the guard read must
+    # serialize against a concurrent retire's `active=False` write.
+    sub = session.get(
+        ReplicationSubscription, _as_uuid(subscription_id), with_for_update=True
+    )
     if sub is None:
         raise ValueError(
             f"no replication subscription with id {subscription_id!r}"
         )
     _guard_active_subscription(session, sub)
 
-    stmt = select(ReplicationOutboxRow).where(
+    where = [
         ReplicationOutboxRow.subscription_id == sub.id,
         ReplicationOutboxRow.status == "rejected",
-    )
+    ]
     if event_type is not None:
-        stmt = stmt.where(ReplicationOutboxRow.event_type == event_type)
-    rows = session.scalars(stmt).all()
-    if reason is not None:
-        rows = [r for r in rows if _rejection_reason(r.last_error) == reason]
+        where.append(ReplicationOutboxRow.event_type == event_type)
+    values = {"status": "pending", "attempts": 0, "next_attempt_at": None}
 
-    for row in rows:
-        row.status = "pending"
-        row.attempts = 0
-        row.next_attempt_at = None
+    if reason is None:
+        # One set-based UPDATE — no ORM materialization (payloads can be
+        # large; even list_rejected leaves them out) and no per-row UPDATEs.
+        requeued = session.execute(
+            update(ReplicationOutboxRow).where(*where).values(**values)
+        ).rowcount
+    else:
+        # The reason filter needs Python (parsed out of last_error), but only
+        # (id, last_error) is fetched — never the payload — and the flip is
+        # still one UPDATE over the matched id set.
+        pairs = session.execute(
+            select(ReplicationOutboxRow.id, ReplicationOutboxRow.last_error)
+            .where(*where)
+        ).all()
+        ids = [rid for rid, err in pairs if _rejection_reason(err) == reason]
+        if ids:
+            session.execute(
+                update(ReplicationOutboxRow)
+                .where(ReplicationOutboxRow.id.in_(ids))
+                .values(**values)
+            )
+        requeued = len(ids)
     session.flush()
     return {
         "subscription_id": str(sub.id),
         "source_id": sub.source_id,
         "epoch": sub.epoch,
-        "requeued": len(rows),
+        "requeued": requeued,
     }
 
 

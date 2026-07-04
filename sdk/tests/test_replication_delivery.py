@@ -599,3 +599,123 @@ def test_requeue_rejected_bulk_refuses_whole_call_on_retired_subscription(sessio
 def test_requeue_rejected_bulk_unknown_subscription(session):
     with pytest.raises(ValueError, match="no replication subscription"):
         emit.requeue_rejected_bulk(session, "00000000-0000-0000-0000-000000000000")
+
+
+def test_requeue_rejected_bulk_rerun_is_idempotent(session):
+    """A second bulk call over an already-requeued set is a clean
+    `requeued: 0` — nothing left in `rejected` matches, nothing double-flips,
+    no error (rerunning a recovery script is safe)."""
+    _setup(session)
+    emit.emit_event(session, "thing.recorded", {"n": 1})
+    assert _deliver(session, PeerTransport(_reject_with("malformed_envelope"))) == 0
+
+    sub_id = emit.list_rejected(session)[0]["subscription_id"]
+    assert emit.requeue_rejected_bulk(session, sub_id)["requeued"] == 1
+    assert emit.requeue_rejected_bulk(session, sub_id)["requeued"] == 0
+    assert [r.status for r in _rows(session)] == ["pending"]
+
+
+def test_requeue_rejected_bulk_combined_event_type_and_reason_filters(session):
+    """Both filters in ONE call intersect: only the row matching the
+    event_type AND the reason requeues; every other combination stays."""
+    emit.create_outbound_subscription(
+        session,
+        "http://peer.example/events/ingest",
+        "s2",
+        ["thing.recorded", "other.thing"],
+        epoch="e2",
+    )
+
+    reasons = {1: "malformed_envelope", 2: "bad_signature", 3: "malformed_envelope"}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(405)
+        seq = json.loads(request.content)["seq"]
+        return httpx.Response(
+            400, json={"status": "rejected", "reason": reasons[seq]}
+        )
+
+    emit.emit_event(session, "thing.recorded", {"n": 1})  # seq1: malformed
+    emit.emit_event(session, "thing.recorded", {"n": 2})  # seq2: bad_signature
+    emit.emit_event(session, "other.thing", {"n": 3})  # seq3: malformed
+
+    transport = PeerTransport(respond)
+    for _ in range(3):
+        _deliver(session, transport)
+    assert [r.status for r in _rows(session)] == ["rejected"] * 3
+
+    sub_id = emit.list_rejected(session)[0]["subscription_id"]
+    result = emit.requeue_rejected_bulk(
+        session, sub_id, event_type="thing.recorded", reason="malformed_envelope"
+    )
+    assert result["requeued"] == 1  # only seq 1 matches both
+    remaining = emit.list_rejected(session)
+    assert [(r["seq"], r["event_type"], r["reason"]) for r in remaining] == [
+        (2, "thing.recorded", "bad_signature"),
+        (3, "other.thing", "malformed_envelope"),
+    ]
+
+
+def test_requeue_rejected_bulk_rejects_a_typo_reason_loudly(session):
+    """`reason` is a CLOSED vocabulary (only REJECTION_REASONS values can
+    appear on a rejected row), so a typo'd filter raises instead of answering
+    a silent `requeued: 0` that reads as 'already handled'."""
+    sub = _setup(session)
+    with pytest.raises(ValueError, match="unknown rejection reason"):
+        emit.requeue_rejected_bulk(session, sub["id"], reason="bad_signatur")
+
+
+def test_requeue_ambiguous_successor_is_not_named(session):
+    """TWO active subscriptions to the same peer target: the refusal still
+    fires but names NO successor — pointing at either would be a guess, and
+    a wrong pointer is worse than none."""
+    sub = _setup(session)
+    emit.emit_event(session, "thing.recorded", {"n": 1})
+    assert _deliver(session, PeerTransport(_reject_with("bad_signature", 401))) == 0
+
+    row_id = emit.list_rejected(session)[0]["id"]
+    emit.retire_outbound_subscription(session, sub["id"])
+    for epoch in ("e2", "e3"):
+        emit.create_outbound_subscription(
+            session, sub["target_url"], f"s-{epoch}", ["thing.recorded"], epoch=epoch
+        )
+
+    with pytest.raises(emit.RequeueRefusedError) as exc_info:
+        emit.requeue_rejected(session, row_id)
+    detail = exc_info.value.detail
+    assert detail["reason"] == "subscription_retired"
+    assert "successor_subscription_id" not in detail
+    assert "successor_epoch" not in detail
+
+
+def test_requeue_guard_loads_the_subscription_with_for_update(session, monkeypatch):
+    """Pins the guard's QUERY SHAPE: both requeue paths must load the
+    subscription `with_for_update=True` so the retired check serializes
+    against a concurrent retire under Postgres READ COMMITTED (a plain read
+    could pass the guard, the retire commit, and the flip land on a
+    now-retired stream — the #108 limbo through the guarded path). SQLite
+    ignores FOR UPDATE, so the race itself can't run here; the lock flag on
+    the load is the testable contract."""
+    from sqlalchemy.orm import Session as _Session
+
+    from snowline_plugin_sdk.replication.models import ReplicationSubscription
+
+    _setup(session)
+    emit.emit_event(session, "thing.recorded", {"n": 1})
+    assert _deliver(session, PeerTransport(_reject_with("bad_signature", 401))) == 0
+    rejected = emit.list_rejected(session)
+    row_id, sub_id = rejected[0]["id"], rejected[0]["subscription_id"]
+
+    lock_flags = []
+    orig_get = _Session.get
+
+    def spying_get(self, entity, ident, **kw):
+        if entity is ReplicationSubscription:
+            lock_flags.append(kw.get("with_for_update"))
+        return orig_get(self, entity, ident, **kw)
+
+    monkeypatch.setattr(_Session, "get", spying_get)
+    emit.requeue_rejected(session, row_id)
+    emit.requeue_rejected_bulk(session, sub_id)  # requeued: 0 — flags still load
+    assert lock_flags == [True, True]

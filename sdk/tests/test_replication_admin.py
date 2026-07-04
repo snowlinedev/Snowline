@@ -353,6 +353,16 @@ def test_requeue_rejected_bulk_over_http(make_instance):
     )
     assert missing.status_code == 404
 
+    # A typo'd reason answers 400 naming the closed vocabulary — never a
+    # silent `{"requeued": 0}` that reads as "already handled".
+    typo = _request(
+        app, "POST", "/replication-admin/rejected/requeue-bulk",
+        json={"subscription_id": sub["id"], "reason": "bad_signatur"},
+    )
+    assert typo.status_code == 400
+    assert "unknown rejection reason" in typo.json()["detail"]
+    assert "bad_signature" in typo.json()["detail"]
+
 
 def test_requeue_refuses_retired_subscription_over_http(make_instance):
     """Issue #108 over HTTP: both the per-row and the bulk requeue routes
