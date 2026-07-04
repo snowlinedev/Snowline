@@ -179,6 +179,38 @@ each opted-in plugin covers its write surface with events:
   trust gate applies unchanged. No new auth surface — the HMAC secret
   authenticates the *stream*, the tailnet authenticates the *network*.
 
+### 5.1 Bind posture — loopback first, tailnet via tailscaled
+
+Both instances serve their composed surfaces on **loopback**, with tailnet
+exposure delegated to tailscaled. Rationale:
+
+- **The spoke must survive tailscaled being down** — that is half its job.
+  Binding only the tailscale `100.x` address makes the local agent's access
+  contingent on the very daemon whose absence defines "offline"; the address
+  may not even be bindable then. Loopback is the one interface guaranteed
+  present. The same posture on the hub keeps mini-local sessions alive
+  through a tailnet outage (the vacation scenario, again).
+- **Trusting loopback widens nothing.** A local process hitting the
+  machine's own tailnet IP already arrives from inside `100.64.0.0/10` and
+  is trusted as `owner` today; adding `127.0.0.0/8` + `::1` to
+  `SNOWLINE_TRUSTED_CIDRS` makes that existing equivalence explicit and
+  tailscaled-independent. Possession of the machine implies possession of
+  its tailnet identity (the node key lives on it).
+- **Never bind `0.0.0.0` on the roaming spoke.** The CIDR gate fails closed,
+  but a wildcard bind parks a pre-auth listener on every hotel LAN the
+  laptop joins. Loopback-only binds keep the untrusted-network surface at
+  zero; the tailnet path is tailscaled's (`tailscale serve` TCP-forwarding
+  to loopback, or a tiny front proxy — decide at implementation).
+- **Layer-3 synergy.** "App on localhost, a flipper in front owning the
+  tailnet address" is exactly the shape deploy-continuity.md §4 sketched
+  for platform socket continuity — this posture is a step toward that
+  deferred layer, not a divergence from it.
+
+Degradation is then strictly ordered: the local path (agent → loopback)
+cannot be taken down by the tailnet path; losing tailscaled costs only
+cross-instance delivery and cross-tailnet plugins, and the outbox absorbs
+that (§3).
+
 ## 6. Conflict policy — small by construction, loud by rule
 
 With one authority, one human, and append-mostly domains, conflicts reduce to
@@ -250,6 +282,9 @@ next delivery pass rather than dropping data.
 - With the tailnet down, the spoke's gateway serves every opted-in plugin's
   reads from local data; a non-opted-in plugin's absence costs only its own
   tools.
+- With **tailscaled stopped entirely** on either instance, that machine's
+  agent still reaches its full local surface over loopback (§5.1); the
+  trust gate accepts the loopback peer as `owner`.
 - A write authored on the spoke while partitioned appears on the primary
   within one delivery interval of reconnect; re-delivery is a no-op
   (watermark verified); nothing dead-letters from unreachability alone.
