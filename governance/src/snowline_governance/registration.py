@@ -37,7 +37,20 @@ PLUGIN_NAME = "governance"
 
 def build_manifest(base_url: str | None = None) -> dict:
     """The manifest governance hands the platform. `base_url` defaults to
-    `config.base_url()` (where this plugin advertises itself)."""
+    `config.base_url()` (where this plugin advertises itself).
+
+    `ui` (ui-shell.md §3, issue #55): governance is the FIRST plugin with a
+    registered UI contribution — the shadow-discussions views, read-only (§8
+    step 3), over the `/ui-api` routes in `ui_api.py`. One `stat` widget (open
+    shadow branches, home grid) and two pages: `shadow-branches` (`table`,
+    every branch across scopes) and `shadow-branch` (`thread`, one branch's
+    narrative notes + nodes, reached by the table's row links — `nav: False`
+    since it's not a nav destination on its own). The `shadow-branch` page's
+    route/data both key on the branch's stable `id` (see `ui_api.py`'s
+    module docstring for why: branch names are only unique WITHIN a scope, so
+    a `<scope>:<name>` route would need a two-segment or percent-encoded
+    param; `id` round-trips in one).
+    """
     return {
         "name": PLUGIN_NAME,
         "base_url": (base_url or config.base_url()),
@@ -49,6 +62,36 @@ def build_manifest(base_url: str | None = None) -> dict:
         # read-real grounding, NO real-write) composes onto `shadow` — the
         # isolation mirrors the MCP isolation (decision 8a7f0a11).
         "surfaces": {"/mcp": "main", "/shadow/mcp": "shadow"},
+        "ui": {
+            "contract_version": 1,
+            "widgets": [
+                {
+                    "id": "shadow-activity",
+                    "slot": "home",
+                    "kind": "stat",
+                    "title": "Open shadow branches",
+                    "data": "/ui-api/widgets/shadow-activity",
+                    "refresh_seconds": 30,
+                },
+            ],
+            "pages": [
+                {
+                    "id": "shadow-branches",
+                    "route": "/shadow",
+                    "title": "Shadow discussions",
+                    "nav": True,
+                    "kind": "table",
+                    "data": "/ui-api/pages/branches",
+                },
+                {
+                    "id": "shadow-branch",
+                    "route": "/shadow/{branch_id}",
+                    "nav": False,
+                    "kind": "thread",
+                    "data": "/ui-api/pages/branches/{branch_id}",
+                },
+            ],
+        },
     }
 
 
