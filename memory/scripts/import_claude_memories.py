@@ -156,16 +156,19 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
 def _record_from_file(path: Path) -> dict | None:
     """Parse + VALIDATE one memory file into a `remember` kwargs dict, or None if
     it has no usable content. The resolved name (frontmatter `name`, else the
-    file stem) is validated against the kebab grammar and `kind` is normalized
-    HERE — the parse phase — so `--dry-run` fails exactly where a live run would.
-    Raises `ValueError` (e.g. `InvalidNameError`) for a file that would fail
-    live."""
+    file stem) is auto-kebab-normalized and `kind` is normalized HERE — the
+    parse phase — mirroring exactly what `remember` itself does, so `--dry-run`
+    predicts live outcomes (an underscore/space-y frontmatter `name` normalizes
+    here the same way it would on a live `remember` call). Raises `ValueError`
+    (e.g. `InvalidNameError`) only for a file that would still fail live — i.e.
+    a name that normalizes to empty."""
     text = path.read_text(encoding="utf-8")
     fields, body = parse_frontmatter(text)
     content = body or text.strip()
     if not content:
         return None
-    name = memory_verbs.validate_name(fields.get("name") or path.stem)
+    raw_name = fields.get("name") or path.stem
+    name = memory_verbs.normalize_name_or_raise(raw_name)
     return {
         "name": name,
         "description": fields.get("description") or None,
@@ -209,6 +212,30 @@ def import_dir(
             report["skipped"].append(path.name)
             continue
         parsed.append((path.name, rec))
+
+    # Intra-batch collision guard: two files whose names normalize to the same
+    # key (`My_Note.md` + `my-note.md`) would otherwise silently last-write-win
+    # through the live upsert, and dry-run would blindly predict two creates.
+    # The first file (sorted order) keeps the name; later colliders fail loudly
+    # naming the winner. Detected at parse time so dry-run predicts exactly
+    # what the live run does.
+    first_by_name: dict[str, str] = {}
+    deduped: list[tuple[str, dict]] = []
+    for fname, rec in parsed:
+        winner = first_by_name.setdefault(rec["name"], fname)
+        if winner != fname:
+            report["failed"].append(
+                {
+                    "file": fname,
+                    "error": (
+                        f"name {rec['name']!r} collides with {winner!r} "
+                        "after normalization"
+                    ),
+                }
+            )
+            continue
+        deduped.append((fname, rec))
+    parsed = deduped
 
     if dry_run:
         # Report what WOULD happen without touching the store — including the

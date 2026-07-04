@@ -75,9 +75,13 @@ def build_main_surface() -> FastMCP:
         session would otherwise have to rediscover.
 
         UPSERTS by `name` (kebab-case): writing the SAME name UPDATES that memory
-        in place — use this to refine a note rather than piling up duplicates.
-        Omit `name` to auto-generate one from the description/content. `kind` is
-        one of user/feedback/project/reference/gotcha (default `project`). `scope`
+        in place — use this to refine a note rather than piling up duplicates. A
+        provided `name` is AUTO-NORMALIZED to kebab-case — lowercased, with
+        underscores/spaces/other punctuation collapsed to hyphens — so
+        `my_note` or `My Note Title` both save instead of erroring; it only
+        raises if that leaves nothing (an all-punctuation name). Omit `name` to
+        auto-generate one from the description/content. `kind` is one of
+        user/feedback/project/reference/gotcha (default `project`). `scope`
         is an optional Snowline slug (`org` or `org/repo`) tagging the note to a
         scope; omit it for portfolio-wide. If it has hardened into policy, prefer
         `record_decision` on the governance surface instead.
@@ -150,9 +154,11 @@ def build_main_surface() -> FastMCP:
 
     @mcp.tool()
     async def forget(name: str) -> dict:
-        """Delete one memory by `name`. Use for stale or wrong notes. Idempotent —
-        forgetting a name that doesn't exist reports `forgotten: false` rather
-        than erroring.
+        """Delete one memory by `name`. `name` is normalized the same way
+        `remember` normalizes it (auto-kebab-cased), so forgetting `my_note`
+        removes the memory saved (and stored) as `my-note`. Use for stale or
+        wrong notes. Idempotent — forgetting a name that doesn't exist reports
+        `forgotten: false` rather than erroring.
         """
         return await anyio.to_thread.run_sync(_forget_sync, name)
 

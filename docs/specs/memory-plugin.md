@@ -68,7 +68,14 @@ One table, `memories`:
 - `id` — uuid PK.
 - `name` — text, **UNIQUE NOT NULL**, kebab-case (`^[a-z0-9]+(-[a-z0-9]+)*$`).
   The stable upsert key. Generated from the description/content head when a
-  caller omits it.
+  caller omits it. A caller-**provided** name is **auto-normalized** to this
+  form rather than rejected — lowercased, with underscores/spaces/other
+  invalid-character runs collapsed to a single hyphen and clamped to the max
+  length of 80 chars (`my_note` / `My Note Title` both save on the first
+  attempt). A whitespace-only name counts as omitted. Only an
+  all-punctuation name that normalizes to `""` raises. `forget` normalizes its
+  `name` argument the same way, so a name saved as `my_note` (stored as
+  `my-note`) can still be forgotten by either spelling.
 - `description` — text NOT NULL. The **one-line hook** shown in the digest
   (`name — description`). Derived from the content's first line when omitted.
 - `content` — text NOT NULL. The markdown body — the actual working note.
@@ -100,9 +107,12 @@ All verbs run their blocking DB work in a thread (the monolith's
 `anyio.to_thread.run_sync` pattern) so the async transport isn't blocked.
 
 - **`remember(content, name?, description?, kind?, scope?)`** — the write.
-  **Upsert by `name`**: writing the same name updates the row in place (bumping
-  `updated_at`); a new name inserts. When `name` is omitted it's generated (kebab)
-  from the description, else the content head. When `description` is omitted it's
+  **Upsert by `name`**: writing the same (normalized) name updates the row in
+  place (bumping `updated_at`); a new name inserts. When `name` is provided it's
+  **auto-normalized** to kebab-case (lowercased, invalid-character runs → single
+  hyphens, clamped) rather than rejected — it only raises if normalization
+  leaves nothing. When `name` is omitted it's generated (kebab) from the
+  description, else the content head. When `description` is omitted it's
   derived from the content's first line. `kind` defaults to `project` and is
   lowercased at the boundary; `scope` is
   an optional slug (validated, stored verbatim). Save durable working context —
@@ -144,7 +154,11 @@ indicator is never stored. It **upserts** via the same `remember` semantics
 (idempotent — re-running updates in place, never duplicates). Records are
 **validated at parse time** (name/scope grammar, kind normalization — the same
 checks `remember` applies), so `--dry-run` predicts live outcomes and previews
-each file's parsed name/kind/description. Live application is **per-file
+each file's parsed name/kind/description. Two files whose names normalize to
+the **same key** (`My_Note.md` + `my-note.md`) would silently last-write-win
+through the upsert, so the batch is deduped at parse time: the first file (in
+sorted order) keeps the name and later colliders are reported `failed` naming
+the winner — in dry-run and live identically. Live application is **per-file
 isolated** (a savepoint per record): one bad file is reported `failed` with its
 reason and the rest still import; the per-file report always prints and the exit
 code is nonzero when any file failed. ~40 memories migrate on day one. The

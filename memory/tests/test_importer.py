@@ -113,13 +113,14 @@ def test_dry_run_validates_names_and_previews(tmp_path):
         "---\nname: good-note\ndescription: a hook\nmetadata:\n  type: gotcha\n"
         "---\nbody text\n"
     )
-    # No frontmatter name → falls back to the DOTTED stem, which fails the
-    # kebab grammar exactly as a live `remember` would.
-    (tmp_path / "bad.dotted.stem.md").write_text("some content\n")
+    # No frontmatter name → falls back to the file stem, auto-normalized to
+    # kebab-case (issue #48) the same way a live `remember` would; an
+    # all-punctuation stem normalizes to "" and still fails.
+    (tmp_path / "!!!.md").write_text("some content\n")
 
     report = importer.import_dir(tmp_path, dry_run=True)
     assert report["created"] == ["good-note"]
-    assert [f["file"] for f in report["failed"]] == ["bad.dotted.stem.md"]
+    assert [f["file"] for f in report["failed"]] == ["!!!.md"]
     assert "invalid memory name" in report["failed"][0]["error"]
     assert report["preview"] == [
         {
@@ -129,6 +130,45 @@ def test_dry_run_validates_names_and_previews(tmp_path):
             "description": "a hook",
         }
     ]
+
+
+def test_dry_run_fails_intra_batch_name_collisions(tmp_path):
+    # Two files normalizing to the same key: the first (sorted order) wins,
+    # the later collider fails loudly instead of silently overwriting through
+    # the live upsert.
+    (tmp_path / "My_Note.md").write_text("uppercase underscore content\n")
+    (tmp_path / "my-note.md").write_text("kebab content\n")
+
+    report = importer.import_dir(tmp_path, dry_run=True)
+    assert report["created"] == ["my-note"]  # from My_Note.md (sorts first)
+    (failure,) = report["failed"]
+    assert failure["file"] == "my-note.md"
+    assert "collides with 'My_Note.md'" in failure["error"]
+
+
+def test_live_import_fails_collisions_same_as_dry_run(clean_db, tmp_path):
+    from snowline_memory import memory
+    from snowline_memory.db import session_scope
+
+    (tmp_path / "My_Note.md").write_text("uppercase underscore content\n")
+    (tmp_path / "my-note.md").write_text("kebab content\n")
+
+    report = importer.import_dir(tmp_path)
+    assert report["created"] == ["my-note"]
+    assert [f["file"] for f in report["failed"]] == ["my-note.md"]
+    with session_scope() as s:
+        row = memory.recall(s, query="content")["memories"][0]
+        # The winner's content survives — no silent last-write-wins overwrite.
+        assert row["content"] == "uppercase underscore content"
+
+
+def test_dotted_stem_imports_normalized(tmp_path):
+    # A dotted filename stem is a valid name post-normalization (issue #48),
+    # where the pre-normalization importer hard-rejected it.
+    (tmp_path / "notes.v2.md").write_text("dotted stem content\n")
+    report = importer.import_dir(tmp_path, dry_run=True)
+    assert report["created"] == ["notes-v2"]
+    assert report["failed"] == []
 
 
 def test_dry_run_preview_derives_missing_description(tmp_path):
@@ -147,14 +187,14 @@ def test_dry_run_validates_scope():
 
 def test_main_exits_nonzero_and_always_prints_report(tmp_path, capsys):
     (tmp_path / "good-note.md").write_text("good content\n")
-    (tmp_path / "bad.dotted.stem.md").write_text("content\n")
+    (tmp_path / "!!!.md").write_text("content\n")
 
     rc = importer.main([str(tmp_path), "--dry-run"])
     out = capsys.readouterr().out
     assert rc == 1  # any failed file → nonzero exit
     assert "would import: good-note.md -> good-note" in out
     assert "description: good content" in out
-    assert "FAILED: bad.dotted.stem.md" in out
+    assert "FAILED: !!!.md" in out
     assert "1 failed" in out
 
 
@@ -234,17 +274,18 @@ def test_import_dir_isolates_per_record_failures(clean_db, tmp_path, monkeypatch
 
 
 def test_import_dir_live_parse_failure_doesnt_abort_batch(clean_db, tmp_path):
-    """A file that fails PARSE-phase validation (dotted stem → invalid name) is
-    reported `failed`; the rest of the batch still imports live."""
+    """A file that fails PARSE-phase validation (all-punctuation stem → empty
+    after kebab-normalization) is reported `failed`; the rest of the batch still
+    imports live."""
     from snowline_memory import memory
     from snowline_memory.db import session_scope
 
     (tmp_path / "good-note.md").write_text("good content\n")
-    (tmp_path / "bad.dotted.stem.md").write_text("content\n")
+    (tmp_path / "!!!.md").write_text("content\n")
 
     report = importer.import_dir(tmp_path)
     assert report["created"] == ["good-note"]
-    assert [f["file"] for f in report["failed"]] == ["bad.dotted.stem.md"]
+    assert [f["file"] for f in report["failed"]] == ["!!!.md"]
     with session_scope() as s:
         assert memory.list_memories(s)["items_total"] == 1
 
