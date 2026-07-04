@@ -37,6 +37,15 @@ DEFAULT_PLATFORM_URL = "http://127.0.0.1:8848"
 # A distinct port from governance's (8801) so both can run on one host.
 DEFAULT_BASE_URL = "http://127.0.0.1:8802"
 
+# The LWW tiebreak identity for local writes (replication-continuity §6, #80).
+# When replication is paired, `SNOWLINE_REPLICATION_SOURCE_ID` is the
+# instance-qualified `<instance>.memory` (e.g. `roam.memory`) and the SDK emit
+# path is fail-loud without it; the memory WRITE MODEL, however, must work on an
+# UNPAIRED single instance too, where the tiebreak only ever compares against
+# other local writes — so here (unlike the SDK's `source_id_from_env`) an unset
+# id falls back to this stable default rather than raising.
+DEFAULT_SOURCE_ID = "local.memory"
+
 
 def database_url() -> str:
     return os.environ.get("SNOWLINE_MEMORY_DATABASE_URL", DEFAULT_DATABASE_URL)
@@ -48,3 +57,11 @@ def platform_url() -> str:
 
 def base_url() -> str:
     return os.environ.get("SNOWLINE_MEMORY_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+
+
+def source_id() -> str:
+    """This instance's LWW tiebreak identity for locally-authored writes (#80),
+    read live from `SNOWLINE_REPLICATION_SOURCE_ID` (the same var the SDK emit
+    path stamps onto streams at pairing), falling back to `DEFAULT_SOURCE_ID` on
+    an unpaired instance."""
+    return os.environ.get("SNOWLINE_REPLICATION_SOURCE_ID") or DEFAULT_SOURCE_ID

@@ -183,3 +183,53 @@ def test_ui_block_unknown_kind_and_future_contract_version_register_ok():
     r = client.post("/plugins", json=ok)
     assert r.status_code == 201, r.text
     assert r.json()["manifest"]["ui"]["contract_version"] == 999
+
+
+# --- the manifest `replication` block (replication-continuity.md §4) --------
+#
+# Model-level validation edge cases live in test_replication_manifest.py;
+# these prove the SAME rules apply at the HTTP boundary (POST /plugins ->
+# 422), the surface a plugin's registration heartbeat actually hits.
+
+_REPLICATION_MANIFEST = _MANIFEST | {
+    "replication": {
+        "contract_version": 2,
+        "ingest_path": "/events/ingest",
+        "events": ["decision.recorded", "decision.superseded"],
+    }
+}
+
+
+def test_valid_replication_block_registers_via_post():
+    client = _trusted_client()
+    r = client.post("/plugins", json=_REPLICATION_MANIFEST)
+    assert r.status_code == 201, r.text
+    replication = r.json()["manifest"]["replication"]
+    assert replication["contract_version"] == 2
+    assert replication["ingest_path"] == "/events/ingest"
+    assert replication["events"] == ["decision.recorded", "decision.superseded"]
+
+
+def test_absent_replication_block_registers_via_post():
+    client = _trusted_client()
+    r = client.post("/plugins", json=_MANIFEST)
+    assert r.status_code == 201, r.text
+    assert r.json()["manifest"]["replication"] is None
+
+
+def test_replication_block_missing_ingest_path_is_422():
+    client = _trusted_client()
+    bad = _MANIFEST | {"replication": {"contract_version": 2}}
+    assert client.post("/plugins", json=bad).status_code == 422
+
+
+def test_replication_block_unknown_top_level_field_is_422():
+    client = _trusted_client()
+    bad = _MANIFEST | {
+        "replication": {
+            "contract_version": 2,
+            "ingest_path": "/events/ingest",
+            "unexpected_field": True,
+        }
+    }
+    assert client.post("/plugins", json=bad).status_code == 422

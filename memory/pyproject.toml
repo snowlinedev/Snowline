@@ -12,9 +12,11 @@ dependencies = [
     # The MCP surface (FastMCP, streamable HTTP) — mirrors governance.
     "mcp>=1.2",
     # Registers with the platform over HTTP via the shared registration
-    # heartbeat (issue #50); the `[client]` extra pulls httpx + anyio. Memory has
-    # no OTHER httpx use, so it needs no direct httpx dependency of its own.
-    "snowline-plugin-sdk[client]",
+    # heartbeat (issue #50); the `[client]` extra pulls httpx + anyio. The
+    # `[replication]` extra (issue #80, replication-continuity §4) pulls the
+    # outbox/watermark/parked machinery memory adopts for `memory.set` /
+    # `memory.forgotten` — sqlalchemy + fastapi, both already direct deps here.
+    "snowline-plugin-sdk[client,replication]",
 ]
 
 [dependency-groups]

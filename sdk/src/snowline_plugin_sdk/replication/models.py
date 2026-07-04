@@ -115,9 +115,11 @@ class ReplicationOutboxRow(ReplicationBase):
     delivery time). `status` is `pending` | `delivered` | `rejected`: there is
     deliberately NO attempt cap — unreachability retries forever under the
     capped `next_attempt_at` backoff, and `rejected` (the dead-letter terminal
-    state) is reserved for a delivered event the receiver REFUSED as invalid
-    (bad signature / malformed / unknown stream — a bug, not a partition).
-    Ordering refusals and version holds (HTTP 409) never land here."""
+    state) is reserved for the ingest vocabulary's own rejection verdicts
+    (bad signature / malformed / unknown stream — a bug, not a partition;
+    `emit.requeue_rejected` is the operator recovery). Ordering refusals,
+    version holds (HTTP 409), and bare stream-level 4xx (a trust-gate 403, a
+    pre-mount 404) never land here — they hold retryably."""
 
     __tablename__ = "replication_outbox"
 

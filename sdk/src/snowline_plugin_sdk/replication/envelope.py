@@ -27,7 +27,14 @@ HTTP status:
     version skew on a live stream is a hold, not a failure).
   * 4xx REJECTIONS (400/401/404) — a delivered event the receiver refused
     (`malformed_envelope`, `bad_signature`, `unknown_stream`): a bug, not a
-    partition; the sender dead-letters it (§3.1).
+    partition; the sender dead-letters it (§3.1). The sender dead-letters
+    ONLY on this exact vocabulary — a `{"status": "rejected"}` JSON body with
+    a reason in `REJECTION_REASONS`. A bare 4xx (a trust-gate 403 — §5.1's own
+    config trap, a 404 from a not-yet-mounted router mid-§7-seed, a proxy's
+    405/429) never came from a healthy ingest's verdict on THIS event; it is a
+    stream-level, usually-recoverable condition and is held retryably —
+    otherwise one misconfiguration would cascade-reject the whole backlog,
+    one head per tick.
   * 503 RETRY — a bounded retryable apply error (`apply_failed`, §8.1): the
     sender backs off and redelivers; the receiver parks after the bound.
 
@@ -56,6 +63,13 @@ RETRY_APPLY_FAILED = "apply_failed"
 REJECT_MALFORMED = "malformed_envelope"
 REJECT_BAD_SIGNATURE = "bad_signature"
 REJECT_UNKNOWN_STREAM = "unknown_stream"
+
+# The sender's dead-letter gate: ONLY a 4xx carrying `{"status": "rejected"}`
+# with one of these reasons is a rejection; any other 4xx is a stream-level
+# retryable hold (see the module docstring's cascade rationale).
+REJECTION_REASONS = frozenset(
+    {REJECT_MALFORMED, REJECT_BAD_SIGNATURE, REJECT_UNKNOWN_STREAM}
+)
 
 # The envelope fields the v2 stream contract requires beyond the domain payload.
 STREAM_FIELDS = ("source", "epoch", "seq", "peer_seen")

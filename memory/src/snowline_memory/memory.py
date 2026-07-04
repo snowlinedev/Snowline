@@ -1,31 +1,47 @@
 """The memory substrate — remember / recall / digest / list / forget over
 `Memory` rows.
 
-Memory is FLAT and scope-tagged (no supersession, no inheritance, no events;
-memory-plugin spec §3). The behaviors here are:
+Memory is FLAT and scope-tagged (no supersession, no inheritance walk;
+memory-plugin spec §3). Its write model is a **per-name last-writer-wins
+register with tombstoned deletes** (replication-continuity §4 coverage note,
+#80) — the shape that makes it replication-safe under the checklist:
 
-  - `remember` — upsert by kebab-case `name` (same name updates in place); name
-    and description are generated/derived when omitted.
-  - `recall` — FTS-ranked when a query is given (Postgres `websearch_to_tsquery`
-    + `ts_rank` over the generated `search_vector` column), newest-first
-    otherwise; filtered by kind + scope (scope ⊇ portfolio-wide).
-  - `memory_digest` — the cheap, deterministic session-start read: every
-    applicable memory as a one-line `name — description` entry, grouped by kind.
-  - `list_memories` — the hygiene/browse twin of a query-less recall.
-  - `forget` — delete one memory by name (idempotent).
+  - `remember` — LWW-upsert of the register named `name`: an incoming write wins
+    iff its `(event_at, source_id)` strictly beats the stored clock (`_wins`,
+    §6). In the ordinary single-instance case a local write's `now()` always
+    wins, so this reads exactly like the old upsert-in-place; the clock only
+    changes the outcome against a concurrent replicated write. Emits `memory.set`.
+  - `forget` — TOMBSTONES the memory (`forgotten=True`) rather than hard-deleting,
+    so a late-arriving OLDER `set` loses the LWW compare and cannot resurrect it.
+    Emits `memory.forgotten`. Idempotent — a miss (or an already-tombstoned row)
+    is a no-op that authors no event.
+  - `apply_event` — the SDK ingest apply seam: a replicated `memory.set` /
+    `memory.forgotten` converges the SAME register by the SAME `_wins` rule, so
+    both instances reach the same state regardless of delivery order.
+  - `recall` / `memory_digest` / `list_memories` — reads, all excluding
+    tombstones. `recall` is FTS-ranked with a query (Postgres
+    `websearch_to_tsquery` + `ts_rank` over the generated `search_vector`
+    column), newest-first otherwise; filtered by kind + scope (scope ⊇
+    portfolio-wide).
 
-Scope is a SOFT reference: a slug is validated against the platform grammar
-(carried, not imported — import-purity) and stored verbatim; it is never resolved
-against the platform.
+`id`/`created_at`/`updated_at` are LOCAL bookkeeping and are NOT the converged
+value — the register value is (content, description, kind, scope_slug, forgotten)
+resolved by (`last_event_at`, `last_source_id`). Scope is a SOFT reference: a
+slug is validated against the platform grammar (carried, not imported —
+import-purity) and stored verbatim; it is never resolved against the platform.
 """
 
 from __future__ import annotations
 
 import re
+from datetime import datetime, timedelta, timezone
 
+from snowline_plugin_sdk.contract import EVENT_MEMORY_FORGOTTEN, EVENT_MEMORY_SET
+from snowline_plugin_sdk.replication import emit_event
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
+from snowline_memory import config
 from snowline_memory.models import Memory
 
 # --- soft enum + defaults ---------------------------------------------------
@@ -186,6 +202,157 @@ def _scope_filter(scope: str | None):
     return or_(Memory.scope_slug == scope, Memory.scope_slug.is_(None))
 
 
+# --- LWW register core (#80) ------------------------------------------------
+
+
+def _utcnow() -> datetime:
+    """Naive UTC — the authoring clock stamped into local writes. Matches the
+    SDK/monolith convention so `last_event_at` comparisons stay dialect-agnostic
+    (naive both sides of the compare)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _monotonic_local_at(
+    session: Session, name: str, source_id: str
+) -> datetime:
+    """The authoring clock for a LOCAL write: `now()`, but forced strictly greater
+    than this instance's OWN last write to `name`. Without this, two rapid
+    same-name writes (a `remember` then an immediate `forget`, say) could tie on
+    the microsecond and the second would lose the strict `_wins` compare and be
+    silently dropped. It bumps ONLY against our own prior write (same
+    `source_id`) — a genuinely newer REMOTE state (a different source, e.g. a
+    future-dated peer write under clock skew) still wins by strict LWW, so
+    cross-instance convergence is untouched."""
+    at = _utcnow()
+    existing = session.scalar(select(Memory).where(Memory.name == name))
+    if (
+        existing is not None
+        and existing.last_source_id == source_id
+        and existing.last_event_at >= at
+    ):
+        at = existing.last_event_at + timedelta(microseconds=1)
+    return at
+
+
+def _event_at(payload: dict) -> datetime:
+    """Parse a replicated event's authoring timestamp back to naive UTC. A
+    well-formed emitter always stamps `event_at`; a missing one can't be ordered,
+    so it sorts to `datetime.min` and loses the LWW compare against any real
+    write (defensive, never expected)."""
+    raw = payload.get("event_at")
+    return datetime.fromisoformat(raw) if raw else datetime.min
+
+
+def _wins(
+    event_at: datetime,
+    source_id: str,
+    stored_at: datetime,
+    stored_source_id: str,
+) -> bool:
+    """The §6 deterministic LWW merge — computed IDENTICALLY on every instance so
+    a register converges without a resolution event: the incoming write wins iff
+    `(event_at, source_id)` is strictly greater than the stored clock,
+    lexicographically (timestamp first; `source_id` the stable tiebreak for a
+    same-instant race). Strict `>` makes an exact re-delivery a no-op — the
+    semantic idempotence §4 checklist item 4 requires."""
+    return (event_at, source_id) > (stored_at, stored_source_id)
+
+
+def _apply_set(
+    session: Session,
+    *,
+    name: str,
+    content: str,
+    description: str,
+    kind: str,
+    scope_slug: str | None,
+    event_at: datetime,
+    source_id: str,
+) -> tuple[Memory, bool]:
+    """LWW-apply a `set` to the register named `name` — the shared core of the
+    local `remember` and a replicated `memory.set`. Inserts when the name is
+    absent; on an existing row it overwrites the value columns, CLEARS the
+    tombstone, and advances the LWW clock ONLY when the incoming write strictly
+    beats the stored clock (`_wins`) — otherwise it is a no-op (the stored write
+    is newer). A winning set over a tombstone RESURRECTS the memory (the
+    "a newer set beats the tombstone" criterion). Returns `(row, created)` where
+    `created` is True only for a fresh insert."""
+    existing = session.scalar(select(Memory).where(Memory.name == name))
+    if existing is None:
+        m = Memory(
+            name=name,
+            description=description,
+            content=content,
+            kind=kind,
+            scope_slug=scope_slug,
+            forgotten=False,
+            last_event_at=event_at,
+            last_source_id=source_id,
+        )
+        session.add(m)
+        session.flush()
+        session.refresh(m)
+        return m, True
+    if _wins(event_at, source_id, existing.last_event_at, existing.last_source_id):
+        existing.content = content
+        existing.description = description
+        existing.kind = kind
+        existing.scope_slug = scope_slug
+        existing.forgotten = False
+        existing.last_event_at = event_at
+        existing.last_source_id = source_id
+        existing.updated_at = func.now()
+        session.flush()
+        session.refresh(existing)
+    return existing, False
+
+
+def _apply_forget(
+    session: Session,
+    *,
+    name: str,
+    event_at: datetime,
+    source_id: str,
+) -> bool:
+    """LWW-apply a tombstone to the register named `name`. Returns whether a LIVE
+    row was tombstoned by this call.
+
+    Unlike the local `forget` (which no-ops on a missing row — it authored no
+    event), a REPLICATED forget CREATES a tombstone when the row is absent: the
+    `set` it supersedes may still arrive later on a DIFFERENT stream (streams are
+    only ordered internally), and the tombstone must already be present to WIN
+    the LWW against that older set — otherwise the two instances diverge. On an
+    existing row the tombstone advances only when it strictly beats the stored
+    clock. Idempotent — re-delivery ties the clock and no-ops."""
+    existing = session.scalar(select(Memory).where(Memory.name == name))
+    if existing is None:
+        session.add(
+            Memory(
+                name=name,
+                description="",
+                content="",
+                kind=DEFAULT_KIND,
+                scope_slug=None,
+                forgotten=True,
+                last_event_at=event_at,
+                last_source_id=source_id,
+            )
+        )
+        session.flush()
+        return False
+    if not _wins(
+        event_at, source_id, existing.last_event_at, existing.last_source_id
+    ):
+        return False
+    was_live = not existing.forgotten
+    existing.forgotten = True
+    existing.last_event_at = event_at
+    existing.last_source_id = source_id
+    existing.updated_at = func.now()
+    session.flush()
+    return was_live
+
+
 # --- verbs ------------------------------------------------------------------
 
 
@@ -232,35 +399,43 @@ def remember(
     else:
         name = validate_name(slugify_to_name(description or content))
 
-    existing = session.scalar(select(Memory).where(Memory.name == name))
-    if existing is not None:
-        existing.content = content
-        existing.description = description
-        existing.kind = kind
-        existing.scope_slug = scope
-        # Force the `updated_at` bump even when nothing changed: SQLAlchemy
-        # skips the UPDATE entirely for a no-net-change flush, which would leave
-        # `updated_at` stale and contradict "bumps on every upsert" (spec §4).
-        # Assigning the SQL expression marks the row dirty unconditionally.
-        existing.updated_at = func.now()
-        session.flush()
-        session.refresh(existing)
-        row = _row(existing)
-        row["created"] = False
-        return row
-
-    m = Memory(
+    # The authoring clock for this write (#80): local `now()` (made strictly
+    # monotonic against our own prior write to this name) almost always wins the
+    # LWW compare, so the common single-instance path is still an in-place upsert
+    # that bumps `updated_at`. The event carries the SAME clock, so a peer
+    # computes the identical `_wins` verdict.
+    src = config.source_id()
+    event_at = _monotonic_local_at(session, name, src)
+    m, created = _apply_set(
+        session,
         name=name,
-        description=description,
         content=content,
+        description=description,
         kind=kind,
         scope_slug=scope,
+        event_at=event_at,
+        source_id=src,
     )
-    session.add(m)
-    session.flush()
-    session.refresh(m)
+    # Emit the authored `set` regardless of the local verdict: a set that lost
+    # locally (a newer replicated write already present) loses on every peer too,
+    # a harmless no-op — so emission stays unconditional and the outbox seq
+    # ordering never has to reason about win/lose.
+    emit_event(
+        session,
+        EVENT_MEMORY_SET,
+        {
+            "id": str(m.id),
+            "name": name,
+            "description": description,
+            "content": content,
+            "kind": kind,
+            "scope_slug": scope,
+            "event_at": event_at.isoformat(),
+            "source_id": src,
+        },
+    )
     row = _row(m)
-    row["created"] = True
+    row["created"] = created
     return row
 
 
@@ -278,7 +453,8 @@ def recall(
     scope = validate_scope(scope)
     lim = _resolve_limit(limit, DEFAULT_RECALL_LIMIT)
 
-    filters = []
+    # Tombstones (forgotten memories, #80) are never read.
+    filters = [Memory.forgotten.is_(False)]
     if kind:
         filters.append(Memory.kind == kind.strip())
     sf = _scope_filter(scope)
@@ -330,7 +506,7 @@ def memory_digest(session: Session, scope: str | None = None) -> dict:
     novel kinds alphabetically; entries within a kind are name-sorted so the
     digest is stable across calls."""
     scope = validate_scope(scope)
-    filters = []
+    filters = [Memory.forgotten.is_(False)]  # tombstones are never read (#80)
     sf = _scope_filter(scope)
     if sf is not None:
         filters.append(sf)
@@ -369,7 +545,7 @@ def list_memories(
     scope = validate_scope(scope)
     lim = _resolve_limit(limit, DEFAULT_LIST_LIMIT)
 
-    filters = []
+    filters = [Memory.forgotten.is_(False)]  # tombstones are never read (#80)
     if kind:
         filters.append(Memory.kind == kind.strip())
     sf = _scope_filter(scope)
@@ -395,17 +571,93 @@ def list_memories(
 
 
 def forget(session: Session, name: str) -> dict:
-    """Delete one memory by name. `name` is normalized the same way `remember`
-    normalizes a provided name (kebab-cased), so a caller who saved `my_note`
-    (stored as `my-note`) can still `forget("my_note")`. Idempotent — a miss
-    reports `{forgotten: False}` rather than raising."""
+    """TOMBSTONE one memory by name (#80) — mark it `forgotten` rather than
+    hard-deleting, so a late-arriving OLDER `set` cannot resurrect it. `name` is
+    normalized the same way `remember` normalizes a provided name (kebab-cased),
+    so a caller who saved `my_note` (stored as `my-note`) can still
+    `forget("my_note")`. Emits `memory.forgotten` on success.
+
+    Idempotent — a miss (no such name) OR an already-tombstoned row reports
+    `{forgotten: False}` and authors NO event: a forget that tombstones nothing
+    live carries no information to converge, and not minting a tombstone for an
+    unknown local name keeps the store from accreting phantom rows (a REPLICATED
+    forget, by contrast, does create one — see `_apply_forget`)."""
     # Deliberately bare normalize_name (not normalize_name_or_raise): an
     # unnormalizable name can't match any stored key, and under the idempotent
-    # contract "nothing to delete" is a miss, not an error.
+    # contract "nothing to forget" is a miss, not an error.
     name = normalize_name(name)
-    m = session.scalar(select(Memory).where(Memory.name == name))
-    if m is None:
+    existing = session.scalar(select(Memory).where(Memory.name == name))
+    if existing is None or existing.forgotten:
         return {"forgotten": False, "name": name}
-    session.delete(m)
+
+    src = config.source_id()
+    # Same monotonic-clock guard as `remember` (see `_monotonic_local_at`): a
+    # forget immediately after a same-instance set must not tie the microsecond
+    # and lose. Bump only against our own prior write; a newer remote write still
+    # wins the compare below.
+    event_at = _utcnow()
+    if existing.last_source_id == src and existing.last_event_at >= event_at:
+        event_at = existing.last_event_at + timedelta(microseconds=1)
+    if not _wins(
+        event_at, src, existing.last_event_at, existing.last_source_id
+    ):
+        # A newer write already beat this forget (a future-dated remote set on a
+        # skewed clock) — the live row stands. Vanishingly rare under sane clocks
+        # (§6); reported as a miss rather than claiming a delete that didn't land.
+        return {"forgotten": False, "name": name}
+
+    existing.forgotten = True
+    existing.last_event_at = event_at
+    existing.last_source_id = src
+    existing.updated_at = func.now()
     session.flush()
+    emit_event(
+        session,
+        EVENT_MEMORY_FORGOTTEN,
+        {
+            "id": str(existing.id),
+            "name": name,
+            "event_at": event_at.isoformat(),
+            "source_id": src,
+        },
+    )
     return {"forgotten": True, "name": name}
+
+
+# --- replication apply seam (#80) -------------------------------------------
+
+
+def apply_event(session: Session, envelope: dict) -> None:
+    """The idempotent domain apply the SDK ingest runs for a delivered event
+    (replication-continuity §4 checklist item 4; wired via
+    `build_replication_router` in `app.py`). `envelope` is the v2 stream envelope;
+    the memory domain body is `envelope["payload"]`. Convergence is per-name LWW
+    (§6): a `memory.set` LWW-upserts the register, a `memory.forgotten`
+    LWW-tombstones it — both computed by the SAME `_wins` rule the local verbs
+    use, so the two instances reach the same state regardless of delivery order.
+
+    Runs UNDER the SDK's origin suppression, and this seam never calls
+    `emit_event` itself, so an applied write can never re-emit (§3.2 hard rule).
+    Raises on an unknown event type — every apply exception is §8.1-retryable, so
+    a genuinely poison event parks loudly rather than being silently dropped."""
+    event_type = envelope.get("event_type")
+    payload = envelope.get("payload") or {}
+    name = payload["name"]
+    event_at = _event_at(payload)
+    src = payload.get("source_id") or ""
+
+    if event_type == EVENT_MEMORY_SET:
+        _apply_set(
+            session,
+            name=name,
+            content=payload.get("content", ""),
+            description=payload.get("description", ""),
+            kind=payload.get("kind", DEFAULT_KIND),
+            scope_slug=payload.get("scope_slug"),
+            event_at=event_at,
+            source_id=src,
+        )
+    elif event_type == EVENT_MEMORY_FORGOTTEN:
+        _apply_forget(session, name=name, event_at=event_at, source_id=src)
+    else:
+        raise ValueError(f"unknown memory event type {event_type!r}")

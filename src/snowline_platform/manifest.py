@@ -285,6 +285,48 @@ class UIBlock(BaseModel):
         return v
 
 
+# --- Replication block (replication-continuity.md §4/§9 item 2) -----------
+#
+# The registry stores this block; nothing else reads it. Gateway and health
+# only ever read `name`/`base_url`/`health_path`/`surfaces`/`mcp_path` (see
+# gateway.py / health.py), so a `replication` block on a manifest is inert to
+# both by construction. It is advisory metadata the future pairing step (§5)
+# consumes; the platform never routes events itself.
+
+
+class ReplicationBlock(BaseModel):
+    """The manifest's optional `replication` object (replication-continuity.md
+    §4): a plugin's self-declaration that it participates in hub-and-spoke
+    replication.
+
+    `extra="forbid"` — same fail-loud posture as `UIBlock`: an unknown
+    top-level field (a typo, or a future field an older platform doesn't
+    know) rejects the whole manifest at registration.
+
+    Absent block = plugin does not replicate; it degrades alone per §4. A
+    present block is stored as-is by the registry — advisory metadata read
+    only by the pairing step (§5), never by the gateway or health checker.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    contract_version: int = Field(
+        description="the replication envelope contract version (§3.2) this "
+        "plugin's SDK copy speaks; the platform does not validate it against "
+        "its own constant — pairing (§5) is what warns on a version mismatch "
+        "between two instances' copies of a plugin"
+    )
+    ingest_path: str = Field(
+        description="where the plugin receives peers' signed events, "
+        "relative to base_url (SDK-provided handler, §4)"
+    )
+    events: list[str] = Field(
+        default_factory=list,
+        description="the event-type vocabulary this plugin emits, declared "
+        "so pairing (§5) can warn on vocabulary skew between instances",
+    )
+
+
 class PluginManifest(BaseModel):
     name: str = Field(description="unique plugin id / slug, e.g. 'governance'")
     base_url: str = Field(
@@ -321,6 +363,13 @@ class PluginManifest(BaseModel):
         default=None,
         description="optional declarative widget/page contributions (ui-shell.md "
         "§3); None for a headless plugin with no shell contributions",
+    )
+    replication: ReplicationBlock | None = Field(
+        default=None,
+        description="optional replication contract declaration "
+        "(replication-continuity.md §4); advisory metadata only — the "
+        "gateway and health checker never read it. None if the plugin does "
+        "not participate in replication",
     )
 
     @field_validator("surfaces")

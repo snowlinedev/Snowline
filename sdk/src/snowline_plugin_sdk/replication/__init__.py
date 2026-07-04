@@ -24,7 +24,9 @@ from .emit import (
     deliver_pending,
     emit_event,
     list_outbound_subscriptions,
+    list_rejected,
     replication_delivery_loop,
+    requeue_rejected,
     retire_outbound_subscription,
     set_subscription_secret,
 )
@@ -65,6 +67,8 @@ __all__ = [
     "set_subscription_secret",
     "deliver_pending",
     "replication_delivery_loop",
+    "list_rejected",
+    "requeue_rejected",
     "ingest_delivery",
     "register_inbound_stream",
     "list_inbound_streams",
