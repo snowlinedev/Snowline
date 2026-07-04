@@ -30,7 +30,7 @@ from sqlalchemy.orm import Session
 
 from snowline_platform.models import Scope
 from snowline_plugin_sdk.contract import EVENT_SCOPE_CREATED, EVENT_SCOPE_UPDATED
-from snowline_plugin_sdk.replication import emit_event
+from snowline_plugin_sdk.replication import ParkNow, emit_event
 
 # --- slug / kind contract (carried from the monolith parser, §2.1) ----------
 
@@ -401,26 +401,32 @@ def apply_scope_event(session: Session, envelope: dict) -> None:
     rule) — replicated writes can never boomerang back onto the wire.
 
     Reusing `create`/`update` rather than a separate write path means their
-    EXISTING exceptions ARE the §8 error taxonomy — no new exception classes:
+    EXISTING exceptions ARE the §8 error taxonomy — the two cases split by
+    whether waiting can ever help (issue #92):
 
       * `ScopeConflictError` (the slug is already taken by a DIFFERENT id) —
-        the cross-partition slug collision spec §8 calls out by name. Every
-        apply exception is §8.1-retryable: this one will never resolve
-        itself by waiting (the colliding slug does not stop colliding), but
-        it still goes through the SAME bounded retry-then-park path as any
-        other apply failure, because parking already IS spec §8's "fail
-        loud, manual resolution" — first-class state (tool/UI/health signal,
-        never a log line) that stays re-appliable once an operator renames
-        or retires the losing scope and calls `reapply_parked`. Special-
-        casing an immediate, un-retried park would need new machinery the
-        SDK doesn't have (§8.1 has one bound, not a per-error-class one) for
-        a case that is `acceptably rare for a single owner` (spec §8)
-        exactly because it CAN afford to wait out the same bound as any
-        other apply error.
+        the cross-partition slug collision spec §8 calls out by name. It will
+        NEVER resolve itself by waiting (the colliding slug does not stop
+        colliding; the local id differs from the event's, so it is not an
+        idempotent replay), so this apply re-raises it as the SDK's `ParkNow`
+        (#92): the event parks on THIS delivery with no retry budget spent.
+        Parking already IS spec §8's "fail loud, manual resolution" — first-
+        class state (tool/UI/health signal, never a log line) that stays
+        re-appliable via `reapply_parked` once the slug is freed. Freeing it
+        today means MANUAL DB SURGERY on the losing local row: slugs are
+        immutable by design (spec §2 — no rename path), and retiring via
+        `status` does not free the slug (`resolve` matches regardless of
+        status), so an operator must delete the losing row (or re-slug it by
+        hand) directly; purpose-built remediation tooling is TBD. A `ParkNow`
+        park is bit-for-bit the same state as a bound-reached park — it only
+        skips the pointless backoff budget before the inevitable park (the
+        friction #92 filed from this exact call site).
       * `ScopeNotFoundError` (the parent slug hasn't replicated yet) — an
-        ordering gap, not a failure (spec §8's ordering note): retries the
-        same way and self-heals the moment the parent's own `scope.created`
-        applies, so ordinary scope-stream lag never drops data.
+        ordering gap, not a permanent failure (spec §8's ordering note): it
+        stays on the DEFAULT bounded-retryable path (NOT `ParkNow`) and
+        self-heals the moment the parent's own `scope.created` applies, so
+        ordinary scope-stream lag never drops data. This is precisely the
+        transient case the retry bound exists for.
 
     Idempotent past the gate (checklist item 4, §4): a payload `id` already
     present locally is a no-op — covers `reapply_parked` replay and any
@@ -434,20 +440,27 @@ def apply_scope_event(session: Session, envelope: dict) -> None:
     if event_type == EVENT_SCOPE_CREATED:
         if session.get(Scope, scope_id) is not None:
             return  # already applied — idempotent replay
-        create(
-            session,
-            slug=payload["slug"],
-            name=payload["name"],
-            kind=payload["kind"],
-            parent=payload["parent"],
-            isolated=payload["isolated"],
-            status=payload["status"],
-            scope_id=scope_id,
-        )
+        try:
+            create(
+                session,
+                slug=payload["slug"],
+                name=payload["name"],
+                kind=payload["kind"],
+                parent=payload["parent"],
+                isolated=payload["isolated"],
+                status=payload["status"],
+                scope_id=scope_id,
+            )
+        except ScopeConflictError as exc:
+            # Permanent cross-partition slug collision (§8): the slug is taken by
+            # a different id and will never un-collide — park now, don't burn the
+            # retry budget (#92). ScopeNotFoundError (unknown parent) is NOT
+            # caught here: it stays retryable and self-heals.
+            raise ParkNow(str(exc)) from exc
     elif event_type == EVENT_SCOPE_UPDATED:
         existing = resolve(session, payload["slug"])
         if existing is not None and existing.id != scope_id:
-            raise ScopeConflictError(
+            raise ParkNow(
                 f"scope {payload['slug']!r} update targets id {scope_id} but "
                 f"the local row under that slug has id {existing.id} — "
                 f"cross-partition slug collision (spec §8)"
