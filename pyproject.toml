@@ -9,7 +9,16 @@ dependencies = [
     "sqlalchemy>=2.0",
     "psycopg[binary]>=3.1",
     "alembic>=1.13",
+    # The `snowline replicate` CLI (issue #82) is an HTTP client of the SDK
+    # replication-admin surface; the gateway/health/ui-api paths already import
+    # httpx at runtime, so this promotes it to a declared runtime dependency.
+    "httpx>=0.27",
 ]
+
+# The operator CLI (replication pairing + seeding, §5/§7, issue #82). `snowline
+# replicate pair|seed|reseed-check` — deliberately a CLI, never MCP (§5).
+[project.scripts]
+snowline = "snowline_platform.cli:main"
 
 [dependency-groups]
 # `snowline-governance` is a workspace MEMBER, not a runtime dependency of the
