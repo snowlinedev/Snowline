@@ -412,10 +412,15 @@ def apply_scope_event(session: Session, envelope: dict) -> None:
         (#92): the event parks on THIS delivery with no retry budget spent.
         Parking already IS spec §8's "fail loud, manual resolution" — first-
         class state (tool/UI/health signal, never a log line) that stays
-        re-appliable once an operator renames or retires the losing scope and
-        calls `reapply_parked` — and a `ParkNow` park is bit-for-bit that same
-        state, it only skips the pointless backoff budget before the
-        inevitable park (the friction #92 filed from this exact call site).
+        re-appliable via `reapply_parked` once the slug is freed. Freeing it
+        today means MANUAL DB SURGERY on the losing local row: slugs are
+        immutable by design (spec §2 — no rename path), and retiring via
+        `status` does not free the slug (`resolve` matches regardless of
+        status), so an operator must delete the losing row (or re-slug it by
+        hand) directly; purpose-built remediation tooling is TBD. A `ParkNow`
+        park is bit-for-bit the same state as a bound-reached park — it only
+        skips the pointless backoff budget before the inevitable park (the
+        friction #92 filed from this exact call site).
       * `ScopeNotFoundError` (the parent slug hasn't replicated yet) — an
         ordering gap, not a permanent failure (spec §8's ordering note): it
         stays on the DEFAULT bounded-retryable path (NOT `ParkNow`) and

@@ -421,6 +421,35 @@ def test_park_now_mixes_with_transient_retries_on_a_live_stream(session):
     assert [e["seq"] for e in apply.envelopes] == [1, 2, 3]  # 4 never applied
 
 
+def test_park_now_mid_backoff_resets_the_counting_state(session):
+    """`_park_now`'s promised reset: a seq that accrued transient 503s and THEN
+    raises `ParkNow` on a later redelivery parks immediately — the committed
+    `blocked_seq`/`blocked_attempts` land at `(None, 0)`, the same reset a
+    bound-reached park performs, and the park state matches (gate advanced,
+    frontier pinned, row parked)."""
+    secret = _register(session)["secret"]
+    apply = Applied(fail_on={1})
+
+    # Two transient failures on seq 1: counting state committed at (1, 2).
+    for attempt in (1, 2):
+        status, resp = _ingest(session, secret, 1, apply, park_after=5)
+        assert (status, resp["reason"], resp["attempts"]) == (503, "apply_failed", attempt)
+    assert (_stream(session).blocked_seq, _stream(session).blocked_attempts) == (1, 2)
+
+    # The SAME seq now turns out permanent (e.g. deeper inspection on a later
+    # attempt): ParkNow parks it well under the bound of 5.
+    apply.fail_on = set()
+    apply.park_now_on = {1}
+    status, resp = _ingest(session, secret, 1, apply, park_after=5)
+    assert (status, resp["status"]) == (200, "parked")
+
+    stream = _stream(session)
+    assert (stream.blocked_seq, stream.blocked_attempts) == (None, 0)
+    assert (stream.gate_seq, stream.applied_seq) == (1, 0)  # gate past, frontier pinned
+    parked = ingest.list_parked(session)
+    assert [(p["seq"], p["reason"]) for p in parked] == [(1, "permanent failure for seq 1")]
+
+
 def test_reapply_unknown_park_raises(session):
     _register(session)
     with pytest.raises(ValueError, match="no parked event"):

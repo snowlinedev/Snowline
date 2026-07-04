@@ -211,10 +211,10 @@ def test_slug_collision_parks_immediately_then_needs_manual_resolution(db_sessio
     assert (status, resp["status"]) == (200, "applied")
     assert (_stream(db_session).gate_seq, _stream(db_session).applied_seq) == (2, 0)
 
-    # Manual resolution (spec §8): an operator retires the LOSING local scope
-    # (slugs are never renamed/reused by design — spec §2 — so there is no
-    # rename-out-of-the-way path), freeing the slug, then re-applies from the
-    # park.
+    # Manual resolution (spec §8): today this is manual DB surgery — deleting
+    # the LOSING local row frees the slug (slugs are immutable by design —
+    # spec §2 — so there is no rename path, and a status change would not free
+    # it: `resolve` matches regardless of status); then re-apply from the park.
     db_session.delete(local)
     db_session.commit()
     out = ingest.reapply_parked(db_session, *STREAM, 1, scopes.apply_scope_event)

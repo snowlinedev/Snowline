@@ -398,11 +398,14 @@ def _apply_failed(
             "error": str(exc),
             "attempts": stream.blocked_attempts,
         }
+    out = _park(session, stream, envelope, str(exc))
+    # Log AFTER the park state flushed — the line must never claim a park a
+    # failed flush prevented.
     log.error(
         "replication event PARKED (stream %s/%s seq %s) after %s failed applies: %s",
         stream.source_id, stream.epoch, seq, bound, exc,
     )
-    return _park(session, stream, envelope, str(exc))
+    return out
 
 
 def _park_now(
@@ -420,12 +423,15 @@ def _park_now(
     `_park` whether or not this seq accrued earlier transient failures — the same
     reset a bound-reached park performs."""
     session.rollback()
+    out = _park(session, stream, envelope, str(exc))
+    # Log AFTER the park state flushed — same discipline as the bound-reached
+    # route: never claim a park a failed flush prevented.
     log.error(
         "replication event PARKED NOW (stream %s/%s seq %s) — apply declared the "
         "failure permanent, no retry budget spent: %s",
         stream.source_id, stream.epoch, envelope["seq"], exc,
     )
-    return _park(session, stream, envelope, str(exc))
+    return out
 
 
 def _park(
@@ -440,7 +446,9 @@ def _park(
     through here, so their surfaced state is bit-for-bit identical — same parked
     row fields, same gate advance, same `blocked_*` reset, same frontier pin,
     same 200 `parked` ACK. The only per-caller difference is the `reason` string
-    (each caller passes `str(exc)`) and the log line each emits before calling."""
+    (each caller passes `str(exc)`) and the log line each emits after this
+    returns (after the flush — a log line must never claim a park a failed
+    flush prevented)."""
     seq = envelope["seq"]
     session.add(
         ReplicationParkedEvent(
