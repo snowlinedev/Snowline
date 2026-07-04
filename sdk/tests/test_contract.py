@@ -10,11 +10,19 @@ from snowline_plugin_sdk import contract
 def test_event_type_literals():
     assert contract.EVENT_DECISION_RECORDED == "decision.recorded"
     assert contract.EVENT_DECISION_SUPERSEDED == "decision.superseded"
+    # The platform's own adoption (replication-continuity §8, issue #81).
+    assert contract.EVENT_SCOPE_CREATED == "scope.created"
+    assert contract.EVENT_SCOPE_UPDATED == "scope.updated"
 
 
 def test_event_types_frozenset():
     assert contract.EVENT_TYPES == frozenset(
-        {"decision.recorded", "decision.superseded"}
+        {
+            "decision.recorded",
+            "decision.superseded",
+            "scope.created",
+            "scope.updated",
+        }
     )
     assert isinstance(contract.EVENT_TYPES, frozenset)
 

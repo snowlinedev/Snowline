@@ -26,8 +26,21 @@ from __future__ import annotations
 EVENT_DECISION_RECORDED: str = "decision.recorded"
 EVENT_DECISION_SUPERSEDED: str = "decision.superseded"
 
+# The platform's own adoption (replication-continuity §8, §9 item 5, issue
+# #81): the scope namespace dogfoods the same contract it offers plugins.
+# Governance does not emit these — they're vendored here ONLY so this copy
+# stays equal to the SDK's (the drift guard below), which is what proves the
+# producer/consumer registries can never silently fork.
+EVENT_SCOPE_CREATED: str = "scope.created"
+EVENT_SCOPE_UPDATED: str = "scope.updated"
+
 EVENT_TYPES: frozenset[str] = frozenset(
-    {EVENT_DECISION_RECORDED, EVENT_DECISION_SUPERSEDED}
+    {
+        EVENT_DECISION_RECORDED,
+        EVENT_DECISION_SUPERSEDED,
+        EVENT_SCOPE_CREATED,
+        EVENT_SCOPE_UPDATED,
+    }
 )
 
 # The published contract version, stamped into every emitted payload. A consumer

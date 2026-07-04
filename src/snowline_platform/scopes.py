@@ -9,6 +9,15 @@ this is the read/resolve + create surface the HTTP API and MCP tools wrap.
 `resolve` is NON-MUTATING (spec §3 "auto-vivify"): the monolith's
 `resolve_or_stub` convenience is intentionally NOT carried into the public read
 path — creation is explicit via `create`.
+
+**Replication (spec §8, issue #81):** the platform dogfoods the same SDK
+emit/ingest modules it offers plugins — `create`/`update` emit
+`scope.created`/`scope.updated` in the SAME transaction as the domain write
+(the transactional outbox, §3), and `apply_scope_event` is the domain APPLY
+function an opted-in stream runs deliveries through (`replication.py` wires it
+into the SDK's ingest route). Both directions reuse `create`/`update` rather
+than a separate write path, so their EXISTING exceptions are the ordering/
+collision error taxonomy §8 needs — see `apply_scope_event`'s docstring.
 """
 
 from __future__ import annotations
@@ -20,6 +29,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from snowline_platform.models import Scope
+from snowline_plugin_sdk.contract import EVENT_SCOPE_CREATED, EVENT_SCOPE_UPDATED
+from snowline_plugin_sdk.replication import emit_event
 
 # --- slug / kind contract (carried from the monolith parser, §2.1) ----------
 
@@ -197,6 +208,7 @@ def create(
     parent: str | None = None,
     isolated: bool = False,
     status: str = "active",
+    scope_id: uuid.UUID | None = None,
 ) -> Scope:
     """Create a scope (spec §3). Enforces the bare-slug⇔org invariant and
     derives/validates `parent_id` from the slug hierarchy: an explicit `parent`
@@ -204,8 +216,18 @@ def create(
     `rsplit('/', 1)[0]` prefix, linked to that ROW if it exists (the slug
     hierarchy and `parent_id` are kept consistent — spec §5).
 
-    Raises `ScopeConflictError` if the slug is already taken, `InvalidSlugError`
-    / `InvalidScopeFieldError` on a bad slug/kind/parent.
+    Emits `scope.created` (spec §8) in this SAME transaction — a no-op until a
+    replication subscription exists (§9 item 5/6, pairing not yet built).
+
+    `scope_id` is the replication apply seam (`apply_scope_event`): a
+    spoke-authored scope keeps its ORIGIN-side UUID on every instance, since
+    plugins reference scopes by that id. Human/API callers never pass it — a
+    fresh id is minted as usual.
+
+    Raises `ScopeConflictError` if the slug is already taken (spec §8: this is
+    ALSO the cross-partition slug-collision error a replicated create surfaces
+    — see `apply_scope_event`), `InvalidSlugError` / `InvalidScopeFieldError` on
+    a bad slug/kind/parent.
     """
     validate_slug(slug)
     _validate_kind_for_slug(slug, kind)
@@ -234,7 +256,7 @@ def create(
         if prow is not None:
             parent_id = prow.id
 
-    scope = Scope(
+    kwargs = dict(
         slug=slug,
         name=name,
         kind=kind,
@@ -242,8 +264,12 @@ def create(
         isolated=isolated,
         status=status,
     )
+    if scope_id is not None:
+        kwargs["id"] = scope_id
+    scope = Scope(**kwargs)
     session.add(scope)
     session.flush()
+    emit_event(session, EVENT_SCOPE_CREATED, to_replication_payload(scope))
     return scope
 
 
@@ -262,7 +288,9 @@ def update(
 ) -> Scope:
     """Modify an existing scope (spec §3). Validates the bare-slug⇔org invariant
     on `kind`; `parent` ("" / None clears, a slug re-points to that existing row)
-    keeps `parent_id` consistent. Raises `ScopeNotFoundError` if unknown."""
+    keeps `parent_id` consistent. Raises `ScopeNotFoundError` if unknown.
+
+    Emits `scope.updated` (spec §8) in this SAME transaction, same as `create`."""
     scope = resolve(session, slug)
     if scope is None:
         raise ScopeNotFoundError(f"no scope with slug {slug!r}")
@@ -295,6 +323,7 @@ def update(
             scope.parent_id = prow.id
 
     session.flush()
+    emit_event(session, EVENT_SCOPE_UPDATED, to_replication_payload(scope))
     return scope
 
 
@@ -316,3 +345,102 @@ def to_row(scope: Scope) -> dict:
         "isolated": scope.isolated,
         "org": scope.slug.split("/", 1)[0],
     }
+
+
+# --- replication (spec §8, issue #81) ---------------------------------------
+
+
+def to_replication_payload(scope: Scope) -> dict:
+    """The `scope.created` / `scope.updated` event body — the domain `payload`
+    the SDK envelope nests (envelope.py `build_envelope`).
+
+    Keyed by `id` (the UUID every plugin's soft reference travels by) and by
+    the PARENT'S SLUG, not `parent_id`: a receiver's `parent_id` is a LOCAL row
+    id that means nothing on the wire, but slug is stable across instances
+    (never reused, spec §8) and reusing `create`/`update`'s existing
+    parent-slug resolution is what turns an out-of-order parent into the
+    ordinary retryable ordering gap spec §8's note describes, with no new
+    machinery."""
+    return {
+        "id": str(scope.id),
+        "slug": scope.slug,
+        "name": scope.name,
+        "kind": scope.kind,
+        "parent": scope.parent.slug if scope.parent is not None else None,
+        "isolated": scope.isolated,
+        "status": scope.status,
+    }
+
+
+def apply_scope_event(session: Session, envelope: dict) -> None:
+    """The platform's replication APPLY function (spec §8) — the seam
+    `replication.py` wires into the SDK's `ingest_delivery`
+    (`snowline_plugin_sdk.replication.ingest`). Runs under origin suppression,
+    so `create`/`update`'s own `emit_event` call is a no-op here (§3.2 hard
+    rule) — replicated writes can never boomerang back onto the wire.
+
+    Reusing `create`/`update` rather than a separate write path means their
+    EXISTING exceptions ARE the §8 error taxonomy — no new exception classes:
+
+      * `ScopeConflictError` (the slug is already taken by a DIFFERENT id) —
+        the cross-partition slug collision spec §8 calls out by name. Every
+        apply exception is §8.1-retryable: this one will never resolve
+        itself by waiting (the colliding slug does not stop colliding), but
+        it still goes through the SAME bounded retry-then-park path as any
+        other apply failure, because parking already IS spec §8's "fail
+        loud, manual resolution" — first-class state (tool/UI/health signal,
+        never a log line) that stays re-appliable once an operator renames
+        or retires the losing scope and calls `reapply_parked`. Special-
+        casing an immediate, un-retried park would need new machinery the
+        SDK doesn't have (§8.1 has one bound, not a per-error-class one) for
+        a case that is `acceptably rare for a single owner` (spec §8)
+        exactly because it CAN afford to wait out the same bound as any
+        other apply error.
+      * `ScopeNotFoundError` (the parent slug hasn't replicated yet) — an
+        ordering gap, not a failure (spec §8's ordering note): retries the
+        same way and self-heals the moment the parent's own `scope.created`
+        applies, so ordinary scope-stream lag never drops data.
+
+    Idempotent past the gate (checklist item 4, §4): a payload `id` already
+    present locally is a no-op — covers `reapply_parked` replay and any
+    future re-delivery ambiguity, even though the SDK's watermark already
+    keeps a live stream from re-invoking apply for an already-applied seq.
+    """
+    payload = envelope["payload"]
+    event_type = envelope["event_type"]
+    scope_id = uuid.UUID(payload["id"])
+
+    if event_type == EVENT_SCOPE_CREATED:
+        if session.get(Scope, scope_id) is not None:
+            return  # already applied — idempotent replay
+        create(
+            session,
+            slug=payload["slug"],
+            name=payload["name"],
+            kind=payload["kind"],
+            parent=payload["parent"],
+            isolated=payload["isolated"],
+            status=payload["status"],
+            scope_id=scope_id,
+        )
+    elif event_type == EVENT_SCOPE_UPDATED:
+        existing = resolve(session, payload["slug"])
+        if existing is not None and existing.id != scope_id:
+            raise ScopeConflictError(
+                f"scope {payload['slug']!r} update targets id {scope_id} but "
+                f"the local row under that slug has id {existing.id} — "
+                f"cross-partition slug collision (spec §8)"
+            )
+        update(
+            session,
+            payload["slug"],
+            name=payload["name"],
+            kind=payload["kind"],
+            parent=payload["parent"],
+            isolated=payload["isolated"],
+            status=payload["status"],
+        )
+    else:
+        raise ValueError(
+            f"scope replication apply: unknown event_type {event_type!r}"
+        )
