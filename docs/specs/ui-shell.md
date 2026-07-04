@@ -157,6 +157,11 @@ capability flag + reorder endpoint) are the same idea and land with the pm
 work. **v1 shells render read-only** and ignore `actions` — but the field is
 in the kind schemas from day one so pm lands as registration, not redesign.
 
+The first ACTIVATION of this seam is input-shaped rather than button-shaped:
+the `thread` kind's **`composer`** (`shadow-conversations.md` §4) — a declared
+POST endpoint rendered as a message box. Composer and `actions` share the same
+proxy-POST enablement and the same endpoint-allowlist posture (§5).
+
 ### 4.4 Fail visible
 
 A contribution whose `kind` (or `contract_version`) the shell doesn't support
@@ -181,7 +186,10 @@ GET /ui-api/<plugin>/<path>   →   <plugin base_url><path>
   proxy cannot be aimed at a plugin's MCP surface or arbitrary routes.
 - **Health-aware:** a DOWN plugin short-circuits to 503 (shell renders the
   grey state) instead of hanging on a dead upstream.
-- **Verbs:** GET in v1; POST reserved for actions (§4.3).
+- **Verbs:** GET, plus POST to endpoints a plugin DECLARED as write targets
+  in its `ui` block (`composer.endpoint`, `actions[].endpoint`) — structural
+  allowlist, JSON-only, size-capped (`shadow-conversations.md` §3). Undeclared
+  paths 403.
 
 ## 6. Platform-native views & the shell
 
@@ -244,7 +252,9 @@ colorblind-safe series palette.
 ## 9. Out of scope (v1)
 
 - Writes from the browser (action *rendering*; the contract shape ships in v1
-  schemas).
+  schemas). *Superseded for the composer path: `shadow-conversations.md`
+  activates proxy POST + the thread composer; button-shaped `actions`
+  rendering still lands with the pm work.*
 - Remote-module escape hatch (documented direction only).
 - `search` page kind; websockets/SSE liveness (poll first); mobile-dedicated
   layouts (responsive reflow only); theming beyond light/dark.
