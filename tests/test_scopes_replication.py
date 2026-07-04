@@ -176,12 +176,13 @@ def test_apply_dangling_child_does_not_derive_a_local_parent(db_session):
 # --- the named cross-partition slug collision (§8) ----------------------------
 
 
-def test_slug_collision_parks_then_needs_manual_resolution(db_session):
+def test_slug_collision_parks_immediately_then_needs_manual_resolution(db_session):
     """spec §8, verbatim: 'slug collisions across a partition fail loud at
-    ingest and require manual resolution.' Every apply exception is
-    §8.1-retryable — a collision goes through the SAME bounded retry-then-park
-    path as any other apply failure; parking's loud, re-appliable state IS the
-    'fail loud, manual resolution' the spec calls for, not a second mechanism."""
+    ingest and require manual resolution.' A collision will never self-heal, so
+    `apply_scope_event` raises the SDK's `ParkNow` (#92): the event parks on the
+    FIRST delivery with no retry budget spent — no wasted 503s before the
+    inevitable park. Parking's loud, re-appliable state IS the 'fail loud,
+    manual resolution' the spec calls for, identical to a bound-reached park."""
     local = scopes.create(db_session, slug="acme", name="Acme HQ", kind="org")
     db_session.commit()
 
@@ -189,14 +190,7 @@ def test_slug_collision_parks_then_needs_manual_resolution(db_session):
     peer_payload = _payload("acme", "Acme (peer)", "org")
     assert peer_payload["id"] != str(local.id)
 
-    for attempt in (1, 2):
-        status, resp = _deliver(
-            db_session, secret, EVENT_SCOPE_CREATED, peer_payload, 1, park_after=3
-        )
-        assert (status, resp["reason"]) == (503, "apply_failed")
-        assert resp["attempts"] == attempt
-        assert "already exists" in resp["error"]
-
+    # No retries: a permanent collision parks on the first delivery attempt.
     status, resp = _deliver(
         db_session, secret, EVENT_SCOPE_CREATED, peer_payload, 1, park_after=3
     )

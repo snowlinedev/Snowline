@@ -32,6 +32,7 @@ from .emit import (
 )
 from .envelope import build_envelope, sign_body, verify_signature
 from .ingest import (
+    ParkNow,
     ingest_delivery,
     is_applying_replicated_event,
     list_inbound_streams,
@@ -77,4 +78,5 @@ __all__ = [
     "reapply_parked",
     "list_parked",
     "is_applying_replicated_event",
+    "ParkNow",
 ]

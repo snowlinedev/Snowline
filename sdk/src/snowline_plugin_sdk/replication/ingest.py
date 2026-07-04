@@ -28,6 +28,16 @@ bounded retryable error (§8.1): the sender redelivers under backoff until the
 parking bound, then the event parks LOUDLY — the park ACKs to the sender, the
 gate advances, and the parked event stays re-appliable once the cause is fixed.
 
+The one opt-out is `ParkNow` (issue #92): an apply that KNOWS a failure is
+permanent (a cross-partition slug collision that will never stop colliding)
+raises it to park the event on THIS delivery, skipping a retry budget that
+would only add latency before the inevitable park. A `ParkNow` park is
+bit-for-bit the same first-class §8.1 state a bound-reached park produces —
+same parked row, same ACK, same gate advance, same `applied_seq` pin,
+re-appliable the same way (both go through the one `_park` helper) — it only
+skips the pointless wait. A merely SLOW-to-heal error (an unknown parent slug
+still replicating) must NOT raise it: that is what the bound's retries are for.
+
 Version skew on a live stream is a HOLD, not a failure (§3.2): a version-AHEAD
 envelope (peer upgraded first) and a v1 envelope on a v2-paired stream are both
 409 retryable refusals — never accept-and-misprocess (`check_contract_version`'s
@@ -68,6 +78,31 @@ from snowline_plugin_sdk.replication.models import (
 )
 
 log = logging.getLogger("snowline_plugin_sdk.replication.ingest")
+
+
+class ParkNow(Exception):
+    """Raised by a plugin apply function to opt one event into IMMEDIATE parking,
+    skipping the §8.1 retry budget — the "this will never self-heal" fast path
+    (issue #92).
+
+    The default apply contract is uniformly retryable (§8.1): every OTHER apply
+    exception is redelivered under backoff until the one shared bound, then
+    parks. An apply raises `ParkNow` ONLY when it KNOWS the failure is permanent
+    (e.g. a cross-partition slug collision that will never stop colliding), where
+    burning the full backoff budget before the inevitable park is pure latency.
+
+    The resulting park is bit-for-bit the SAME surfaced state a bound-reached
+    park produces — same parked row (stream/seq/event_type/payload/reason/
+    parked_at), same 200 `parked` ACK to the sender, same gate advance, same
+    `applied_seq` pin, re-appliable via `reapply_parked` the same way (both
+    paths go through the one `_park` helper). The ONLY differences are
+    deterministic and documented: the parked row's `reason` is this exception's
+    message (`str(exc)` — the identical plumbing a bound-reached park uses for
+    the final failure's `str(exc)`), and the emitted log line names the
+    fast-path. There is no attempt-count field on a parked row to reconcile.
+
+    A merely slow-to-heal error (an unknown parent slug still replicating) must
+    NOT raise `ParkNow`: it needs the bound's retries to self-heal."""
 
 
 def _park_after_attempts() -> int:
@@ -217,10 +252,12 @@ def ingest_delivery(
       200 `duplicate`  — seq at/under the gate: ACKed as a no-op (§8.1 — the
                          gate, not `applied_seq`, keys the dedupe: a redelivery
                          of a PARKED seq must not re-apply out of order).
-      200 `parked`     — apply kept failing past the bound (§8.1): the event
-                         moved whole into the park, the gate advanced, and this
-                         ACKs so the sender's cursor moves on. `applied_seq`
-                         did NOT advance.
+      200 `parked`     — apply kept failing past the bound (§8.1) OR raised
+                         `ParkNow` (#92: a permanent failure, parked on this
+                         delivery with no retry budget spent): the event moved
+                         whole into the park, the gate advanced, and this ACKs
+                         so the sender's cursor moves on. `applied_seq` did NOT
+                         advance. Both routes produce identical park state.
       409 `out_of_order` / `version_hold` — retryable refusals (§3.1/§3.2).
       503 `apply_failed` — a retryable apply error under the bound; the sender
                          backs off and redelivers.
@@ -314,7 +351,9 @@ def ingest_delivery(
     try:
         with _applying_replicated_event():
             apply(session, envelope)
-    except Exception as exc:  # noqa: BLE001 - every apply error is §8.1-retryable
+    except ParkNow as exc:  # the apply declared the failure permanent (#92)
+        return _park_now(session, stream, envelope, exc)
+    except Exception as exc:  # noqa: BLE001 - every other apply error is §8.1-retryable
         return _apply_failed(session, stream, envelope, exc, park_after)
 
     stream.gate_seq = seq
@@ -359,6 +398,50 @@ def _apply_failed(
             "error": str(exc),
             "attempts": stream.blocked_attempts,
         }
+    log.error(
+        "replication event PARKED (stream %s/%s seq %s) after %s failed applies: %s",
+        stream.source_id, stream.epoch, seq, bound, exc,
+    )
+    return _park(session, stream, envelope, str(exc))
+
+
+def _park_now(
+    session: Session,
+    stream: ReplicationInboundStream,
+    envelope: dict,
+    exc: ParkNow,
+) -> tuple[int, dict]:
+    """The `ParkNow` fast path (§8.1, issue #92): the apply declared this
+    failure permanent, so the event parks on THIS delivery with NO retry budget
+    spent. Same rollback discipline as `_apply_failed` (a partial apply must not
+    leak out under the park commit — the apply seam promises idempotence, not
+    atomicity) and the SAME `_park` state as a bound-reached park; only the retry
+    counting is skipped. `blocked_seq`/`blocked_attempts` land at `(None, 0)` via
+    `_park` whether or not this seq accrued earlier transient failures — the same
+    reset a bound-reached park performs."""
+    session.rollback()
+    log.error(
+        "replication event PARKED NOW (stream %s/%s seq %s) — apply declared the "
+        "failure permanent, no retry budget spent: %s",
+        stream.source_id, stream.epoch, envelope["seq"], exc,
+    )
+    return _park(session, stream, envelope, str(exc))
+
+
+def _park(
+    session: Session,
+    stream: ReplicationInboundStream,
+    envelope: dict,
+    reason: str,
+) -> tuple[int, dict]:
+    """Move one event WHOLE into the park (§8.1) and advance the gate past it,
+    pinning `applied_seq`. The SINGLE park code path: a bound-reached park
+    (`_apply_failed`) and a `ParkNow` fast-path park (`_park_now`) both funnel
+    through here, so their surfaced state is bit-for-bit identical — same parked
+    row fields, same gate advance, same `blocked_*` reset, same frontier pin,
+    same 200 `parked` ACK. The only per-caller difference is the `reason` string
+    (each caller passes `str(exc)`) and the log line each emits before calling."""
+    seq = envelope["seq"]
     session.add(
         ReplicationParkedEvent(
             source_id=stream.source_id,
@@ -366,7 +449,7 @@ def _apply_failed(
             seq=seq,
             event_type=envelope.get("event_type", ""),
             payload=envelope,
-            reason=str(exc),
+            reason=reason,
         )
     )
     stream.gate_seq = seq  # the gate advances past the park — the stream flows
@@ -374,10 +457,6 @@ def _apply_failed(
     stream.blocked_attempts = 0
     _recompute_applied_seq(session, stream)  # …but the applied frontier PINS
     session.flush()
-    log.error(
-        "replication event PARKED (stream %s/%s seq %s) after %s failed applies: %s",
-        stream.source_id, stream.epoch, seq, bound, exc,
-    )
     return 200, {
         "status": STATUS_PARKED,
         "gate_seq": stream.gate_seq,
