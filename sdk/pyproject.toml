@@ -18,12 +18,25 @@ dependencies = []
 # base install (and importing the package root) stays dependency-free. Pins match
 # the workspace (governance/memory declare httpx>=0.27; anyio is transitive).
 client = ["httpx>=0.27", "anyio>=4"]
+# The replication modules (`snowline_plugin_sdk.replication`, issue #77 /
+# replication-continuity §3) own the outbox/watermark/parked tables and the
+# tailnet-gated admin+ingest routes, so they pull sqlalchemy + fastapi (and the
+# delivery loop needs the [client] pair). Imported EXPLICITLY — the package root
+# stays dependency-free.
+replication = ["sqlalchemy>=2.0", "fastapi>=0.110", "httpx>=0.27", "anyio>=4"]
 
 [dependency-groups]
-# Carries the [client] extra's deps too: sdk/tests and `testing.py` import
-# httpx/anyio, so the SDK must be testable STANDALONE — not only via sibling
-# workspace members dragging the extra into the shared root venv.
-dev = ["pytest>=8.0", "httpx>=0.27", "anyio>=4"]
+# Carries the extras' deps too: sdk/tests and `testing.py` import httpx/anyio,
+# and the replication tests import sqlalchemy/fastapi, so the SDK must be
+# testable STANDALONE — not only via sibling workspace members dragging the
+# extras into the shared root venv.
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27",
+    "anyio>=4",
+    "sqlalchemy>=2.0",
+    "fastapi>=0.110",
+]
 
 [build-system]
 requires = ["hatchling"]

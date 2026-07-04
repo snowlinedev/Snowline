@@ -14,6 +14,18 @@ the authoritative EMIT side (decision 97907576, #630):
     at delivery time, retry, dead-letter at the attempt cap,
   * `webhook_delivery_loop` — the background timer (run in the app lifespan).
 
+AMENDED for REPLICATION (replication-continuity spec §3.2, #77): the
+delivery-time `seq` this module allocates — the recorded standing behavior of
+decision 97907576 / #630 — is the right shape for fire-and-forget webhooks and
+the WRONG one for replication streams (delivery order is not authoring order; a
+re-created subscription restarts at 1). Replication-class subscriptions use the
+SDK's `snowline_plugin_sdk.replication` emit module instead: `seq` allocated at
+EMIT time in the domain write's transaction, streams keyed `(source_id, epoch)`,
+`peer_seen` in the envelope, contract version 2. Governance adopts it in §9
+item 3 (#79); THIS module remains the fire-and-forget bus until then.
+Signatures stay DELIVERY-time over the exact bytes POSTed in both classes —
+§5's hitless rotation depends on it.
+
 IMPORT DISCIPLINE (import-purity, spec §10 / no cycle): this module imports from
 governance models + stdlib + httpx/anyio/sqlalchemy ONLY — never the monolith,
 substrate, the SDK, or `decisions.py`. The emit HOOK in `decisions.py` passes the
@@ -30,7 +42,10 @@ scope_id`, exactly as the monolith does, so the wire behavior is identical.
 Subscription management (`create_subscription` / `list_subscriptions` /
 `deactivate_subscription`) is PROGRAMMATIC — there is deliberately NO MCP tool or
 CLI surface (remote subscription registration is out-of-band v1, per the SDK's
-`events.py` note).
+`events.py` note). SUPERSEDED for REPLICATION-CLASS subscriptions
+(replication-continuity §5, #77): those are managed over the SDK's tailnet-gated
+replication-admin surface (`snowline_plugin_sdk.replication.admin`) — still OFF
+MCP. The no-surface posture stands for THIS module's fire-and-forget class.
 """
 
 from __future__ import annotations

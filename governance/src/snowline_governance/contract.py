@@ -33,4 +33,7 @@ EVENT_TYPES: frozenset[str] = frozenset(
 # The published contract version, stamped into every emitted payload. A consumer
 # (the SDK) refuses a payload whose `contract_version` is NEWER than it
 # understands; bumping this is a deliberate major contract change.
-CONTRACT_VERSION: int = 1
+# Version 2 (replication-continuity §3.2, #77): the stream envelope — `epoch`,
+# EMIT-time `seq`, `peer_seen` — a breaking addition, bumped in BOTH pinned
+# copies in one commit (the drift guard keeps them equal).
+CONTRACT_VERSION: int = 2

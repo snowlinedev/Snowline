@@ -119,6 +119,15 @@ transactional outbox + async delivery with per-subscription monotonic `seq`).
 Event-type registry + `CONTRACT_VERSION` are the published contract (the
 `snowline-plugin-sdk` consumes them). Subscribers are other plugins/services.
 
+> **Amended for replication** (`replication-continuity.md` §3.2, #77): the
+> per-subscription delivery-time `seq` above (decision `97907576`, #630) is the
+> fire-and-forget webhook shape only. Replication streams use the SDK's
+> `snowline_plugin_sdk.replication` modules — `seq` allocated at EMIT time in
+> the domain write's transaction, streams keyed `(source_id, epoch)`,
+> `peer_seen` causal context, contract version 2 — which governance adopts in
+> replication-continuity §9 item 3 (#79). Signatures stay delivery-time over
+> the exact bytes POSTed in both classes.
+
 ## 8. Out of scope (these are other plugins / the platform)
 
 - The PM layer — work items, initiatives, phases, roadmap, `whats_next`,

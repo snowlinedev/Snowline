@@ -1,0 +1,463 @@
+"""The EMIT half — transactional outbox with emit-time seq, and the delivery
+loop with the replication retry class (replication-continuity §3.1/§3.2,
+issue #77).
+
+Generalized from governance's `replication.py` (the bus, decision 97907576/#630)
+WITH the §3.2 stream contract, which *changes* the emit side rather than
+relocating it:
+
+  * `seq` is allocated HERE, at EMIT time, in the domain write's transaction —
+    a per-stream counter row incremented under a row lock. The bus deliberately
+    allocated at delivery time so a seq collision could never roll back the
+    user's write; replication inverts the trade: authoring order IS the stream
+    order, and the counter must travel with the store in a `pg_dump` (§7). The
+    counter row is created at pairing (subscription creation), so the emit path
+    only ever UPDATEs an existing row — no insert race in the hot path.
+  * `peer_seen` (the contiguous applied frontier of the inbound stream from the
+    subscription's peer) is stamped into the envelope at emit — authoring-time
+    causal context (§6.1), frozen into the outbox payload.
+  * Signatures stay DELIVERY-time over the exact bytes POSTed (§5 rotation
+    correctness — after a secret swap the whole queued backlog re-signs).
+
+The §3.1 retry class replaces the bus's attempt cap: for a replication peer,
+being down for two weeks is normal operation, not failure. Unbounded retry with
+CAPPED per-row backoff (`next_attempt_at`, exponential to ~interval x 10), a
+per-INGEST reachability probe whose unreachable→reachable transition resets the
+backoff on that ingest's rows (the probe is load-bearing: on a quiet heal with
+every row at the ceiling, a purely reactive reset could never fire the first
+delivery), and dead-letter (`rejected`) reserved for REJECTIONS — a delivered
+event the receiver refused as invalid. An ORDERING refusal or version hold
+(HTTP 409) is retryable by definition and never dead-letters.
+
+Origin suppression (§3.2, hard rule): `emit_event` is a no-op while the ingest
+apply path is running (`ingest.is_applying_replicated_event`), so an
+ingest-applied write can NEVER re-emit — without this a delivered event
+boomerangs between the pair forever.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import uuid
+from collections.abc import Callable
+from contextlib import AbstractContextManager
+from datetime import datetime, timedelta, timezone
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from snowline_plugin_sdk.replication import ingest as _ingest
+from snowline_plugin_sdk.replication.envelope import build_envelope, sign_body
+from snowline_plugin_sdk.replication.models import (
+    ReplicationOutboxRow,
+    ReplicationStreamCounter,
+    ReplicationSubscription,
+)
+
+log = logging.getLogger("snowline_plugin_sdk.replication.emit")
+
+
+def source_id_from_env() -> str:
+    """This instance's emit identity, instance-qualified `<instance>.<plugin>`
+    (§3 — e.g. `roam.governance`), from `SNOWLINE_REPLICATION_SOURCE_ID`. Read
+    live (not module-level) so a test/env change is honored. Fail-loud when
+    unset: a defaulted source id would silently fork stream identity between
+    two instances of the same plugin."""
+    source = os.environ.get("SNOWLINE_REPLICATION_SOURCE_ID")
+    if not source:
+        raise ValueError(
+            "SNOWLINE_REPLICATION_SOURCE_ID is not set — replication needs the "
+            "instance-qualified <instance>.<plugin> source id (spec §3)"
+        )
+    return source
+
+
+def _interval_seconds() -> float:
+    return float(os.environ.get("SNOWLINE_REPLICATION_INTERVAL", "30"))
+
+
+def _utcnow() -> datetime:
+    """Naive UTC — the house convention for compared column values (matches the
+    monolith ingest's normalization; keeps SQLite/Postgres comparisons sane)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+# --- subscription management (programmatic + the §5 admin surface) -----------
+
+
+def create_outbound_subscription(
+    session: Session,
+    target_url: str,
+    secret: str,
+    event_types: list[str],
+    *,
+    epoch: str,
+    source_id: str | None = None,
+    peer_source_id: str | None = None,
+) -> dict:
+    """Create one outbound stream toward a peer ingest — the SENDING half of the
+    §5 pairing handshake (the receiver already minted `secret` and registered
+    the inbound side, so the verifying side holds the secret by construction).
+    `epoch` comes from that handshake; `source_id` defaults from
+    `SNOWLINE_REPLICATION_SOURCE_ID` and is STAMPED onto the row (stream
+    identity is fixed at pairing, not re-read at emit). Also creates the
+    stream's emit counter row, so the emit hot path never inserts it."""
+    sid = source_id or source_id_from_env()
+    sub = ReplicationSubscription(
+        target_url=target_url,
+        secret=secret,
+        event_types=list(event_types),
+        source_id=sid,
+        epoch=epoch,
+        peer_source_id=peer_source_id,
+        active=True,
+    )
+    session.add(sub)
+    if session.get(ReplicationStreamCounter, (sid, epoch)) is None:
+        session.add(
+            ReplicationStreamCounter(source_id=sid, epoch=epoch, last_seq=0)
+        )
+    session.flush()
+    return _subscription_dict(sub)
+
+
+def list_outbound_subscriptions(session: Session) -> list[dict]:
+    """Every outbound subscription (active and retired), newest first. Secrets
+    are never included (§5: returned once at the handshake, never logged)."""
+    rows = session.scalars(
+        select(ReplicationSubscription).order_by(
+            ReplicationSubscription.created_at.desc(), ReplicationSubscription.id
+        )
+    ).all()
+    return [_subscription_dict(s) for s in rows]
+
+
+def retire_outbound_subscription(session: Session, subscription_id: str) -> dict:
+    """Soft-retire an outbound stream (re-pair/re-seed, §7 step 5): the row and
+    its delivery log stay; the delivery loop stops draining it. Raises
+    ValueError on an unknown id."""
+    sub = session.get(ReplicationSubscription, _as_uuid(subscription_id))
+    if sub is None:
+        raise ValueError(f"no replication subscription with id {subscription_id!r}")
+    sub.active = False
+    sub.retired_at = _utcnow()
+    session.flush()
+    return _subscription_dict(sub)
+
+
+def set_subscription_secret(
+    session: Session, subscription_id: str, secret: str
+) -> dict:
+    """The SENDER's half of §5 rotation: swap in the replacement secret the
+    receiver minted. Delivery-time signing makes the swap hitless — every still-
+    queued row re-signs with the new secret on its next attempt, and the
+    receiver retires the old secret on the first new-signed delivery."""
+    sub = session.get(ReplicationSubscription, _as_uuid(subscription_id))
+    if sub is None:
+        raise ValueError(f"no replication subscription with id {subscription_id!r}")
+    sub.secret = secret
+    session.flush()
+    return _subscription_dict(sub)
+
+
+def _as_uuid(value) -> uuid.UUID:
+    return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+
+
+def _subscription_dict(sub: ReplicationSubscription) -> dict:
+    return {
+        "id": str(sub.id),
+        "target_url": sub.target_url,
+        "event_types": list(sub.event_types or []),
+        "source_id": sub.source_id,
+        "epoch": sub.epoch,
+        "peer_source_id": sub.peer_source_id,
+        "active": sub.active,
+        "created_at": sub.created_at.isoformat() if sub.created_at else None,
+        "retired_at": sub.retired_at.isoformat() if sub.retired_at else None,
+    }
+
+
+# --- the transactional outbox (emit-time seq, §3.2) ---------------------------
+
+
+def emit_event(session: Session, event_type: str, payload: dict) -> list[dict]:
+    """Write one outbox row per matching outbound stream, IN the caller's domain
+    transaction (transactional outbox, §3 — the offline-write buffer). Returns
+    the envelopes written (empty when nothing matched or emission is
+    suppressed).
+
+    Per stream: `seq` = the stream counter's next value, incremented under a
+    row lock (the §3.2 emit-time allocation); `peer_seen` = the applied frontier
+    of the inbound stream from `peer_source_id` (0 before the reverse direction
+    is paired). The full envelope is frozen into the row — both are
+    authoring-time facts and must not drift to delivery time.
+
+    ORIGIN SUPPRESSION (hard rule, §3.2): while the SDK ingest apply path is
+    running, this is a no-op — events exist only for locally-originated writes,
+    so a replicated write can never boomerang back onto the wire."""
+    if _ingest.is_applying_replicated_event():
+        return []
+
+    subs = session.scalars(
+        select(ReplicationSubscription).where(
+            ReplicationSubscription.active.is_(True)
+        )
+    ).all()
+    matching = [s for s in subs if event_type in (s.event_types or [])]
+    if not matching:
+        return []
+
+    envelopes: list[dict] = []
+    for sub in matching:
+        counter = session.get(
+            ReplicationStreamCounter,
+            (sub.source_id, sub.epoch),
+            with_for_update=True,
+        )
+        if counter is None:
+            # Defensive: the counter is created with the subscription; a missing
+            # row means a hand-created subscription — heal rather than fail the
+            # domain write.
+            counter = ReplicationStreamCounter(
+                source_id=sub.source_id, epoch=sub.epoch, last_seq=0
+            )
+            session.add(counter)
+            session.flush()
+        counter.last_seq += 1
+        envelope = build_envelope(
+            event_type,
+            payload,
+            source_id=sub.source_id,
+            epoch=sub.epoch,
+            seq=counter.last_seq,
+            peer_seen=_peer_seen(session, sub.peer_source_id),
+        )
+        session.add(
+            ReplicationOutboxRow(
+                subscription_id=sub.id,
+                seq=counter.last_seq,
+                event_type=event_type,
+                payload=envelope,
+                status="pending",
+            )
+        )
+        envelopes.append(envelope)
+    session.flush()
+    return envelopes
+
+
+def _peer_seen(session: Session, peer_source_id: str | None) -> int:
+    """The contiguous APPLIED frontier (`applied_seq`, not the delivery gate —
+    §3.2: a parked seq pins it) of the active inbound stream from
+    `peer_source_id`. 0 when the reverse direction isn't paired yet."""
+    if peer_source_id is None:
+        return 0
+    from snowline_plugin_sdk.replication.models import ReplicationInboundStream
+
+    row = session.scalars(
+        select(ReplicationInboundStream)
+        .where(
+            ReplicationInboundStream.source_id == peer_source_id,
+            ReplicationInboundStream.active.is_(True),
+        )
+        .order_by(ReplicationInboundStream.created_at.desc())
+    ).first()
+    return row.applied_seq if row is not None else 0
+
+
+# --- delivery: the §3.1 replication retry class -------------------------------
+
+# Per-process reachability memory for the reconnect reset: ingest URL → last
+# known reachable? A restart forgets it (rows' backoff state is the durable
+# half); the first probe after boot repopulates it without resetting anything.
+_REACHABILITY: dict[str, bool] = {}
+
+
+def _backoff(attempts: int) -> timedelta:
+    """Exponential from one delivery interval, capped at ~interval x 10 (§3.1):
+    a two-week partition retries every ~5 minutes at the default 30s interval,
+    never dead-letters, and drains within one interval of the probe seeing the
+    heal."""
+    interval = _interval_seconds()
+    return timedelta(seconds=min(interval * (2 ** (attempts - 1)), interval * 10))
+
+
+def _probe_ingests(
+    client, urls: set[str], reachability: dict[str, bool]
+) -> set[str]:
+    """Cheaply probe every ingest endpoint that has queued rows; return the set
+    that just transitioned unreachable → reachable (whose rows get their backoff
+    reset). ANY HTTP response counts as reachable — the probe asks "is the
+    ingest answering?", not "would a delivery succeed?" (a GET on a POST-only
+    route answering 405 is a healthy ingest). Per-INGEST, not per-peer, on
+    purpose (§3.1): a single plugin's ingest healing on an otherwise-reachable
+    peer must trigger the reset too."""
+    healed: set[str] = set()
+    for url in urls:
+        was_reachable = reachability.get(url)
+        try:
+            client.get(url)
+            reachable = True
+        except Exception:  # noqa: BLE001 - any transport error means unreachable
+            reachable = False
+        reachability[url] = reachable
+        if reachable and was_reachable is False:
+            healed.add(url)
+    return healed
+
+
+def deliver_pending(
+    session: Session,
+    client,
+    *,
+    now: datetime | None = None,
+    reachability: dict[str, bool] | None = None,
+) -> int:
+    """One delivery pass over every active outbound stream. Returns the count
+    newly ACKed (applied / duplicate / parked all count — a park ACKs exactly
+    like a success, §8.1).
+
+    Per stream, rows drain IN SEQ ORDER and the drain STOPS at the first
+    non-ACK: the per-stream cursor never advances past an undelivered seq
+    (§3.2), so a persistently failing delivery blocks only its own stream —
+    loud and recoverable — and nothing is skipped to be later discarded as
+    already-seen. Only the stream head ever carries backoff state (rows behind
+    it are never attempted), so the head's `next_attempt_at` gates the whole
+    stream's next try.
+
+    Classification (§3.1): 2xx → delivered. 409 → retryable refusal (ordering /
+    version hold) — backoff, NEVER dead-letter. Other 4xx → REJECTION →
+    `rejected` (dead-letter; the stream wedges loudly behind it, since skipping
+    a seq would only trade the wedge for an out-of-order refusal). 5xx and
+    transport errors → retryable with backoff. Each row's outcome commits
+    per-row so progress survives a mid-pass crash (re-delivery is a duplicate
+    no-op on the receiver).
+
+    The tick opens with the §3.1 reachability probe; an ingest transitioning
+    unreachable → reachable gets its rows' backoff cleared, which is what makes
+    §10's "within one delivery interval of reconnect" satisfiable."""
+    now = now or _utcnow()
+    if reachability is None:
+        reachability = _REACHABILITY
+
+    subs = session.scalars(
+        select(ReplicationSubscription).where(
+            ReplicationSubscription.active.is_(True)
+        )
+    ).all()
+    pending_by_sub: dict[uuid.UUID, list[ReplicationOutboxRow]] = {}
+    for sub in subs:
+        rows = session.scalars(
+            select(ReplicationOutboxRow)
+            .where(
+                ReplicationOutboxRow.subscription_id == sub.id,
+                ReplicationOutboxRow.status == "pending",
+            )
+            .order_by(ReplicationOutboxRow.seq)
+        ).all()
+        if rows:
+            pending_by_sub[sub.id] = list(rows)
+
+    # The reconnect reset (§3.1): probe first, then clear backoff on healed
+    # ingests' rows so the backlog flushes THIS tick, not ~10 intervals later.
+    queued_urls = {s.target_url for s in subs if s.id in pending_by_sub}
+    healed = _probe_ingests(client, queued_urls, reachability)
+    if healed:
+        for sub in subs:
+            if sub.target_url in healed:
+                for row in pending_by_sub.get(sub.id, []):
+                    row.next_attempt_at = None
+        session.commit()
+
+    delivered = 0
+    for sub in subs:
+        for row in pending_by_sub.get(sub.id, []):
+            if row.next_attempt_at is not None and row.next_attempt_at > now:
+                break  # head not due — the whole stream waits (contiguity)
+            body = json.dumps(row.payload).encode()
+            headers = {
+                "Content-Type": "application/json",
+                "X-Snowline-Event": row.event_type,
+                "X-Snowline-Signature": f"sha256={sign_body(sub.secret, body)}",
+            }
+            try:
+                resp = client.post(sub.target_url, content=body, headers=headers)
+            except Exception as exc:  # noqa: BLE001 - transport error → retry
+                reachability[sub.target_url] = False
+                _record_retry(row, now, str(exc))
+                session.commit()
+                break
+            reachability[sub.target_url] = True
+            if 200 <= resp.status_code < 300:
+                row.status = "delivered"
+                row.delivered_at = now
+                row.next_attempt_at = None
+                delivered += 1
+                session.commit()
+                continue
+            if resp.status_code == 409:
+                # Ordering refusal / version hold — retryable BY DEFINITION,
+                # carved out of the dead-letter rejection class (§3.1/§3.2).
+                _record_retry(row, now, _response_error(resp))
+            elif 400 <= resp.status_code < 500:
+                # A delivered event the receiver REFUSED — a bug, not a
+                # partition. Dead-letter, loudly; the stream wedges behind it.
+                row.status = "rejected"
+                row.last_error = _response_error(resp)
+                log.error(
+                    "replication delivery REJECTED (stream %s/%s seq %s): %s",
+                    sub.source_id, sub.epoch, row.seq, row.last_error,
+                )
+            else:
+                _record_retry(row, now, _response_error(resp))
+            session.commit()
+            break  # non-ACK: never advance past an undelivered seq
+    return delivered
+
+
+def _record_retry(row: ReplicationOutboxRow, now: datetime, error: str) -> None:
+    row.attempts = (row.attempts or 0) + 1
+    row.last_error = error
+    row.next_attempt_at = now + _backoff(row.attempts)
+
+
+def _response_error(resp) -> str:
+    try:
+        detail = resp.json()
+    except Exception:  # noqa: BLE001 - non-JSON error body
+        detail = None
+    return f"HTTP {resp.status_code}" + (f" {detail}" if detail else "")
+
+
+async def replication_delivery_loop(
+    session_scope: Callable[[], AbstractContextManager[Session]],
+) -> None:
+    """Background loop draining the replication outbox on a timer
+    (`SNOWLINE_REPLICATION_INTERVAL`, default 30s) — the plugin runs it in its
+    app lifespan next to its other loops, passing its own `session_scope`.
+    Mirrors governance's `webhook_delivery_loop`: one session + one client per
+    tick, per-tick exceptions swallowed/logged so a transient outage can never
+    kill the loop. Disable with `SNOWLINE_REPLICATION_DISABLED`."""
+    import anyio
+    import httpx
+
+    if os.environ.get("SNOWLINE_REPLICATION_DISABLED"):
+        log.info("replication delivery disabled via SNOWLINE_REPLICATION_DISABLED")
+        return
+
+    def _tick() -> None:
+        with httpx.Client(timeout=20.0, follow_redirects=True) as client:
+            with session_scope() as session:
+                n = deliver_pending(session, client)
+        if n:
+            log.info("replication delivery: delivered=%d", n)
+
+    while True:
+        try:
+            await anyio.to_thread.run_sync(_tick)
+        except Exception:  # noqa: BLE001 - the loop must outlive any one tick
+            log.exception("replication delivery tick failed; loop continues")
+        await anyio.sleep(_interval_seconds())

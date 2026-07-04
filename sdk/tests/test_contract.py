@@ -20,7 +20,9 @@ def test_event_types_frozenset():
 
 
 def test_contract_version():
-    assert contract.CONTRACT_VERSION == 1
+    # 2 = the stream envelope (replication-continuity §3.2, #77): epoch,
+    # emit-time seq, peer_seen — a breaking addition over v1.
+    assert contract.CONTRACT_VERSION == 2
 
 
 def test_check_contract_version_none_is_accepted():
