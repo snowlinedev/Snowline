@@ -39,18 +39,26 @@ awaited off the event loop from an async FastAPI route.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
 import anyio
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 from sqlalchemy import func, select
 
 from snowline_governance import shadow
 from snowline_governance.db import session_scope
 from snowline_governance.models import (
     DEFAULT_SHADOW_BRANCH_STATUS,
+    SHADOW_BRANCH_STATUS_ARCHIVED,
     ShadowBranch,
     ShadowNode,
 )
+
+# A sort sentinel for entries whose timestamp is somehow NULL (should not happen
+# post-commit) — keeps the chronological merge total-orderable without a None
+# comparison blowing up.
+_MIN_DT = datetime.min
 
 router = APIRouter(prefix="/ui-api")
 
@@ -143,6 +151,31 @@ def _citation_label(citation: dict) -> str:
     return f"decision:{citation['cited_decision_id']}"
 
 
+def _conversation_entry(event) -> dict:
+    """Render a conversation event (shadow-conversations §5) as a thread node.
+
+    A `message` maps its payload author for DISPLAY — `human` → `you`, everything
+    else (`agent`) → `agent` — and renders `kind: "message"`. An `agent.error`
+    renders `{author: "agent", kind: "error", markdown: <the payload error>}` so
+    a failed phase-2 turn is VISIBLE in the thread (fail-visible, §2/ui-shell §4.4)."""
+    payload = event.payload or {}
+    at = event.created_at.isoformat() if event.created_at else None
+    if event.kind == shadow.CONVERSATION_ERROR_KIND:
+        return {
+            "author": "agent",
+            "kind": "error",
+            "markdown": payload.get("error", ""),
+            "at": at,
+        }
+    author = "you" if payload.get("author") == "human" else "agent"
+    return {
+        "author": author,
+        "kind": "message",
+        "markdown": payload.get("markdown", ""),
+        "at": at,
+    }
+
+
 def _branch_thread_sync(branch_id: str) -> dict:
     try:
         bid = uuid.UUID(branch_id)
@@ -156,8 +189,9 @@ def _branch_thread_sync(branch_id: str) -> dict:
 
         nodes: list[dict] = []
         # The branch's narrative notes (the running reasoning thread, §4) come
-        # FIRST so one page tells the whole story without a second shell kind:
-        # a synthetic "narrative"/"notes" node ahead of the actual shadow nodes.
+        # FIRST regardless of any timestamp so one page tells the whole story
+        # without a second shell kind: a synthetic "narrative"/"notes" node ahead
+        # of everything else.
         if branch.narrative_notes:
             nodes.append(
                 {
@@ -168,6 +202,11 @@ def _branch_thread_sync(branch_id: str) -> dict:
                 }
             )
 
+        # The shadow nodes AND the conversation events (spec §5) INTERLEAVE
+        # chronologically by their creation time — one page, one timeline. Python's
+        # sort is stable, so a node and a message sharing a timestamp keep their
+        # insertion order (nodes before messages) deterministically.
+        timeline: list[tuple[datetime, dict]] = []
         for node in shadow._branch_nodes(session, branch.id):
             citations = shadow.list_citations(session, str(node.id))
             markdown = node.statement
@@ -181,20 +220,81 @@ def _branch_thread_sync(branch_id: str) -> dict:
             }
             if citations:
                 entry["citations"] = [_citation_label(c) for c in citations]
-            nodes.append(entry)
+            timeline.append((node.created_at or _MIN_DT, entry))
+
+        for event in shadow._branch_conversation_events(session, branch.id):
+            timeline.append((event.created_at or _MIN_DT, _conversation_entry(event)))
+
+        timeline.sort(key=lambda item: item[0])
+        nodes.extend(entry for _, entry in timeline)
 
         has_notes = bool(branch.narrative_notes)
         meta = f"{branch.scope_slug} · {branch.status}"
         if has_notes:
             meta = f"{meta} · has narrative notes"
 
-        return {"title": branch.name, "meta": meta, "nodes": nodes}
+        result: dict = {"title": branch.name, "meta": meta, "nodes": nodes}
+        # Machine-readable status flags for the shell (ui-shell §4.2 thread
+        # contract, EXTENDED here): a top-level `flags` list. The composer's
+        # `disabled_when: "archived"` (registration.build_manifest) keys on the
+        # presence of the literal string "archived" in this list — that is the
+        # exact contract the dashboard shell (#69) consumes to grey out the
+        # composer. Absent/empty when the branch is active.
+        if branch.status == SHADOW_BRANCH_STATUS_ARCHIVED:
+            result["flags"] = [SHADOW_BRANCH_STATUS_ARCHIVED]
+        return result
 
 
 @router.get("/pages/branches/{branch_id}")
 async def branch_thread(branch_id: str) -> dict:
-    """`thread` contract (§4.2): the branch's narrative notes (if any) as the
-    first node, then its shadow nodes in creation order — the re-entry surface
-    for a speculation line, rendered without any shell change. 404s (JSON) on
-    an unknown/malformed `branch_id`."""
+    """`thread` contract (§4.2, EXTENDED by shadow-conversations §5): the branch's
+    narrative notes (if any) FIRST, then its shadow nodes and conversation
+    messages INTERLEAVED chronologically — the re-entry surface for a speculation
+    line. 404s (JSON) on an unknown/malformed `branch_id`.
+
+    Adds a top-level `flags: ["archived"]` list when the branch is archived (the
+    chosen shape for the archived status flag; absent otherwise) — the dashboard
+    shell's composer `disabled_when: "archived"` greys the composer out by
+    checking for `"archived"` in this list."""
     return await anyio.to_thread.run_sync(_branch_thread_sync, branch_id)
+
+
+# --- page: append a conversation message (shadow-conversations §5) ---------
+
+
+class _MessageBody(BaseModel):
+    """The composer POST body (spec §5): just `{ "markdown": str }`. The author is
+    ALWAYS "human" on this route — the browser is the human seam, so a client
+    cannot spoof an "agent" message here (that's the MCP `add_message` verb's
+    job)."""
+
+    markdown: str
+
+
+def _branch_add_message_sync(branch_id: str, markdown: str) -> dict:
+    with session_scope() as session:
+        try:
+            return shadow.add_message(session, branch_id, markdown, "human")
+        except shadow.BranchNotFoundError:
+            raise HTTPException(
+                status_code=404, detail="no such shadow branch"
+            ) from None
+        except shadow.BranchArchivedError:
+            raise HTTPException(
+                status_code=409, detail="shadow branch is archived"
+            ) from None
+        except shadow.MessageValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+
+
+@router.post("/pages/branches/{branch_id}/messages")
+async def branch_add_message(branch_id: str, body: _MessageBody) -> dict:
+    """Append a human message to a branch's conversation log (spec §5). Body is
+    `{ "markdown": str }`; the author is ALWAYS "human" (the browser seam). Returns
+    the appended event (with its `seq`). 404 on an unknown/malformed `branch_id`,
+    409 on an archived branch, 422 on blank/oversize markdown (capped at the
+    /ui-api proxy's `UI_WRITE_BODY_LIMIT`). Same `anyio.to_thread` + `session_scope`
+    pattern as the read routes above."""
+    return await anyio.to_thread.run_sync(
+        _branch_add_message_sync, branch_id, body.markdown
+    )

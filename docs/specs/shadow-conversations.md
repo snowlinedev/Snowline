@@ -79,7 +79,7 @@ ride the same proxy-POST enablement):
   "composer": {
     "endpoint": "/ui-api/pages/branches/{branch}/messages",  // POST target
     "placeholder": "Reply in this branch…",
-    "disabled_when": "archived"   // thread meta flag (§5) that greys it out
+    "disabled_when": "archived"   // thread `flags` entry (§5) that greys it out
   }
 }
 ```
@@ -111,7 +111,8 @@ Shell (dashboard `thread` component):
 - **Thread page GET** (`/ui-api/pages/branches/{branch_id}`) — conversation
   events MERGE into `nodes` chronologically with the shadow nodes (narrative
   notes stay first): `{ author: "you" | "agent", kind: "message", markdown,
-  at }`. The thread `meta` gains the branch status flag the composer's
+  at }`. The thread response gains a top-level `flags` list carrying the
+  branch status flag the composer's
   `disabled_when` keys on. One page still tells the whole story — no second
   kind, no second route.
 - MCP parity: the same events are readable from the shadow MCP surface

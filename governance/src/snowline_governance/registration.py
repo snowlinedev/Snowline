@@ -92,6 +92,21 @@ def build_manifest(base_url: str | None = None) -> dict:
                     "nav": False,
                     "kind": "thread",
                     "data": "/ui-api/pages/branches/{branch_id}",
+                    # The composer write seam (shadow-conversations §4/§5): the
+                    # shell renders a markdown textarea + send button at the thread
+                    # foot that POSTs `{ "markdown": ... }` through the /ui-api
+                    # proxy to this endpoint. The endpoint's `{branch_id}` param
+                    # MUST match this page's route param name (`branch_id`, not the
+                    # spec §4 example's `{branch}`) — platform validation (PR #72,
+                    # UIPage._valid_composer_for_kind) enforces endpoint-params ⊆
+                    # route-params. `disabled_when: "archived"` is the literal
+                    # string the shell (#69) checks for in the thread response's
+                    # top-level `flags` list to grey the composer out.
+                    "composer": {
+                        "endpoint": "/ui-api/pages/branches/{branch_id}/messages",
+                        "placeholder": "Reply in this branch…",
+                        "disabled_when": "archived",
+                    },
                 },
             ],
         },

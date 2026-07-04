@@ -74,6 +74,11 @@ DEFAULT_ARTIFACT_VERSION_STATUS = "proposed"
 # expired/deleted.
 SHADOW_BRANCH_STATUSES = ("active", "archived")
 DEFAULT_SHADOW_BRANCH_STATUS = "active"
+# Named because it is LOAD-BEARING contract in three places that must
+# coincide: the append guard (add_message 409s), the thread page's `flags`
+# entry, and the manifest composer's `disabled_when` — one constant, not
+# three bare literals that can desync.
+SHADOW_BRANCH_STATUS_ARCHIVED = "archived"
 
 
 class Base(DeclarativeBase):

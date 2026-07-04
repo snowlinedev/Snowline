@@ -147,8 +147,9 @@ COMPOSER_SHAPE: dict[str, str] = {
     "endpoint": "required — a /ui-api-relative POST target; may template "
     "'{param}' segments matching the page's route params",
     "placeholder": "optional — composer textarea placeholder text",
-    "disabled_when": "optional — a thread `meta` flag name the shell reads "
-    "to grey out the composer (e.g. 'archived')",
+    "disabled_when": "optional — a flag name the shell looks for in the "
+    "thread response's top-level `flags` list to grey out the composer "
+    "(e.g. 'archived')",
 }
 
 # Kind name -> its response-contract shape doc, for a plugin author to look

@@ -59,6 +59,16 @@ def _get_sync(app, path: str) -> httpx.Response:
     return anyio.run(_get, app, path)
 
 
+async def _post(app, path: str, json_body: dict) -> httpx.Response:
+    async with app.router.lifespan_context(app):
+        async with _http(app) as http:
+            return await http.post(path, json=json_body)
+
+
+def _post_sync(app, path: str, json_body: dict) -> httpx.Response:
+    return anyio.run(_post, app, path, json_body)
+
+
 # --- widget: stat --------------------------------------------------------
 
 
@@ -239,3 +249,192 @@ def test_branch_thread_malformed_id_is_404_json(monkeypatch, clean_db):
     resp = _get_sync(_app(monkeypatch), "/ui-api/pages/branches/not-a-uuid")
     assert resp.status_code == 404
     assert "detail" in resp.json()
+
+
+# --- page: conversation merge + composer POST (shadow-conversations §5) ------
+
+
+def test_branch_thread_merges_conversation_chronologically(monkeypatch, clean_db):
+    # Separate commits give each row a distinct func.now() timestamp, so the
+    # chronological interleave (node, message, node) this test asserts is
+    # deterministic. Narrative notes must stay FIRST regardless.
+    with session_scope() as s:
+        branch = shadow.create_branch(
+            s, "acme/widget", _sid("acme/widget"), "line-a", "the reasoning"
+        )
+    with session_scope() as s:
+        shadow.add_node(s, "acme/widget", "line-a", "node one")
+    with session_scope() as s:
+        shadow.add_message(s, branch["id"], "a human reply", "human")
+    with session_scope() as s:
+        shadow.add_node(s, "acme/widget", "line-a", "node two")
+
+    resp = _get_sync(_app(monkeypatch), f"/ui-api/pages/branches/{branch['id']}")
+    assert resp.status_code == 200
+    nodes = resp.json()["nodes"]
+
+    # Narrative FIRST regardless of timestamp, then chronological interleave.
+    assert [n["kind"] for n in nodes] == ["notes", "node", "message", "node"]
+    assert nodes[0]["author"] == "narrative"
+    assert nodes[1]["markdown"].startswith("node one")
+    # A human message renders with the display author "you".
+    assert nodes[2] == {
+        "author": "you",
+        "kind": "message",
+        "markdown": "a human reply",
+        "at": nodes[2]["at"],
+    }
+    assert nodes[3]["markdown"].startswith("node two")
+
+
+def test_branch_thread_renders_agent_message_and_error(monkeypatch, clean_db):
+    with session_scope() as s:
+        branch = shadow.create_branch(
+            s, "acme/widget", _sid("acme/widget"), "line-a"
+        )
+    with session_scope() as s:
+        shadow.add_message(s, branch["id"], "an agent turn", "agent")
+    with session_scope() as s:
+        # An agent.error event (phase 2's turn-runner writes these via the same
+        # service) renders fail-visible as an "error" node.
+        shadow.append_error(s, branch["id"], "codex timed out")
+
+    nodes = _get_sync(
+        _app(monkeypatch), f"/ui-api/pages/branches/{branch['id']}"
+    ).json()["nodes"]
+    assert nodes[0] == {
+        "author": "agent",
+        "kind": "message",
+        "markdown": "an agent turn",
+        "at": nodes[0]["at"],
+    }
+    assert nodes[1] == {
+        "author": "agent",
+        "kind": "error",
+        "markdown": "codex timed out",
+        "at": nodes[1]["at"],
+    }
+
+
+def test_branch_thread_archived_sets_flags(monkeypatch, clean_db):
+    with session_scope() as s:
+        branch = shadow.create_branch(
+            s, "acme/widget", _sid("acme/widget"), "line-a"
+        )
+    # Active: no flags.
+    active = _get_sync(
+        _app(monkeypatch), f"/ui-api/pages/branches/{branch['id']}"
+    ).json()
+    assert "flags" not in active or active["flags"] == []
+
+    with session_scope() as s:
+        shadow.archive_branch(s, "acme/widget", "line-a")
+
+    archived = _get_sync(
+        _app(monkeypatch), f"/ui-api/pages/branches/{branch['id']}"
+    ).json()
+    # The chosen archived-flag shape the shell's `disabled_when: "archived"` keys on.
+    assert archived["flags"] == ["archived"]
+
+
+def test_post_message_appends_and_returns_event(monkeypatch, clean_db):
+    with session_scope() as s:
+        branch = shadow.create_branch(
+            s, "acme/widget", _sid("acme/widget"), "line-a"
+        )
+
+    resp = _post_sync(
+        _app(monkeypatch),
+        f"/ui-api/pages/branches/{branch['id']}/messages",
+        {"markdown": "hello from the browser"},
+    )
+    assert resp.status_code == 200
+    ev = resp.json()
+    assert ev["seq"] == 1
+    assert ev["kind"] == "message"
+    # The route ALWAYS stamps author "human" — the browser is the human seam.
+    assert ev["payload"] == {"author": "human", "markdown": "hello from the browser"}
+
+    # It's durably appended — the thread page now shows it.
+    nodes = _get_sync(
+        _app(monkeypatch), f"/ui-api/pages/branches/{branch['id']}"
+    ).json()["nodes"]
+    assert nodes[-1]["markdown"] == "hello from the browser"
+    assert nodes[-1]["author"] == "you"
+
+
+def test_post_message_ignores_client_author(monkeypatch, clean_db):
+    with session_scope() as s:
+        branch = shadow.create_branch(
+            s, "acme/widget", _sid("acme/widget"), "line-a"
+        )
+    # A client trying to spoof an agent author is ignored — the route forces human.
+    resp = _post_sync(
+        _app(monkeypatch),
+        f"/ui-api/pages/branches/{branch['id']}/messages",
+        {"markdown": "sneaky", "author": "agent"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["payload"]["author"] == "human"
+
+
+def test_post_message_unknown_branch_is_404(monkeypatch, clean_db):
+    resp = _post_sync(
+        _app(monkeypatch),
+        f"/ui-api/pages/branches/{uuid.uuid4()}/messages",
+        {"markdown": "hi"},
+    )
+    assert resp.status_code == 404
+
+
+def test_post_message_malformed_branch_is_404(monkeypatch, clean_db):
+    resp = _post_sync(
+        _app(monkeypatch),
+        "/ui-api/pages/branches/not-a-uuid/messages",
+        {"markdown": "hi"},
+    )
+    assert resp.status_code == 404
+
+
+def test_post_message_archived_branch_is_409(monkeypatch, clean_db):
+    with session_scope() as s:
+        branch = shadow.create_branch(
+            s, "acme/widget", _sid("acme/widget"), "line-a"
+        )
+    with session_scope() as s:
+        shadow.archive_branch(s, "acme/widget", "line-a")
+
+    resp = _post_sync(
+        _app(monkeypatch),
+        f"/ui-api/pages/branches/{branch['id']}/messages",
+        {"markdown": "too late"},
+    )
+    assert resp.status_code == 409
+
+
+def test_post_message_blank_markdown_is_422(monkeypatch, clean_db):
+    with session_scope() as s:
+        branch = shadow.create_branch(
+            s, "acme/widget", _sid("acme/widget"), "line-a"
+        )
+    resp = _post_sync(
+        _app(monkeypatch),
+        f"/ui-api/pages/branches/{branch['id']}/messages",
+        {"markdown": "   "},
+    )
+    assert resp.status_code == 422
+
+
+def test_post_message_oversize_markdown_is_422(monkeypatch, clean_db):
+    from snowline_plugin_sdk.ui import UI_WRITE_BODY_LIMIT
+
+    with session_scope() as s:
+        branch = shadow.create_branch(
+            s, "acme/widget", _sid("acme/widget"), "line-a"
+        )
+    resp = _post_sync(
+        _app(monkeypatch),
+        f"/ui-api/pages/branches/{branch['id']}/messages",
+        {"markdown": "x" * (UI_WRITE_BODY_LIMIT + 1)},
+    )
+    assert resp.status_code == 422

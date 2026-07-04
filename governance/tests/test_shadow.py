@@ -9,12 +9,15 @@ isolation test needs no DB (it enumerates `list_tools()`).
 
 from __future__ import annotations
 
+import json
 import uuid
 
 import anyio
 import pytest
+from mcp.shared.memory import create_connected_server_and_client_session
 
 from snowline_governance import decisions, shadow
+from snowline_governance.db import session_scope
 from snowline_governance.mcp_surface import build_main_surface, build_shadow_surface
 from snowline_governance.models import Decision
 
@@ -63,6 +66,9 @@ _SHADOW_WRITE_TOOLS = {
     # archive_branch is a PURE shadow op (active→archived status flip, no real
     # write), so it lives on the shadow surface alongside the other shadow writes.
     "archive_branch",
+    # add_message appends to the branch's durable conversation log (a pure shadow
+    # write, shadow-conversations §5) — the SAME service the /ui-api composer calls.
+    "add_message",
 }
 
 _READ_REAL_GROUNDING = {
@@ -80,7 +86,7 @@ def _tool_names(surface) -> set[str]:
 
 
 def test_shadow_surface_is_isolated_no_real_write():
-    """THE KEY isolation test: the shadow surface's tool set is EXACTLY the 9
+    """THE KEY isolation test: the shadow surface's tool set is EXACTLY the 10
     shadow writes + the 6 read-real grounding tools — and contains ZERO real-write
     verbs. The absence of record_decision / supersede / register / revise /
     resolve / set_governs / set_maturity IS the isolation (decision 8a7f0a11)."""
@@ -292,3 +298,223 @@ def test_corpus_search_scope_narrowing(db_session):
 def test_corpus_search_rejects_blank_query(db_session):
     with pytest.raises(ValueError):
         shadow.corpus_search(db_session, "   ")
+
+
+# === conversation (shadow-conversations §2/§5) ===============================
+
+
+def test_add_message_allocates_monotonic_seq(db_session):
+    slug = "acme/widget"
+    branch = shadow.create_branch(db_session, slug, _sid(slug), "line-a")
+    bid = branch["id"]
+
+    e1 = shadow.add_message(db_session, bid, "first", "human")
+    e2 = shadow.add_message(db_session, bid, "second", "agent")
+
+    # Per-branch monotonic seq (spec §2): 1, then 2.
+    assert e1["seq"] == 1
+    assert e2["seq"] == 2
+    assert e1["kind"] == "message"
+    assert e1["payload"] == {"author": "human", "markdown": "first"}
+    assert e2["payload"] == {"author": "agent", "markdown": "second"}
+    assert e1["created_at"] and e2["created_at"]
+
+
+def test_add_message_seq_is_per_branch(db_session):
+    slug = "acme/widget"
+    b1 = shadow.create_branch(db_session, slug, _sid(slug), "line-a")
+    b2 = shadow.create_branch(db_session, slug, _sid(slug), "line-b")
+
+    # Each branch has its OWN seq counter (scoped by branch_id, spec §2).
+    assert shadow.add_message(db_session, b1["id"], "a1", "human")["seq"] == 1
+    assert shadow.add_message(db_session, b2["id"], "b1", "human")["seq"] == 1
+    assert shadow.add_message(db_session, b1["id"], "a2", "human")["seq"] == 2
+
+
+def test_add_message_for_update_path_yields_sequential_seqs(db_session):
+    # The FOR UPDATE-locked max(seq)+1 allocation (spec §2 concurrency safety):
+    # a burst of appends on one branch hands out a gapless, ordered seq run and
+    # the DB's unique (branch_id, seq) is never violated. True cross-connection
+    # concurrency isn't practical in this single-session harness, so this
+    # exercises the lock/allocate code path and pins the sequential outcome.
+    slug = "acme/widget"
+    branch = shadow.create_branch(db_session, slug, _sid(slug), "line-a")
+    seqs = [
+        shadow.add_message(db_session, branch["id"], f"m{i}", "human")["seq"]
+        for i in range(5)
+    ]
+    assert seqs == [1, 2, 3, 4, 5]
+
+
+def test_add_message_rejects_blank_markdown(db_session):
+    slug = "acme/widget"
+    branch = shadow.create_branch(db_session, slug, _sid(slug), "line-a")
+    with pytest.raises(shadow.MessageValidationError):
+        shadow.add_message(db_session, branch["id"], "   ", "human")
+
+
+def test_add_message_rejects_oversize_markdown(db_session):
+    from snowline_plugin_sdk.ui import UI_WRITE_BODY_LIMIT
+
+    slug = "acme/widget"
+    branch = shadow.create_branch(db_session, slug, _sid(slug), "line-a")
+    # One byte over the proxy's UTF-8 byte cap.
+    oversize = "x" * (UI_WRITE_BODY_LIMIT + 1)
+    with pytest.raises(shadow.MessageValidationError):
+        shadow.add_message(db_session, branch["id"], oversize, "human")
+    # A message exactly AT the cap is accepted (boundary is inclusive).
+    at_cap = "y" * UI_WRITE_BODY_LIMIT
+    assert shadow.add_message(db_session, branch["id"], at_cap, "human")["seq"] == 1
+
+
+def test_add_message_unknown_branch_raises_not_found(db_session):
+    with pytest.raises(shadow.BranchNotFoundError):
+        shadow.add_message(db_session, str(uuid.uuid4()), "hi", "human")
+
+
+def test_add_message_malformed_branch_id_raises_not_found(db_session):
+    with pytest.raises(shadow.BranchNotFoundError):
+        shadow.add_message(db_session, "not-a-uuid", "hi", "human")
+
+
+def test_add_message_archived_branch_raises(db_session):
+    slug = "acme/widget"
+    branch = shadow.create_branch(db_session, slug, _sid(slug), "line-a")
+    shadow.archive_branch(db_session, slug, "line-a")
+    with pytest.raises(shadow.BranchArchivedError):
+        shadow.add_message(db_session, branch["id"], "too late", "human")
+
+
+def test_get_branch_includes_conversation_tail(db_session):
+    slug = "acme/widget"
+    branch = shadow.create_branch(db_session, slug, _sid(slug), "line-a")
+    shadow.add_message(db_session, branch["id"], "human says hi", "human")
+    shadow.add_message(db_session, branch["id"], "agent replies", "agent")
+
+    got = shadow.get_branch(db_session, slug, "line-a")
+    tail = got["conversation"]
+    # Oldest-first, each {seq, author, markdown, at} (author kept RAW for MCP).
+    assert [e["seq"] for e in tail] == [1, 2]
+    assert tail[0] == {
+        "seq": 1,
+        "author": "human",
+        "markdown": "human says hi",
+        "at": tail[0]["at"],
+    }
+    assert tail[1]["author"] == "agent"
+    assert tail[1]["markdown"] == "agent replies"
+
+
+def test_get_branch_conversation_tail_caps_and_includes_errors(db_session):
+    slug = "acme/widget"
+    branch = shadow.create_branch(db_session, slug, _sid(slug), "line-a")
+    # More than the tail cap, so the OLDEST drop and only the last N remain.
+    total = shadow.CONVERSATION_TAIL_LIMIT + 3
+    for i in range(total):
+        shadow.add_message(db_session, branch["id"], f"m{i}", "human")
+    # An agent.error event counts as conversation (spec §2) and appears in the tail.
+    shadow.append_error(db_session, branch["id"], "boom")
+
+    tail = shadow.get_branch(db_session, slug, "line-a")["conversation"]
+    assert len(tail) == shadow.CONVERSATION_TAIL_LIMIT
+    # Newest entries retained; the error is the very last, rendered as an agent.
+    last = tail[-1]
+    assert last["author"] == "agent"
+    assert last["markdown"] == "boom"
+    assert last["seq"] == total + 1
+
+
+def test_append_error_allocates_seq_and_respects_archive(db_session):
+    # append_error shares the ONE seq allocator with add_message — interleaved
+    # appends of both kinds get strictly increasing seqs — and an archived
+    # branch takes no further error events either.
+    slug = "acme/widget"
+    branch = shadow.create_branch(db_session, slug, _sid(slug), "line-b")
+    m1 = shadow.add_message(db_session, branch["id"], "hi", "human")
+    e1 = shadow.append_error(db_session, branch["id"], "codex timed out")
+    m2 = shadow.add_message(db_session, branch["id"], "retry?", "human")
+    assert [m1["seq"], e1["seq"], m2["seq"]] == [1, 2, 3]
+    assert e1["kind"] == shadow.CONVERSATION_ERROR_KIND
+    assert e1["payload"] == {"error": "codex timed out"}
+    # Blank error text still yields a visible message, never an empty bubble.
+    e2 = shadow.append_error(db_session, branch["id"], "   ")
+    assert e2["payload"]["error"]
+    shadow.archive_branch(db_session, slug, "line-b")
+    with pytest.raises(shadow.BranchArchivedError):
+        shadow.append_error(db_session, branch["id"], "late failure")
+
+
+def test_add_message_rejects_unknown_author(db_session):
+    # The author enum guards the thread renderer's you/agent mapping — an MCP
+    # caller can't invent a third author kind (or spoof arbitrary strings).
+    slug = "acme/widget"
+    branch = shadow.create_branch(db_session, slug, _sid(slug), "line-c")
+    with pytest.raises(shadow.MessageValidationError, match="author"):
+        shadow.add_message(db_session, branch["id"], "hi", "narrative")
+
+
+# --- MCP parity (shadow-conversations §5) — in-memory FastMCP round-trip ------
+
+
+def _shadow_tool(tool_name: str, args: dict) -> dict:
+    """Call one `shadow` MCP tool over the in-memory transport (mirroring the
+    gateway's `create_connected_server_and_client_session` pattern) and return the
+    tool's structured dict result. The surface opens its OWN `session_scope`, so a
+    caller must COMMIT the branch/messages first (via `session_scope()`)."""
+
+    async def _run() -> dict:
+        surface = build_shadow_surface(scope_client=_NoopScopeClient())
+        async with create_connected_server_and_client_session(
+            surface, raise_exceptions=True
+        ) as session:
+            result = await session.call_tool(tool_name, args)
+            assert result.isError is not True
+            return json.loads(result.content[0].text)
+
+    return anyio.run(_run)
+
+
+def test_mcp_add_message_round_trip(clean_db):
+    slug = "acme/widget"
+    with session_scope() as s:
+        shadow.create_branch(s, slug, _sid(slug), "line-a")
+
+    # Default author is "agent" for MCP callers.
+    ev = _shadow_tool(
+        "add_message", {"scope": slug, "name": "line-a", "markdown": "from a session"}
+    )
+    assert ev["seq"] == 1
+    assert ev["kind"] == "message"
+    assert ev["payload"] == {"author": "agent", "markdown": "from a session"}
+
+    # An explicit "human" author is accepted too.
+    ev2 = _shadow_tool(
+        "add_message",
+        {"scope": slug, "name": "line-a", "markdown": "as human", "author": "human"},
+    )
+    assert ev2["seq"] == 2
+    assert ev2["payload"]["author"] == "human"
+
+    # And get_branch's tail reflects both, oldest-first — the SAME conversation a
+    # UI session sees (acceptance §7.6).
+    branch = _shadow_tool("get_branch", {"scope": slug, "name": "line-a"})
+    assert [e["seq"] for e in branch["conversation"]] == [1, 2]
+    assert branch["conversation"][0]["author"] == "agent"
+    assert branch["conversation"][1]["author"] == "human"
+
+
+def test_mcp_get_branch_conversation_tail(clean_db):
+    slug = "acme/widget"
+    with session_scope() as s:
+        branch = shadow.create_branch(s, slug, _sid(slug), "line-a")
+        shadow.add_message(s, branch["id"], "logged in the UI", "human")
+
+    got = _shadow_tool("get_branch", {"scope": slug, "name": "line-a"})
+    assert got["conversation"] == [
+        {
+            "seq": 1,
+            "author": "human",
+            "markdown": "logged in the UI",
+            "at": got["conversation"][0]["at"],
+        }
+    ]
