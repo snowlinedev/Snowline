@@ -58,6 +58,14 @@ UI_KINDS: frozenset[str] = WIDGET_KINDS | PAGE_KINDS
 # pinned equal to this copy by `test_ui_contract_drift.py`.
 COMPOSER_FIELDS: frozenset[str] = frozenset({"endpoint", "placeholder", "disabled_when"})
 
+# The /ui-api proxy's POST body cap (shadow-conversations.md §3): a
+# conversation message, not an upload. THE shared value — the platform's
+# proxy enforcement (`snowline_platform.ui_api.POST_BODY_LIMIT`) is pinned
+# equal by `test_ui_contract_drift.py`, and a plugin's write route should
+# reject at the same boundary (import THIS constant, don't hardcode 65536)
+# so proxy and plugin can't drift apart on what fits.
+UI_WRITE_BODY_LIMIT: int = 64 * 1024
+
 # --- Response-contract shapes, by kind (§4.1/§4.2) --------------------------
 #
 # Each entry documents the plugin-side JSON response body a widget/page's
@@ -193,4 +201,5 @@ __all__ = [
     "ACTION_SHAPE",
     "COMPOSER_FIELDS",
     "COMPOSER_SHAPE",
+    "UI_WRITE_BODY_LIMIT",
 ]

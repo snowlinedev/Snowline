@@ -52,6 +52,28 @@ _ROUTE_PARAM_RE = re.compile(r"^\{[A-Za-z_][A-Za-z0-9_]*\}$")
 _ROUTE_LITERAL_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
+def _valid_path_segments(path: str, label: str) -> None:
+    """The shared per-segment shape rule for `route` and write `endpoint`
+    paths: each segment is a literal token or a whole '{name}' param. `label`
+    names the field in errors ('route', 'composer endpoint', later
+    'action endpoint') so one walk serves every path-shaped field."""
+    for segment in path[1:].split("/"):
+        if not segment:
+            raise ValueError(
+                f"{label} {path!r} has an empty path segment (a stray '//')"
+            )
+        if "{" in segment or "}" in segment:
+            if not _ROUTE_PARAM_RE.match(segment):
+                raise ValueError(
+                    f"{label} {path!r} has a malformed path param {segment!r} — "
+                    "expected a whole '{name}' segment with a valid identifier"
+                )
+        elif not _ROUTE_LITERAL_RE.match(segment):
+            raise ValueError(
+                f"{label} {path!r} has an invalid path segment {segment!r}"
+            )
+
+
 def _valid_ui_route(route: str) -> str:
     if not route.startswith("/"):
         raise ValueError(f"route {route!r} must start with '/'")
@@ -59,21 +81,7 @@ def _valid_ui_route(route: str) -> str:
         return route
     if route.endswith("/"):
         raise ValueError(f"route {route!r} must not end with a trailing '/'")
-    for segment in route[1:].split("/"):
-        if not segment:
-            raise ValueError(
-                f"route {route!r} has an empty path segment (a stray '//')"
-            )
-        if "{" in segment or "}" in segment:
-            if not _ROUTE_PARAM_RE.match(segment):
-                raise ValueError(
-                    f"route {route!r} has a malformed path param {segment!r} — "
-                    "expected a whole '{name}' segment with a valid identifier"
-                )
-        elif not _ROUTE_LITERAL_RE.match(segment):
-            raise ValueError(
-                f"route {route!r} has an invalid path segment {segment!r}"
-            )
+    _valid_path_segments(route, "route")
     return route
 
 
@@ -97,37 +105,28 @@ def _path_param_names(path: str) -> set[str]:
     }
 
 
-def _valid_ui_endpoint(endpoint: str) -> str:
+def _valid_ui_endpoint(endpoint: str, label: str = "composer endpoint") -> str:
     # A composer/action endpoint is a POST write target proxied through
     # /ui-api (shadow-conversations.md §3) — same '/ui-api/' confinement rule
-    # as `data`, plus the same per-segment shape rule `_valid_ui_route` uses
-    # for `route` (either a literal token or a whole '{name}' param segment),
-    # since the proxy's write-path matcher (ui_api.py) walks it segment by
-    # segment the same way.
+    # as `data`, plus the shared per-segment shape rule, since the proxy's
+    # write-path matcher (ui_api.py) walks it segment by segment the same way.
+    # `label` keeps the 422s honest when actions[].endpoint reuses this.
     if not endpoint.startswith("/ui-api/"):
-        raise ValueError(f"composer endpoint {endpoint!r} must start with '/ui-api/'")
+        raise ValueError(f"{label} {endpoint!r} must start with '/ui-api/'")
     if endpoint.endswith("/"):
+        raise ValueError(f"{label} {endpoint!r} must not end with a trailing '/'")
+    _valid_path_segments(endpoint, label)
+    # '.'/'..' pass the literal-token regex (routes may use dots in slugs) but
+    # the proxy dot-collapses every request path BEFORE matching, so a literal
+    # dot-segment in a declared endpoint could never match anything — a
+    # registered-but-dead write seam. Fail loud here instead.
+    segments = set(endpoint[1:].split("/"))
+    if segments & {".", ".."}:
         raise ValueError(
-            f"composer endpoint {endpoint!r} must not end with a trailing '/'"
+            f"{label} {endpoint!r} contains a '.'/'..' segment — the proxy "
+            "normalizes dot-segments away before matching, so this endpoint "
+            "could never be reached"
         )
-    for segment in endpoint[1:].split("/"):
-        if not segment:
-            raise ValueError(
-                f"composer endpoint {endpoint!r} has an empty path segment "
-                "(a stray '//')"
-            )
-        if "{" in segment or "}" in segment:
-            if not _ROUTE_PARAM_RE.match(segment):
-                raise ValueError(
-                    f"composer endpoint {endpoint!r} has a malformed path param "
-                    f"{segment!r} — expected a whole '{{name}}' segment with a "
-                    "valid identifier"
-                )
-        elif not _ROUTE_LITERAL_RE.match(segment):
-            raise ValueError(
-                f"composer endpoint {endpoint!r} has an invalid path segment "
-                f"{segment!r}"
-            )
     return endpoint
 
 
@@ -139,7 +138,13 @@ def _no_duplicate_ids(items: list, what: str) -> None:
 
 
 class UIWidget(BaseModel):
-    """One home-grid widget contribution (ui-shell.md §3/§4.1)."""
+    """One home-grid widget contribution (ui-shell.md §3/§4.1).
+
+    `extra="forbid"` — unknown FIELDS fail loud at registration (same posture
+    as `UIBlock`); only unknown `kind` STRINGS fail visible at render (§4.4).
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     id: str = Field(description="unique within the plugin's widgets")
     slot: Literal["home"] = Field(
@@ -190,7 +195,15 @@ class UIComposer(BaseModel):
 
 
 class UIPage(BaseModel):
-    """One page contribution (ui-shell.md §3/§4.2)."""
+    """One page contribution (ui-shell.md §3/§4.2).
+
+    `extra="forbid"` — now that pages carry LOAD-BEARING optional fields, a
+    typo'd `composer` key must 422 at registration, not silently drop and
+    leave the write seam dead (every POST 403ing with nothing to explain why).
+    Unknown `kind` STRINGS still fail visible at render (§4.4).
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     id: str = Field(description="unique within the plugin's pages")
     route: str = Field(

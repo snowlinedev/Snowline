@@ -242,6 +242,34 @@ def test_composer_unknown_field_rejected():
         )
 
 
+def test_composer_typo_on_page_rejected():
+    # `extra="forbid"` on UIPage: a misspelled `composer` key must 422 at
+    # registration, not silently drop and leave the write seam dead (every
+    # POST 403ing with nothing to explain why).
+    page = _thread_page()
+    page["composeer"] = {"endpoint": "/ui-api/pages/branches/{branch}/messages"}
+    with pytest.raises(ValidationError):
+        _manifest({"pages": [page]})
+
+
+def test_composer_endpoint_dot_segment_rejected():
+    # '.'/'..' are valid literal tokens in a route slug, but the proxy
+    # dot-collapses request paths BEFORE matching, so a declared endpoint
+    # containing one could never be reached — fail loud, not dead-on-arrival.
+    with pytest.raises(ValidationError, match="dot-segment|'\\.'"):
+        _manifest(
+            {
+                "pages": [
+                    _thread_page(
+                        composer=_composer(
+                            endpoint="/ui-api/pages/branches/{branch}/../messages"
+                        )
+                    )
+                ]
+            }
+        )
+
+
 def test_composer_endpoint_param_not_in_route_rejected():
     with pytest.raises(ValidationError, match="not present in route"):
         _manifest(

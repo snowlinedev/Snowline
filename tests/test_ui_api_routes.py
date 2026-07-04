@@ -12,6 +12,7 @@ speaks plain HTTP/JSON, not MCP.
 from __future__ import annotations
 
 import httpx
+import pytest
 from starlette.testclient import TestClient
 
 from snowline_platform import ui_api
@@ -125,11 +126,13 @@ def test_proxy_unknown_status_and_up_status_proceed():
         assert TestClient(app).get("/ui-api/gov/pages/branches").status_code == 200
 
 
-def test_proxy_put_is_still_405():
+@pytest.mark.parametrize("verb", ["put", "delete", "patch"])
+def test_proxy_other_verbs_are_405(verb):
     # Only GET and POST are wired (ui-shell.md §5); every other verb keeps
-    # the normal Starlette method-not-allowed behavior.
+    # the normal Starlette method-not-allowed behavior — pinned per verb so a
+    # future router change can't quietly widen the write seam.
     app = _app(_registry())
-    r = TestClient(app).put("/ui-api/gov/pages/branches")
+    r = getattr(TestClient(app), verb)("/ui-api/gov/pages/branches")
     assert r.status_code == 405
 
 
@@ -372,6 +375,25 @@ def test_proxy_post_dot_segment_cannot_bypass_the_allowlist():
         json={"markdown": "hi"},
     )
     assert r.status_code in (403, 404)
+
+
+def test_proxy_post_forwards_the_query_string():
+    # Same posture as GET: the query string rides along to the upstream (an
+    # idempotency key or csrf token on a write must not be silently stripped).
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["query"] = dict(request.url.params)
+        return httpx.Response(200, json={"ok": True})
+
+    app = _app(_registry_with_composer())
+    _wire_mock_upstream(app, handler)
+    r = TestClient(app).post(
+        "/ui-api/gov/pages/branches/abc/messages?idempotency=xyz",
+        json={"markdown": "hi"},
+    )
+    assert r.status_code == 200
+    assert seen["query"] == {"idempotency": "xyz"}
 
 
 def test_proxy_post_upstream_connect_error_is_502():

@@ -36,5 +36,23 @@ def test_ui_kind_vocabulary_equals_sdk():
 
 def test_composer_fields_equals_sdk():
     # thread pages' write seam (shadow-conversations.md §4) — same
-    # never-silently-fork discipline as the kind vocabulary above.
+    # never-silently-fork discipline as the kind vocabulary above. Pinned to
+    # the REAL enforcement surface too (`UIComposer.model_fields`): unlike
+    # `kind` (a free string, where the constant IS the vocabulary), composer
+    # fields are pydantic-enforced, so a constant not tied to the model would
+    # be an inert shadow that drifts the moment the model grows a field.
+    assert set(platform_manifest.UIComposer.model_fields) == (
+        platform_manifest.COMPOSER_FIELDS
+    )
     assert platform_manifest.COMPOSER_FIELDS == sdk_ui.COMPOSER_FIELDS
+    # The SDK's human-facing shape doc must cover the same vocabulary.
+    assert set(sdk_ui.COMPOSER_SHAPE) == sdk_ui.COMPOSER_FIELDS
+
+
+def test_write_body_limit_equals_sdk():
+    # The proxy's POST cap is contract, not implementation detail: governance's
+    # message route (#70) rejects at the same boundary by importing the SDK
+    # constant, so the two enforcement points must be the one spec value.
+    from snowline_platform import ui_api
+
+    assert ui_api.POST_BODY_LIMIT == sdk_ui.UI_WRITE_BODY_LIMIT

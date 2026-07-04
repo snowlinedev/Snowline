@@ -291,23 +291,15 @@ async def proxy_post(plugin: str, path: str, request: Request) -> Response:
             status_code=status.HTTP_413_CONTENT_TOO_LARGE,
         )
 
-    # Cheap precheck against a well-formed Content-Length — but never trusted
-    # alone (a client can lie, omit it, or chunk-encode), so the read below
-    # enforces the same cap against the actual bytes regardless.
-    content_length = request.headers.get("content-length")
-    if content_length is not None:
-        try:
-            declared_length = int(content_length)
-        except ValueError:
-            declared_length = None
-        if declared_length is not None and declared_length > POST_BODY_LIMIT:
-            return _too_large()
-
+    # ONE enforcement path: the cap is checked against the actual streamed
+    # bytes (a Content-Length header can lie, be absent, or chunk-encode), and
+    # BEFORE buffering each chunk, so an oversize single-chunk body never
+    # occupies memory past the limit.
     body = bytearray()
     async for chunk in request.stream():
-        body.extend(chunk)
-        if len(body) > POST_BODY_LIMIT:
+        if len(body) + len(chunk) > POST_BODY_LIMIT:
             return _too_large()
+        body.extend(chunk)
     body_bytes = bytes(body)
 
     upstream_url = f"{entry.manifest.base_url}/ui-api/{suffix}"
@@ -316,6 +308,7 @@ async def proxy_post(plugin: str, path: str, request: Request) -> Response:
     try:
         upstream_resp = await client.post(
             upstream_url,
+            params=request.query_params,
             content=body_bytes,
             headers={"content-type": "application/json"},
         )
