@@ -25,6 +25,16 @@ from __future__ import annotations
 
 EVENT_DECISION_RECORDED: str = "decision.recorded"
 EVENT_DECISION_SUPERSEDED: str = "decision.superseded"
+# The missing half of §6.1's reconciliation sentence — "the flag clears once the
+# supersession edge exists (OR the pair is explicitly marked compatible)" (#97).
+# A permanent, idempotent judgment anchored to the immutable normalized pair on
+# `decision_concurrences` (decisions are content-immutable — an "edit" is a
+# supersession with a NEW id, so there is nothing to re-flag). No LWW, no unmark:
+# apply is an order-independent upsert. Additive vocabulary (§3.2) — it lands in
+# BOTH pinned EVENT_TYPES copies in ONE commit with NO CONTRACT_VERSION bump: a
+# new event type does not change the envelope's keying fields, unlike v2's #77
+# addition (epoch/emit-seq/peer_seen) that forced the bump.
+EVENT_DECISION_MARKED_COMPATIBLE: str = "decision.marked_compatible"
 
 # Full-write-surface coverage (replication-continuity §4 / §9 item 3, #79):
 # one event type per lifecycle write, so two instances' governance stores can
@@ -66,6 +76,7 @@ EVENT_TYPES: frozenset[str] = frozenset(
     {
         EVENT_DECISION_RECORDED,
         EVENT_DECISION_SUPERSEDED,
+        EVENT_DECISION_MARKED_COMPATIBLE,
         EVENT_SHADOW_BRANCH_CREATED,
         EVENT_SHADOW_BRANCH_ARCHIVED,
         EVENT_SHADOW_NOTES_SET,

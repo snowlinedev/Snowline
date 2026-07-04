@@ -30,6 +30,7 @@ from sqlalchemy import func, select
 from snowline_governance import artifacts, concurrence, decisions, graduation, shadow
 from snowline_governance.contract import (
     EVENT_ARTIFACT_MATURITY_SET,
+    EVENT_DECISION_MARKED_COMPATIBLE,
     EVENT_DECISION_RECORDED,
     EVENT_DECISION_SUPERSEDED,
     EVENT_SHADOW_BRANCH_ARCHIVED,
@@ -146,7 +147,7 @@ def test_losing_superseded_event_is_applied_never_skipped(db_session, apply_fn):
     assert str(b_row.supersedes_id) == x["id"]
     # Both superseders stand as leaves — and the pair is flagged (§6.1).
     assert concurrence.concurrent_with(db_session, uuid.UUID(a["id"])) == [
-        b_payload["id"]
+        {"id": b_payload["id"], "compatible": False}
     ]
 
 
@@ -167,11 +168,11 @@ def test_siblings_flagged_in_same_scope(db_session, apply_fn):
     assert flagged == {local["id"], incoming["id"]}
     # Markers surface on BOTH decisions' full reads.
     assert decisions.get_decision(db_session, local["id"])["concurrent_with"] == [
-        incoming["id"]
+        {"id": incoming["id"], "compatible": False}
     ]
     assert decisions.get_decision(db_session, incoming["id"])[
         "concurrent_with"
-    ] == [local["id"]]
+    ] == [{"id": local["id"], "compatible": False}]
 
 
 def test_siblings_flagged_along_the_applicability_chain_both_directions(
@@ -185,7 +186,7 @@ def test_siblings_flagged_along_the_applicability_chain_both_directions(
     child_in = _decision_payload(scope="acme/widget")
     apply_fn(db_session, _envelope(EVENT_DECISION_RECORDED, child_in, peer_seen=0))
     assert concurrence.concurrent_with(db_session, uuid.UUID(parent["id"])) == [
-        child_in["id"]
+        {"id": child_in["id"], "compatible": False}
     ]
 
     # Local decision at the CHILD scope; incoming at the parent (seq 2).
@@ -197,9 +198,12 @@ def test_siblings_flagged_along_the_applicability_chain_both_directions(
         db_session,
         _envelope(EVENT_DECISION_RECORDED, parent_in, seq=2, peer_seen=0),
     )
-    assert parent_in["id"] in concurrence.concurrent_with(
-        db_session, uuid.UUID(child_local["id"])
-    )
+    assert parent_in["id"] in {
+        e["id"]
+        for e in concurrence.concurrent_with(
+            db_session, uuid.UUID(child_local["id"])
+        )
+    }
 
 
 def test_non_inheriting_sibling_scopes_are_not_flagged(db_session, apply_fn):
@@ -282,6 +286,153 @@ def test_flag_clears_when_the_supersession_arrives_as_an_event(
     apply_fn(
         db_session, _envelope(EVENT_DECISION_SUPERSEDED, fix, seq=2, peer_seen=1)
     )
+    assert concurrence.unreconciled_pairs(db_session)["items_total"] == 0
+
+
+# --- §6.1 explicit compatibility marking (#97) ---------------------------------
+
+
+def _flag_a_pair(db_session, apply_fn) -> tuple[dict, dict]:
+    """Detect one concurrent pair the standard way; return (local, incoming)."""
+    _pair_outbound(db_session)
+    local = decisions.record_decision(
+        db_session, "acme/widget", _sid("acme/widget"), "local take"
+    )
+    incoming = _decision_payload(scope="acme/widget", decision="peer take")
+    apply_fn(db_session, _envelope(EVENT_DECISION_RECORDED, incoming, peer_seen=0))
+    assert concurrence.unreconciled_pairs(db_session)["items_total"] == 1
+    return local, incoming
+
+
+def _marked_compatible_payload(lo, hi, *, at=None) -> dict:
+    return _payload(
+        decision_id=str(lo),
+        concurrent_with_id=str(hi),
+        actor="peer",
+        marked_compatible_at=(at or utcnow()).isoformat(),
+    )
+
+
+def test_mark_compatible_clears_the_flag_and_keeps_both_decisions(
+    db_session, apply_fn
+):
+    """§6.1's second reconciliation path (#97): marking a flagged pair compatible
+    drops it from the unreconciled view while BOTH decisions stay active leaves —
+    and `concurrent_with` still EXPOSES the pair, now `compatible=True` (the
+    marker is history, not a disappearance)."""
+    local, incoming = _flag_a_pair(db_session, apply_fn)
+
+    decisions.mark_decisions_compatible(db_session, local["id"], incoming["id"])
+
+    assert concurrence.unreconciled_pairs(db_session)["items_total"] == 0
+    # Both decisions are still active leaves — nothing superseded.
+    assert decisions.get_decision(db_session, local["id"])["superseded_by"] is None
+    assert (
+        decisions.get_decision(db_session, incoming["id"])["superseded_by"] is None
+    )
+    # The pair still surfaces on both full reads, flagged compatible.
+    assert decisions.get_decision(db_session, local["id"])["concurrent_with"] == [
+        {"id": incoming["id"], "compatible": True}
+    ]
+    assert decisions.get_decision(db_session, incoming["id"])[
+        "concurrent_with"
+    ] == [{"id": local["id"], "compatible": True}]
+
+
+def test_mark_compatible_is_idempotent_and_order_independent(db_session, apply_fn):
+    """Re-marking (arguments in EITHER order — normalization collapses them to the
+    same pair) is a no-op that keeps the first stamp; the judgment is permanent."""
+    local, incoming = _flag_a_pair(db_session, apply_fn)
+    lo, hi = sorted([uuid.UUID(local["id"]), uuid.UUID(incoming["id"])])
+    decisions.mark_decisions_compatible(db_session, local["id"], incoming["id"])
+    row = concurrence.get_pair(db_session, lo, hi)
+    stamp = row.marked_compatible_at
+    # Re-mark with the arguments SWAPPED.
+    decisions.mark_decisions_compatible(db_session, incoming["id"], local["id"])
+    db_session.refresh(row)
+    assert row.marked_compatible_at == stamp
+    assert concurrence.unreconciled_pairs(db_session)["items_total"] == 0
+
+
+def test_mark_compatible_rejects_an_unflagged_pair(db_session):
+    """You can only judge a pair detection surfaced — an unflagged pair raises
+    clearly instead of inventing a marker row."""
+    a = decisions.record_decision(
+        db_session, "acme/widget", _sid("acme/widget"), "a"
+    )
+    b = decisions.record_decision(
+        db_session, "acme/widget", _sid("acme/widget"), "b"
+    )
+    with pytest.raises(decisions.PairNotConcurrentError):
+        decisions.mark_decisions_compatible(db_session, a["id"], b["id"])
+
+
+def test_marked_compatible_event_upserts_before_detection(db_session, apply_fn):
+    """The mark can arrive BEFORE this side has detected the pair itself (the peer
+    decision / its detection still in flight). Apply UPSERTS the concurrence row,
+    and the LATER detection tolerates the pre-existing row (no clobber) — the pair
+    is compatible on both paths, order-independent."""
+    _pair_outbound(db_session)
+    local = decisions.record_decision(
+        db_session, "acme/widget", _sid("acme/widget"), "local take"
+    )
+    incoming = _decision_payload(scope="acme/widget", decision="peer take")
+    lo, hi = sorted([uuid.UUID(local["id"]), uuid.UUID(incoming["id"])])
+
+    # The mark arrives FIRST — before the peer decision even applies here.
+    apply_fn(
+        db_session,
+        _envelope(
+            EVENT_DECISION_MARKED_COMPATIBLE,
+            _marked_compatible_payload(lo, hi),
+            peer_seen=0,
+        ),
+    )
+    row = concurrence.get_pair(db_session, lo, hi)
+    assert row is not None and row.marked_compatible_at is not None
+
+    # Now the peer decision arrives and detection runs — it must TOLERATE the
+    # pre-existing row, leaving the pair compatible / off-view.
+    apply_fn(
+        db_session,
+        _envelope(EVENT_DECISION_RECORDED, incoming, seq=2, peer_seen=0),
+    )
+    assert concurrence.unreconciled_pairs(db_session)["items_total"] == 0
+    assert decisions.get_decision(db_session, local["id"])["concurrent_with"] == [
+        {"id": incoming["id"], "compatible": True}
+    ]
+
+
+def test_marked_compatible_apply_keeps_earliest_stamp_and_is_idempotent(
+    db_session, apply_fn
+):
+    """Convergence: out-of-order / redelivered marks converge to the EARLIEST
+    stamp — the judgment is a permanent fact with no clock or tiebreak."""
+    local, incoming = _flag_a_pair(db_session, apply_fn)
+    lo, hi = sorted([uuid.UUID(local["id"]), uuid.UUID(incoming["id"])])
+    early = utcnow() - timedelta(hours=1)
+    late_mark = _marked_compatible_payload(lo, hi)  # ~now
+    early_mark = _marked_compatible_payload(lo, hi, at=early)
+
+    # Apply the LATER mark first, then the EARLIER one (out of order).
+    apply_fn(
+        db_session,
+        _envelope(EVENT_DECISION_MARKED_COMPATIBLE, late_mark, seq=2, peer_seen=0),
+    )
+    apply_fn(
+        db_session,
+        _envelope(EVENT_DECISION_MARKED_COMPATIBLE, early_mark, seq=3, peer_seen=0),
+    )
+    row = concurrence.get_pair(db_session, lo, hi)
+    assert row.marked_compatible_at == early
+
+    # Redelivery of the later mark does not move the earliest stamp.
+    apply_fn(
+        db_session,
+        _envelope(EVENT_DECISION_MARKED_COMPATIBLE, late_mark, seq=2, peer_seen=0),
+    )
+    db_session.refresh(row)
+    assert row.marked_compatible_at == early
     assert concurrence.unreconciled_pairs(db_session)["items_total"] == 0
 
 

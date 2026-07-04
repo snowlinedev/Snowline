@@ -453,9 +453,11 @@ class DecisionConcurrence(Base):
     The pair is stored NORMALIZED (`decision_id` < `concurrent_with_id` as
     UUIDs), one row per unordered pair — both sides compute the identical row.
     The row is never deleted: "unreconciled" is DERIVED (both members still
-    leaves), so recording the reconciling supersession clears the flag on both
-    sides the moment that ordinary event applies — no marker write needed
-    (§6.1: reconciliation is ordinary governance)."""
+    leaves AND `marked_compatible_at IS NULL`), so recording the reconciling
+    supersession — OR explicitly marking the pair compatible (§6.1's second
+    clearing path, #97) — clears the flag on both sides the moment that ordinary
+    event applies — no marker deletion needed (§6.1: reconciliation is ordinary
+    governance)."""
 
     __tablename__ = "decision_concurrences"
 
@@ -465,6 +467,13 @@ class DecisionConcurrence(Base):
     decision_id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
     concurrent_with_id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    # §6.1's explicit compatibility judgment (#97): a permanent, idempotent stamp
+    # anchored to this immutable pair — set once (the earliest mark wins, so apply
+    # is order-independent), never cleared (decisions are content-immutable, so
+    # there is nothing to re-judge; a wrong call is corrected by superseding a
+    # member, which reconciles the pair via the leaf rule anyway). NULL = not yet
+    # marked; a non-NULL value drops the pair from the `unreconciled` view.
+    marked_compatible_at: Mapped[datetime | None] = mapped_column(nullable=True)
 
 
 class LwwRegister(Base):

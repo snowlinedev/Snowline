@@ -32,6 +32,7 @@ from sqlalchemy.orm import Session
 
 from snowline_governance import branching, concurrence, replication, replication_stream
 from snowline_governance.contract import (
+    EVENT_DECISION_MARKED_COMPATIBLE,
     EVENT_DECISION_RECORDED,
     EVENT_DECISION_SUPERSEDED,
 )
@@ -41,6 +42,12 @@ from snowline_governance.scope_client import ScopeClient
 
 class DecisionNotFoundError(Exception):
     """No decision with the given id."""
+
+
+class PairNotConcurrentError(Exception):
+    """`mark_decisions_compatible` was asked to judge a pair the system never
+    flagged as concurrent siblings. You can only mark a pair `unreconciled`
+    detection actually surfaced — record the judgment against a real flag."""
 
 
 class DecisionScopeMismatchError(Exception):
@@ -254,6 +261,68 @@ def supersede_decision(
         "decision": _decision_summary(row.decision),
         "recorded_at": row.recorded_at.isoformat() if row.recorded_at else None,
         "supersedes": str(prior.id),
+    }
+
+
+def mark_decisions_compatible(
+    session: Session,
+    decision_id: str,
+    other_id: str,
+    actor: str | None = None,
+) -> dict:
+    """Record §6.1's explicit compatibility judgment over a flagged concurrent
+    pair (#97) — the missing half of "the flag clears once the supersession edge
+    exists (or the pair is explicitly marked compatible)". Both decisions STAY
+    active; the pair leaves the `unreconciled` view on both instances.
+
+    The pair MUST already be flagged locally (`PairNotConcurrentError` otherwise)
+    — you can only judge a pair detection surfaced. Idempotent + permanent: the
+    judgment anchors to the immutable normalized pair, re-marking is a no-op, and
+    there is no unmark verb (a wrong call is corrected by superseding a member,
+    the existing path). Replicates through both the legacy webhook bus and the
+    replication stream, matching `decision.superseded`'s emit site.
+    """
+    try:
+        a = uuid.UUID(str(decision_id))
+        b = uuid.UUID(str(other_id))
+    except (ValueError, AttributeError) as exc:
+        raise DecisionNotFoundError(
+            f"not a valid decision id pair: {decision_id!r}, {other_id!r}"
+        ) from exc
+    row = concurrence.get_pair(session, a, b)
+    if row is None:
+        raise PairNotConcurrentError(
+            f"decisions {decision_id!r} and {other_id!r} are not a flagged "
+            f"concurrent-sibling pair on this instance — nothing to mark "
+            f"compatible (see the unreconciled view for judgeable pairs)."
+        )
+    lo, hi = row.decision_id, row.concurrent_with_id
+    marked_at = replication_stream.utcnow()
+    who = actor or replication_stream.source_id()
+    concurrence.mark_compatible(session, lo, hi, marked_at, create_if_absent=False)
+    # EMIT (spec §7 / §6.1, #97): the compatibility judgment is a first-class
+    # replicated event — the scope_ids of the two members anchor the legacy
+    # bus's scope filter; the stream carries the normalized pair.
+    d_lo = session.get(Decision, lo)
+    d_hi = session.get(Decision, hi)
+    replication.emit_marked_compatible_event(
+        session,
+        lo,
+        hi,
+        who,
+        marked_at,
+        {d.scope_id for d in (d_lo, d_hi) if d is not None},
+    )
+    replication_stream.emit(
+        session,
+        EVENT_DECISION_MARKED_COMPATIBLE,
+        replication_stream.marked_compatible_payload(lo, hi, who, marked_at),
+    )
+    return {
+        "decision_id": str(lo),
+        "concurrent_with_id": str(hi),
+        "marked_compatible_at": marked_at.isoformat(),
+        "actor": who,
     }
 
 

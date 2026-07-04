@@ -65,7 +65,10 @@ import httpx
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from snowline_governance.contract import CONTRACT_VERSION
+from snowline_governance.contract import (
+    CONTRACT_VERSION,
+    EVENT_DECISION_MARKED_COMPATIBLE,
+)
 from snowline_governance.db import session_scope
 from snowline_governance.models import WebhookDelivery, WebhookSubscription
 
@@ -159,6 +162,62 @@ def emit_decision_event(
                 subscription_id=sub.id,
                 seq=None,  # allocated at delivery time by the loop
                 event_type=event_type,
+                payload=payload,
+                status="pending",
+            )
+        )
+
+
+def build_marked_compatible_event(
+    lo, hi, actor: str, marked_at
+) -> dict:
+    """The webhook payload for `decision.marked_compatible` (#97). Pure shaping —
+    the NORMALIZED immutable pair ids, the `actor` who judged, and the permanent
+    `marked_compatible_at` stamp. `contract_version` unchanged (additive
+    vocabulary, §3.2); `source` is the per-source watermark key."""
+    return {
+        "event_type": EVENT_DECISION_MARKED_COMPATIBLE,
+        "source": _source_id(),
+        "contract_version": CONTRACT_VERSION,
+        "marked_compatible": {
+            "decision_id": str(lo),
+            "concurrent_with_id": str(hi),
+            "actor": actor,
+            "marked_compatible_at": (
+                marked_at.isoformat() if marked_at else None
+            ),
+        },
+    }
+
+
+def emit_marked_compatible_event(
+    session: Session, lo, hi, actor: str, marked_at, scope_ids
+) -> None:
+    """The fire-and-forget webhook half of a mark-compatible (#97) — the sibling
+    of `emit_decision_event` on the decisions-only legacy bus, written in the
+    mark's transaction (transactional outbox). A subscription matches when it is
+    active, lists the event type, and is global (`scope_id` IS NULL) or anchored
+    to EITHER member's scope (the pair may straddle two scopes along the
+    applicability chain). No-op when nobody subscribes (the common case)."""
+    subs = session.scalars(
+        select(WebhookSubscription).where(WebhookSubscription.active.is_(True))
+    ).all()
+    anchored = {sid for sid in scope_ids if sid is not None}
+    matching = [
+        s
+        for s in subs
+        if EVENT_DECISION_MARKED_COMPATIBLE in (s.event_types or [])
+        and (s.scope_id is None or s.scope_id in anchored)
+    ]
+    if not matching:
+        return
+    payload = build_marked_compatible_event(lo, hi, actor, marked_at)
+    for sub in matching:
+        session.add(
+            WebhookDelivery(
+                subscription_id=sub.id,
+                seq=None,  # allocated at delivery time by the loop
+                event_type=EVENT_DECISION_MARKED_COMPATIBLE,
                 payload=payload,
                 status="pending",
             )
