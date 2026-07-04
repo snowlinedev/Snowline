@@ -112,6 +112,33 @@ def test_validate_rejects_allowlist_for_unmounted_surface(monkeypatch):
         )
 
 
+def test_trusted_cidrs_default_unset(monkeypatch):
+    """Unset `SNOWLINE_TRUSTED_CIDRS` resolves to the tailnet + loopback set —
+    not the tailnet-only range (issue #93: a tailnet-only platform default 403s
+    loopback deliveries and pairing-CLI calls behind a serve->loopback front)."""
+    monkeypatch.delenv("SNOWLINE_TRUSTED_CIDRS", raising=False)
+    assert config.trusted_cidrs() == ["100.64.0.0/10", "127.0.0.0/8", "::1"]
+
+
+def test_default_matches_sdk_admin_default(monkeypatch):
+    """Issue #93 regression: the platform's unset-env default and the SDK
+    replication admin router's unset-env default for the SAME env var,
+    `SNOWLINE_TRUSTED_CIDRS`, must resolve identically. Before this fix the
+    platform's default was tailnet-only (`100.64.0.0/10`) while the SDK's
+    included loopback (`100.64.0.0/10,127.0.0.0/8,::1`, per
+    replication-continuity.md §5.1's serve->loopback bind posture) — leaving
+    the platform default unset 403'd loopback deliveries and pairing-CLI calls
+    on first boot. Pinning equality here catches the two drifting apart again."""
+    # importorskip, not a hard import: the SDK is a dev-only dependency (same
+    # treatment as governance's test_contract_drift.py).
+    sdk_admin = pytest.importorskip("snowline_plugin_sdk.replication.admin")
+    sdk_default = sdk_admin.DEFAULT_TRUSTED_CIDRS
+
+    monkeypatch.delenv("SNOWLINE_TRUSTED_CIDRS", raising=False)
+    assert config.DEFAULT_TRUSTED_CIDRS == sdk_default
+    assert config.trusted_cidrs() == [c.strip() for c in sdk_default.split(",")]
+
+
 def test_validate_accepts_allowlist_named_in_both_envs(monkeypatch):
     """The documented shape — the constrained surface present in BOTH envs —
     validates cleanly (and the empty allowlist trivially so)."""

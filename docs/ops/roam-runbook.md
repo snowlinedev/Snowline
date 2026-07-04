@@ -31,9 +31,13 @@ not hand-run the steps out of order.
 
 ## 1. The trusted-CIDR list — state it IN FULL
 
-`SNOWLINE_TRUSTED_CIDRS` **replaces** the default when set (§5.1 config trap), so
-it must list every trusted range explicitly. Set it identically on **every
-process on both instances**:
+`SNOWLINE_TRUSTED_CIDRS` **replaces** the default when set (§5.1 config trap).
+As of issue #93, both the platform (`config.DEFAULT_TRUSTED_CIDRS`) and the SDK
+admin surface default to the full tailnet + loopback set below when the env is
+unset, so a bare first boot no longer 403s loopback deliveries or pairing-CLI
+calls. **Setting it explicitly is still recommended** for clarity and for
+anyone reading the deployment config without also reading the source — spell
+out every trusted range on **every process on both instances**:
 
 ```
 SNOWLINE_TRUSTED_CIDRS="100.64.0.0/10,127.0.0.0/8,::1"
@@ -45,12 +49,11 @@ SNOWLINE_TRUSTED_CIDRS="100.64.0.0/10,127.0.0.0/8,::1"
 **Why loopback is not optional here.** Behind the `tailscale serve → loopback`
 front (§2 below), *every* request — the local agent and cross-instance
 deliveries alike — reaches the app with a **loopback** peer IP. So the loopback
-entries are what admit cross-instance traffic; dropping them is the outage. Note
-the mismatch this papers over: the platform's own default
-(`config.DEFAULT_TRUSTED_CIDRS`) is tailnet-**only**, while the SDK admin
-surface's default includes loopback — setting this env on the platform process
-erases the difference. Pin listeners to one address family (loopback-only bind,
-§2) so a dual-stack `::ffff:127.0.0.1` peer can't dodge the gate.
+entries are what admit cross-instance traffic; dropping them is the outage —
+and because `SNOWLINE_TRUSTED_CIDRS` REPLACES rather than extends the default,
+an explicit setting that omits loopback is just as much an outage as it was
+before the default changed. Pin listeners to one address family (loopback-only
+bind, §2) so a dual-stack `::ffff:127.0.0.1` peer can't dodge the gate.
 
 ## 2. Bind posture — loopback first, tailnet via tailscaled (§5.1)
 
