@@ -14,6 +14,13 @@ Pure constants + one pure function — no imports beyond stdlib.
 
 EVENT_DECISION_RECORDED: str = "decision.recorded"
 EVENT_DECISION_SUPERSEDED: str = "decision.superseded"
+# §6.1's explicit compatibility judgment — the missing half of "the flag clears
+# once the supersession edge exists (OR the pair is explicitly marked
+# compatible)" (#97). A permanent idempotent mark on the immutable normalized
+# concurrence pair; apply is an order-independent upsert (no LWW, no unmark).
+# Additive vocabulary — vendored EQUAL to the producer, both packages one commit,
+# NO CONTRACT_VERSION bump (the envelope keying fields are unchanged).
+EVENT_DECISION_MARKED_COMPATIBLE: str = "decision.marked_compatible"
 
 # Full-write-surface coverage (replication-continuity §4 / §9 item 3, #79) —
 # governance's shadow-graph, artifact (spec/plan/reference doc), and graduation
@@ -48,6 +55,7 @@ EVENT_TYPES: frozenset[str] = frozenset(
     {
         EVENT_DECISION_RECORDED,
         EVENT_DECISION_SUPERSEDED,
+        EVENT_DECISION_MARKED_COMPATIBLE,
         EVENT_SHADOW_BRANCH_CREATED,
         EVENT_SHADOW_BRANCH_ARCHIVED,
         EVENT_SHADOW_NOTES_SET,

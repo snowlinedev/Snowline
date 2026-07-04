@@ -218,9 +218,10 @@ def _register_read_tools(mcp: FastMCP, client: ScopeClient) -> None:
         (replication-continuity §6.1): authored on both instances during a
         partition, in the same scope or along one applicability chain — they
         may semantically collide, and neither supersedes the other yet. Review
-        each pair; reconciliation is ordinary governance (record a
-        `supersede_decision` over the losing member — the flag clears on both
-        instances once that replicates). Read-only; empty is the healthy state.
+        each pair; reconciliation is ordinary governance — either
+        `supersede_decision` the losing member, OR, if both should stand,
+        `mark_decisions_compatible` the pair (#97). Either clears the flag on
+        both instances once it replicates. Read-only; empty is the healthy state.
         """
         return await anyio.to_thread.run_sync(_unreconciled_decisions_sync, limit)
 
@@ -313,6 +314,28 @@ def build_main_surface(scope_client: ScopeClient | None = None) -> FastMCP:
         """
         return await anyio.to_thread.run_sync(
             _supersede_decision_sync, prior_decision_id, decision, rationale, scope
+        )
+
+    def _mark_decisions_compatible_sync(decision_id: str, other_id: str):
+        with session_scope() as session:
+            return decisions.mark_decisions_compatible(
+                session, decision_id, other_id
+            )
+
+    @mcp.tool()
+    async def mark_decisions_compatible(decision_id: str, other_id: str) -> dict:
+        """Judge a flagged CONCURRENT-SIBLING pair COMPATIBLE — both decisions
+        stand, and the pair leaves the `unreconciled` view on both instances
+        (replication-continuity §6.1, the other half of reconciliation alongside
+        `supersede_decision`). Use this when review finds the two decisions do
+        NOT actually collide — the over-inclusive detection net flagged a false
+        positive. The pair MUST already appear in `unreconciled_decisions` (you
+        can only judge a pair the system flagged). The judgment is PERMANENT and
+        idempotent — there is no unmark; if it was wrong, `supersede_decision` a
+        member instead (which both corrects the record and clears the pair).
+        """
+        return await anyio.to_thread.run_sync(
+            _mark_decisions_compatible_sync, decision_id, other_id
         )
 
     # --- graduation (shadow → real) — a REAL write, MAIN surface only --------

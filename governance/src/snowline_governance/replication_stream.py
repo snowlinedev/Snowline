@@ -205,6 +205,24 @@ def decision_payload(row) -> dict:
     )
 
 
+def marked_compatible_payload(
+    lo: uuid.UUID, hi: uuid.UUID, actor: str, marked_at: datetime
+) -> dict:
+    """`decision.marked_compatible` (#97) — §6.1's explicit compatibility
+    judgment. Carries the NORMALIZED immutable pair (lesser UUID first, both
+    sides key the identical `DecisionConcurrence` row), the `actor` who judged,
+    and `marked_compatible_at` — the permanent stamp apply writes (the earliest
+    wins, so this is order-independent). `_base`'s `at` is the occurred-at."""
+    return _base(
+        {
+            "decision_id": str(lo),
+            "concurrent_with_id": str(hi),
+            "actor": actor,
+            "marked_compatible_at": marked_at.isoformat(),
+        }
+    )
+
+
 def branch_created_payload(branch) -> dict:
     return _base(
         {

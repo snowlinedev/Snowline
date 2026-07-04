@@ -39,6 +39,9 @@ def test_main_surface_exposes_the_decision_and_artifact_tools():
         # decisions
         "record_decision",
         "supersede_decision",
+        # §6.1's second reconciliation path — mark a false-positive pair
+        # compatible so both decisions stand (replication-continuity, #97).
+        "mark_decisions_compatible",
         "get_decision",
         "list_decisions",
         "applicable_decisions",

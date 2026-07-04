@@ -73,6 +73,7 @@ from snowline_governance.contract import (
     EVENT_ARTIFACT_REGISTERED,
     EVENT_ARTIFACT_RESOLVED,
     EVENT_ARTIFACT_REVISED,
+    EVENT_DECISION_MARKED_COMPATIBLE,
     EVENT_DECISION_RECORDED,
     EVENT_DECISION_SUPERSEDED,
     EVENT_SHADOW_BRANCH_ARCHIVED,
@@ -330,6 +331,24 @@ def _apply_decision(session, client, envelope: dict) -> None:
         )
         session.flush()
     _detect_concurrent_siblings(session, client, envelope)
+
+
+def _apply_marked_compatible(session, client, envelope: dict) -> None:
+    """§6.1's explicit compatibility judgment (#97). Order-independent idempotent
+    UPSERT: the mark can arrive BEFORE this side has detected the pair itself (the
+    second member / its detection still in flight), so `create_if_absent=True`
+    materializes the `DecisionConcurrence` row here — a later `_detect_concurrent_
+    siblings` then finds it and no-ops. Applying to an already-marked pair keeps
+    the EARLIEST stamp, so re-delivery and both-sides authorship converge without
+    a clock or tiebreak."""
+    p = envelope["payload"]
+    lo = _uuid(p["decision_id"])
+    hi = _uuid(p["concurrent_with_id"])
+    # Hard-key the envelope `at` fallback (the `_apply_branch_archived`
+    # pattern): a payload missing BOTH stamps is malformed and must raise
+    # retryably — never ACK an unmarked row into existence.
+    at = _dt(p.get("marked_compatible_at")) or replication_stream.parse_at(p["at"])
+    concurrence.mark_compatible(session, lo, hi, at, create_if_absent=True)
 
 
 def _apply_branch_created(session, client, envelope: dict) -> None:
@@ -632,6 +651,7 @@ def _apply_governs_set(session, client, envelope: dict) -> None:
 _HANDLERS = {
     EVENT_DECISION_RECORDED: _apply_decision,
     EVENT_DECISION_SUPERSEDED: _apply_decision,
+    EVENT_DECISION_MARKED_COMPATIBLE: _apply_marked_compatible,
     EVENT_SHADOW_BRANCH_CREATED: _apply_branch_created,
     EVENT_SHADOW_BRANCH_ARCHIVED: _apply_branch_archived,
     EVENT_SHADOW_NOTES_SET: _apply_notes_set,
