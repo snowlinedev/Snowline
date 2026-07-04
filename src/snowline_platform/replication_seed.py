@@ -44,12 +44,14 @@ overwrite the spoke's only applied copy of that write (§7 step 5).
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import subprocess
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from sqlalchemy import create_engine, delete, select
 from sqlalchemy.orm import Session
@@ -178,7 +180,15 @@ def prime_forward(
     (step 4). Returns `(epoch, secret)` for the script to carry into step 3.
 
     From the instant this returns, every matching primary write emits into the
-    stream, so this MUST precede the dump."""
+    stream, so this MUST precede the dump.
+
+    RE-RUN SAFETY: priming mints a FRESH epoch each call, so a prime that failed
+    mid-sequence (or an aborted seed) leaves an ORPHANED active outbound
+    subscription toward this spoke on the primary — its old-epoch deliveries
+    would dead-letter against the spoke's newly-injected registration. So before
+    creating the new one, retire any active outbound already targeting this
+    spoke's ingest URL. Idempotent: the first, clean run finds none."""
+    _retire_orphan_forward(client, sp, report=report)
     epoch = mint_epoch()
     secret = secrets.token_hex(32)
     report(
@@ -213,9 +223,16 @@ def dump_and_restore(sp: SeedParticipant, *, report: Report = print) -> None:
     --if-exists` so a spoke DB that already has the (alembic-created) schema is
     dropped-and-replaced cleanly rather than colliding. `--no-owner
     --no-privileges` keeps the restore host-role-agnostic (the two instances are
-    different owner Macs)."""
-    dump_url = _libpq_url(sp.primary_dump_url)
-    restore_url = _libpq_url(sp.spoke_db_url)
+    different owner Macs).
+
+    `--exit-on-error` is LOAD-BEARING: `--if-exists` already downgrades the only
+    benign noise (dropping objects absent on a first restore), so without
+    `--exit-on-error` pg_restore would keep going past a GENUINE error and still
+    exit non-zero — a partially-restored store would then flow into scrub + boot
+    as silent data loss (§7's whole failure mode). So any non-zero exit aborts
+    the seed before step 3. Passwords ride PGPASSWORD, never argv (ps hygiene)."""
+    dump_url, dump_env = _libpq_url_and_env(sp.primary_dump_url)
+    restore_url, restore_env = _libpq_url_and_env(sp.spoke_db_url)
     with tempfile.TemporaryDirectory() as tmp:
         dump_file = Path(tmp) / f"{sp.name}.dump"
         report(f"[dump ] {sp.name}: pg_dump primary -> {dump_file.name}")
@@ -223,16 +240,14 @@ def dump_and_restore(sp: SeedParticipant, *, report: Report = print) -> None:
             ["pg_dump", "-Fc", "--no-owner", "--no-privileges", "-f",
              str(dump_file), dump_url],
             what=f"pg_dump {sp.name}",
+            env=dump_env,
         )
         report(f"[restore] {sp.name}: pg_restore -> spoke")
         _run(
-            ["pg_restore", "--clean", "--if-exists", "--no-owner",
-             "--no-privileges", "-d", restore_url, str(dump_file)],
+            ["pg_restore", "--clean", "--if-exists", "--exit-on-error",
+             "--no-owner", "--no-privileges", "-d", restore_url, str(dump_file)],
             what=f"pg_restore {sp.name}",
-            # pg_restore warns (non-fatally) about DROP ... of objects absent on a
-            # first restore; --clean --if-exists suppresses the errors but it can
-            # still exit non-zero on benign notices, so tolerate a warn-only exit.
-            allow_returncodes=(0, 1),
+            env=restore_env,
         )
 
 
@@ -358,8 +373,11 @@ def check_reseed_preconditions(
     — raises `SeedError` on the first failure so a re-seed never runs over unsafe
     state:
 
-      (a) the spoke's outbox is empty/delivered — no `pending` spoke→primary
-          rows waiting to reach the primary; AND
+      (a) the spoke's outbox is empty/DELIVERED — no `pending` row still waiting
+          to reach the primary, AND no `rejected` (dead-lettered) row either: a
+          rejected spoke write was refused by the primary and will NEVER apply,
+          so it is NOT convergent, and re-seeding would wipe the spoke's only
+          copy just as surely as a pending one; AND
       (b) the primary's parked set for the spoke's streams is empty — no
           spoke-authored event the primary received but could not apply.
 
@@ -369,11 +387,19 @@ def check_reseed_preconditions(
     write."""
     failures: list[str] = []
     for sp in cfg.participants:
-        pending = _spoke_pending_count(sp)
+        pending, rejected = _spoke_undelivered_counts(sp)
         if pending:
             failures.append(
-                f"{sp.name}: spoke has {pending} undelivered outbox row(s) — "
-                f"deliver them to the primary before re-seeding (precondition a)"
+                f"{sp.name}: spoke has {pending} PENDING outbox row(s) still "
+                f"undelivered — deliver them to the primary before re-seeding "
+                f"(precondition a)"
+            )
+        if rejected:
+            failures.append(
+                f"{sp.name}: spoke has {rejected} REJECTED (dead-lettered) outbox "
+                f"row(s) — the primary refused them, so they never applied and are "
+                f"NOT convergent; resolve/export them before re-seeding or they are "
+                f"lost (precondition a)"
             )
         parked = _primary_parked_for_spoke(client, sp)
         if parked:
@@ -411,16 +437,22 @@ def retire_old_streams(
 # --- helpers ------------------------------------------------------------------
 
 
-def _spoke_pending_count(sp: SeedParticipant) -> int:
+def _spoke_undelivered_counts(sp: SeedParticipant) -> tuple[int, int]:
+    """`(pending, rejected)` outbox-row counts on the spoke. Anything not
+    `delivered` blocks a re-seed: `pending` is in flight, `rejected` is
+    dead-lettered and will never apply — both mean the spoke holds the only copy
+    of a non-convergent write (§7 step 5)."""
     engine = create_engine(_sqlalchemy_url(sp.spoke_db_url), future=True)
     try:
         with Session(engine) as session:
             rows = session.scalars(
                 select(ReplicationOutboxRow).where(
-                    ReplicationOutboxRow.status == "pending"
+                    ReplicationOutboxRow.status != "delivered"
                 )
             ).all()
-            return len(rows)
+            pending = sum(1 for r in rows if r.status == "pending")
+            rejected = sum(1 for r in rows if r.status == "rejected")
+            return pending, rejected
     finally:
         engine.dispose()
 
@@ -433,6 +465,25 @@ def _primary_parked_for_spoke(client, sp: SeedParticipant) -> int:
             f"GET {sp.primary.admin_base}/parked -> HTTP {resp.status_code}"
         )
     return sum(1 for p in resp.json() if p.get("source_id") == sp.spoke_source_id)
+
+
+def _retire_orphan_forward(client, sp: SeedParticipant, *, report: Report) -> None:
+    """Retire any ACTIVE primary outbound subscription already targeting this
+    spoke's ingest URL — the orphan a previously-aborted prime would leave. Keyed
+    on `target_url` (the specific spoke stream), so a re-prime can't accumulate
+    two live forward subscriptions racing deliveries under different epochs."""
+    listed = client.get(f"{sp.primary.admin_base}/outbound")
+    if listed.status_code >= 400:
+        return
+    for sub in listed.json():
+        if sub.get("active") and sub.get("target_url") == sp.spoke_ingest_url:
+            client.post(
+                f"{sp.primary.admin_base}/outbound/retire", json={"id": sub["id"]}
+            )
+            report(
+                f"[prime] {sp.name}: retired orphaned prior forward subscription "
+                f"{sub['id']} (epoch {sub.get('epoch')}) before re-priming"
+            )
 
 
 def _retire_primary_outbound(client, sp: SeedParticipant, *, report: Report) -> None:
@@ -481,6 +532,26 @@ def _libpq_url(url: str) -> str:
     return url
 
 
+def _libpq_url_and_env(url: str) -> tuple[str, dict[str, str]]:
+    """A libpq URL with the password LIFTED OUT of the URL and into a `PGPASSWORD`
+    env fragment, so it never rides pg_dump/pg_restore's argv (visible in `ps`).
+    Returns `(url_without_password, env_overlay)`; the overlay is empty when the
+    URL carries no password (peer/trust auth, or a socket connection)."""
+    plain = _libpq_url(url)
+    parts = urlsplit(plain)
+    if not parts.password:
+        return plain, {}
+    userinfo = parts.username or ""
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    netloc = f"{userinfo}@{host}" if userinfo else host
+    scrubbed = urlunsplit(
+        (parts.scheme, netloc, parts.path, parts.query, parts.fragment)
+    )
+    return scrubbed, {"PGPASSWORD": parts.password}
+
+
 def _sqlalchemy_url(url: str) -> str:
     """A SQLAlchemy URL for the scrub/inject engine: normalize a bare
     `postgresql://` to the platform's `postgresql+psycopg://` driver so the seed
@@ -492,9 +563,22 @@ def _sqlalchemy_url(url: str) -> str:
 
 
 def _run(
-    argv: list[str], *, what: str, allow_returncodes: tuple[int, ...] = (0,)
+    argv: list[str],
+    *,
+    what: str,
+    env: dict[str, str] | None = None,
+    allow_returncodes: tuple[int, ...] = (0,),
 ) -> None:
-    proc = subprocess.run(argv, capture_output=True, text=True)
+    """Run a pg CLI tool. ANY exit code outside `allow_returncodes` (default:
+    only 0) aborts with `SeedError` — the seed must never proceed past a
+    partially-failed dump/restore. `env` overlays the current environment (e.g.
+    a lifted `PGPASSWORD`)."""
+    proc = subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        env={**os.environ, **env} if env else None,
+    )
     if proc.returncode not in allow_returncodes:
         raise SeedError(
             f"{what} failed (exit {proc.returncode}):\n"

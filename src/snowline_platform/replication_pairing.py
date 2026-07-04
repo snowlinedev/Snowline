@@ -35,11 +35,15 @@ an event type one side doesn't know simply never arrives from it.
 
 from __future__ import annotations
 
+import ipaddress
+import logging
 import secrets
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit, urlunsplit
+
+log = logging.getLogger("snowline_platform.replication_pairing")
 
 # The platform's own replication participation (§8) is not in its own `/plugins`
 # registry, so its metadata is not manifest-discoverable the way a plugin's is.
@@ -186,6 +190,11 @@ def handshake_direction(
     (§3.2). The secret lives only in this function's frame and is dropped on
     return."""
     epoch = epoch or mint_epoch()
+    # Contract-version refuse (§10), enforced HERE so it covers every caller —
+    # `pair` (which also refuses up front in `plan_pairing`) AND the §7 seed's
+    # reverse-pair, which reaches the handshake directly. A version mismatch is a
+    # bug to fix, not a stream to open.
+    refuse_on_version_mismatch(sender, receiver)
     # Run-once guard (§5): the handshake mints a FRESH epoch each call, so the
     # receiver's own duplicate-(source_id, epoch) guard can't catch a re-pair —
     # a second run would silently open a SECOND live stream from the same sender.
@@ -248,6 +257,32 @@ def handshake_direction(
 # --- the whole pairing run ----------------------------------------------------
 
 
+def _version_mismatch(a: Participant, b: Participant) -> bool:
+    """True iff both sides declare a contract_version and they DIFFER. A None on
+    either side (the platform's scope stream, whose version isn't
+    manifest-declared) is not a mismatch — any real skew there holds at delivery
+    time (§3.2)."""
+    return (
+        a.contract_version is not None
+        and b.contract_version is not None
+        and a.contract_version != b.contract_version
+    )
+
+
+def refuse_on_version_mismatch(a: Participant, b: Participant) -> None:
+    """Raise `PairingError` if `a` and `b` declare mismatched contract_versions
+    (§10 — pairing REFUSES a version-mismatched pair). Shared by `plan_pairing`
+    (the up-front `pair` check) and `handshake_direction` (so the seed's
+    reverse-pair is guarded too)."""
+    if _version_mismatch(a, b):
+        raise PairingError(
+            f"contract_version mismatch pairing {a.name!r} "
+            f"({a.source_id} v{a.contract_version} vs {b.source_id} "
+            f"v{b.contract_version}) — upgrade the lagging side's SDK before "
+            f"pairing (§3.2/§10)."
+        )
+
+
 def plan_pairing(
     local: dict[str, Participant],
     peer: dict[str, Participant],
@@ -266,11 +301,7 @@ def plan_pairing(
                 f"{present} instance only — skipped (no peer to pair it with)."
             )
             continue
-        if (
-            l.contract_version is not None
-            and p.contract_version is not None
-            and l.contract_version != p.contract_version
-        ):
+        if _version_mismatch(l, p):
             plan.refused.append(name)
             plan.notes.append(
                 f"REFUSE {name!r}: contract_version mismatch "
@@ -347,12 +378,37 @@ def pair(
 def _rehost(url: str, host: str | None) -> str:
     """Rewrite `url`'s host to `host`, preserving scheme, PORT, path (§4.1
     cross-tailnet addressing). `host` None returns the url unchanged (local
-    discovery uses the loopback base_url as-is)."""
+    discovery uses the loopback base_url as-is).
+
+    The rewrite ASSUMES the peer advertised a LOOPBACK base_url (§4.1) that the
+    serve posture re-exposes on the tailnet at the SAME port. If the original
+    host is NOT loopback, that assumption may not hold — the plugin may have
+    advertised a real address on purpose — so we WARN rather than silently
+    redirect it to a port that maps to something else on the peer."""
     if not host:
         return url
     parts = urlsplit(url)
+    if not _is_loopback(parts.hostname):
+        log.warning(
+            "rehosting non-loopback base_url %r onto peer host %r (port %s "
+            "preserved) — §4.1 assumes plugins advertise LOOPBACK base_urls that "
+            "tailscale serve re-exposes 1:1; verify this port maps to this "
+            "plugin on the peer",
+            url, host, parts.port,
+        )
     port = f":{parts.port}" if parts.port else ""
     return urlunsplit((parts.scheme, f"{host}{port}", parts.path, parts.query, parts.fragment))
+
+
+def _is_loopback(hostname: str | None) -> bool:
+    if not hostname:
+        return False
+    if hostname == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
 
 
 def _raise_for_status(resp, what: str) -> None:

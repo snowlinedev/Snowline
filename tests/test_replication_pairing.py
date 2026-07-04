@@ -213,3 +213,44 @@ def test_rehost_preserves_port_and_path():
     assert pairing._rehost("http://127.0.0.1:8801/x", "h.tailnet") == "http://h.tailnet:8801/x"
     assert pairing._rehost("http://127.0.0.1:8801", "h.tailnet") == "http://h.tailnet:8801"
     assert pairing._rehost("http://127.0.0.1:8801", None) == "http://127.0.0.1:8801"
+
+
+def test_rehost_warns_only_when_original_is_not_loopback(caplog):
+    """Review finding: rewriting a NON-loopback base_url may not honor the §4.1
+    serve→loopback assumption, so it warns; a loopback base_url (the expected
+    case) rewrites silently."""
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="snowline_platform.replication_pairing"):
+        assert pairing._rehost("http://10.0.0.5:8801/x", "peer.tailnet") == "http://peer.tailnet:8801/x"
+    assert any("non-loopback" in r.message for r in caplog.records)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="snowline_platform.replication_pairing"):
+        pairing._rehost("http://127.0.0.1:8801/x", "peer.tailnet")
+        pairing._rehost("http://localhost:8801/x", "peer.tailnet")
+    assert caplog.records == []
+
+
+def test_handshake_direction_refuses_version_mismatch_before_touching_wire():
+    """Review finding: the refuse lives in handshake_direction so EVERY caller
+    (pair AND the seed's reverse-pair) is covered. client=None proves it raises
+    before any HTTP call."""
+    a = pairing.Participant("governance", "http://a/replication-admin",
+                            "http://a/events/ingest", "roam.governance",
+                            ("decision.recorded",), 2)
+    b = pairing.Participant("governance", "http://b/replication-admin",
+                            "http://b/events/ingest", "primary.governance",
+                            ("decision.recorded",), 3)
+    with pytest.raises(pairing.PairingError, match="contract_version mismatch"):
+        pairing.handshake_direction(None, a, b, report=lambda _m: None)
+
+
+def test_handshake_direction_allows_unknown_version_on_one_side():
+    """A None contract_version (the platform's scope stream) is not a mismatch —
+    refuse_on_version_mismatch lets it through (skew holds at delivery, §3.2)."""
+    a = pairing.Participant("platform", "http://a/replication-admin",
+                            "http://a/x", "roam.platform", ("scope.created",), None)
+    b = pairing.Participant("platform", "http://b/replication-admin",
+                            "http://b/x", "primary.platform", ("scope.created",), 2)
+    pairing.refuse_on_version_mismatch(a, b)  # no raise
