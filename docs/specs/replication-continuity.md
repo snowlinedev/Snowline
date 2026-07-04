@@ -104,10 +104,23 @@ The bus's attempt cap (`SNOWLINE_WEBHOOK_MAX_ATTEMPTS`, default 5) treats
 sustained unreachability as failure. For a replication peer, **being down for
 two weeks is normal operation**, not failure — a vacationing laptop must never
 dead-letter the primary's stream (or vice versa). Replication subscriptions
-therefore use **unbounded retry with capped backoff** (attempt cap disabled;
-backoff grows to a ceiling of ~the delivery interval × 10). Dead-letter stays
-reserved for *rejections* — a delivered event the receiver refused (bad
-signature, contract-version mismatch) — which indicate a bug, not a partition.
+therefore use **unbounded retry with capped backoff** — and, honestly, that
+is new machinery, not a tuning change: the bus today has NO backoff at all
+(`deliver_pending` retries every pending row flat on each interval tick;
+`attempts` is only a counter), so this adds per-row `next_attempt_at` state
+with exponential growth to a ceiling of ~the delivery interval × 10. Two
+companions keep it correct:
+
+- **Reconnect reset** — any successful delivery or ingest involving a peer
+  resets the backoff on every queued row for that peer's streams, so a
+  healed partition flushes the whole backlog promptly. This is what makes
+  §10's "within one delivery interval of reconnect" criterion satisfiable;
+  without it, a ceiling'd backoff could idle ~10 intervals after the link
+  returns.
+- **Dead-letter stays reserved for *rejections*** — a delivered event the
+  receiver refused (bad signature, contract-version mismatch) — which
+  indicate a bug, not a partition. Receiver-side authentic-but-unappliable
+  events park instead (§8.1).
 
 ### 3.2 Stream identity — emit-time seq, epochs, causal context
 
@@ -149,7 +162,7 @@ pins the following envelope semantics (all SDK-owned):
 ## 4. Plugin opt-in — the replication contract
 
 Replication is a **plugin capability, not a platform service** — plugins own
-their stores (architecture.md §3.1), so only a plugin can emit and apply its
+their stores (architecture.md §2), so only a plugin can emit and apply its
 own domain events. The platform's role is limited to **declaration and
 pairing**. This keeps the server thin and makes participation strictly opt-in:
 
@@ -167,9 +180,11 @@ pairing**. This keeps the server thin and makes participation strictly opt-in:
   `base_url` (SDK-provided handler).
 - `events` — the event vocabulary this plugin emits, declared so pairing can
   warn on version/vocabulary skew between the two instances' copies.
-- Absent block = plugin does not replicate. **Registration, gateway, health
-  are untouched** — the block is advisory metadata the pairing step (§5)
-  reads; the platform never routes events itself.
+- Absent block = plugin does not replicate. **Gateway and health never read
+  the block**; registration changes only by *storing* it — the manifest
+  model and registry gain the field (§9 item 2; today's manifest model would
+  silently drop an unknown key). It is advisory metadata the pairing step
+  (§5) reads; the platform never routes events itself.
 
 **What opting in requires of a plugin (the replication-safe checklist):**
 
@@ -180,8 +195,12 @@ pairing**. This keeps the server thin and makes participation strictly opt-in:
    detail.)
 2. **UUID (or globally-unique) primary keys** — two sides author without
    coordination.
-3. **Writes expressible as domain events** — append-mostly with explicit
-   lifecycle events (record / supersede / forget), not in-place mutation.
+3. **Writes expressible as domain events with a deterministic merge** —
+   append-mostly with explicit lifecycle events (record / supersede) is the
+   easy shape. An in-place-update domain qualifies only as an explicit
+   last-writer-wins register with tombstoned deletes (memory's shape — see
+   the coverage note below). What disqualifies a store is mutation with
+   neither append semantics nor a declared merge rule.
 4. **Idempotent apply** — re-delivery and replay are no-ops past the
    watermark; the SDK gate enforces per-stream contiguous ordering (§3.2),
    the apply function enforces semantic idempotence (e.g. INSERT … ON
@@ -207,10 +226,14 @@ shapes:
 - **Single-home, cross-registered** — one process on one machine, registered
   (and heartbeating) with *every* instance that should compose it,
   advertising the right `base_url` per target: loopback to the platform it
-  shares a machine with (§5.1), its tailnet address to the other. This is
-  just gateway.md §5's cross-tailnet addressing exercised from the spoke.
-  Tailnet up → its tools work everywhere, proxied; tailnet down → health
-  marks it unreachable on the remote instance and only its tools route-around.
+  shares a machine with (§5.1), its tailnet address to the other. The
+  gateway side of this is just gateway.md §5's cross-tailnet addressing
+  exercised from the spoke; the PLUGIN side is small-but-real wiring — the
+  SDK's registration heartbeat is single-target today, so cross-registration
+  means one heartbeat loop per target platform, each advertising its
+  per-target `base_url` (§9 item 1). Tailnet up → its tools work everywhere,
+  proxied; tailnet down → health marks it unreachable on the remote instance
+  and only its tools route-around.
 - **Per-machine, locally registered** — for a plugin whose "store" is the
   machine itself (walkthrough-mcp: the local `simctl` simulators), run an
   independent instance on each Mac, each registering only with its local
@@ -228,8 +251,16 @@ each opted-in plugin covers its write surface with events:
 
 - **governance**: decisions (exists) + shadow graph, artifacts, specs — the
   gap to close, one event type per lifecycle write.
-- **memory**: `memory.recorded` (remember) and `memory.forgotten` (forget) —
-  a small vocabulary; recall/digest/list are reads.
+- **memory**: a small vocabulary (`memory.set`, `memory.forgotten`) but NOT
+  a small adoption. Memory's write model today violates the checklist as-is:
+  `remember` is an in-place upsert keyed on the human-chosen `name` (the
+  UUID is not the dedup key) and `forget` is a hard delete. Adoption
+  requires a write-model rework first: `forget` becomes a **tombstone** (so
+  a late-arriving pre-forget `set` cannot resurrect the memory), and apply
+  converges **per name** by the same LWW-by-event-timestamp rule as §6.
+  This is legitimate under checklist item 3 because a memory named X is
+  *semantically* a last-writer-wins register — LWW-with-tombstones IS its
+  correct convergence, not a workaround.
 - **pm (private)**: its own vocabulary, defined in its own repo against the
   SDK contract; the platform never sees the payloads' semantics.
 
@@ -237,13 +268,37 @@ each opted-in plugin covers its write surface with events:
 
 - Each instance sets `SNOWLINE_INSTANCE_ID` (`primary` / `roam`). Instance
   identity is config, not code — a third peer is another ID.
-- **Pairing is a CLI step, not an MCP surface** — subscription management is
-  deliberately programmatic (replication.py's standing note). A
-  `snowline replicate pair <peer-base-url>` script, run once per side:
-  for every plugin whose manifest declares `replication` *on both instances*,
-  it creates the cross-subscriptions (this side's bus → the peer plugin's
-  `ingest_path`) with a generated shared secret, and warns on any plugin
-  opted in on one side only or with mismatched `contract_version`/vocabulary.
+- **Pairing is a CLI step, not an MCP surface** — but it can no longer be
+  purely programmatic: subscriptions are rows in each plugin's OWN store
+  (the bus's `create_subscription` has deliberately no remote surface), and
+  a platform-level CLI cannot reach into governance's, memory's, and pm's
+  databases. So the SDK's ingest module ships a small tailnet-gated HTTP
+  **replication-admin surface** alongside `ingest_path` — create/list/retire
+  inbound stream registrations and outbound subscriptions. This supersedes
+  the bus's "no remote surface" posture for replication-class subscriptions
+  only, and it stays OFF MCP: agents never manage plumbing.
+- `snowline replicate pair <peer-platform-url>` runs **once per pair** and
+  drives both sides over that admin surface. For every plugin whose manifest
+  declares `replication` on both instances, per direction, it performs the
+  **secret handshake**:
+  1. ask the RECEIVING plugin to register the inbound stream
+     `(source_id, epoch)` — the receiver mints that epoch's shared secret,
+     stores it keyed by stream, and returns it once over the tailnet
+     (WireGuard-encrypted transport; never logged);
+  2. create the SENDING plugin's outbound subscription (peer `ingest_path` +
+     stream + that secret).
+  The receiver minting means the verifying side holds the secret by
+  construction — a secret that only the sender knows can never verify. The
+  CLI warns on any plugin opted in on one side only or with mismatched
+  `contract_version`/vocabulary.
+- **Secrets, concretely.** A secret authenticates one stream for one epoch.
+  Storage is a row in each plugin's own store, same posture as the bus today
+  (both stores live on owner boxes; at-rest encryption is the host's
+  concern, not this spec's). **Rotation** is the same handshake re-run for a
+  live stream: the receiver mints a replacement, accepts old+new during the
+  switch, and retires the old on the first new-signed delivery — no epoch
+  change, no re-seed. A leaked secret's blast radius is forged events on one
+  stream *from inside the tailnet*; rotation is the remediation.
 - Delivery flows over the tailnet exactly like every other plugin call; the
   trust gate applies unchanged. No new auth surface — the HMAC secret
   authenticates the *stream*, the tailnet authenticates the *network*.
@@ -261,10 +316,14 @@ exposure delegated to tailscaled. Rationale:
   through a tailnet outage (the vacation scenario, again).
 - **Trusting loopback widens nothing.** A local process hitting the
   machine's own tailnet IP already arrives from inside `100.64.0.0/10` and
-  is trusted as `owner` today; adding `127.0.0.0/8` + `::1` to
-  `SNOWLINE_TRUSTED_CIDRS` makes that existing equivalence explicit and
-  tailscaled-independent. Possession of the machine implies possession of
-  its tailnet identity (the node key lives on it).
+  is trusted as `owner` today; extending the trusted set to loopback makes
+  that equivalence explicit and tailscaled-independent. **Config trap:**
+  `SNOWLINE_TRUSTED_CIDRS` REPLACES the default when set — state the full
+  list, `SNOWLINE_TRUSTED_CIDRS="100.64.0.0/10,127.0.0.0/8,::1"`; setting
+  only the loopback entries silently un-trusts the tailnet and 403s every
+  cross-instance delivery and cross-tailnet plugin call. Possession of the
+  machine implies possession of its tailnet identity (the node key lives on
+  it).
 - **Never bind `0.0.0.0` on the roaming spoke.** The CIDR gate fails closed,
   but a wildcard bind parks a pre-auth listener on every hotel LAN the
   laptop joins. Loopback-only binds keep the untrusted-network surface at
@@ -327,8 +386,15 @@ mechanical, adjudication belongs to the LLM.**
   a decision at a parent scope governs descendants, so the incoming decision
   is checked against concurrent local decisions in any scope along either
   one's ancestors-until-isolated walk (the walk governance already performs
-  for `applicable_decisions`). Detection runs symmetrically on both sides
-  and is deliberately over-inclusive — a heuristic net, not a judgment.
+  for `applicable_decisions`). One honest coupling: that walk is not local —
+  governance resolves ancestors via the platform scope service
+  (`GET /scopes/{slug}/ancestors`), so detection performs a scope-service
+  round-trip at apply time and depends on platform availability. Acceptable
+  because the platform is co-located on loopback (§5.1) — it shares fate
+  with the instance, not the tailnet — and a scope-service outage is a
+  bounded retryable apply error (§8.1), never a silent skip of detection.
+  Detection runs symmetrically on both sides and is deliberately
+  over-inclusive — a heuristic net, not a judgment.
 - **Surfacing, as first-class state — not a log line.** Each flagged pair
   gets a `concurrent_with` marker on both decisions and appears in an
   `unreconciled` read view on the governance surface (tool + UI widget), so
@@ -439,12 +505,16 @@ events. The two never overlap.
    watermark + contiguous apply, signature verify, origin suppression,
    parking §8.1, idempotent apply seam) carving `replication_ingest` from
    the monolith as read-only reference. Unbounded-retry subscription class
-   (§3.1).
+   with per-row backoff + reconnect reset (§3.1). The replication-admin
+   surface + secret handshake (§5). Multi-target registration heartbeats
+   for §4.1's cross-registered shape.
 2. **Manifest**: additive `replication` block + registry storage (advisory).
 3. **Governance** adopts SDK ingest (emit exists); extends event coverage to
    shadow/artifacts/specs; concurrent-sibling detection + `unreconciled`
    view (§6.1).
-4. **Memory** adopts emit + ingest (`memory.recorded` / `memory.forgotten`).
+4. **Memory** write-model rework, THEN adoption: tombstoned `forget`,
+   per-name LWW apply, `memory.set` / `memory.forgotten` events (§4
+   coverage note) — scheduled as a rework, not a small vocabulary task.
 5. **Platform scopes** adopt the contract (§8).
 6. **Pairing CLI** + seed procedure (§5, §7); stand up `roam` on the laptop.
 7. **PM plugin** adopts privately against the published SDK — this spec is
@@ -479,6 +549,13 @@ events. The two never overlap.
   it replicates in order (or self-heals via §8's retryable-unknown-slug rule).
 - Pairing refuses (with a clear message) a plugin pair with mismatched
   `contract_version`, and warns on one-sided opt-in.
+- After pairing, BOTH directions verify: an event signed by either sender is
+  accepted by its receiver (the handshake put the secret on the verifying
+  side); rotating a stream's secret is hitless — old-signed deliveries are
+  accepted during the switch and refused after retirement (§5).
+- `remember("x")` on both sides during a partition converges to the newer
+  write on both sides after heal; a tombstoned `forget` beats an older
+  `set`, and a newer `set` beats the tombstone (§4 memory note).
 - Seeding per §7 loses nothing: a primary write authored between pairing and
   the dump, and another authored after the dump, each reach the spoke exactly
   once (snapshot or stream — never neither, never both applied twice).
