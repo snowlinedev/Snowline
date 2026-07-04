@@ -117,7 +117,15 @@ class ReplicationOutboxRow(ReplicationBase):
     capped `next_attempt_at` backoff, and `rejected` (the dead-letter terminal
     state) is reserved for a delivered event the receiver REFUSED as invalid
     (bad signature / malformed / unknown stream — a bug, not a partition).
-    Ordering refusals and version holds (HTTP 409) never land here."""
+    Ordering refusals and version holds (HTTP 409) never land here.
+
+    RETENTION NOTE: DELIVERED rows are not just a log — plugin apply logic
+    reads them against an incoming envelope's `peer_seen` to compute
+    concurrency (governance's §6.1 sibling detection and §6 conflict
+    warnings: `seq > peer_seen` ⇒ the author hadn't applied that write).
+    A pruning job that drops delivered rows would silently blind that
+    detection; none exists, and adding one must account for the lowest
+    `peer_seen` a peer can still send."""
 
     __tablename__ = "replication_outbox"
 

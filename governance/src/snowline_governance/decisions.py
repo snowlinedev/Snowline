@@ -272,9 +272,15 @@ def get_decision(session: Session, decision_id: str) -> dict:
     d = session.get(Decision, key)
     if d is None:
         raise DecisionNotFoundError(f"no decision with id {decision_id!r}")
-    superseded_by = session.scalar(
-        select(Decision.id).where(Decision.supersedes_id == d.id)
-    )
+    # The supersession DAG is BRANCHING (≥2 children is a permanent state after
+    # a §6 partition race), so the scalar pick must be deterministic — the
+    # NEWEST superseder, id-tiebroken — or converged stores would answer
+    # differently. `concurrent_with` below is where a competing pair surfaces.
+    superseded_by = session.scalars(
+        select(Decision.id)
+        .where(Decision.supersedes_id == d.id)
+        .order_by(Decision.recorded_at.desc(), Decision.id.desc())
+    ).first()
     return {
         "id": str(d.id),
         "scope": d.scope_slug,
@@ -343,11 +349,17 @@ def list_decisions(
     rows = list(session.scalars(stmt))
     superseder: dict[uuid.UUID, uuid.UUID] = {}
     if include_superseded:
+        # Ascending order + overwrite ⇒ the retained entry is the NEWEST
+        # superseder (id-tiebroken) — the same deterministic pick as
+        # `get_decision`'s `superseded_by` (branching DAG: ≥2 children is a
+        # reachable permanent state).
         for prior_id, succ_id in session.execute(
-            select(Decision.supersedes_id, Decision.id).where(
+            select(Decision.supersedes_id, Decision.id)
+            .where(
                 Decision.scope_id == sid,
                 Decision.supersedes_id.is_not(None),
             )
+            .order_by(Decision.recorded_at, Decision.id)
         ):
             superseder[prior_id] = succ_id
     return {

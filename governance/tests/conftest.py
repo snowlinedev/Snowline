@@ -28,6 +28,8 @@ import sqlalchemy as sa  # noqa: E402
 from alembic import command  # noqa: E402
 from alembic.config import Config  # noqa: E402
 
+from snowline_governance.scope_client import ScopeNotFoundError  # noqa: E402
+
 MIGRATIONS = (
     Path(__file__).parents[1] / "src" / "snowline_governance" / "migrations"
 )
@@ -215,6 +217,12 @@ class StubScopeClient:
 
     def ancestors(self, slug: str) -> list[dict]:
         self.ancestors_calls.append(slug)
+        if slug not in self._tree:
+            # Mirror HttpScopeClient: the platform 404s an unknown slug. An
+            # empty-chain return here would let a caller silently treat an
+            # unknown scope as "no ancestors" instead of the §8 retryable
+            # error the real client raises.
+            raise ScopeNotFoundError(f"no scope with slug {slug!r} (stub 404)")
         chain: list[dict] = []
         seen: set[str] = set()
         node: str | None = slug

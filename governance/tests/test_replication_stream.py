@@ -12,6 +12,7 @@ tests also prove the migrated schema carries the SDK models.
 from __future__ import annotations
 
 import uuid
+from datetime import timedelta
 
 from snowline_plugin_sdk.replication import emit as sdk_emit
 from snowline_plugin_sdk.replication.models import ReplicationOutboxRow
@@ -20,6 +21,7 @@ from sqlalchemy import select
 from snowline_governance import artifacts, decisions, graduation, shadow
 from snowline_governance.contract import (
     CONTRACT_VERSION,
+    EVENT_ARTIFACT_MATURITY_SET,
     EVENT_DECISION_RECORDED,
     EVENT_DECISION_SUPERSEDED,
     EVENT_TYPES,
@@ -166,6 +168,40 @@ def test_register_class_writes_record_lww_coordinates(db_session):
     assert reg.written_at >= first_at  # advanced by the newer local write
     # No subscription existed — nothing emitted, register kept regardless.
     assert _outbox(db_session) == []
+
+
+def test_clock_step_back_clamps_register_writes_monotonic(db_session, monkeypatch):
+    """§6 hardening: a same-source wall-clock STEP-BACK (NTP correction) must
+    not mint a register-class event that would LOSE to this instance's own
+    prior write on the peer — locally the store would hold the new value while
+    the peer kept the old one, forever. `emit` clamps the payload `at`
+    strictly past the register BEFORE the envelope freezes, so the clamped
+    coordinate is what replicates and strict LWW converges on the actual
+    latest write everywhere."""
+    from snowline_governance import replication_stream
+
+    _subscribe(db_session)
+    art = artifacts.register_artifact(db_session, body="# spec")
+    artifacts.set_maturity(db_session, art["id"], "exploratory")
+
+    real_now = replication_stream.utcnow()
+    monkeypatch.setattr(
+        replication_stream, "utcnow", lambda: real_now - timedelta(hours=1)
+    )
+    artifacts.set_maturity(db_session, art["id"], "stable")
+
+    maturity_ats = [
+        replication_stream.parse_at(r.payload["payload"]["at"])
+        for r in _outbox(db_session)
+        if r.event_type == EVENT_ARTIFACT_MATURITY_SET
+    ]
+    assert len(maturity_ats) == 2
+    assert maturity_ats[1] > maturity_ats[0]  # clamped forward, not stepped back
+    reg = db_session.get(
+        LwwRegister, ("artifact", uuid.UUID(art["id"]), "maturity")
+    )
+    assert reg.written_at == maturity_ats[1]  # register tracks the emitted at
+    assert artifacts.get_artifact(db_session, art["id"])["maturity"] == "stable"
 
 
 def test_idempotent_rearchive_emits_nothing(db_session):

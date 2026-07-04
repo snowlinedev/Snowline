@@ -25,7 +25,7 @@ from snowline_plugin_sdk.replication.models import (
     ReplicationInboundStream,
     ReplicationOutboxRow,
 )
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from snowline_governance import artifacts, concurrence, decisions, graduation, shadow
 from snowline_governance.contract import (
@@ -378,6 +378,17 @@ def test_unknown_event_type_is_retryable(db_session, apply_fn):
         apply_fn(db_session, _envelope("governance.future_thing", _payload()))
 
 
+def test_decision_event_in_unknown_scope_is_retryable(db_session, apply_fn):
+    """§8 for decision events too: the gate cannot ride the §6.1 ancestors
+    walk (which only runs when concurrent candidates exist — here there are
+    none), so an unpaired/common-case decision in a not-yet-replicated scope
+    must STILL raise instead of applying ungated."""
+    incoming = _decision_payload(scope="acme/unknown")
+    with pytest.raises(ValueError, match="unknown scope slug"):
+        apply_fn(db_session, _envelope(EVENT_DECISION_RECORDED, incoming))
+    assert db_session.get(Decision, uuid.UUID(incoming["id"])) is None
+
+
 # --- SDK round-trip: no echo, duplicate ACK, HTTP route ---------------------------
 
 
@@ -536,6 +547,78 @@ def test_lww_source_id_tiebreak_is_deterministic(db_session, apply_fn):
     assert artifacts.get_artifact(db_session, art["id"])["maturity"] == "stable"
     reg = db_session.get(LwwRegister, ("artifact", uuid.UUID(art["id"]), "maturity"))
     assert reg.source_id == PEER
+
+
+def test_lww_winning_concurrent_override_logs_warning_with_both_event_ids(
+    db_session, apply_fn, caplog
+):
+    """The WINNING side of a §6 conflict also logs: the incoming event beats a
+    local register write its author had NOT applied (genuine concurrency, read
+    off peer_seen against the outbox) — WARNING with both event ids. A
+    SEQUENTIAL cross-source follow-up (peer_seen past the local write) stays
+    quiet: no false conflict noise."""
+    from snowline_governance.models import LwwRegister
+
+    _pair_outbound(db_session)
+    art = artifacts.register_artifact(db_session, body="# spec")
+    artifacts.set_maturity(db_session, art["id"], "exploratory")  # on the stream
+    local_ref = db_session.get(
+        LwwRegister, ("artifact", uuid.UUID(art["id"]), "maturity")
+    ).event_ref
+
+    newer = _payload(artifact_id=art["id"], maturity="stable")
+    newer["at"] = (utcnow() + timedelta(minutes=5)).isoformat()
+    with caplog.at_level(logging.WARNING, logger=APPLY_LOG):
+        apply_fn(
+            db_session,
+            _envelope(EVENT_ARTIFACT_MATURITY_SET, newer, peer_seen=0),
+        )
+    assert artifacts.get_artifact(db_session, art["id"])["maturity"] == "stable"
+    won = [
+        r.getMessage()
+        for r in caplog.records
+        if "WON over concurrent" in r.getMessage()
+    ]
+    assert len(won) == 1
+    assert newer["event_id"] in won[0]
+    assert local_ref in won[0]
+
+    # The quiet path: a fresh artifact's local write that the peer HAS applied
+    # (peer_seen at my stream head) — the peer's later overwrite is ordinary
+    # sequential LWW, not a conflict.
+    caplog.clear()
+    art2 = artifacts.register_artifact(db_session, body="# spec2")
+    artifacts.set_maturity(db_session, art2["id"], "exploratory")
+    head = db_session.scalar(select(func.max(ReplicationOutboxRow.seq))) or 0
+    follow = _payload(artifact_id=art2["id"], maturity="stable")
+    follow["at"] = (utcnow() + timedelta(minutes=10)).isoformat()
+    with caplog.at_level(logging.WARNING, logger=APPLY_LOG):
+        apply_fn(
+            db_session,
+            _envelope(EVENT_ARTIFACT_MATURITY_SET, follow, seq=2, peer_seen=head),
+        )
+    assert artifacts.get_artifact(db_session, art2["id"])["maturity"] == "stable"
+    assert not [
+        r for r in caplog.records if "resolved by LWW" in r.getMessage()
+    ]
+
+
+def test_superseded_by_is_deterministic_on_a_branched_dag(db_session, apply_fn):
+    """Two superseders of one decision is a PERMANENT state after a §6 race —
+    the scalar `superseded_by` must pick the same child on both converged
+    stores (newest recorded_at, id-tiebroken), not scan order."""
+    _pair_outbound(db_session)
+    x = decisions.record_decision(db_session, "acme/widget", _sid("acme/widget"), "X")
+    a = decisions.supersede_decision(db_session, x["id"], "A supersedes X")
+
+    b = _decision_payload(decision="B supersedes X", supersedes_id=x["id"])
+    b["recorded_at"] = (utcnow() - timedelta(hours=1)).isoformat()  # older child
+    apply_fn(db_session, _envelope(EVENT_DECISION_SUPERSEDED, b, peer_seen=0))
+
+    # A is the newest superseder — the deterministic pick, regardless of which
+    # child applied first; B still surfaces via concurrent_with.
+    got = decisions.get_decision(db_session, x["id"])
+    assert got["superseded_by"] == a["id"]
 
 
 def test_concurrent_double_graduation_resolves_by_lww_append_survives(

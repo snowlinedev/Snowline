@@ -47,7 +47,7 @@ from __future__ import annotations
 import logging
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from snowline_plugin_sdk.replication import emit as sdk_emit
 
@@ -108,22 +108,41 @@ def emit(session, event_type: str, payload: dict) -> list[dict]:
     builder's dict, in the caller's transaction) and keep the §6 LWW register
     for register-class events. Returns the SDK's envelopes (empty when nothing
     matched or emission is suppressed — the register upkeep still runs; it
-    records LOCAL authorship, not delivery)."""
-    envelopes = sdk_emit.emit_event(session, event_type, payload)
+    records LOCAL authorship, not delivery).
+
+    MONOTONIC CLAMP (register-class only): a local write whose wall-clock `at`
+    does not EXCEED the register's current coordinate gets bumped strictly past
+    it — in the PAYLOAD, before the envelope freezes, so the clamped value is
+    what replicates. Two failure modes this closes, both permanent divergence
+    under strict LWW: an NTP step-back (the same source writes A at t10 then B
+    at "t5" — locally B stands, but B's event would lose to A's everywhere
+    else), and overwriting a just-applied peer value during clock skew (the
+    local author SAW the value it overwrote, so its write must beat it —
+    last-writer means last-observed-writer, not fastest clock). The apply path
+    never needs the clamp: a winning apply's coordinate is already >= the
+    register's by the LWW rule itself."""
     register = LWW_REGISTERS.get(event_type)
+    key = None
     if register is not None:
         kind, id_key, field = register
         object_id = payload.get(id_key)
         if object_id is not None:  # branch-level shadow.graduated has no node_id
-            record_register(
-                session,
-                kind,
-                uuid.UUID(str(object_id)),
-                field,
-                at=parse_at(payload["at"]),
-                source=source_id(),
-                event_ref=payload["event_id"],
-            )
+            key = (kind, uuid.UUID(str(object_id)), field)
+            row = session.get(LwwRegister, key)
+            at = parse_at(payload["at"])
+            if row is not None and at <= row.written_at:
+                payload["at"] = (
+                    row.written_at + timedelta(microseconds=1)
+                ).isoformat()
+    envelopes = sdk_emit.emit_event(session, event_type, payload)
+    if key is not None:
+        record_register(
+            session,
+            *key,
+            at=parse_at(payload["at"]),
+            source=source_id(),
+            event_ref=payload["event_id"],
+        )
     return envelopes
 
 

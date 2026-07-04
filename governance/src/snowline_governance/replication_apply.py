@@ -158,7 +158,14 @@ def _unseen_local_rows(session, envelope: dict) -> list[ReplicationOutboxRow]:
     envelope's author with `seq > peer_seen` — exactly the locally-authored
     events the author had NOT applied when it authored this event (contiguous
     apply makes the comparison exact). Empty when no outbound stream toward the
-    author exists (one-way pairing: nothing computable)."""
+    author exists (one-way pairing: nothing computable).
+
+    OUTBOX RETENTION IS LOAD-BEARING: this deliberately reads DELIVERED rows
+    too — a row's seq stays comparable to `peer_seen` long after delivery
+    (delivered ≠ applied-and-acknowledged-in-a-later-authored-event). Any
+    future outbox-pruning job that drops delivered rows above a peer's lowest
+    in-flight `peer_seen` would silently blind §6.1 sibling detection and the
+    §6 concurrent-override warning."""
     sub = session.scalars(
         select(ReplicationSubscription)
         .where(
@@ -265,7 +272,10 @@ def _detect_concurrent_siblings(session, client: ScopeClient, envelope: dict) ->
     incoming_id = _uuid(payload["id"])
     incoming_scope_id = payload["scope_id"]
     # The incoming decision's ancestors-until-isolated chain, by STABLE id
-    # (#11); this call is also the §8 unknown-slug gate for decision events.
+    # (#11). The §8 unknown-slug gate lives in `_apply_decision` (this walk
+    # only runs when candidates exist, so it cannot be that gate); a raise
+    # here — outage, or a candidate's since-unknown slug — is the same
+    # retryable class.
     incoming_chain = {str(sc["id"]) for sc in client.ancestors(payload["scope"])}
     chains: dict[str, set[str]] = {}
     for row in candidates:
@@ -298,6 +308,13 @@ def _apply_decision(session, client, envelope: dict) -> None:
     p = envelope["payload"]
     decision_id = _uuid(p["id"])
     if session.get(Decision, decision_id) is None:
+        # §8 unknown-slug gate, same as every scope-bearing apply. Detection
+        # below only reaches the scope service when concurrent candidates
+        # exist, so it cannot double as this gate — without it, a decision in
+        # a not-yet-replicated scope would apply ungated in the common
+        # (peer_seen-current) case instead of retrying until the scope stream
+        # catches up.
+        _require_scope(client, p["scope"])
         session.add(
             Decision(
                 id=decision_id,
