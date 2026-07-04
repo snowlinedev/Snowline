@@ -119,3 +119,10 @@ export function clampRefreshSeconds(requested: number | undefined | null): numbe
 export function contractSupported(plugin: PluginEntry): boolean {
   return (plugin.manifest.ui?.contract_version ?? 1) === 1;
 }
+
+/** shadow-conversations.md §4: thread pages carrying a composer refetch on a
+ * fixed 5s cadence (paused while the tab is hidden) so phase-2 agent replies
+ * appear without a manual reload. Composer-less threads are unaffected —
+ * this is a page-kind-specific cadence, not a change to the widget
+ * `refresh_seconds` clamp above. */
+export const THREAD_COMPOSER_POLL_SECONDS = 5;

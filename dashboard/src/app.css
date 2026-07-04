@@ -288,6 +288,87 @@
   margin-top: var(--space-2);
 }
 
+/* thread composer (shadow-conversations.md §4): the input-shaped write path
+ * at the thread foot. Sizes/colors off the same density/theme tokens as
+ * everything else — no relaxation, comfortable or compact. */
+.thread-composer {
+  margin-top: var(--space-5);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--hairline);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.thread-composer-label {
+  font-weight: 600;
+  font-size: var(--font-small);
+  color: var(--ink-secondary);
+}
+
+.thread-composer-input {
+  min-height: calc(var(--row-h) * 2);
+  padding: var(--space-3);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  background: var(--surface-page);
+  color: var(--ink-primary);
+  font: inherit;
+  resize: vertical;
+}
+
+.thread-composer-input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.thread-composer-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.thread-composer-actions button {
+  min-height: var(--control-h);
+  padding: 0 var(--space-4);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-size: var(--font-small);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.thread-composer-actions button:disabled {
+  background: var(--surface-card);
+  border-color: var(--hairline);
+  color: var(--ink-muted);
+  cursor: not-allowed;
+}
+
+.thread-composer-reason {
+  margin: 0;
+}
+
+.thread-composer-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.thread-composer-error button {
+  flex-shrink: 0;
+  min-height: var(--control-h);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  background: var(--surface-card);
+  color: var(--ink-secondary);
+  font-size: var(--font-small);
+  cursor: pointer;
+}
+
 /* kind: document */
 .document-title {
   margin: 0 0 var(--space-2);
