@@ -109,11 +109,14 @@ tuning change: the bus today has NO backoff at all
 with exponential growth to a ceiling of ~the delivery interval × 10. Two
 companions keep it correct:
 
-- **Reconnect reset** — backoff is per-row, but reachability is per-PEER:
-  each delivery tick opens with a cheap per-peer probe (a health touch on
-  the peer's ingest), and a peer transitioning unreachable→reachable resets
-  the backoff on every queued row for that peer's streams; any successful
-  delivery or ingest does the same. The probe is load-bearing: a reset that
+- **Reconnect reset** — backoff is per-row, but reachability is
+  per-INGEST (per plugin, per peer — the granularity streams actually have):
+  each delivery tick opens with a cheap probe of every ingest endpoint
+  that has queued rows, and an ingest transitioning unreachable→reachable
+  resets the backoff on that ingest's rows; any successful delivery or
+  ingest does the same. Per-peer granularity would miss a single plugin's
+  ingest healing on an otherwise-reachable peer — the same
+  nothing-fires-for-~10-intervals pathology, one level down. The probe is load-bearing: a reset that
   only *reacts* to a successful delivery can never produce the first one —
   on a quiet heal with every row at the ceiling, nothing would fire for ~10
   intervals. With the probe, the next tick detects the heal and flushes the
@@ -159,10 +162,14 @@ v1 therefore pins the following envelope semantics (all SDK-owned):
   topology. This is what makes concurrency *computable* (§6.1) instead of
   guessed from wall clocks. Note the two counters this forces apart once
   parking (§8.1) exists: the **delivery gate** (the watermark, which parking
-  advances so the stream flows) and **`applied_seq`** (the highest seq
-  actually applied — what `peer_seen` reports). A parked event advances the
-  gate but never `applied_seq`; conflating them would let a parked-unseen
-  event masquerade as seen and silently blind §6.1's detection.
+  advances so the stream flows) and **`applied_seq`** — the **contiguous
+  applied frontier**, the highest N such that every seq ≤ N has been
+  applied. `peer_seen` reports `applied_seq`. A parked seq PINS the
+  frontier even as later seqs apply past it (gate at 9 with seq 5 parked →
+  `applied_seq` stays 4); a max-style "highest seq applied" would let the
+  parked-unseen event masquerade as seen the moment seq 6 applies, silently
+  blinding §6.1's detection — which is the whole reason the two counters
+  are distinct.
 - **This envelope is contract version 2.** The fields above (epoch,
   emit-time seq, `peer_seen`) are breaking additions, and
   `check_contract_version` accepts anything ≤ its own version — so without a
@@ -173,6 +180,16 @@ v1 therefore pins the following envelope semantics (all SDK-owned):
   them equal), and every new event type this spec introduces (§4 memory, §8
   scopes, governance's shadow/artifacts/specs) lands in the drift-guarded
   `EVENT_TYPES` registries the same way: both packages, one commit.
+  **Version skew on live streams is a hold, not a failure**: instances
+  cannot restart atomically, so a rolling upgrade has a window where one
+  peer speaks v2 and the other v1. A version-AHEAD event (peer upgraded
+  first) is a RETRYABLE refusal — the sender's backlog waits out the
+  receiver's upgrade — and a v2 receiver likewise refuses v1-envelope
+  events on a v2-paired stream retryably, never accept-and-misprocess
+  (`check_contract_version`'s ≤ rule is for consumers of a stable envelope,
+  not for a stream whose keying fields changed). Dead-letter is reserved
+  for envelopes invalid under every version either side has spoken. Upgrade
+  both instances promptly; the held backlog is bounded by the skew window.
 - **Origin suppression (hard rule)** — an ingest-applied write NEVER
   re-emits. The SDK apply path runs the domain write with the emit hook
   disabled; events exist only for locally-originated writes. Without this
@@ -471,13 +488,22 @@ mechanical, adjudication belongs to the LLM.**
 The bus is a **delta fabric, not an event-sourced log** — outbox rows are
 pending deliveries, and history is not retained for replay. Standing up a
 spoke therefore starts from a snapshot — and the ORDER is load-bearing
-(**pair first, dump second**): emit only writes outbox rows for
+(**prime the stream first, dump second**): emit only writes outbox rows for
 subscriptions that exist at write time, so a write landing between a dump
-and a later pairing would be in neither the snapshot nor any delivery —
-lost. The procedure:
+and a later-created subscription would be in neither the snapshot nor any
+delivery — lost. The procedure:
 
-1. **Pair first** (§5): create the subscriptions and mint the stream epochs
-   (§3.2). From this instant every primary write emits into the stream.
+1. **Prime the primary→spoke stream** — the only half of pairing that must
+   precede the dump. The seed script creates the PRIMARY's outbound
+   subscription (epoch minted, secret generated by the script). Seeding is
+   the one exception to §5's receiver-mints rule: the receiver's store does
+   not exist yet, so the script plays the receiver's part — it carries the
+   secret (tailnet transport, never logged, discarded after step 3) and
+   injects it into the spoke in step 3. Without this split, pairing state
+   written into the spoke before the restore would be wiped BY the restore,
+   and the primary's dump can never supply the spoke's inbound secret (the
+   primary is the sender on that stream and never holds it). From this
+   instant every primary write emits into the stream.
 2. **Then snapshot**: `pg_dump`/restore each opted-in plugin's store (and
    the platform DB for scopes, §8). Because `seq` is allocated at emit time
    in the write's transaction (§3.2), the dumped store carries its own
@@ -494,17 +520,31 @@ lost. The procedure:
    `source_id`, which is exactly the spoke's inbound stream — initialize the
    spoke's inbound watermark and `applied_seq` for that stream to it, then
    **truncate every cloned replication table** (subscriptions, outbox,
-   watermarks, parked events) before first boot. The spoke's own outbound
-   counters start fresh under its own `source_id`. Events emitted after the
-   dump (seq above the counter) are waiting in the primary's outbox and
-   deliver normally — the snapshot-to-stream handoff is gapless and
-   exactly-once.
-4. From then on the spoke tracks by events alone. Re-seeding after long
+   watermarks, parked events) before first boot, then **write the spoke's
+   inbound registration** for the primary→spoke stream (stream, epoch, the
+   script-carried secret) — the receiver's half of the handshake, replayed
+   after the restore so it survives it. Nothing CLONED survives; the
+   seed-written registration is not a clone. The retained emit counters are
+   inert: emit allocation is `source_id`-keyed, so the spoke's own outbound
+   counters start fresh under its own `source_id`, and any downstream seed
+   reads only the counters matching the source instance's `source_id`,
+   ignoring stale foreign rows. Events emitted after the dump (seq above
+   the counter) are waiting in the primary's outbox and deliver normally —
+   the snapshot-to-stream handoff is gapless and exactly-once.
+4. **Boot, then pair the reverse direction.** The spoke→primary stream
+   needs no pre-dump half — the spoke authors nothing before first boot —
+   so it is created by the ordinary §5 handshake (primary mints, as
+   receiver) once the spoke is up.
+5. From then on the spoke tracks by events alone. Re-seeding after long
    divergence is the same procedure under a **fresh epoch** — the old
    epoch's watermarks and pending rows are retired at re-pair, so the new
-   stream's seq restarting at 1 can never be rejected as already-seen.
-   (Spoke-side pending outbox rows must be empty or delivered first — the
-   pairing script checks.)
+   stream's seq restarting at 1 can never be rejected as already-seen. Two
+   preconditions, both checked by the pairing script: spoke-side pending
+   outbox rows are empty or delivered first, AND the primary's parked set
+   for the spoke's streams is empty (resolved or re-applied) — a park ACKs
+   as delivered, so an empty spoke outbox does NOT imply the spoke's writes
+   were applied on the primary, and re-seeding over an unresolved park
+   would overwrite the spoke's only applied copy of that write.
 
 ## 8. The scope namespace — the platform dogfoods the contract
 
@@ -553,7 +593,8 @@ generous against any real scope-stream lag), after which the event is
 - A parked event is **re-appliable**: fix the cause (record the missing
   scope, resolve the slug collision, ship the apply fix), then re-apply it
   from the park — apply idempotence (§4 checklist item 4) makes the replay
-  safe.
+  safe. Re-applying unpins the frontier: `applied_seq` advances through the
+  formerly-parked seq and any contiguously-applied span beyond it (§3.2).
 - Known limit: events *behind* a parked one that causally depended on it
   may themselves park or apply with degraded meaning. Parking trades strict
   ordering for liveness and makes the trade visible; if a park cascade ever
@@ -620,18 +661,26 @@ events. The two never overlap.
   accepted by its receiver (the handshake put the secret on the verifying
   side); rotating a stream's secret is hitless — old-signed deliveries are
   accepted during the switch and refused after retirement (§5).
+- A one-sided SDK upgrade holds live streams instead of failing them:
+  version-skew refusals are retryable in both directions, nothing
+  dead-letters, and the held backlog drains once both sides run the new
+  version (§3.2).
 - `remember("x")` on both sides during a partition converges to the newer
   write on both sides after heal; a tombstoned `forget` beats an older
   `set`, and a newer `set` beats the tombstone (§4 memory note).
-- Seeding per §7 loses nothing: a primary write authored between pairing and
-  the dump, and another authored after the dump, each reach the spoke exactly
-  once (snapshot or stream — never neither, never both applied twice).
+- Seeding per §7 loses nothing: a primary write authored between the stream
+  priming and the dump, and another authored after the dump, each reach the
+  spoke exactly once (snapshot or stream — never neither, never both applied
+  twice). After first boot, both directions verify: the seed-injected
+  inbound registration matches the primary's outbound secret, and the
+  reverse direction pairs normally.
 - Re-seeding under a fresh epoch (§3.2/§7) is fully accepted — no event of
   the new stream is rejected by the old epoch's watermark.
 - An event whose apply keeps failing parks after the bound (§8.1): the park
   ACKs to the sender (its cursor advances past the parked seq), the stream
-  resumes, the parked view shows it, `applied_seq` does NOT advance, and
-  re-applying it after the cause is fixed succeeds.
+  resumes, the parked view shows it, and `applied_seq` stays pinned below
+  the parked seq — even as later seqs apply past it. Re-applying it after
+  the cause is fixed succeeds and unpins the frontier.
 - After the §7 scrub, the spoke's first boot delivers nothing it didn't
   author: no cloned subscription, outbox row, watermark, or parked event
   survives the restore.
