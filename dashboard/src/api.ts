@@ -136,7 +136,15 @@ async function post<T>(path: string, body: unknown): Promise<T> {
     }
     throw new UiApiError(resp.status, detail);
   }
-  return (await resp.json()) as T;
+  // A 2xx IS success — callers of the write path don't consume the body, so a
+  // 204/empty/non-JSON success reply must not surface as a false failure
+  // (which would strand the draft and bait a duplicate re-send of a message
+  // the server already persisted).
+  try {
+    return (await resp.json()) as T;
+  } catch {
+    return undefined as T;
+  }
 }
 
 /** The write half of the `/ui-api` proxy (ui-shell.md §5, activated by

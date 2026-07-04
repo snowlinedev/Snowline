@@ -14,6 +14,7 @@
  * plain queries and property/attribute checks. */
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import axe from "axe-core";
 import { MemoryRouter } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
 
@@ -66,6 +67,27 @@ describe("thread composer", () => {
     );
     expect(screen.getByText(/archived — read-only/)).toBeTruthy();
     expect(textarea.getAttribute("aria-describedby")).toBeTruthy();
+  });
+
+  it("the DISABLED composer state is axe-violation-free", async () => {
+    // The shared a11y fixture only ever renders the ENABLED composer, so the
+    // greyed state's wiring (disabled textarea + aria-describedby reason
+    // note) gets its own axe run — the sub-state most likely to regress is
+    // the one the matrix would otherwise never see.
+    const { container } = render(
+      <Thread title="main-plan-x" nodes={[]} flags={["archived"]} composer={COMPOSER} />,
+    );
+    const results = await axe.run(container, {
+      rules: { "color-contrast": { enabled: false } },
+    });
+    expect(results.violations.map((v) => `${v.id}: ${v.nodes[0]?.html}`)).toEqual(
+      [],
+    );
+    // And the reason note the textarea points at actually resolves.
+    const textarea = screen.getByLabelText("Reply") as HTMLTextAreaElement;
+    const reasonId = textarea.getAttribute("aria-describedby");
+    expect(reasonId).toBeTruthy();
+    expect(document.getElementById(reasonId!)).not.toBeNull();
   });
 
   it("does not disable the composer when flags omits disabled_when", () => {

@@ -9,7 +9,15 @@
  * version (§4.4), and renders an error card on a malformed response — the
  * ONLY code path registered widgets/pages render through. */
 
-import { createElement, useId, useState, type KeyboardEvent, type ReactNode } from "react";
+import {
+  createElement,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type ReactNode,
+} from "react";
 import { Link } from "react-router-dom";
 
 import { fetchUiData, postUiApi, UiApiError, type UIComposer } from "../api";
@@ -349,9 +357,24 @@ export type ThreadComposerConfig = {
  * reassuring copy; everything else (422/413 body-shape, network failure)
  * surfaces the server's own message verbatim — fail-visible, never a bare
  * status code. */
+// ONE copy of the archived sentence: the pre-disabled reason note and the 409
+// error path must say the same thing (two surfaces of one state).
+const ARCHIVED_COPY = "This branch is archived — read-only.";
+
+/** The greyed-composer reason. `disabled_when` is a MACHINE flag name
+ * (manifest.py: "the plugin owns the semantics"), never display copy — the
+ * known flag maps to its sentence and anything else gets neutral copy rather
+ * than leaking the raw token into the UI. */
+function composerDisabledReason(disabledWhen: string | undefined): string {
+  if (disabledWhen === undefined || disabledWhen === "archived") {
+    return ARCHIVED_COPY;
+  }
+  return "Read-only — this thread is not accepting new messages.";
+}
+
 function composerErrorMessage(err: unknown): string {
   if (err instanceof UiApiError) {
-    if (err.status === 409) return "This branch is archived — read-only.";
+    if (err.status === 409) return ARCHIVED_COPY;
     if (err.status === 503) return "This plugin is currently down — try again shortly.";
     return err.message;
   }
@@ -377,19 +400,40 @@ function ThreadComposer(props: {
   const id = useId();
   const reasonId = `${id}-reason`;
   const controlsDisabled = props.disabled || sending;
+  // Ref latch, not state: two events in one tick (keydown burst + click)
+  // both read a stale `sending === false` before React commits, so the state
+  // flag alone can double-POST. The ref flips synchronously.
+  const inflight = useRef(false);
+  // Liveness: a send resolving after unmount (or after the route re-bound
+  // this composer to a DIFFERENT branch) must not clear the new branch's
+  // draft or trigger its refetch.
+  const boundPath = useRef(props.composer.path);
+  boundPath.current = props.composer.path;
+  useEffect(() => {
+    return () => {
+      boundPath.current = null as unknown as string;
+    };
+  }, []);
 
   const send = () => {
     const markdown = value.trim();
-    if (!markdown || controlsDisabled) return;
+    if (!markdown || controlsDisabled || inflight.current) return;
+    inflight.current = true;
+    const sentFor = props.composer.path;
     setSending(true);
+    const stillLive = () => boundPath.current === sentFor;
     postUiApi(props.composer.plugin, props.composer.path, { markdown }).then(
       () => {
+        inflight.current = false;
+        if (!stillLive()) return;
         setSending(false);
         setError(null);
         setValue("");
         props.onSent?.();
       },
       (err) => {
+        inflight.current = false;
+        if (!stillLive()) return;
         setSending(false);
         setError(composerErrorMessage(err));
       },
@@ -409,7 +453,7 @@ function ThreadComposer(props: {
     <div className="thread-composer">
       {props.disabled && (
         <StateNote id={reasonId} className="thread-composer-reason">
-          {`${props.composer.disabledWhen ?? "archived"} — read-only.`}
+          {composerDisabledReason(props.composer.disabledWhen)}
         </StateNote>
       )}
       {error != null && (
