@@ -15,6 +15,10 @@ Pure constants + one pure function — no imports beyond stdlib.
 EVENT_DECISION_RECORDED: str = "decision.recorded"
 EVENT_DECISION_SUPERSEDED: str = "decision.superseded"
 
+# The platform's own adoption (replication-continuity §8, §9 item 5, issue
+# #81): the scope namespace dogfoods the same contract it offers plugins.
+EVENT_SCOPE_CREATED: str = "scope.created"
+EVENT_SCOPE_UPDATED: str = "scope.updated"
 # Memory's replication vocabulary (replication-continuity §4 coverage note, #80).
 # Memory is a per-name last-writer-wins register with tombstoned deletes: `set`
 # carries the winning write, `forgotten` the tombstone. EVERY event type any
@@ -27,6 +31,8 @@ EVENT_TYPES: frozenset[str] = frozenset(
     {
         EVENT_DECISION_RECORDED,
         EVENT_DECISION_SUPERSEDED,
+        EVENT_SCOPE_CREATED,
+        EVENT_SCOPE_UPDATED,
         EVENT_MEMORY_SET,
         EVENT_MEMORY_FORGOTTEN,
     }

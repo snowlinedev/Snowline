@@ -10,6 +10,9 @@ from snowline_plugin_sdk import contract
 def test_event_type_literals():
     assert contract.EVENT_DECISION_RECORDED == "decision.recorded"
     assert contract.EVENT_DECISION_SUPERSEDED == "decision.superseded"
+    # The platform's own adoption (replication-continuity §8, issue #81).
+    assert contract.EVENT_SCOPE_CREATED == "scope.created"
+    assert contract.EVENT_SCOPE_UPDATED == "scope.updated"
     # Memory's replication vocabulary (#80) — the whole-platform registry.
     assert contract.EVENT_MEMORY_SET == "memory.set"
     assert contract.EVENT_MEMORY_FORGOTTEN == "memory.forgotten"
@@ -20,6 +23,8 @@ def test_event_types_frozenset():
         {
             "decision.recorded",
             "decision.superseded",
+            "scope.created",
+            "scope.updated",
             "memory.set",
             "memory.forgotten",
         }

@@ -110,13 +110,20 @@ def migrated_db() -> str:
 
 @pytest.fixture()
 def clean_db(migrated_db):
-    """Truncate the scopes table before each test (so writes a test makes are
-    visible across the separate sessions the service/route open — mirroring
-    production)."""
+    """Truncate the scopes table AND the adopted replication tables (spec §8,
+    issue #81) before each test (so writes a test makes are visible across the
+    separate sessions the service/route open — mirroring production). CASCADE
+    covers `replication_outbox`'s FK to `replication_subscriptions`."""
     from snowline_platform.db import session_scope
 
     with session_scope() as s:
-        s.execute(sa.text("TRUNCATE scopes RESTART IDENTITY CASCADE"))
+        s.execute(
+            sa.text(
+                "TRUNCATE scopes, replication_subscriptions, replication_outbox, "
+                "replication_stream_counters, replication_inbound_streams, "
+                "replication_parked_events RESTART IDENTITY CASCADE"
+            )
+        )
     yield
 
 
