@@ -35,7 +35,12 @@ def _db_name(url: str) -> str:
 
 
 def _maintenance_url(url: str) -> str:
-    return str(sa.make_url(url).set(database="postgres"))
+    # render_as_string, NOT str(): str() masks the password as `***`, which the
+    # maintenance engine would then send literally — a password-bearing test DB
+    # URL could never connect.
+    return sa.make_url(url).set(database="postgres").render_as_string(
+        hide_password=False
+    )
 
 
 def alembic_config() -> Config:
@@ -135,7 +140,13 @@ def db_session(clean_db):
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 
 _REPL_DB_URLS = {
-    name: str(sa.make_url(TEST_DB_URL).set(database=f"snowline_memory_{name}"))
+    # render_as_string(hide_password=False), not str(): these URLs are used
+    # directly to create the real replication-store engines below, so a masked
+    # `***` password would break connections the same way it broke the
+    # maintenance URL.
+    name: sa.make_url(TEST_DB_URL)
+    .set(database=f"snowline_memory_{name}")
+    .render_as_string(hide_password=False)
     for name in ("repl_a", "repl_b")
 }
 
