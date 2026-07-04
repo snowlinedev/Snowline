@@ -5,12 +5,10 @@
 > kept convergent by async, plugin-owned event replication over the tailnet.
 > This is **not failover** — deploy-continuity.md §7's "multi-host HA out of
 > scope" still stands; there is no shared socket, no leader election, no
-> traffic flip. Design session 2026-07-04 (Sean); builds on the decision-event
-> webhook bus (governance-plugin.md §7, `replication.py`) and the frozen
-> monolith's `replication_ingest` (carve material, governance-plugin.md §9).
-> Revised same day after an adversarial review pass: stream contract (§3.2),
-> origin suppression, parking (§8.1), and a single symmetric conflict rule
-> (§6) replaced the first draft's delivery-time-seq / primary-ordered model.
+> traffic flip. Design session 2026-07-04 (Sean), hardened the same day by
+> two adversarial review passes; builds on the decision-event webhook bus
+> (governance-plugin.md §7, `replication.py`) and the frozen monolith's
+> `replication_ingest` (carve material, governance-plugin.md §9).
 
 ## 1. The problem, precisely
 
@@ -104,8 +102,8 @@ The bus's attempt cap (`SNOWLINE_WEBHOOK_MAX_ATTEMPTS`, default 5) treats
 sustained unreachability as failure. For a replication peer, **being down for
 two weeks is normal operation**, not failure — a vacationing laptop must never
 dead-letter the primary's stream (or vice versa). Replication subscriptions
-therefore use **unbounded retry with capped backoff** — and, honestly, that
-is new machinery, not a tuning change: the bus today has NO backoff at all
+therefore use **unbounded retry with capped backoff** — new machinery, not a
+tuning change: the bus today has NO backoff at all
 (`deliver_pending` retries every pending row flat on each interval tick;
 `attempts` is only a counter), so this adds per-row `next_attempt_at` state
 with exponential growth to a ceiling of ~the delivery interval × 10. Two
@@ -283,9 +281,8 @@ each opted-in plugin covers its write surface with events:
   requires a write-model rework first: `forget` becomes a **tombstone** (so
   a late-arriving pre-forget `set` cannot resurrect the memory), and apply
   converges **per name** by the same LWW-by-event-timestamp rule as §6.
-  This is legitimate under checklist item 3 because a memory named X is
-  *semantically* a last-writer-wins register — LWW-with-tombstones IS its
-  correct convergence, not a workaround.
+  A memory named X is *semantically* a last-writer-wins register, so
+  LWW-with-tombstones is its correct convergence under checklist item 3.
 - **pm (private)**: its own vocabulary, defined in its own repo against the
   SDK contract; the platform never sees the payloads' semantics.
 
@@ -331,9 +328,10 @@ each opted-in plugin covers its write surface with events:
   **Sign-time is contract, not implementation detail:** signatures are
   computed at DELIVERY time over the exact bytes POSTed (the bus's existing
   behavior) — retire-on-first-new-signed depends on it, because after a swap
-  the entire queued backlog re-signs with the new secret. An SDK
-  reimplementation that signed at emit time would strand a partitioned
-  peer's old-signed backlog past retirement and dead-letter it; don't.
+  the entire queued backlog re-signs with the new secret. An implementation
+  that signed at emit time would strand a partitioned peer's old-signed
+  backlog past retirement and dead-letter it — delivery-time signing is part
+  of the envelope contract, alongside §3.2.
 - Delivery flows over the tailnet exactly like every other plugin call; the
   trust gate applies unchanged. No new auth surface — the HMAC secret
   authenticates the *stream*, the tailnet authenticates the *network*.
@@ -354,8 +352,8 @@ exposure delegated to tailscaled. Rationale:
   is trusted as `owner` today; extending the trusted set to loopback makes
   that equivalence explicit and tailscaled-independent. **Config trap:**
   `SNOWLINE_TRUSTED_CIDRS` REPLACES the default when set — state the full
-  list, `SNOWLINE_TRUSTED_CIDRS="100.64.0.0/10,127.0.0.0/8,::1"`. And be
-  clear which entry is load-bearing for what: behind this posture's
+  list, `SNOWLINE_TRUSTED_CIDRS="100.64.0.0/10,127.0.0.0/8,::1"`. Which
+  entry is load-bearing differs by topology: behind this posture's
   `tailscale serve`→loopback front, EVERY request — the local agent and
   cross-tailnet deliveries alike — reaches the app with a *loopback* peer
   IP, so the loopback entries are what admit cross-instance traffic; the
@@ -438,8 +436,8 @@ mechanical, adjudication belongs to the LLM.**
   a decision at a parent scope governs descendants, so the incoming decision
   is checked against concurrent local decisions in any scope along either
   one's ancestors-until-isolated walk (the walk governance already performs
-  for `applicable_decisions`). One honest coupling: that walk is not local —
-  governance resolves ancestors via the platform scope service
+  for `applicable_decisions`). The walk is not local, though — governance
+  resolves ancestors via the platform scope service
   (`GET /scopes/{slug}/ancestors`), so detection performs a scope-service
   round-trip at apply time and depends on platform availability. Acceptable
   because the platform is co-located on loopback (§5.1) — it shares fate
@@ -556,7 +554,7 @@ generous against any real scope-stream lag), after which the event is
   scope, resolve the slug collision, ship the apply fix), then re-apply it
   from the park — apply idempotence (§4 checklist item 4) makes the replay
   safe.
-- Honest limit: events *behind* a parked one that causally depended on it
+- Known limit: events *behind* a parked one that causally depended on it
   may themselves park or apply with degraded meaning. Parking trades strict
   ordering for liveness and makes the trade visible; if a park cascade ever
   grows, the §7 re-seed is the clean recovery.
@@ -583,7 +581,7 @@ events. The two never overlap.
    view (§6.1).
 4. **Memory** write-model rework, THEN adoption: tombstoned `forget`,
    per-name LWW apply, `memory.set` / `memory.forgotten` events (§4
-   coverage note) — scheduled as a rework, not a small vocabulary task.
+   coverage note).
 5. **Platform scopes** adopt the contract (§8).
 6. **Pairing CLI** + seed procedure (§5, §7); stand up `roam` on the laptop.
 7. **PM plugin** adopts privately against the published SDK — this spec is
