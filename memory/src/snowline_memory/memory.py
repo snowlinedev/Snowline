@@ -47,6 +47,11 @@ _TS_CONFIG = "english"
 # Kebab-case: lowercase alphanumeric words joined by single hyphens (spec §4).
 NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 
+# Any run of characters that ISN'T lowercase-alnum collapses to a single hyphen
+# when auto-normalizing a caller-provided name (underscores, spaces, punctuation,
+# repeated hyphens — all become one separator).
+_NAME_INVALID_RUN_RE = re.compile(r"[^a-z0-9]+")
+
 # The platform scope slug grammar, CARRIED (not imported — import-purity) from
 # `snowline_platform.scopes` §2.1: a bare org segment or `<org>/<rest>...`.
 _SLUG_SEG = r"[._-]*[a-z0-9][a-z0-9._-]*"
@@ -89,6 +94,21 @@ def validate_scope(scope: str | None) -> str | None:
             "(`org` or `org/rest`)"
         )
     return scope
+
+
+def normalize_name(name: str) -> str:
+    """Auto-kebab-case a CALLER-PROVIDED name (issue #48): lowercase, collapse any
+    run of non-`[a-z0-9]` characters (underscores, spaces, punctuation, repeated
+    hyphens) to a single hyphen, strip leading/trailing hyphens, and clamp to
+    `_NAME_MAX`. Unlike `slugify_to_name` (used only to GENERATE a name when one
+    is omitted), this does NOT clamp to a handful of words — a caller's full
+    intended name is preserved, just kebab-ified, so `remember`/`forget` don't
+    silently truncate an explicit name. Applied at every name-accepting boundary
+    so the same input always resolves to the same stored key (`my_note` and
+    `my-note` collide). May return `""` for an all-punctuation input — callers
+    must check for that."""
+    slug = _NAME_INVALID_RUN_RE.sub("-", (name or "").strip().lower()).strip("-")
+    return slug[:_NAME_MAX].strip("-")
 
 
 def slugify_to_name(text: str) -> str:
@@ -165,16 +185,22 @@ def remember(
 ) -> dict:
     """Save durable working context, UPSERTING by `name`.
 
-    A blank `content` is rejected. `name` (kebab) is generated from the
-    description/content head when omitted; `description` is derived from the
-    content's first line when omitted; `kind` defaults to `project` and is
+    A blank `content` is rejected. A PROVIDED `name` is auto-normalized to
+    kebab-case (issue #48) — lowercased, with underscores/spaces/other invalid
+    runs collapsed to single hyphens and clamped to `_NAME_MAX` — rather than
+    hard-rejected, so `my_note` and `My Note Title` both save instead of erroring
+    on the first attempt; it only raises if that normalization leaves nothing
+    (an all-punctuation name). `name` is generated (kebab, from `slugify_to_name`)
+    from the description/content head when omitted; `description` is derived from
+    the content's first line when omitted; `kind` defaults to `project` and is
     LOWERCASED at this boundary (soft enum — `Gotcha` and `gotcha` are the same
     kind, so the digest never splits on case); `scope` is an optional, validated,
-    verbatim-stored slug. If a memory with `name` already exists it is updated IN
-    PLACE (content/description/kind/scope), bumping `updated_at` on EVERY upsert
-    — including an identical-content re-remember (the write is a deliberate
-    touch). Returns the full row plus `created` (True on insert, False on
-    in-place update)."""
+    verbatim-stored slug. If a memory with the NORMALIZED `name` already exists it
+    is updated IN PLACE (content/description/kind/scope), bumping `updated_at` on
+    EVERY upsert — including an identical-content re-remember (the write is a
+    deliberate touch) — so `my_note` then `my-note` collide as the same memory.
+    Returns the full row plus `created` (True on insert, False on in-place
+    update)."""
     if not content or not content.strip():
         raise ValueError("`content` must be a non-empty string")
     content = content.strip()
@@ -186,7 +212,13 @@ def remember(
         description = description[: _DESCRIPTION_MAX - 1].rstrip() + "…"
 
     if name:
-        name = validate_name(name)
+        normalized = normalize_name(name)
+        if not normalized:
+            raise InvalidNameError(
+                f"invalid memory name {name!r} — name must be kebab-case "
+                "(lowercase alphanumerics + hyphens)"
+            )
+        name = validate_name(normalized)  # backstop: normalize_name should already satisfy this
     else:
         name = validate_name(slugify_to_name(description or content))
 
@@ -353,9 +385,11 @@ def list_memories(
 
 
 def forget(session: Session, name: str) -> dict:
-    """Delete one memory by name. Idempotent — a miss reports
-    `{forgotten: False}` rather than raising."""
-    name = (name or "").strip()
+    """Delete one memory by name. `name` is normalized the same way `remember`
+    normalizes a provided name (kebab-cased), so a caller who saved `my_note`
+    (stored as `my-note`) can still `forget("my_note")`. Idempotent — a miss
+    reports `{forgotten: False}` rather than raising."""
+    name = normalize_name(name)
     m = session.scalar(select(Memory).where(Memory.name == name))
     if m is None:
         return {"forgotten": False, "name": name}

@@ -111,9 +111,38 @@ def test_remember_rejects_blank_content(db_session):
         memory.remember(db_session, content="   ", name="x")
 
 
-def test_remember_rejects_bad_name(db_session):
-    with pytest.raises(memory.InvalidNameError):
-        memory.remember(db_session, content="x", name="Not Kebab Case")
+def test_remember_normalizes_underscore_name(db_session):
+    # Issue #48: a provided name is auto-kebab-cased, not hard-rejected — an
+    # underscore-named note (as produced by the bulk-migration importer) saves
+    # on the first attempt.
+    row = memory.remember(db_session, content="x", name="my_note")
+    assert row["name"] == "my-note"
+
+
+def test_remember_normalizes_sentence_case_with_spaces(db_session):
+    row = memory.remember(db_session, content="x", name="My Note Title")
+    assert row["name"] == "my-note-title"
+
+
+def test_remember_normalized_name_upserts_across_spellings(db_session):
+    # Normalization happens BEFORE the upsert lookup, so `my_note` and
+    # `my-note` resolve to the same stored key — one row, not two.
+    first = memory.remember(db_session, content="old", name="my_note")
+    assert first["created"] is True
+
+    second = memory.remember(db_session, content="new", name="my-note")
+    assert second["created"] is False
+    assert second["name"] == "my-note"
+
+    listed = memory.list_memories(db_session)
+    assert listed["items_total"] == 1
+
+
+def test_remember_rejects_all_punctuation_name(db_session):
+    # Normalization strips every character, leaving "" — that's the one case
+    # that still raises, with a message stating the rule exactly.
+    with pytest.raises(memory.InvalidNameError, match="kebab-case"):
+        memory.remember(db_session, content="x", name="!!!___")
 
 
 def test_remember_rejects_bad_scope(db_session):
@@ -256,3 +285,107 @@ def test_forget_removes_and_is_idempotent(db_session):
     # Idempotent — forgetting a missing name is a no-op, not an error.
     again = memory.forget(db_session, "doomed")
     assert again == {"forgotten": False, "name": "doomed"}
+
+
+def test_forget_normalizes_underscore_name(db_session):
+    # Issue #48: a caller who saved `my_note` (stored as `my-note`) must be able
+    # to forget it by the name they remembered it under.
+    memory.remember(db_session, content="x", name="my_note")
+    gone = memory.forget(db_session, "my_note")
+    assert gone == {"forgotten": True, "name": "my-note"}
+    assert memory.list_memories(db_session)["items_total"] == 0
+
+
+# --- issue #47: pin every row/header shape's exact key set -------------------
+#
+# The plugin's serializers already emit `scope`/`kind` (unlike the old monolith
+# this issue was audited against) — these tests exist so a future field drop
+# fails loudly instead of quietly regressing scoped rows back to "unscoped".
+
+
+def test_row_shape_pins_keys(db_session):
+    row = memory.remember(
+        db_session, content="x", name="pin-row", kind="gotcha", scope="acme/widget"
+    )
+    assert set(row.keys()) == {
+        "id",
+        "name",
+        "description",
+        "content",
+        "kind",
+        "scope",
+        "created_at",
+        "updated_at",
+        "created",
+    }
+    assert row["scope"] == "acme/widget"
+    assert row["kind"] == "gotcha"
+
+
+def test_recall_row_shape_pins_keys_with_query(db_session):
+    memory.remember(
+        db_session,
+        content="postgres is the durable store",
+        name="pin-recall-fts",
+        kind="reference",
+        scope="acme/widget",
+    )
+    out = memory.recall(db_session, query="postgres")
+    row = out["memories"][0]
+    assert set(row.keys()) == {
+        "id",
+        "name",
+        "description",
+        "content",
+        "kind",
+        "scope",
+        "created_at",
+        "updated_at",
+        "rank",
+    }
+    assert row["scope"] == "acme/widget"
+    assert row["kind"] == "reference"
+
+
+def test_recall_row_shape_pins_keys_without_query(db_session):
+    memory.remember(
+        db_session, content="x", name="pin-recall-plain", kind="user", scope="acme/widget"
+    )
+    out = memory.recall(db_session)
+    row = out["memories"][0]
+    assert set(row.keys()) == {
+        "id",
+        "name",
+        "description",
+        "content",
+        "kind",
+        "scope",
+        "created_at",
+        "updated_at",
+    }
+    assert row["scope"] == "acme/widget"
+    assert row["kind"] == "user"
+
+
+def test_header_shape_pins_keys(db_session):
+    memory.remember(
+        db_session, content="x", name="pin-header", kind="feedback", scope="acme/widget"
+    )
+    out = memory.list_memories(db_session)
+    hdr = out["memories"][0]
+    assert set(hdr.keys()) == {"name", "description", "kind", "scope", "updated_at"}
+    assert hdr["scope"] == "acme/widget"
+    assert hdr["kind"] == "feedback"
+
+
+def test_digest_entry_shape_pins_keys(db_session):
+    memory.remember(
+        db_session, content="x", name="pin-digest", kind="user", scope="acme/widget"
+    )
+    out = memory.memory_digest(db_session)
+    entry = out["groups"][0]["entries"][0]
+    # `kind` is the group key, not a per-entry field — the entry shape is
+    # deliberately name/description/scope.
+    assert set(entry.keys()) == {"name", "description", "scope"}
+    assert entry["scope"] == "acme/widget"
+    assert out["groups"][0]["kind"] == "user"

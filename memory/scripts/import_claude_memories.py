@@ -156,16 +156,25 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
 def _record_from_file(path: Path) -> dict | None:
     """Parse + VALIDATE one memory file into a `remember` kwargs dict, or None if
     it has no usable content. The resolved name (frontmatter `name`, else the
-    file stem) is validated against the kebab grammar and `kind` is normalized
-    HERE — the parse phase — so `--dry-run` fails exactly where a live run would.
-    Raises `ValueError` (e.g. `InvalidNameError`) for a file that would fail
-    live."""
+    file stem) is auto-kebab-normalized and `kind` is normalized HERE — the
+    parse phase — mirroring exactly what `remember` itself does, so `--dry-run`
+    predicts live outcomes (an underscore/space-y frontmatter `name` normalizes
+    here the same way it would on a live `remember` call). Raises `ValueError`
+    (e.g. `InvalidNameError`) only for a file that would still fail live — i.e.
+    a name that normalizes to empty."""
     text = path.read_text(encoding="utf-8")
     fields, body = parse_frontmatter(text)
     content = body or text.strip()
     if not content:
         return None
-    name = memory_verbs.validate_name(fields.get("name") or path.stem)
+    raw_name = fields.get("name") or path.stem
+    name = memory_verbs.normalize_name(raw_name)
+    if not name:
+        raise memory_verbs.InvalidNameError(
+            f"invalid memory name {raw_name!r} — name must be kebab-case "
+            "(lowercase alphanumerics + hyphens)"
+        )
+    name = memory_verbs.validate_name(name)
     return {
         "name": name,
         "description": fields.get("description") or None,
