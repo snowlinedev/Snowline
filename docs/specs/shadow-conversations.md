@@ -1,7 +1,9 @@
 # Shadow conversations — conversing in a branch from the UI
 
-> **Status: draft** (designed 2026-07-03, Sean's ask: "can we have a
-> conversation in the UI for a shadow conversation"). Two phases: the UI
+> **Status: exploratory** (designed 2026-07-03 from Sean's ask — "can we
+> have a conversation in the UI for a shadow conversation"; both phases
+> shipped and live-drilled 2026-07-04: #68/#69/#70/#71, artifact `9fc33a02`;
+> stable once real dogfooded conversations prove the turn quality). Two phases: the UI
 > write seam + a durable per-branch conversation log (phase 1), then
 > server-side agent turns on the codex inference carrier (phase 2). This spec
 > ACTIVATES two seams `ui-shell.md` deliberately reserved — §4.3 (the
