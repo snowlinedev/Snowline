@@ -139,7 +139,7 @@ alone would reject a re-paired stream wholesale as already-seen. **This
 section AMENDS the recorded bus contract** — governance-plugin.md §7 and
 replication.py's carve notes (decision `97907576`, #630) document
 delivery-time seq as the standing behavior; replication is the requirement
-that changes it, and both records gain a pointer here when §9 item 1 lands.
+that changes it, and both records gain a pointer here when §9 item 1 (#77) lands.
 v1 therefore pins the following envelope semantics (all SDK-owned):
 
 - **`seq` is allocated at EMIT time, in the domain write's transaction** — a
@@ -606,7 +606,7 @@ events. The two never overlap.
 
 ## 9. v1 scope and build order
 
-1. **SDK**: generalize `replication.py` into `snowline-plugin-sdk` emit
+1. **SDK** (#77): generalize `replication.py` into `snowline-plugin-sdk` emit
    module — with the §3.2 stream contract, which *changes* the emit side
    (emit-time seq + epoch in place of delivery-time seq; `peer_seen` in the
    envelope), not just relocates it; write the ingest module (per-stream
@@ -616,15 +616,15 @@ events. The two never overlap.
    with per-row backoff + reconnect reset (§3.1). The replication-admin
    surface + secret handshake (§5). Multi-target registration heartbeats
    for §4.1's cross-registered shape.
-2. **Manifest**: additive `replication` block + registry storage (advisory).
-3. **Governance** adopts SDK ingest (emit exists); extends event coverage to
+2. **Manifest** (#78): additive `replication` block + registry storage (advisory).
+3. **Governance** (#79) adopts SDK ingest (emit exists); extends event coverage to
    shadow/artifacts/specs; concurrent-sibling detection + `unreconciled`
    view (§6.1).
-4. **Memory** write-model rework, THEN adoption: tombstoned `forget`,
+4. **Memory** (#80) write-model rework, THEN adoption: tombstoned `forget`,
    per-name LWW apply, `memory.set` / `memory.forgotten` events (§4
    coverage note).
-5. **Platform scopes** adopt the contract (§8).
-6. **Pairing CLI** + seed procedure (§5, §7); stand up `roam` on the laptop.
+5. **Platform scopes** (#81) adopt the contract (§8).
+6. **Pairing CLI** (#82) + seed procedure (§5, §7); stand up `roam` on the laptop.
 7. **PM plugin** adopts privately against the published SDK — this spec is
    its behavior reference; no platform work required.
 
@@ -692,10 +692,10 @@ events. The two never overlap.
   promoted; deploy-continuity.md §7 stands. The agent on each machine points
   at that machine's gateway; endpoint choice is client config, not platform
   behavior.
-- **fly.io / a third replica** — deferred with the revisit triggers in §2.
+- **fly.io / a third replica** — deferred with the revisit triggers in §2 (#83).
 - **Trust changes** — the tailnet remains the boundary; OAuth is a separate
   seam (architecture.md §3.5).
 - **General multi-master conflict resolution** (CRDTs, vector clocks) —
-  rejected in §2; revisit only if a second *human* writer appears.
+  rejected in §2; revisit only if a second *human* writer appears (#84).
 - **Event-log retention / replay-from-genesis** — the bus stays a delta
   fabric; seeding is snapshot-based (§7).
