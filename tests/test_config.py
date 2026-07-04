@@ -129,9 +129,10 @@ def test_default_matches_sdk_admin_default(monkeypatch):
     replication-continuity.md §5.1's serve->loopback bind posture) — leaving
     the platform default unset 403'd loopback deliveries and pairing-CLI calls
     on first boot. Pinning equality here catches the two drifting apart again."""
-    from snowline_plugin_sdk.replication.admin import (
-        DEFAULT_TRUSTED_CIDRS as sdk_default,
-    )
+    # importorskip, not a hard import: the SDK is a dev-only dependency (same
+    # treatment as governance's test_contract_drift.py).
+    sdk_admin = pytest.importorskip("snowline_plugin_sdk.replication.admin")
+    sdk_default = sdk_admin.DEFAULT_TRUSTED_CIDRS
 
     monkeypatch.delenv("SNOWLINE_TRUSTED_CIDRS", raising=False)
     assert config.DEFAULT_TRUSTED_CIDRS == sdk_default
