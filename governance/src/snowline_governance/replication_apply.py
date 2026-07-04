@@ -344,7 +344,10 @@ def _apply_marked_compatible(session, client, envelope: dict) -> None:
     p = envelope["payload"]
     lo = _uuid(p["decision_id"])
     hi = _uuid(p["concurrent_with_id"])
-    at = _dt(p.get("marked_compatible_at")) or _dt(p.get("at"))
+    # Hard-key the envelope `at` fallback (the `_apply_branch_archived`
+    # pattern): a payload missing BOTH stamps is malformed and must raise
+    # retryably — never ACK an unmarked row into existence.
+    at = _dt(p.get("marked_compatible_at")) or replication_stream.parse_at(p["at"])
     concurrence.mark_compatible(session, lo, hi, at, create_if_absent=True)
 
 

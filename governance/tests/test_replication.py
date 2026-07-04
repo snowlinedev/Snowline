@@ -18,9 +18,10 @@ import uuid
 import httpx
 import pytest
 
-from snowline_governance import decisions, replication
+from snowline_governance import concurrence, decisions, replication
 from snowline_governance.contract import (
     CONTRACT_VERSION,
+    EVENT_DECISION_MARKED_COMPATIBLE,
     EVENT_DECISION_RECORDED,
     EVENT_DECISION_SUPERSEDED,
 )
@@ -121,6 +122,118 @@ def test_inactive_subscription_does_not_match(db_session):
         db_session, "acme/widget", _sid("acme/widget"), "use postgres"
     )
     assert _deliveries(db_session) == []
+
+
+# --- transactional outbox: emit on mark-compatible (§6.1, #97) ----------------
+
+
+def _flagged_cross_scope_pair(db_session) -> tuple[dict, dict]:
+    """A flagged concurrent pair straddling TWO scopes along the applicability
+    chain (parent `acme` vs child `acme/widget`) — the case the either-member
+    scope matching exists for. Flagged via the detection primitive."""
+    parent = decisions.record_decision(db_session, "acme", _sid("acme"), "org rule")
+    child = decisions.record_decision(
+        db_session, "acme/widget", _sid("acme/widget"), "widget rule"
+    )
+    concurrence.flag_pair(
+        db_session, uuid.UUID(parent["id"]), uuid.UUID(child["id"])
+    )
+    return parent, child
+
+
+def test_mark_compatible_emits_to_global_and_either_member_scope(db_session):
+    """`emit_marked_compatible_event` matches a global subscription AND one
+    anchored to EITHER member's scope (the pair may straddle two scopes along
+    the applicability chain); an unrelated-scope subscription does not fire."""
+    glob = replication.create_subscription(
+        db_session,
+        "https://g.example/hook",
+        "s-glob",
+        [EVENT_DECISION_MARKED_COMPATIBLE],
+    )
+    parent_scope = replication.create_subscription(
+        db_session,
+        "https://p.example/hook",
+        "s-parent",
+        [EVENT_DECISION_MARKED_COMPATIBLE],
+        scope_id=_sid("acme"),
+    )
+    child_scope = replication.create_subscription(
+        db_session,
+        "https://w.example/hook",
+        "s-widget",
+        [EVENT_DECISION_MARKED_COMPATIBLE],
+        scope_id=_sid("acme/widget"),
+    )
+    other = replication.create_subscription(
+        db_session,
+        "https://o.example/hook",
+        "s-other",
+        [EVENT_DECISION_MARKED_COMPATIBLE],
+        scope_id=_sid("acme/other"),
+    )
+    parent, child = _flagged_cross_scope_pair(db_session)
+
+    out = decisions.mark_decisions_compatible(db_session, parent["id"], child["id"])
+
+    rows = [
+        r
+        for r in _deliveries(db_session)
+        if r.event_type == EVENT_DECISION_MARKED_COMPATIBLE
+    ]
+    sub_ids = {str(r.subscription_id) for r in rows}
+    assert sub_ids == {glob["id"], parent_scope["id"], child_scope["id"]}
+    assert other["id"] not in sub_ids
+    lo, hi = sorted([parent["id"], child["id"]])
+    for r in rows:
+        assert r.status == "pending"
+        assert r.seq is None  # not allocated until delivery
+        assert r.payload["event_type"] == EVENT_DECISION_MARKED_COMPATIBLE
+        assert r.payload["contract_version"] == CONTRACT_VERSION
+        body = r.payload["marked_compatible"]
+        # The NORMALIZED pair, plus the stored (permanent) stamp + actor.
+        assert body["decision_id"] == lo
+        assert body["concurrent_with_id"] == hi
+        assert body["marked_compatible_at"] == out["marked_compatible_at"]
+        assert body["actor"] == out["actor"]
+
+
+def test_mark_compatible_event_type_filter_and_no_reemit_on_remark(db_session):
+    """A subscription without the event type gets nothing; and a RE-mark (a pure
+    no-op — the judgment is permanent) does not emit a second delivery."""
+    replication.create_subscription(
+        db_session, "https://x.example/hook", "s-rec", [EVENT_DECISION_RECORDED]
+    )
+    marks = replication.create_subscription(
+        db_session,
+        "https://m.example/hook",
+        "s-mark",
+        [EVENT_DECISION_MARKED_COMPATIBLE],
+    )
+    parent, child = _flagged_cross_scope_pair(db_session)
+
+    first = decisions.mark_decisions_compatible(
+        db_session, parent["id"], child["id"]
+    )
+    rows = [
+        r
+        for r in _deliveries(db_session)
+        if r.event_type == EVENT_DECISION_MARKED_COMPATIBLE
+    ]
+    assert len(rows) == 1  # only the marks subscription, not the recorded-only one
+    assert str(rows[0].subscription_id) == marks["id"]
+
+    # Re-mark (arguments swapped): idempotent — same stored stamp, NO new emit.
+    again = decisions.mark_decisions_compatible(
+        db_session, child["id"], parent["id"]
+    )
+    assert again["marked_compatible_at"] == first["marked_compatible_at"]
+    rows = [
+        r
+        for r in _deliveries(db_session)
+        if r.event_type == EVENT_DECISION_MARKED_COMPATIBLE
+    ]
+    assert len(rows) == 1
 
 
 # --- delivery: sign over the exact body + monotonic seq ----------------------

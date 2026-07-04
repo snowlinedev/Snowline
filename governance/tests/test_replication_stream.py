@@ -18,7 +18,7 @@ from snowline_plugin_sdk.replication import emit as sdk_emit
 from snowline_plugin_sdk.replication.models import ReplicationOutboxRow
 from sqlalchemy import select
 
-from snowline_governance import artifacts, decisions, graduation, shadow
+from snowline_governance import artifacts, concurrence, decisions, graduation, shadow
 from snowline_governance.contract import (
     CONTRACT_VERSION,
     EVENT_ARTIFACT_MATURITY_SET,
@@ -104,6 +104,14 @@ def test_full_write_surface_emits_every_registry_event_type(db_session):
     # Decisions.
     dec = decisions.record_decision(db_session, scope, sid, "use postgres")
     decisions.supersede_decision(db_session, dec["id"], "use postgres 16")
+    # §6.1's explicit compatibility judgment (#97): the verb requires a flagged
+    # pair, so flag one (the detection primitive) over two fresh leaves first.
+    pa = decisions.record_decision(db_session, scope, sid, "take A")
+    pb = decisions.record_decision(db_session, scope, sid, "take B")
+    concurrence.flag_pair(
+        db_session, uuid.UUID(pa["id"]), uuid.UUID(pb["id"])
+    )
+    decisions.mark_decisions_compatible(db_session, pa["id"], pb["id"])
 
     # Shadow graph — every write verb.
     shadow.create_branch(db_session, scope, sid, "line-a", "notes v0")

@@ -297,27 +297,36 @@ def mark_decisions_compatible(
             f"compatible (see the unreconciled view for judgeable pairs)."
         )
     lo, hi = row.decision_id, row.concurrent_with_id
-    marked_at = replication_stream.utcnow()
     who = actor or replication_stream.source_id()
-    concurrence.mark_compatible(session, lo, hi, marked_at, create_if_absent=False)
-    # EMIT (spec §7 / §6.1, #97): the compatibility judgment is a first-class
-    # replicated event — the scope_ids of the two members anchor the legacy
-    # bus's scope filter; the stream carries the normalized pair.
-    d_lo = session.get(Decision, lo)
-    d_hi = session.get(Decision, hi)
-    replication.emit_marked_compatible_event(
-        session,
-        lo,
-        hi,
-        who,
-        marked_at,
-        {d.scope_id for d in (d_lo, d_hi) if d is not None},
+    already_marked = row.marked_compatible_at is not None
+    row = concurrence.mark_compatible(
+        session, lo, hi, replication_stream.utcnow(), create_if_absent=False
     )
-    replication_stream.emit(
-        session,
-        EVENT_DECISION_MARKED_COMPATIBLE,
-        replication_stream.marked_compatible_payload(lo, hi, who, marked_at),
-    )
+    # The STORED stamp is the truth everywhere (the earliest wins) — the
+    # payloads and the response carry it, never a fresher wall-clock that the
+    # store rejected.
+    marked_at = row.marked_compatible_at
+    if not already_marked:
+        # EMIT (spec §7 / §6.1, #97) — only when the mark actually landed: a
+        # re-mark is a pure no-op, so re-emitting it would just replay the same
+        # permanent fact (and misstamp it with a later timestamp). The scope_ids
+        # of the two members anchor the legacy bus's scope filter; the stream
+        # carries the normalized pair.
+        d_lo = session.get(Decision, lo)
+        d_hi = session.get(Decision, hi)
+        replication.emit_marked_compatible_event(
+            session,
+            lo,
+            hi,
+            who,
+            marked_at,
+            {d.scope_id for d in (d_lo, d_hi) if d is not None},
+        )
+        replication_stream.emit(
+            session,
+            EVENT_DECISION_MARKED_COMPATIBLE,
+            replication_stream.marked_compatible_payload(lo, hi, who, marked_at),
+        )
     return {
         "decision_id": str(lo),
         "concurrent_with_id": str(hi),
