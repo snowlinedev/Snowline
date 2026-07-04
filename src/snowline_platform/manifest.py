@@ -8,8 +8,9 @@ health-check it. The platform never imports plugin code; it routes to `base_url`
 from __future__ import annotations
 
 import re
+from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # Plugin names are used in gateway routes (/<name>/mcp/...), so keep them a
 # url-safe slug: lowercase alphanumerics and hyphens, starting alphanumeric.
@@ -17,6 +18,146 @@ from pydantic import BaseModel, Field, field_validator
 # `SNOWLINE_SURFACE_PLUGINS` against THIS rule, so a token that could never
 # name a registered plugin fails at boot instead of silently matching nothing.
 PLUGIN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+# --- UI block (ui-shell.md §3/§4) ------------------------------------------
+#
+# These constants are the PLATFORM's source of truth for the UI contract's
+# version + kind-name vocabulary. They are NOT used to validate a manifest's
+# `ui` block (see `UIWidget`/`UIPage`/`UIBlock` below — `kind` stays a free
+# string and an unknown `kind`/`contract_version` registers fine per spec §3
+# "fails visible", not at registration). They exist so a drift-guard test
+# (tests/test_ui_contract_drift.py, mirroring
+# governance/tests/test_contract_drift.py) can pin the published SDK's copy
+# (`snowline_plugin_sdk.ui`) equal to this one — the two must never silently
+# fork, the same discipline as the governance event contract.
+UI_CONTRACT_VERSION: int = 1
+
+UI_WIDGET_KINDS: frozenset[str] = frozenset({"stat", "list"})
+UI_PAGE_KINDS: frozenset[str] = frozenset({"table", "thread", "document"})
+UI_KINDS: frozenset[str] = UI_WIDGET_KINDS | UI_PAGE_KINDS
+
+# Route path-param segments template verbatim into `data` (ui-shell.md §3):
+# `{name}` where `name` is a simple identifier. A literal segment is a
+# generic url-safe token (letters/digits/`_`/`-`/`.`) — permissive on purpose,
+# since routes are plugin-chosen slugs, not a fixed vocabulary.
+_ROUTE_PARAM_RE = re.compile(r"^\{[A-Za-z_][A-Za-z0-9_]*\}$")
+_ROUTE_LITERAL_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _valid_ui_route(route: str) -> str:
+    if not route.startswith("/"):
+        raise ValueError(f"route {route!r} must start with '/'")
+    if route == "/":
+        return route
+    if route.endswith("/"):
+        raise ValueError(f"route {route!r} must not end with a trailing '/'")
+    for segment in route[1:].split("/"):
+        if not segment:
+            raise ValueError(
+                f"route {route!r} has an empty path segment (a stray '//')"
+            )
+        if "{" in segment or "}" in segment:
+            if not _ROUTE_PARAM_RE.match(segment):
+                raise ValueError(
+                    f"route {route!r} has a malformed path param {segment!r} — "
+                    "expected a whole '{name}' segment with a valid identifier"
+                )
+        elif not _ROUTE_LITERAL_RE.match(segment):
+            raise ValueError(
+                f"route {route!r} has an invalid path segment {segment!r}"
+            )
+    return route
+
+
+def _valid_ui_data(data: str) -> str:
+    # data paths are plugin-relative and proxied through /ui-api (§5); the
+    # proxy's path allowlist depends on every manifest-declared data/endpoint
+    # path already living under /ui-api/, so that's enforced here at
+    # registration too (belt + suspenders with the proxy's own allowlist).
+    if not data.startswith("/ui-api/"):
+        raise ValueError(f"data path {data!r} must start with '/ui-api/'")
+    return data
+
+
+def _no_duplicate_ids(items: list, what: str) -> None:
+    ids = [item.id for item in items]
+    dupes = sorted({i for i in ids if ids.count(i) > 1})
+    if dupes:
+        raise ValueError(f"duplicate {what} id(s) within the plugin: {dupes!r}")
+
+
+class UIWidget(BaseModel):
+    """One home-grid widget contribution (ui-shell.md §3/§4.1)."""
+
+    id: str = Field(description="unique within the plugin's widgets")
+    slot: Literal["home"] = Field(
+        description="placement slot; v1 has exactly one: the home dashboard grid"
+    )
+    kind: str = Field(
+        description="rendering kind (§4.1) — NOT validated against a known list: "
+        "kinds are shell-version-dependent and an unknown one fails visible at "
+        "render (§4.4), not at registration"
+    )
+    title: str | None = None
+    data: str = Field(description="plugin-relative path, proxied via /ui-api (§5)")
+    refresh_seconds: int | None = Field(
+        default=None, description="shell polling hint; the shell may clamp it"
+    )
+
+    _valid_data = field_validator("data")(_valid_ui_data)
+
+
+class UIPage(BaseModel):
+    """One page contribution (ui-shell.md §3/§4.2)."""
+
+    id: str = Field(description="unique within the plugin's pages")
+    route: str = Field(
+        description="shell route, namespaced by the shell to /<plugin>/<route>; "
+        "path params are '{name}' segments that template verbatim into `data`"
+    )
+    title: str | None = None
+    nav: bool = Field(
+        default=False, description="appears in the shell nav under the plugin"
+    )
+    kind: str = Field(
+        description="rendering kind (§4.2) — NOT validated, same fail-visible "
+        "posture as UIWidget.kind"
+    )
+    data: str = Field(description="plugin-relative path, proxied via /ui-api (§5)")
+
+    _valid_data = field_validator("data")(_valid_ui_data)
+    _valid_route = field_validator("route")(_valid_ui_route)
+
+
+class UIBlock(BaseModel):
+    """The manifest's optional `ui` object (ui-shell.md §3).
+
+    `extra="forbid"` on THIS model only — an unknown top-level field (a typo'd
+    key, or a future field an older platform doesn't know) rejects the whole
+    manifest (422), the same fail-loud posture as `SNOWLINE_SURFACE_PLUGINS`.
+    `contract_version` guards this BLOCK's shape, not the kind vocabulary: a
+    newer/older value than this platform's `UI_CONTRACT_VERSION` still
+    registers fine — the shell degrades to the §4.4 placeholder for versions
+    it doesn't render, rather than bricking registration.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    contract_version: int = UI_CONTRACT_VERSION
+    widgets: list[UIWidget] = Field(default_factory=list)
+    pages: list[UIPage] = Field(default_factory=list)
+
+    @field_validator("widgets")
+    @classmethod
+    def _unique_widget_ids(cls, v: list[UIWidget]) -> list[UIWidget]:
+        _no_duplicate_ids(v, "widget")
+        return v
+
+    @field_validator("pages")
+    @classmethod
+    def _unique_page_ids(cls, v: list[UIPage]) -> list[UIPage]:
+        _no_duplicate_ids(v, "page")
+        return v
 
 
 class PluginManifest(BaseModel):
@@ -50,6 +191,11 @@ class PluginManifest(BaseModel):
         default_factory=list,
         description="declared scope-namespace dependencies (advisory until the "
         "platform's scope service exists)",
+    )
+    ui: UIBlock | None = Field(
+        default=None,
+        description="optional declarative widget/page contributions (ui-shell.md "
+        "§3); None for a headless plugin with no shell contributions",
     )
 
     @field_validator("surfaces")

@@ -74,3 +74,112 @@ def test_trust_gate_blocks_registration():
     assert client.post("/plugins", json=_MANIFEST).status_code == 403
     # /health stays reachable (exempt) for liveness checks.
     assert client.get("/health").status_code == 200
+
+
+# --- the manifest `ui` block (ui-shell.md §3) -------------------------------
+#
+# Model-level validation edge cases live in test_manifest.py; these prove the
+# SAME rules apply at the HTTP boundary (POST /plugins -> 422), the surface a
+# plugin's registration heartbeat actually hits.
+
+_UI_MANIFEST = _MANIFEST | {
+    "ui": {
+        "contract_version": 1,
+        "widgets": [
+            {
+                "id": "shadow-activity",
+                "slot": "home",
+                "kind": "stat",
+                "title": "Open shadow branches",
+                "data": "/ui-api/widgets/shadow-activity",
+                "refresh_seconds": 30,
+            }
+        ],
+        "pages": [
+            {
+                "id": "shadow-branches",
+                "route": "/shadow",
+                "title": "Shadow discussions",
+                "nav": True,
+                "kind": "table",
+                "data": "/ui-api/pages/branches",
+            },
+            {
+                "id": "shadow-branch",
+                "route": "/shadow/{branch}",
+                "nav": False,
+                "kind": "thread",
+                "data": "/ui-api/pages/branches/{branch}",
+            },
+        ],
+    }
+}
+
+
+def test_valid_ui_block_registers_via_post():
+    client = _trusted_client()
+    r = client.post("/plugins", json=_UI_MANIFEST)
+    assert r.status_code == 201, r.text
+    ui = r.json()["manifest"]["ui"]
+    assert ui["contract_version"] == 1
+    assert [w["id"] for w in ui["widgets"]] == ["shadow-activity"]
+    assert [p["id"] for p in ui["pages"]] == ["shadow-branches", "shadow-branch"]
+
+
+def test_ui_block_duplicate_widget_id_is_422():
+    client = _trusted_client()
+    bad = _MANIFEST | {
+        "ui": {
+            "widgets": [
+                {"id": "w1", "slot": "home", "kind": "stat", "data": "/ui-api/a"},
+                {"id": "w1", "slot": "home", "kind": "stat", "data": "/ui-api/b"},
+            ]
+        }
+    }
+    assert client.post("/plugins", json=bad).status_code == 422
+
+
+def test_ui_block_bad_data_prefix_is_422():
+    client = _trusted_client()
+    bad = _MANIFEST | {
+        "ui": {
+            "widgets": [
+                {"id": "w1", "slot": "home", "kind": "stat", "data": "/mcp/a"},
+            ]
+        }
+    }
+    assert client.post("/plugins", json=bad).status_code == 422
+
+
+def test_ui_block_bad_route_is_422():
+    client = _trusted_client()
+    bad = _MANIFEST | {
+        "ui": {"pages": [{"id": "p1", "route": "no-leading-slash", "kind": "table", "data": "/ui-api/p1"}]}
+    }
+    assert client.post("/plugins", json=bad).status_code == 422
+
+
+def test_ui_block_unknown_top_level_field_is_422():
+    client = _trusted_client()
+    bad = _MANIFEST | {"ui": {"widgets": [], "unexpected_field": True}}
+    assert client.post("/plugins", json=bad).status_code == 422
+
+
+def test_ui_block_unknown_kind_and_future_contract_version_register_ok():
+    client = _trusted_client()
+    ok = _MANIFEST | {
+        "ui": {
+            "contract_version": 999,
+            "widgets": [
+                {
+                    "id": "w1",
+                    "slot": "home",
+                    "kind": "a-kind-the-shell-does-not-know-yet",
+                    "data": "/ui-api/a",
+                }
+            ],
+        }
+    }
+    r = client.post("/plugins", json=ok)
+    assert r.status_code == 201, r.text
+    assert r.json()["manifest"]["ui"]["contract_version"] == 999

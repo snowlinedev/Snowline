@@ -2,6 +2,33 @@
  * platform at /ui, so these are plain relative fetches through the one trust
  * edge; no CORS anywhere). */
 
+/** A manifest's declarative widget/page contributions (ui-shell.md §3). `kind`
+ * is a free string on purpose — an unknown kind registers fine and fails
+ * visible at render (§4.4), so the shell never validates it here. */
+export type UIWidget = {
+  id: string;
+  slot: "home";
+  kind: string;
+  title?: string;
+  data: string;
+  refresh_seconds?: number;
+};
+
+export type UIPage = {
+  id: string;
+  route: string;
+  title?: string;
+  nav: boolean;
+  kind: string;
+  data: string;
+};
+
+export type UIBlock = {
+  contract_version: number;
+  widgets: UIWidget[];
+  pages: UIPage[];
+};
+
 export type PluginEntry = {
   name: string;
   status: "up" | "down" | "unknown";
@@ -12,6 +39,7 @@ export type PluginEntry = {
     health_path: string;
     ui_path: string | null;
     surfaces: Record<string, string>;
+    ui?: UIBlock | null;
   };
 };
 
@@ -43,3 +71,19 @@ export const fetchSurfaces = () =>
   get<{ surfaces: Surface[] }>("/surfaces").then((b) => b.surfaces);
 export const fetchScopeTree = () =>
   get<{ tree: ScopeNode[] }>("/scopes/tree").then((b) => b.tree);
+
+/** ui-shell.md §5: `GET /ui-api/<plugin>/<path>` proxies to the plugin's own
+ * `/ui-api/<path>`. Manifest `data`/widget values are PLUGIN-RELATIVE and
+ * always start with `/ui-api/` (enforced at registration —
+ * `manifest.py:_valid_ui_data`), so the shell's URL is the platform prefix
+ * plus the plugin name plus that path WITH ITS OWN leading `/ui-api` stripped
+ * — i.e. `/ui-api/<plugin>` + (data minus the leading `/ui-api`). Example:
+ * plugin `governance`, data `/ui-api/widgets/shadow-activity` →
+ * `/ui-api/governance/widgets/shadow-activity`. */
+export function uiApiUrl(plugin: string, data: string): string {
+  const suffix = data.startsWith("/ui-api") ? data.slice("/ui-api".length) : data;
+  return `/ui-api/${plugin}${suffix}`;
+}
+
+export const fetchUiData = (plugin: string, data: string) =>
+  get<unknown>(uiApiUrl(plugin, data));

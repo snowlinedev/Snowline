@@ -12,7 +12,20 @@ import { describe, expect, it } from "vitest";
 
 import { App } from "../src/App";
 
-const PAGES = ["/", "/plugins", "/surfaces", "/scopes"];
+// "/governance/shadow" (table) and "/governance/shadow/main-plan-x" (thread)
+// are REGISTERED pages (ui-shell.md §3, fixture in tests/setup.ts) — they
+// render through the exact same kind components as the native pages, so
+// they're audited the same way, not treated as a special case. "/" also
+// covers the home-grid widget kinds (stat, plus the fail-visible
+// placeholder/error cards) via the same fixture.
+const PAGES = [
+  "/",
+  "/plugins",
+  "/surfaces",
+  "/scopes",
+  "/governance/shadow",
+  "/governance/shadow/main-plan-x",
+];
 
 describe("axe: native pages", () => {
   for (const path of PAGES) {

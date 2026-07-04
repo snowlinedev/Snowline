@@ -18,7 +18,13 @@ import anyio
 from fastapi import FastAPI, Request, Response, status
 from fastapi.responses import FileResponse, JSONResponse
 
-from snowline_platform import config, plugins_routes, scopes_routes, surfaces_routes
+from snowline_platform import (
+    config,
+    plugins_routes,
+    scopes_routes,
+    surfaces_routes,
+    ui_api,
+)
 from snowline_platform.gateway import UpstreamConnector
 from snowline_platform.gateway_app import (
     build_surface_mounts,
@@ -56,46 +62,54 @@ def _migrate_to_head() -> None:
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    if getattr(app.state, "migrate_on_startup", True):
-        _migrate_to_head()
-    # Enter every aggregated MCP surface's streamable-HTTP session manager for the
-    # app lifespan (the gateway, gateway.md §2). The surfaces are mounted at
-    # create_app time; their managers' run() is the required-for-lifespan context.
-    async with gateway_lifespan(app.state.gateway_mounts):
-        # The registry is in-memory, so a restart boots it EMPTY and every mounted
-        # surface serves zero tools until the plugins' registration heartbeats
-        # re-upsert them (issue #39). That window is expected — but it must be
-        # LOUD, not silent: a crash-restart under launchd at 3am otherwise looks
-        # healthy while the whole gateway is hollow.
-        if app.state.gateway_mounts and not app.state.registry.list():
-            log.warning(
-                "boot: %d gateway surface(s) mounted but ZERO plugins registered "
-                "— composed surfaces serve no tools until plugin registration "
-                "heartbeats arrive (issue #39)",
-                len(app.state.gateway_mounts),
-            )
-        # The health poller (health.md): a background task that marks each plugin
-        # UP/DOWN so the gateway routes around dead ones. Off by default (the
-        # test-friendly factory) — the production singleton opts in. Cancelled on
-        # shutdown by tearing down its task group.
-        if getattr(app.state, "poll_health", False):
-            async with anyio.create_task_group() as tg:
-                tg.start_soon(
-                    partial(
-                        health_poll_loop,
-                        app.state.registry,
-                        interval=config.health_poll_interval(),
-                        timeout=config.health_poll_timeout(),
-                    )
+    try:
+        if getattr(app.state, "migrate_on_startup", True):
+            _migrate_to_head()
+        # Enter every aggregated MCP surface's streamable-HTTP session manager for
+        # the app lifespan (the gateway, gateway.md §2). The surfaces are mounted
+        # at create_app time; their managers' run() is the required-for-lifespan
+        # context.
+        async with gateway_lifespan(app.state.gateway_mounts):
+            # The registry is in-memory, so a restart boots it EMPTY and every
+            # mounted surface serves zero tools until the plugins' registration
+            # heartbeats re-upsert them (issue #39). That window is expected —
+            # but it must be LOUD, not silent: a crash-restart under launchd at
+            # 3am otherwise looks healthy while the whole gateway is hollow.
+            if app.state.gateway_mounts and not app.state.registry.list():
+                log.warning(
+                    "boot: %d gateway surface(s) mounted but ZERO plugins "
+                    "registered — composed surfaces serve no tools until plugin "
+                    "registration heartbeats arrive (issue #39)",
+                    len(app.state.gateway_mounts),
                 )
-                try:
-                    yield
-                finally:
-                    # Cancel the poller even if serving raised; the task group
-                    # absorbs its own-scope cancellation, so shutdown stays clean.
-                    tg.cancel_scope.cancel()
-        else:
-            yield
+            # The health poller (health.md): a background task that marks each
+            # plugin UP/DOWN so the gateway routes around dead ones. Off by
+            # default (the test-friendly factory) — the production singleton
+            # opts in. Cancelled on shutdown by tearing down its task group.
+            if getattr(app.state, "poll_health", False):
+                async with anyio.create_task_group() as tg:
+                    tg.start_soon(
+                        partial(
+                            health_poll_loop,
+                            app.state.registry,
+                            interval=config.health_poll_interval(),
+                            timeout=config.health_poll_timeout(),
+                        )
+                    )
+                    try:
+                        yield
+                    finally:
+                        # Cancel the poller even if serving raised; the task
+                        # group absorbs its own-scope cancellation, so shutdown
+                        # stays clean.
+                        tg.cancel_scope.cancel()
+            else:
+                yield
+    finally:
+        # The /ui-api proxy's shared httpx client (ui_api.py) is created
+        # lazily on first request, not here — but however it exits, close it
+        # if one was ever created, so a restart doesn't leak an open client.
+        await ui_api.aclose_client(app)
 
 
 def create_app(
@@ -123,6 +137,7 @@ def create_app(
     app.include_router(plugins_routes.router)
     app.include_router(scopes_routes.router)
     app.include_router(surfaces_routes.router)
+    app.include_router(ui_api.router)
 
     # The dashboard owns the /ui and /ui-api route namespaces (ui-shell.md
     # §5–§6); a gateway surface named after either would mount /<name>/mcp

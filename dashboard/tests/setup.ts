@@ -30,6 +30,54 @@ export const FIXTURES: Record<string, unknown> = {
           health_path: "/health",
           ui_path: null,
           surfaces: { "/mcp": "main", "/shadow/mcp": "shadow" },
+          // ui-shell.md §3: one home widget + a table page (nav) + a thread
+          // page (row-linked, not nav) — plus a deliberately-broken widget
+          // and a deliberately-unknown kind, for the fail-visible tests.
+          ui: {
+            contract_version: 1,
+            widgets: [
+              {
+                id: "shadow-activity",
+                slot: "home",
+                kind: "stat",
+                title: "Open shadow branches",
+                data: "/ui-api/widgets/shadow-activity",
+                refresh_seconds: 30,
+              },
+              {
+                id: "broken-stat",
+                slot: "home",
+                kind: "stat",
+                title: "Broken stat",
+                data: "/ui-api/widgets/broken-stat",
+              },
+              {
+                id: "chart-widget",
+                slot: "home",
+                kind: "chart",
+                title: "Unsupported widget",
+                data: "/ui-api/widgets/chart",
+              },
+            ],
+            pages: [
+              {
+                id: "shadow-branches",
+                route: "/shadow",
+                title: "Shadow discussions",
+                nav: true,
+                kind: "table",
+                data: "/ui-api/pages/branches",
+              },
+              {
+                id: "shadow-branch",
+                route: "/shadow/{branch}",
+                title: "Shadow branch",
+                nav: false,
+                kind: "thread",
+                data: "/ui-api/pages/branches/{branch}",
+              },
+            ],
+          },
         },
       },
       {
@@ -43,6 +91,40 @@ export const FIXTURES: Record<string, unknown> = {
           ui_path: null,
           surfaces: { "/mcp": "main" },
         },
+      },
+    ],
+  },
+  "/ui-api/governance/widgets/shadow-activity": {
+    value: 3,
+    label: "open branches",
+  },
+  // Deliberately malformed (missing required `value`) — exercises the §4.4
+  // malformed-data error card.
+  "/ui-api/governance/widgets/broken-stat": { nope: true },
+  "/ui-api/governance/pages/branches": {
+    columns: [
+      { key: "branch", label: "Branch" },
+      { key: "status", label: "Status" },
+    ],
+    rows: [
+      {
+        cells: { branch: "main-plan-x", status: "open" },
+        href: "/shadow/main-plan-x",
+      },
+    ],
+    empty: "No branches.",
+  },
+  "/ui-api/governance/pages/branches/main-plan-x": {
+    title: "main-plan-x",
+    meta: "Status: open",
+    nodes: [
+      {
+        author: "sean",
+        kind: "comment",
+        markdown:
+          "Discussion about **main-plan-x**.\n\n<script>alert(1)</script> should stay text.",
+        at: "2026-07-01T12:00:00Z",
+        citations: ["decision-abc"],
       },
     ],
   },

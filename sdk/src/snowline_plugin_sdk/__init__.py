@@ -1,7 +1,7 @@
 """Snowline plugin SDK — the published, versioned contract a plugin pins to
 consume the platform's governance core (issue #19).
 
-Two halves were specified in the frozen monolith:
+Three halves were specified in the frozen monolith / built since:
   * REQUEST/RESPONSE — a typed async MCP client (`SnowlineCore`) over the core's
     MCP tool surface. This is DEFERRED here as a follow-up: the platform's
     surfaces differ from the monolith's `/core`, and the typed client pulls the
@@ -10,6 +10,9 @@ Two halves were specified in the frozen monolith:
   * EVENT — `verify_event`, which HMAC-verifies + parses governance's signed
     decision webhooks, version-checked against the vendored `CONTRACT_VERSION`.
     This half is shipped here and is the contract the drift-guard test pins.
+  * UI — `ui.py`'s vendored `UI_CONTRACT_VERSION` + kind vocabulary + shape docs
+    (ui-shell.md §3/§4), for a plugin registering a manifest `ui` block or
+    implementing its `/ui-api` responses. Also pinned by a drift-guard test.
 """
 
 from .contract import (
@@ -21,6 +24,18 @@ from .contract import (
     check_contract_version,
 )
 from .events import BadSignature, verify_event
+from .ui import (
+    PAGE_KIND_DOCUMENT,
+    PAGE_KIND_TABLE,
+    PAGE_KIND_THREAD,
+    PAGE_KINDS,
+    UI_CONTRACT_VERSION,
+    UI_KIND_SHAPES,
+    UI_KINDS,
+    WIDGET_KIND_LIST,
+    WIDGET_KIND_STAT,
+    WIDGET_KINDS,
+)
 
 __all__ = [
     "verify_event",
@@ -31,4 +46,14 @@ __all__ = [
     "EVENT_DECISION_RECORDED",
     "EVENT_DECISION_SUPERSEDED",
     "EVENT_TYPES",
+    "UI_CONTRACT_VERSION",
+    "WIDGET_KIND_STAT",
+    "WIDGET_KIND_LIST",
+    "WIDGET_KINDS",
+    "PAGE_KIND_TABLE",
+    "PAGE_KIND_THREAD",
+    "PAGE_KIND_DOCUMENT",
+    "PAGE_KINDS",
+    "UI_KINDS",
+    "UI_KIND_SHAPES",
 ]
