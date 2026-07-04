@@ -124,6 +124,13 @@ def test_remember_normalizes_sentence_case_with_spaces(db_session):
     assert row["name"] == "my-note-title"
 
 
+def test_remember_treats_whitespace_only_name_as_omitted(db_session):
+    # "   " means "no name", same as None/"" — falls through to the generated
+    # name instead of raising on the empty normalization.
+    row = memory.remember(db_session, content="A real note\nbody", name="   ")
+    assert row["name"] == "a-real-note"
+
+
 def test_remember_normalized_name_upserts_across_spellings(db_session):
     # Normalization happens BEFORE the upsert lookup, so `my_note` and
     # `my-note` resolve to the same stored key — one row, not two.

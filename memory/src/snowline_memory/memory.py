@@ -111,14 +111,28 @@ def normalize_name(name: str) -> str:
     return slug[:_NAME_MAX].strip("-")
 
 
+def normalize_name_or_raise(name: str) -> str:
+    """The single chokepoint for resolving a caller-PROVIDED name to its stored
+    key: `normalize_name`, raising `InvalidNameError` when nothing survives (an
+    all-punctuation name). `remember` and the importer's parse phase both call
+    this — one source for the rule AND the message, so the importer's dry-run
+    prediction can't drift from the live outcome."""
+    normalized = normalize_name(name)
+    if not normalized:
+        raise InvalidNameError(
+            f"invalid memory name {name!r} — name must be kebab-case "
+            "(lowercase alphanumerics + hyphens)"
+        )
+    return normalized
+
+
 def slugify_to_name(text: str) -> str:
     """Derive a kebab-case name from free text (the description or content head)
-    when a caller omits `name`. Lowercase, non-alphanumeric runs → single hyphens,
-    trimmed, clamped to a handful of words so the generated key stays readable."""
+    when a caller omits `name`: `normalize_name`'s kebab transform on the first
+    line, clamped to a handful of words so the generated key stays readable."""
     head = (text or "").strip().split("\n", 1)[0]
-    slug = re.sub(r"[^a-z0-9]+", "-", head.lower()).strip("-")
-    # Keep it to the first ~8 words / _NAME_MAX chars — a stable, readable key.
-    slug = "-".join(slug.split("-")[:8])[:_NAME_MAX].strip("-")
+    # Keep it to the first ~8 words — a stable, readable key.
+    slug = "-".join(normalize_name(head).split("-")[:8])
     return slug or "memory"
 
 
@@ -211,14 +225,10 @@ def remember(
     if len(description) > _DESCRIPTION_MAX:
         description = description[: _DESCRIPTION_MAX - 1].rstrip() + "…"
 
-    if name:
-        normalized = normalize_name(name)
-        if not normalized:
-            raise InvalidNameError(
-                f"invalid memory name {name!r} — name must be kebab-case "
-                "(lowercase alphanumerics + hyphens)"
-            )
-        name = validate_name(normalized)  # backstop: normalize_name should already satisfy this
+    # A whitespace-only name counts as omitted, same as None/"" — only a name
+    # with real characters goes down the provided-name path.
+    if name and name.strip():
+        name = normalize_name_or_raise(name)
     else:
         name = validate_name(slugify_to_name(description or content))
 
@@ -389,6 +399,9 @@ def forget(session: Session, name: str) -> dict:
     normalizes a provided name (kebab-cased), so a caller who saved `my_note`
     (stored as `my-note`) can still `forget("my_note")`. Idempotent — a miss
     reports `{forgotten: False}` rather than raising."""
+    # Deliberately bare normalize_name (not normalize_name_or_raise): an
+    # unnormalizable name can't match any stored key, and under the idempotent
+    # contract "nothing to delete" is a miss, not an error.
     name = normalize_name(name)
     m = session.scalar(select(Memory).where(Memory.name == name))
     if m is None:

@@ -71,7 +71,8 @@ One table, `memories`:
   caller omits it. A caller-**provided** name is **auto-normalized** to this
   form rather than rejected — lowercased, with underscores/spaces/other
   invalid-character runs collapsed to a single hyphen and clamped to the max
-  length (`my_note` / `My Note Title` both save on the first attempt). Only an
+  length of 80 chars (`my_note` / `My Note Title` both save on the first
+  attempt). A whitespace-only name counts as omitted. Only an
   all-punctuation name that normalizes to `""` raises. `forget` normalizes its
   `name` argument the same way, so a name saved as `my_note` (stored as
   `my-note`) can still be forgotten by either spelling.
@@ -153,7 +154,11 @@ indicator is never stored. It **upserts** via the same `remember` semantics
 (idempotent — re-running updates in place, never duplicates). Records are
 **validated at parse time** (name/scope grammar, kind normalization — the same
 checks `remember` applies), so `--dry-run` predicts live outcomes and previews
-each file's parsed name/kind/description. Live application is **per-file
+each file's parsed name/kind/description. Two files whose names normalize to
+the **same key** (`My_Note.md` + `my-note.md`) would silently last-write-win
+through the upsert, so the batch is deduped at parse time: the first file (in
+sorted order) keeps the name and later colliders are reported `failed` naming
+the winner — in dry-run and live identically. Live application is **per-file
 isolated** (a savepoint per record): one bad file is reported `failed` with its
 reason and the rest still import; the per-file report always prints and the exit
 code is nonzero when any file failed. ~40 memories migrate on day one. The

@@ -168,13 +168,7 @@ def _record_from_file(path: Path) -> dict | None:
     if not content:
         return None
     raw_name = fields.get("name") or path.stem
-    name = memory_verbs.normalize_name(raw_name)
-    if not name:
-        raise memory_verbs.InvalidNameError(
-            f"invalid memory name {raw_name!r} — name must be kebab-case "
-            "(lowercase alphanumerics + hyphens)"
-        )
-    name = memory_verbs.validate_name(name)
+    name = memory_verbs.normalize_name_or_raise(raw_name)
     return {
         "name": name,
         "description": fields.get("description") or None,
@@ -218,6 +212,30 @@ def import_dir(
             report["skipped"].append(path.name)
             continue
         parsed.append((path.name, rec))
+
+    # Intra-batch collision guard: two files whose names normalize to the same
+    # key (`My_Note.md` + `my-note.md`) would otherwise silently last-write-win
+    # through the live upsert, and dry-run would blindly predict two creates.
+    # The first file (sorted order) keeps the name; later colliders fail loudly
+    # naming the winner. Detected at parse time so dry-run predicts exactly
+    # what the live run does.
+    first_by_name: dict[str, str] = {}
+    deduped: list[tuple[str, dict]] = []
+    for fname, rec in parsed:
+        winner = first_by_name.setdefault(rec["name"], fname)
+        if winner != fname:
+            report["failed"].append(
+                {
+                    "file": fname,
+                    "error": (
+                        f"name {rec['name']!r} collides with {winner!r} "
+                        "after normalization"
+                    ),
+                }
+            )
+            continue
+        deduped.append((fname, rec))
+    parsed = deduped
 
     if dry_run:
         # Report what WOULD happen without touching the store — including the
