@@ -8,6 +8,9 @@
 > traffic flip. Design session 2026-07-04 (Sean); builds on the decision-event
 > webhook bus (governance-plugin.md §7, `replication.py`) and the frozen
 > monolith's `replication_ingest` (carve material, governance-plugin.md §9).
+> Revised same day after an adversarial review pass: stream contract (§3.2),
+> origin suppression, parking (§8.1), and a single symmetric conflict rule
+> (§6) replaced the first draft's delivery-time-seq / primary-ordered model.
 
 ## 1. The problem, precisely
 
@@ -51,10 +54,12 @@ Chosen: **hub-and-spoke over the existing event bus.**
 - **Writes on the spoke are provisional**: recorded locally so sessions keep
   working, queued in the plugin's transactional outbox, delivered to the
   primary when the tailnet returns. Ingested by the primary → authoritative.
-- **Authority means ordering, not veto.** Both sides keep every record; on
-  the rare conflicting pair (e.g. a supersession race against oneself across
-  the partition) the primary's resolution wins deterministically and the
-  conflict is logged loudly — never silently dropped (§6).
+- **Authority means the seed of truth, not arbitration.** Both sides keep
+  every record; the rare conflicting pair (e.g. a supersession race against
+  oneself across the partition) resolves by a rule both sides compute
+  identically (§6), and the conflict is logged loudly — never silently
+  dropped. The primary's authority is operational — it is the seed (§7) and
+  the always-on home — not a conflict arbiter.
 
 ### 2.1 Layer 0 — the primary must actually be always-on (standing posture)
 
@@ -75,20 +80,22 @@ protocol, carried from the monolith for exactly this purpose:
   outbox is the offline-write buffer.**
 - **Signed events** — HMAC-SHA256 over the exact serialized body; the spoke
   and hub share a per-subscription secret.
-- **Per-source identity + per-subscription monotonic `seq`** — the receiver
-  keys a watermark off `source_id`, giving idempotent, resumable ingest.
+- **Per-source identity + ordered `seq`** — every event is totally ordered
+  within its source **stream**, giving idempotent, resumable ingest — with
+  one structural correction to how the bus allocates `seq` today (§3.2).
 - **Retry + dead-letter** — with one change needed (§3.1).
 
 What v1 adds is the **ingest half and the generalization**:
 
 - Carve `replication_ingest` from the frozen monolith into the **plugin SDK**
   alongside a generalized emit module. The SDK owns the *envelope* mechanics —
-  outbox table + delivery loop, signature verify, `(source_id, seq)` watermark
-  table, exactly-once apply gate — and the plugin supplies the domain **apply
-  function** (payload in, idempotent local write out). A plugin opts in by
-  adopting the SDK module, not by rewriting replication (§4).
+  outbox table + delivery loop, signature verify, the per-stream watermark
+  table and contiguous-apply gate (§3.2), origin suppression (§3.2) — and the
+  plugin supplies the domain **apply function** (payload in, idempotent local
+  write out). A plugin opts in by adopting the SDK module, not by rewriting
+  replication (§4).
 - `SNOWLINE_REPLICATION_SOURCE_ID` becomes instance-qualified:
-  `<instance>.<plugin>` (e.g. `roam.governance`), so a receiver's watermark is
+  `<instance>.<plugin>` (e.g. `roam.governance`), so streams are
   per-peer-per-plugin and a third instance later needs no schema change.
 
 ### 3.1 Dead-letter policy for replication-class subscriptions
@@ -101,6 +108,43 @@ therefore use **unbounded retry with capped backoff** (attempt cap disabled;
 backoff grows to a ceiling of ~the delivery interval × 10). Dead-letter stays
 reserved for *rejections* — a delivered event the receiver refused (bad
 signature, contract-version mismatch) — which indicate a bug, not a partition.
+
+### 3.2 Stream identity — emit-time seq, epochs, causal context
+
+The bus today allocates `seq` per-SUBSCRIPTION at DELIVERY time
+(`deliver_pending`). That is the right shape for fire-and-forget webhooks and
+the wrong one for replication: delivery order is not authoring order, a
+re-created subscription restarts at 1, and a watermark keyed off `source_id`
+alone would reject a re-paired stream wholesale as already-seen. v1 therefore
+pins the following envelope semantics (all SDK-owned):
+
+- **`seq` is allocated at EMIT time, in the domain write's transaction** — a
+  per-stream counter incremented alongside the outbox insert. The stream's
+  order is fixed at authoring and survives any delivery timing, and the
+  counter travels with the store in a `pg_dump` (load-bearing for §7).
+- **A stream is `(source_id, epoch)`** — `source_id` = `<instance>.<plugin>`;
+  `epoch` is minted at pairing and re-minted at every re-pair/re-seed. The
+  receiver keys its watermark per stream, so a fresh epoch's seq restarting
+  at 1 can never collide with the old epoch's watermark.
+- **Contiguous apply** — the receiver applies exactly `watermark + 1`; an
+  out-of-order delivery is refused with "expected seq N", and the sender's
+  per-stream delivery cursor does not advance past an undelivered seq. A
+  persistently failing delivery therefore *blocks its own stream* — loud and
+  recoverable (§3.1, §8.1) — instead of being skipped and later discarded as
+  already-seen. Ordering can never silently drop an event.
+- **Causal context** — each event carries `peer_seen`: the highest seq of the
+  RECEIVER's stream the author had applied when it authored this event ("I
+  had seen your stream up to X"). One integer in the two-instance topology.
+  This is what makes concurrency *computable* (§6.1) instead of guessed from
+  wall clocks.
+- **Origin suppression (hard rule)** — an ingest-applied write NEVER
+  re-emits. The SDK apply path runs the domain write with the emit hook
+  disabled; events exist only for locally-originated writes. Without this
+  rule a delivered event boomerangs: the primary applies the spoke's
+  decision, the outbox hook (which runs in the write's transaction) re-emits
+  it on the primary→spoke subscription, and the pair trade the same event
+  forever. With it, the two-instance mesh needs no forwarding rules at all —
+  every author delivers to every peer directly.
 
 ## 4. Plugin opt-in — the replication contract
 
@@ -139,9 +183,9 @@ pairing**. This keeps the server thin and makes participation strictly opt-in:
 3. **Writes expressible as domain events** — append-mostly with explicit
    lifecycle events (record / supersede / forget), not in-place mutation.
 4. **Idempotent apply** — re-delivery and replay are no-ops past the
-   watermark; the SDK gate enforces `(source_id, seq)` ordering, the apply
-   function enforces semantic idempotence (e.g. INSERT … ON CONFLICT DO
-   NOTHING on the event's UUID).
+   watermark; the SDK gate enforces per-stream contiguous ordering (§3.2),
+   the apply function enforces semantic idempotence (e.g. INSERT … ON
+   CONFLICT DO NOTHING on the event's UUID).
 5. **No hard cross-plugin FKs** — already the platform rule (soft scope
    references); replication is per-plugin, so a hard FK to another store
    could not be guaranteed convergent.
@@ -247,11 +291,15 @@ partition** (in practice: a supersession/forget race against oneself).
   two decisions authored on opposite sides of a partition can conflict
   *semantically* (one should supersede the other) while converging cleanly;
   §6.1 exists to catch exactly that.
-- For a genuine race on one object, resolution is **deterministic and
-  primary-ordered**: the primary applies events in its ingest order; the
-  spoke converges to the primary's outcome. Ties on the same object resolve
-  last-writer-wins by event timestamp, then `source_id` as the stable
-  tiebreak.
+- For a genuine race on one object, resolution is a **pure function of the
+  two events, computed identically on both sides**: last-writer-wins by
+  event timestamp, `source_id` as the stable tiebreak. It must be a pure
+  function — no resolution event exists to carry one side's verdict to the
+  other, so any rule that depends on local state (ingest order, arrival
+  time) lets the two sides pick different winners and diverge silently.
+  LWW-by-timestamp assumes sane clocks (two NTP-synced owner Macs); the
+  tiebreak keeps even a skewed race deterministic, and §6.1 surfaces the
+  pair for human review regardless of which write won.
 - **Every resolved conflict is logged at WARNING with both event ids** — the
   volume should be ~zero; if it isn't, that is a design signal to surface,
   not noise to suppress.
@@ -269,11 +317,13 @@ Whether two decisions *actually* conflict is not machine-decidable — but
 is, cheaply. So the split follows core principle #1: **detection is
 mechanical, adjudication belongs to the LLM.**
 
-- **Detection, at ingest (governance-plugin behavior).** The bus already
-  gives each side the peer's last-delivery point (the watermark state a
-  partition freezes). When ingest applies a `decision.recorded` event, any
-  *locally-authored* decision newer than that point is *concurrent* with it.
-  The collision surface is the **applicability chain, not just same-scope**:
+- **Detection, at ingest (governance-plugin behavior).** Concurrency is
+  read off the envelope's causal context (§3.2): an incoming event carries
+  `peer_seen` — the highest seq of the receiver's own stream its author had
+  applied when authoring. Every *locally-authored* decision whose local
+  stream seq is **greater than `peer_seen`** is *concurrent* with the
+  incoming event — exact, clock-free, computable at apply time. The
+  collision surface is the **applicability chain, not just same-scope**:
   a decision at a parent scope governs descendants, so the incoming decision
   is checked against concurrent local decisions in any scope along either
   one's ancestors-until-isolated walk (the walk governance already performs
@@ -303,16 +353,31 @@ mechanical, adjudication belongs to the LLM.**
 ## 7. Seeding a spoke
 
 The bus is a **delta fabric, not an event-sourced log** — outbox rows are
-per-subscription pending deliveries, and history is not retained for replay.
-Standing up a spoke therefore starts from a snapshot:
+pending deliveries, and history is not retained for replay. Standing up a
+spoke therefore starts from a snapshot — and the ORDER is load-bearing
+(**pair first, dump second**): emit only writes outbox rows for
+subscriptions that exist at write time, so a write landing between a dump
+and a later pairing would be in neither the snapshot nor any delivery —
+lost. The procedure:
 
-1. `pg_dump`/restore each opted-in plugin's store (and the platform DB for
-   scopes, §8) from the primary.
-2. Pair (§5); watermarks start at the primary's current `seq` — the snapshot
-   already contains everything before it.
-3. From then on the spoke tracks by events alone. Re-seeding after long
-   divergence is the same procedure (spoke-side pending outbox rows must be
-   empty or delivered first — the pairing script checks).
+1. **Pair first** (§5): create the subscriptions and mint the stream epochs
+   (§3.2). From this instant every primary write emits into the stream.
+2. **Then snapshot**: `pg_dump`/restore each opted-in plugin's store (and
+   the platform DB for scopes, §8). Because `seq` is allocated at emit time
+   in the write's transaction (§3.2), the dumped store carries its own
+   stream counter — the snapshot provably contains every event up to that
+   counter's value.
+3. **Set watermarks from the snapshot**: the spoke initializes each stream's
+   watermark to the counter value the restored store carries. Events emitted
+   after the dump (seq above it) are waiting in the primary's outbox and
+   deliver normally — the snapshot-to-stream handoff is gapless and
+   exactly-once.
+4. From then on the spoke tracks by events alone. Re-seeding after long
+   divergence is the same procedure under a **fresh epoch** — the old
+   epoch's watermarks and pending rows are retired at re-pair, so the new
+   stream's seq restarting at 1 can never be rejected as already-seen.
+   (Spoke-side pending outbox rows must be empty or delivered first — the
+   pairing script checks.)
 
 ## 8. The scope namespace — the platform dogfoods the contract
 
@@ -331,15 +396,50 @@ for a single owner.
 **Ordering note:** scope events must be *ingestable before* plugin events
 that reference the new slug arrive. v1 keeps this simple: plugin apply
 functions treat an unknown scope slug as a **retryable** ingest error (the
-watermark does not advance past it), so scope-stream lag self-heals on the
-next delivery pass rather than dropping data.
+watermark does not advance past it), so ordinary scope-stream lag self-heals
+on the next delivery pass rather than dropping data. Retryable is
+**bounded**, though — a slug that never materializes must not stall the
+stream forever (§8.1).
+
+### 8.1 Parking — the escape hatch for poison events
+
+Contiguous apply (§3.2) plus unbounded peer retry (§3.1) means one
+permanently-unappliable event — an unknown slug that never arrives, an
+apply-side bug — would otherwise freeze its stream forever and silently
+strand everything behind it. So a retryable apply error gets a **bound**
+(implementation-time tunable; on the order of hours of delivery passes —
+generous against any real scope-stream lag), after which the event is
+**parked**:
+
+- The event moves whole into a `parked_events` table (stream, seq, payload,
+  reason, parked-at) and the watermark advances past it — the stream flows
+  again.
+- Parking is **loud, first-class state**, surfaced like §6.1's unreconciled
+  view (tool + UI widget + health signal) — never just a log line. An empty
+  parked set is the standing invariant to watch.
+- A parked event is **re-appliable**: fix the cause (record the missing
+  scope, resolve the slug collision, ship the apply fix), then re-apply it
+  from the park — apply idempotence (§4 checklist item 4) makes the replay
+  safe.
+- Honest limit: events *behind* a parked one that causally depended on it
+  may themselves park or apply with degraded meaning. Parking trades strict
+  ordering for liveness and makes the trade visible; if a park cascade ever
+  grows, the §7 re-seed is the clean recovery.
+
+Dead-letter (§3.1) stays the SENDER-side terminal state for *rejections*;
+parking is the RECEIVER-side terminal state for *authentic-but-unappliable*
+events. The two never overlap.
 
 ## 9. v1 scope and build order
 
 1. **SDK**: generalize `replication.py` into `snowline-plugin-sdk` emit
-   module; write the ingest module (watermark table, signature verify,
-   idempotent apply seam) carving `replication_ingest` from the monolith as
-   read-only reference. Unbounded-retry subscription class (§3.1).
+   module — with the §3.2 stream contract, which *changes* the emit side
+   (emit-time seq + epoch in place of delivery-time seq; `peer_seen` in the
+   envelope), not just relocates it; write the ingest module (per-stream
+   watermark + contiguous apply, signature verify, origin suppression,
+   parking §8.1, idempotent apply seam) carving `replication_ingest` from
+   the monolith as read-only reference. Unbounded-retry subscription class
+   (§3.1).
 2. **Manifest**: additive `replication` block + registry storage (advisory).
 3. **Governance** adopts SDK ingest (emit exists); extends event coverage to
    shadow/artifacts/specs; concurrent-sibling detection + `unreconciled`
@@ -361,6 +461,11 @@ next delivery pass rather than dropping data.
 - A write authored on the spoke while partitioned appears on the primary
   within one delivery interval of reconnect; re-delivery is a no-op
   (watermark verified); nothing dead-letters from unreachability alone.
+- An applied event is never re-emitted (origin suppression, §3.2): after a
+  partitioned write replicates, both outboxes go quiet — no echo.
+- A delivery that keeps failing blocks only its own stream (contiguous
+  apply, §3.2); when it finally succeeds the stream resumes with no event
+  skipped or discarded as already-seen.
 - Writes to the *same* object on both sides during a partition: both sides
   converge to the same state after heal, the resolution matches §6's rule,
   and a WARNING with both event ids was logged.
@@ -374,6 +479,14 @@ next delivery pass rather than dropping data.
   it replicates in order (or self-heals via §8's retryable-unknown-slug rule).
 - Pairing refuses (with a clear message) a plugin pair with mismatched
   `contract_version`, and warns on one-sided opt-in.
+- Seeding per §7 loses nothing: a primary write authored between pairing and
+  the dump, and another authored after the dump, each reach the spoke exactly
+  once (snapshot or stream — never neither, never both applied twice).
+- Re-seeding under a fresh epoch (§3.2/§7) is fully accepted — no event of
+  the new stream is rejected by the old epoch's watermark.
+- An event whose apply keeps failing parks after the bound (§8.1): its
+  stream resumes past it, the parked view shows it, and re-applying it after
+  the cause is fixed succeeds.
 - Seeding per §7 yields a spoke that converges from events alone thereafter.
 
 ## 11. Out of scope
