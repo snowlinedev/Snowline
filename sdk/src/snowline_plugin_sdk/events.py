@@ -27,6 +27,8 @@ import json
 from .contract import (
     EVENT_DECISION_RECORDED,
     EVENT_DECISION_SUPERSEDED,
+    EVENT_MEMORY_FORGOTTEN,
+    EVENT_MEMORY_SET,
     EVENT_TYPES,
     IncompatibleContractVersion,
     check_contract_version,
@@ -38,6 +40,8 @@ __all__ = [
     "verify_event",
     "EVENT_DECISION_RECORDED",
     "EVENT_DECISION_SUPERSEDED",
+    "EVENT_MEMORY_SET",
+    "EVENT_MEMORY_FORGOTTEN",
     "EVENT_TYPES",
 ]
 

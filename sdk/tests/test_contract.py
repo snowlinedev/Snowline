@@ -10,11 +10,19 @@ from snowline_plugin_sdk import contract
 def test_event_type_literals():
     assert contract.EVENT_DECISION_RECORDED == "decision.recorded"
     assert contract.EVENT_DECISION_SUPERSEDED == "decision.superseded"
+    # Memory's replication vocabulary (#80) — the whole-platform registry.
+    assert contract.EVENT_MEMORY_SET == "memory.set"
+    assert contract.EVENT_MEMORY_FORGOTTEN == "memory.forgotten"
 
 
 def test_event_types_frozenset():
     assert contract.EVENT_TYPES == frozenset(
-        {"decision.recorded", "decision.superseded"}
+        {
+            "decision.recorded",
+            "decision.superseded",
+            "memory.set",
+            "memory.forgotten",
+        }
     )
     assert isinstance(contract.EVENT_TYPES, frozenset)
 

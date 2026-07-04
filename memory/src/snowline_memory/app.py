@@ -26,9 +26,17 @@ from pathlib import Path
 import anyio
 from fastapi import FastAPI
 from snowline_plugin_sdk.registration import install_heartbeat_httpx_filter
+from snowline_plugin_sdk.replication import replication_delivery_loop
+from snowline_plugin_sdk.replication.admin import build_replication_router
 
-from snowline_memory import config, registration
+from snowline_memory import config, memory, registration
+from snowline_memory.db import session_scope
 from snowline_memory.mcp_surface import build_main_surface
+
+# The manifest ingest path §4 declares (matched by the pairing CLI); memory's
+# replication routes mount under this + the admin prefix, as plain FastAPI routes
+# registered BEFORE the catch-all `/` MCP mount so Starlette matches them first.
+REPLICATION_INGEST_PATH = "/events/ingest"
 
 
 def _migrate_to_head() -> None:
@@ -49,10 +57,14 @@ def create_app(
     *,
     migrate_on_startup: bool = True,
     register_on_startup: bool = True,
+    replicate_on_startup: bool = True,
 ) -> FastAPI:
     """Build the memory app. `migrate_on_startup=False` skips the boot-migrate
     (tests provision their own schema); `register_on_startup=False` skips the
-    platform registration heartbeat (tests assert registration separately)."""
+    platform registration heartbeat (tests assert registration separately);
+    `replicate_on_startup=False` skips the replication DELIVERY loop (tests
+    without a store, or that drive delivery by hand, turn it off — the ingest +
+    admin ROUTES are always mounted; they touch the store only per request)."""
     # Drop ONLY the heartbeat's per-beat `POST …/plugins` INFO line from the
     # httpx logger (idempotent; rationale lives with the filter in the SDK).
     install_heartbeat_httpx_filter()
@@ -74,6 +86,14 @@ def create_app(
             # means boot never blocks on a slow/down platform (governance's
             # lifespan pattern).
             tg = await stack.enter_async_context(anyio.create_task_group())
+            # The replication DELIVERY loop (replication-continuity §3, #80)
+            # drains memory's transactional outbox — `memory.set` /
+            # `memory.forgotten` events — to paired peers on a timer, mirroring
+            # the registration heartbeat's best-effort task-group placement. It
+            # self-gates OFF via SNOWLINE_REPLICATION_DISABLED and no-ops with no
+            # subscriptions, so an unpaired instance just ticks quietly.
+            if getattr(app.state, "replicate_on_startup", True):
+                tg.start_soon(replication_delivery_loop, session_scope)
             if getattr(app.state, "register_on_startup", True):
                 tg.start_soon(registration.registration_heartbeat)
             yield
@@ -82,10 +102,24 @@ def create_app(
     app = FastAPI(title="Snowline Memory", lifespan=_lifespan)
     app.state.migrate_on_startup = migrate_on_startup
     app.state.register_on_startup = register_on_startup
+    app.state.replicate_on_startup = replicate_on_startup
 
     @app.get("/health")
     async def health() -> dict:
         return {"status": "ok", "plugin": registration.PLUGIN_NAME}
+
+    # Memory's replication HTTP surface (replication-continuity §5, #80): the
+    # signed-event ingest route + the tailnet-gated admin routes the pairing CLI
+    # drives. Registered BEFORE the `/` MCP mount (same reason `/health` is) so
+    # Starlette matches these routes ahead of the catch-all mount. `apply_event`
+    # is memory's idempotent per-name-LWW domain apply.
+    app.include_router(
+        build_replication_router(
+            session_scope,
+            memory.apply_event,
+            ingest_path=REPLICATION_INGEST_PATH,
+        )
+    )
 
     # Mount the FastMCP surface so the served endpoint is exactly the path the
     # manifest advertises: `/mcp`. FastMCP's `streamable_http_app()` ALREADY

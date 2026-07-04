@@ -122,3 +122,67 @@ def db_session(clean_db):
 
     with session_scope() as s:
         yield s
+
+
+# --- two-instance replication harness (#80) ---------------------------------
+#
+# The §10 memory-convergence criteria need TWO complete memory stores (a hub and
+# a spoke), each with the domain `memories` table AND the SDK replication tables,
+# wired sender→receiver. Two disposable databases, both migrated via the alembic
+# chain (so the replication-tables migration is exercised), each with its own
+# independent engine/sessionmaker — the memory `db.py` global is left untouched.
+
+from sqlalchemy.orm import sessionmaker  # noqa: E402
+
+_REPL_DB_URLS = {
+    name: str(sa.make_url(TEST_DB_URL).set(database=f"snowline_memory_{name}"))
+    for name in ("repl_a", "repl_b")
+}
+
+
+@pytest.fixture(scope="session")
+def _replication_stores() -> dict:
+    """Two freshly created + migrated memory databases (`repl_a`, `repl_b`), each
+    with an independent sessionmaker — the hub and spoke of the convergence
+    tests."""
+    if not _postgres_reachable():
+        pytest.skip("Postgres not reachable — replication convergence tests skipped")
+    makers = {}
+    prev = os.environ.get("SNOWLINE_MEMORY_DATABASE_URL")
+    for name, url in _REPL_DB_URLS.items():
+        drop_database(url)
+        create_database(url)
+        # env.py resets the alembic url from SNOWLINE_MEMORY_DATABASE_URL, so
+        # point it at THIS store for the migration; each instance then gets its
+        # own engine bound to `url` directly.
+        os.environ["SNOWLINE_MEMORY_DATABASE_URL"] = url
+        command.upgrade(alembic_config(), "head")
+        engine = sa.create_engine(url, future=True)
+        makers[name] = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    if prev is not None:
+        os.environ["SNOWLINE_MEMORY_DATABASE_URL"] = prev
+    yield makers
+    for maker in makers.values():
+        maker.kw["bind"].dispose()
+    for url in _REPL_DB_URLS.values():
+        drop_database(url)
+
+
+@pytest.fixture()
+def memory_stores(_replication_stores) -> dict:
+    """Both stores truncated clean before each test — every replication table and
+    the memories table (so a test's rows never leak into the next)."""
+    tables = (
+        "memories",
+        "replication_subscriptions",
+        "replication_outbox",
+        "replication_stream_counters",
+        "replication_inbound_streams",
+        "replication_parked_events",
+    )
+    for maker in _replication_stores.values():
+        with maker() as s:
+            for t in tables:
+                s.execute(sa.text(f"TRUNCATE {t} RESTART IDENTITY CASCADE"))
+            s.commit()
+    return _replication_stores

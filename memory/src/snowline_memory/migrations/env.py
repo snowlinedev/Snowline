@@ -1,4 +1,5 @@
 from alembic import context
+from snowline_plugin_sdk.replication.models import ReplicationBase
 from sqlalchemy import engine_from_config, pool
 
 from snowline_memory.config import database_url
@@ -7,7 +8,10 @@ from snowline_memory.models import Base
 config = context.config
 config.set_main_option("sqlalchemy.url", database_url())
 
-target_metadata = Base.metadata
+# Both memory's domain metadata AND the SDK-owned replication metadata (adopted
+# in the c3d4e5f6a7b8 migration, #80) — so an autogenerate diff sees the
+# replication tables as OWNED, not as strays to drop.
+target_metadata = [Base.metadata, ReplicationBase.metadata]
 
 
 def run_migrations_offline() -> None:
