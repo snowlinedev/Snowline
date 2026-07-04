@@ -96,13 +96,21 @@ async def create_scope(
     session: Session = Depends(get_session),
 ) -> dict:
     try:
+        # `Body(None)` can't distinguish "field omitted" from "field sent
+        # null" — both arrive here as `None`, exactly as they always have.
+        # Omit the kwarg in that case so `create` falls back to its `_UNSET`
+        # default (derive the parent from the slug's prefix) rather than its
+        # explicit-`None` meaning (no parent, no derivation — the replication
+        # apply seam's distinct case, `scopes.apply_scope_event`). This keeps
+        # the HTTP API byte-for-byte identical to its pre-existing behavior.
+        kwargs = {"parent": parent} if parent is not None else {}
         scope = scopes.create(
             session,
             slug=slug,
             name=name,
             kind=kind,
-            parent=parent,
             isolated=isolated,
+            **kwargs,
         )
     except scopes.ScopeConflictError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from None

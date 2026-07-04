@@ -49,7 +49,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from snowline_plugin_sdk.replication import ingest as _ingest
-from snowline_plugin_sdk.replication.envelope import build_envelope, sign_body
+from snowline_plugin_sdk.replication.envelope import (
+    REJECTION_REASONS,
+    build_envelope,
+    sign_body,
+)
 from snowline_plugin_sdk.replication.models import (
     ReplicationOutboxRow,
     ReplicationStreamCounter,
@@ -201,9 +205,14 @@ def emit_event(session: Session, event_type: str, payload: dict) -> list[dict]:
     if _ingest.is_applying_replicated_event():
         return []
 
+    # Deterministic stream order (source_id, epoch) BEFORE taking the counter
+    # row locks below: two concurrent domain writes matching 2+ streams would
+    # otherwise lock the counters in different orders and deadlock on Postgres.
     subs = session.scalars(
-        select(ReplicationSubscription).where(
-            ReplicationSubscription.active.is_(True)
+        select(ReplicationSubscription)
+        .where(ReplicationSubscription.active.is_(True))
+        .order_by(
+            ReplicationSubscription.source_id, ReplicationSubscription.epoch
         )
     ).all()
     matching = [s for s in subs if event_type in (s.event_types or [])]
@@ -328,13 +337,18 @@ def deliver_pending(
     it are never attempted), so the head's `next_attempt_at` gates the whole
     stream's next try.
 
-    Classification (§3.1): 2xx → delivered. 409 → retryable refusal (ordering /
-    version hold) — backoff, NEVER dead-letter. Other 4xx → REJECTION →
-    `rejected` (dead-letter; the stream wedges loudly behind it, since skipping
-    a seq would only trade the wedge for an out-of-order refusal). 5xx and
-    transport errors → retryable with backoff. Each row's outcome commits
-    per-row so progress survives a mid-pass crash (re-delivery is a duplicate
-    no-op on the receiver).
+    Classification (§3.1): 2xx → delivered. A 4xx carrying the ingest
+    vocabulary's rejection body (`{"status": "rejected"}`, reason in
+    `REJECTION_REASONS`) → `rejected` (dead-letter; the stream wedges loudly
+    behind it, since skipping a seq would only trade the wedge for an
+    out-of-order refusal — `requeue_rejected` is the recovery). EVERYTHING
+    else — 409 refusals (ordering / version hold, retryable by definition),
+    bare 4xx (a trust-gate 403, a 404 before the peer's router is mounted, a
+    proxy's 405/429: stream-level conditions, not a verdict on this event —
+    treating them as rejections would cascade-destroy the backlog one head
+    per tick), 5xx and transport errors → retryable with backoff. Each row's
+    outcome commits per-row so progress survives a mid-pass crash
+    (re-delivery is a duplicate no-op on the receiver).
 
     The tick opens with the §3.1 reachability probe; an ingest transitioning
     unreachable → reachable gets its rows' backoff cleared, which is what makes
@@ -398,13 +412,10 @@ def deliver_pending(
                 delivered += 1
                 session.commit()
                 continue
-            if resp.status_code == 409:
-                # Ordering refusal / version hold — retryable BY DEFINITION,
-                # carved out of the dead-letter rejection class (§3.1/§3.2).
-                _record_retry(row, now, _response_error(resp))
-            elif 400 <= resp.status_code < 500:
-                # A delivered event the receiver REFUSED — a bug, not a
-                # partition. Dead-letter, loudly; the stream wedges behind it.
+            if _is_vocabulary_rejection(resp):
+                # The ingest itself REFUSED this event as invalid — a bug, not
+                # a partition. Dead-letter, loudly; the stream wedges behind it
+                # until the cause is fixed and the row is requeued.
                 row.status = "rejected"
                 row.last_error = _response_error(resp)
                 log.error(
@@ -412,10 +423,33 @@ def deliver_pending(
                     sub.source_id, sub.epoch, row.seq, row.last_error,
                 )
             else:
+                # Everything else is retryable: 409 refusals (ordering /
+                # version hold — §3.1/§3.2), bare 4xx stream-level conditions,
+                # 5xx. See the docstring's classification rationale.
                 _record_retry(row, now, _response_error(resp))
             session.commit()
             break  # non-ACK: never advance past an undelivered seq
     return delivered
+
+
+def _is_vocabulary_rejection(resp) -> bool:
+    """True only for a 4xx whose body is the ingest vocabulary's rejection —
+    `{"status": "rejected"}` with a reason in `REJECTION_REASONS`. A bare 4xx
+    (no parseable body / another shape) is a stream-level condition and stays
+    retryable: empirically, a receiver trust-gate 403 would otherwise reject a
+    3-row backlog in 3 ticks — a recoverable misconfiguration permanently
+    destroying data."""
+    if not (400 <= resp.status_code < 500):
+        return False
+    try:
+        body = resp.json()
+    except Exception:  # noqa: BLE001 - any unparseable body is not the vocabulary
+        return False
+    return (
+        isinstance(body, dict)
+        and body.get("status") == "rejected"
+        and body.get("reason") in REJECTION_REASONS
+    )
 
 
 def _record_retry(row: ReplicationOutboxRow, now: datetime, error: str) -> None:
@@ -430,6 +464,63 @@ def _response_error(resp) -> str:
     except Exception:  # noqa: BLE001 - non-JSON error body
         detail = None
     return f"HTTP {resp.status_code}" + (f" {detail}" if detail else "")
+
+
+# --- dead-letter surfacing (§3.1) ---------------------------------------------
+#
+# The sender-side mirror of the receiver's parked view: `rejected` rows are
+# rare-and-real (only the ingest vocabulary's verdicts land here), the stream
+# is wedged behind each one, and an empty list is the standing invariant to
+# watch. The admin surface exposes both next to /parked.
+
+
+def list_rejected(session: Session) -> list[dict]:
+    """Every dead-lettered outbox row, oldest first, labelled with its stream
+    identity (payload omitted — it can be large; the row id keys the requeue)."""
+    rows = session.execute(
+        select(ReplicationOutboxRow, ReplicationSubscription)
+        .join(
+            ReplicationSubscription,
+            ReplicationOutboxRow.subscription_id == ReplicationSubscription.id,
+        )
+        .where(ReplicationOutboxRow.status == "rejected")
+        .order_by(ReplicationOutboxRow.created_at, ReplicationOutboxRow.seq)
+    ).all()
+    return [
+        {
+            "id": str(row.id),
+            "subscription_id": str(sub.id),
+            "source_id": sub.source_id,
+            "epoch": sub.epoch,
+            "seq": row.seq,
+            "event_type": row.event_type,
+            "attempts": row.attempts,
+            "last_error": row.last_error,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        }
+        for row, sub in rows
+    ]
+
+
+def requeue_rejected(session: Session, row_id: str) -> dict:
+    """Put one dead-lettered row back on its stream after the cause is fixed
+    (the recovery for a wedged stream — the receiver's gate still expects this
+    seq, so requeueing the head lets the whole backlog resume). Due
+    immediately; `last_error` keeps the rejection until the next outcome
+    overwrites it. Raises ValueError on an unknown id or a non-rejected row —
+    an operator action, deliberate like `reapply_parked`."""
+    row = session.get(ReplicationOutboxRow, _as_uuid(row_id))
+    if row is None:
+        raise ValueError(f"no replication outbox row with id {row_id!r}")
+    if row.status != "rejected":
+        raise ValueError(
+            f"outbox row {row_id!r} is {row.status!r}, not 'rejected'"
+        )
+    row.status = "pending"
+    row.attempts = 0
+    row.next_attempt_at = None
+    session.flush()
+    return {"id": str(row.id), "seq": row.seq, "status": row.status}
 
 
 async def replication_delivery_loop(
@@ -449,7 +540,10 @@ async def replication_delivery_loop(
         return
 
     def _tick() -> None:
-        with httpx.Client(timeout=20.0, follow_redirects=True) as client:
+        # follow_redirects stays OFF: a 307/308 would re-POST the signed body
+        # to a location the subscription never named; a redirecting front is a
+        # misconfiguration surfaced as a retryable 3xx, not silently followed.
+        with httpx.Client(timeout=20.0) as client:
             with session_scope() as session:
                 n = deliver_pending(session, client)
         if n:

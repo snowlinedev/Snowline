@@ -21,10 +21,12 @@ from fastapi.responses import FileResponse, JSONResponse
 from snowline_platform import (
     config,
     plugins_routes,
+    replication,
     scopes_routes,
     surfaces_routes,
     ui_api,
 )
+from snowline_platform.db import session_scope
 from snowline_platform.gateway import UpstreamConnector
 from snowline_platform.gateway_app import (
     build_surface_mounts,
@@ -35,6 +37,7 @@ from snowline_platform.health import health_poll_loop
 from snowline_platform.middleware import TrustMiddleware
 from snowline_platform.registry import PluginRegistry
 from snowline_platform.trust import CidrTrustProvider, TrustResolver
+from snowline_plugin_sdk.replication import replication_delivery_loop
 
 log = logging.getLogger("snowline_platform.app")
 
@@ -82,25 +85,35 @@ async def _lifespan(app: FastAPI):
                     "registration heartbeats arrive (issue #39)",
                     len(app.state.gateway_mounts),
                 )
-            # The health poller (health.md): a background task that marks each
-            # plugin UP/DOWN so the gateway routes around dead ones. Off by
-            # default (the test-friendly factory) — the production singleton
-            # opts in. Cancelled on shutdown by tearing down its task group.
-            if getattr(app.state, "poll_health", False):
+            # The health poller (health.md) and the replication delivery loop
+            # (spec §8/§9 item 5, issue #81) are both OFF by default (the
+            # test-friendly factory) — the production singleton opts into
+            # both. Same task group either way so a single cancel_scope tears
+            # down whichever is running on shutdown.
+            poll_health = getattr(app.state, "poll_health", False)
+            replicate = getattr(app.state, "replicate", False)
+            if poll_health or replicate:
                 async with anyio.create_task_group() as tg:
-                    tg.start_soon(
-                        partial(
-                            health_poll_loop,
-                            app.state.registry,
-                            interval=config.health_poll_interval(),
-                            timeout=config.health_poll_timeout(),
+                    if poll_health:
+                        tg.start_soon(
+                            partial(
+                                health_poll_loop,
+                                app.state.registry,
+                                interval=config.health_poll_interval(),
+                                timeout=config.health_poll_timeout(),
+                            )
                         )
-                    )
+                    if replicate:
+                        # Drains the platform's OWN scope.created/scope.updated
+                        # outbox on a timer, same as any opted-in plugin
+                        # (§3.1) — harmless with zero subscriptions (the
+                        # common case before pairing, #82, lands).
+                        tg.start_soon(replication_delivery_loop, session_scope)
                     try:
                         yield
                     finally:
-                        # Cancel the poller even if serving raised; the task
-                        # group absorbs its own-scope cancellation, so shutdown
+                        # Cancel even if serving raised; the task group
+                        # absorbs its own-scope cancellation, so shutdown
                         # stays clean.
                         tg.cancel_scope.cancel()
             else:
@@ -118,17 +131,21 @@ def create_app(
     migrate_on_startup: bool = True,
     connector: UpstreamConnector | None = None,
     poll_health: bool = False,
+    replicate: bool = False,
 ) -> FastAPI:
     """Build the platform app. `resolver`/`registry` are injectable for tests;
     `migrate_on_startup=False` skips the lifespan boot-migrate (tests provision
     their own schema); `connector` injects the gateway's upstream connector
     (defaults to streamable-HTTP; tests pass an in-memory one). `poll_health`
-    starts the background health poller — OFF by default so unit tests don't spawn
-    network traffic or race on status; the production singleton opts in."""
+    starts the background health poller and `replicate` starts the replication
+    delivery loop (spec §8, issue #81) — both OFF by default so unit tests
+    don't spawn network traffic or race on status; the production singleton
+    opts into both."""
     app = FastAPI(title="Snowline Platform", lifespan=_lifespan)
     app.state.registry = registry or PluginRegistry()
     app.state.migrate_on_startup = migrate_on_startup
     app.state.poll_health = poll_health
+    app.state.replicate = replicate
     app.add_middleware(
         TrustMiddleware,
         resolver=resolver or build_resolver(),
@@ -136,6 +153,11 @@ def create_app(
     )
     app.include_router(plugins_routes.router)
     app.include_router(scopes_routes.router)
+    # The replication ingest + admin surface (spec §5, §8): the platform's own
+    # opted-in stream, identical shape to what a plugin mounts. Rides behind
+    # the trust middleware like every other route — the router's own tailnet
+    # CIDR check (`_require_trusted`) is defense in depth, not a substitute.
+    app.include_router(replication.router)
     app.include_router(surfaces_routes.router)
     app.include_router(ui_api.router)
 
@@ -224,5 +246,6 @@ def create_app(
     return app
 
 
-# The production singleton: boot-migrate, gateway, AND the health poller on.
-app = create_app(poll_health=True)
+# The production singleton: boot-migrate, gateway, health poller, AND the
+# replication delivery loop on.
+app = create_app(poll_health=True, replicate=True)

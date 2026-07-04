@@ -115,17 +115,11 @@ class ReplicationOutboxRow(ReplicationBase):
     delivery time). `status` is `pending` | `delivered` | `rejected`: there is
     deliberately NO attempt cap — unreachability retries forever under the
     capped `next_attempt_at` backoff, and `rejected` (the dead-letter terminal
-    state) is reserved for a delivered event the receiver REFUSED as invalid
-    (bad signature / malformed / unknown stream — a bug, not a partition).
-    Ordering refusals and version holds (HTTP 409) never land here.
-
-    RETENTION NOTE: DELIVERED rows are not just a log — plugin apply logic
-    reads them against an incoming envelope's `peer_seen` to compute
-    concurrency (governance's §6.1 sibling detection and §6 conflict
-    warnings: `seq > peer_seen` ⇒ the author hadn't applied that write).
-    A pruning job that drops delivered rows would silently blind that
-    detection; none exists, and adding one must account for the lowest
-    `peer_seen` a peer can still send."""
+    state) is reserved for the ingest vocabulary's own rejection verdicts
+    (bad signature / malformed / unknown stream — a bug, not a partition;
+    `emit.requeue_rejected` is the operator recovery). Ordering refusals,
+    version holds (HTTP 409), and bare stream-level 4xx (a trust-gate 403, a
+    pre-mount 404) never land here — they hold retryably."""
 
     __tablename__ = "replication_outbox"
 

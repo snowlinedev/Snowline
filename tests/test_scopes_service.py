@@ -95,6 +95,20 @@ def test_create_derives_parent_from_slug_hierarchy(db_session):
     assert child.parent_id == org.id  # derived from the slug prefix
 
 
+def test_create_explicit_none_parent_skips_derivation(db_session):
+    """`parent` NOT PROVIDED (the default) derives from the slug prefix;
+    explicit `None` means no parent at all, even when a same-prefix scope
+    exists — the distinction `apply_scope_event` relies on (a replica must
+    replay the origin's OWN resolved `parent_id`, never silently attach an
+    unrelated local scope it happens to hold under the same prefix)."""
+    scopes.create(db_session, slug="org", name="Org", kind="org")
+    child = scopes.create(
+        db_session, slug="org/repo", name="Repo", kind="project", parent=None
+    )
+    db_session.flush()
+    assert child.parent_id is None
+
+
 def test_create_explicit_parent_must_exist(db_session):
     with pytest.raises(scopes.ScopeNotFoundError):
         scopes.create(

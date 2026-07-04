@@ -9,6 +9,13 @@ dependencies = [
     "sqlalchemy>=2.0",
     "psycopg[binary]>=3.1",
     "alembic>=1.13",
+    # The platform dogfoods the replication contract it offers plugins (spec
+    # §8, issue #81): scopes adopt the SAME SDK emit/ingest modules, the same
+    # pairing step, the same watermark semantics. Unlike governance/memory/pm,
+    # the platform is not an external plugin — it is the SDK's own publisher —
+    # so depending on it at RUNTIME (not just dev, as the drift-guard test
+    # does) is the legitimate dependency direction (architecture §4).
+    "snowline-plugin-sdk[replication]",
 ]
 
 [dependency-groups]
@@ -25,11 +32,6 @@ dev = [
     # the platform depends on no plugin). It rides the dev group so a plain
     # `uv sync` installs it for the combined test run.
     "snowline-memory",
-    # The published plugin SDK rides the dev group so governance's contract
-    # drift-guard test (`governance/tests/test_contract_drift.py`) can import it
-    # to pin the producer↔consumer wire contract. It is the published, light
-    # dependency external plugins install — NOT a platform runtime dep.
-    "snowline-plugin-sdk",
 ]
 
 [build-system]

@@ -3,11 +3,15 @@ from sqlalchemy import engine_from_config, pool
 
 from snowline_platform.config import database_url
 from snowline_platform.models import Base
+from snowline_plugin_sdk.replication.models import ReplicationBase
 
 config = context.config
 config.set_main_option("sqlalchemy.url", database_url())
 
-target_metadata = Base.metadata
+# Two metadatas: the platform's own `Scope` table, and the SDK's replication
+# tables the platform adopts (spec §8, issue #81) — a SEPARATE metadata by
+# design (SDK `replication/models.py`), so autogenerate needs both named here.
+target_metadata = [Base.metadata, ReplicationBase.metadata]
 
 
 def run_migrations_offline() -> None:

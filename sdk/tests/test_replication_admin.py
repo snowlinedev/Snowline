@@ -200,3 +200,88 @@ def test_outbound_management_over_http(app_and_applied):
 
     missing_field = _request(app, "POST", "/replication-admin/outbound", json={})
     assert missing_field.status_code == 400
+
+
+def test_outbound_body_validation_edges(app_and_applied):
+    """Presence-not-truthiness on required fields (an empty event_types list is
+    a legal value, not 'missing') and a type check where a bare string would
+    list()-explode into characters."""
+    app, _ = app_and_applied
+    base = {
+        "target_url": "http://p/events/ingest",
+        "secret": "s",
+        "epoch": "e-edge",
+    }
+    as_string = _request(
+        app, "POST", "/replication-admin/outbound",
+        json={**base, "event_types": "thing.recorded"},
+    )
+    assert as_string.status_code == 400
+    assert "must be a list" in as_string.json()["detail"]
+
+    empty_list = _request(
+        app, "POST", "/replication-admin/outbound",
+        json={**base, "event_types": []},
+    )
+    assert empty_list.status_code == 200
+    assert empty_list.json()["event_types"] == []
+
+
+def test_rejected_view_and_requeue_over_http(make_instance):
+    """The sender-side dead-letter mirror (§3.1): /rejected surfaces a
+    vocabulary-rejected row next to /parked, and the requeue action puts it
+    back on its stream."""
+    import httpx as _httpx
+
+    from snowline_plugin_sdk.replication import emit
+
+    sessions = make_instance()
+
+    @contextmanager
+    def session_scope():
+        session = sessions()
+        try:
+            yield session
+            session.commit()
+        finally:
+            session.close()
+
+    app = FastAPI()
+    app.include_router(build_replication_router(session_scope, lambda s, e: None))
+
+    assert _request(app, "GET", "/replication-admin/rejected").json() == []
+
+    # Dead-letter one row the real way: emit, then deliver into a vocabulary
+    # rejection.
+    with session_scope() as s:
+        emit.create_outbound_subscription(
+            s, "http://peer/events/ingest", "sec", ["thing.recorded"], epoch="e1"
+        )
+        emit.emit_event(s, "thing.recorded", {"n": 1})
+
+    def reject(request: _httpx.Request) -> _httpx.Response:
+        if request.method == "GET":
+            return _httpx.Response(405)
+        return _httpx.Response(
+            401, json={"status": "rejected", "reason": "bad_signature"}
+        )
+
+    with session_scope() as s, _httpx.Client(
+        transport=_httpx.MockTransport(reject)
+    ) as client:
+        emit.deliver_pending(s, client, reachability={})
+
+    listed = _request(app, "GET", "/replication-admin/rejected").json()
+    assert [(r["seq"], r["event_type"]) for r in listed] == [(1, "thing.recorded")]
+
+    requeued = _request(
+        app, "POST", "/replication-admin/rejected/requeue", json={"id": listed[0]["id"]}
+    )
+    assert requeued.status_code == 200 and requeued.json()["status"] == "pending"
+    assert _request(app, "GET", "/replication-admin/rejected").json() == []
+
+    missing = _request(
+        app, "POST", "/replication-admin/rejected/requeue",
+        json={"id": "00000000-0000-0000-0000-000000000000"},
+    )
+    assert missing.status_code == 404

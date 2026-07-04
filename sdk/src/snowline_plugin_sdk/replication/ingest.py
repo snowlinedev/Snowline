@@ -159,11 +159,22 @@ def rotate_inbound_secret(session: Session, source_id: str, epoch: str) -> dict:
     """§5 rotation, receiver side: mint a replacement secret for a LIVE stream —
     no epoch change, no re-seed. Old and new both verify during the switch; the
     old retires on the first new-signed delivery (`ingest_delivery`). Returns
-    the new secret ONCE (the pairing CLI carries it to the sender)."""
+    the new secret ONCE (the pairing CLI carries it to the sender).
+
+    Re-rotating while a rotation is still pending (the sender hasn't swapped)
+    KEEPS `previous_secret` — the one secret the sender provably still signs
+    with — and discards only the never-delivered replacement. Overwriting it
+    with the undelivered mint would strand the sender at the original secret →
+    401s (the double-rotate race: a pairing CLI that crashed between mint and
+    carry gets re-run, and the stream must survive that re-run). The
+    alternative — refusing while pending — would make that same crash
+    permanent: the lost mint could never be re-issued and retirement (which
+    needs a new-signed delivery) could never happen."""
     row = session.get(ReplicationInboundStream, (source_id, epoch))
     if row is None or not row.active:
         raise ValueError(f"no active inbound stream ({source_id!r}, {epoch!r})")
-    row.previous_secret = row.secret
+    if row.previous_secret is None:
+        row.previous_secret = row.secret
     row.secret = _secrets.token_hex(32)
     session.flush()
     return {**_stream_dict(row), "secret": row.secret}
@@ -274,8 +285,18 @@ def ingest_delivery(
         return 409, {"status": "refused", "reason": REFUSAL_VERSION_HOLD}
 
     seq = envelope.get("seq")
-    if not isinstance(seq, int) or seq < 1 or any(
-        f not in envelope for f in STREAM_FIELDS
+    peer_seen = envelope.get("peer_seen")
+    # peer_seen is validated as strictly as seq: it flows raw into the plugin
+    # apply seam, and §6.1's concurrency detection consumes it — a garbage
+    # value silently corrupting that comparison is worse than a loud 400.
+    if (
+        not isinstance(seq, int)
+        or isinstance(seq, bool)  # JSON true parses as a Python int — exclude
+        or seq < 1
+        or not isinstance(peer_seen, int)
+        or isinstance(peer_seen, bool)
+        or peer_seen < 0
+        or any(f not in envelope for f in STREAM_FIELDS)
     ):
         return 400, {"status": "rejected", "reason": REJECT_MALFORMED}
 

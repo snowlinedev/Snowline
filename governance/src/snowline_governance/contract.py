@@ -47,6 +47,20 @@ EVENT_ARTIFACT_REVISED: str = "artifact.revised"
 EVENT_ARTIFACT_RESOLVED: str = "artifact.resolved"
 EVENT_ARTIFACT_MATURITY_SET: str = "artifact.maturity_set"
 EVENT_ARTIFACT_GOVERNS_SET: str = "artifact.governs_set"
+# The platform's own adoption (replication-continuity §8, §9 item 5, issue
+# #81): the scope namespace dogfoods the same contract it offers plugins.
+# Governance does not emit these — they're vendored here ONLY so this copy
+# stays equal to the SDK's (the drift guard below), which is what proves the
+# producer/consumer registries can never silently fork.
+EVENT_SCOPE_CREATED: str = "scope.created"
+EVENT_SCOPE_UPDATED: str = "scope.updated"
+# Memory's replication vocabulary (replication-continuity §4 coverage note, #80).
+# Governance does not EMIT these — but EVENT_TYPES is the whole platform's
+# drift-guarded vocabulary, not just governance's own: §3.2 pins every plugin's
+# event types into BOTH copies (this producer copy and the SDK's) in one commit,
+# so the drift guard (`tests/test_contract_drift.py`) keeps them byte-equal.
+EVENT_MEMORY_SET: str = "memory.set"
+EVENT_MEMORY_FORGOTTEN: str = "memory.forgotten"
 
 EVENT_TYPES: frozenset[str] = frozenset(
     {
@@ -64,6 +78,10 @@ EVENT_TYPES: frozenset[str] = frozenset(
         EVENT_ARTIFACT_RESOLVED,
         EVENT_ARTIFACT_MATURITY_SET,
         EVENT_ARTIFACT_GOVERNS_SET,
+        EVENT_SCOPE_CREATED,
+        EVENT_SCOPE_UPDATED,
+        EVENT_MEMORY_SET,
+        EVENT_MEMORY_FORGOTTEN,
     }
 )
 
@@ -73,4 +91,8 @@ EVENT_TYPES: frozenset[str] = frozenset(
 # Version 2 (replication-continuity §3.2, #77): the stream envelope — `epoch`,
 # EMIT-time `seq`, `peer_seen` — a breaking addition, bumped in BOTH pinned
 # copies in one commit (the drift guard keeps them equal).
+# DEPLOY ORDERING: this version rides the legacy bus's payloads too
+# (`build_decision_event` stamps it), and an SDK-v1 consumer's `verify_event`
+# rejects it — the bus's attempt cap (default 5) then dead-letters those
+# deliveries. Upgrade webhook consumers before or together with governance.
 CONTRACT_VERSION: int = 2

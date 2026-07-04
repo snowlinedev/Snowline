@@ -34,6 +34,7 @@ from contextlib import AbstractContextManager
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from snowline_plugin_sdk.replication import emit as _emit
@@ -59,7 +60,17 @@ def trusted_networks() -> list:
 def _require_trusted(request: Request) -> None:
     """Reject any request whose peer IP is outside the trusted set. Mirrors the
     platform's `CidrTrustProvider` posture: a network gate, not identity —
-    sufficient inside the tailnet boundary; the stream HMAC does the rest."""
+    sufficient inside the tailnet boundary; the stream HMAC does the rest.
+
+    `request.client.host` is the SOCKET peer; forwarded-for headers are
+    deliberately not consulted. DEPLOYMENT TRAP: running the plugin with
+    proxy-header trust enabled (uvicorn `--proxy-headers` /
+    `ProxyHeadersMiddleware`) rewrites `request.client` FROM
+    `X-Forwarded-For` — behind any front that isn't itself the §5.1
+    tailscale-serve/loopback path, that lets an untrusted client spoof a
+    trusted peer IP with one header. Never enable proxy-header trust on an
+    app serving these routes unless the only reachable front is the trusted
+    proxy itself."""
     peer = request.client.host if request.client else ""
     try:
         ip = ipaddress.ip_address(peer)
@@ -70,7 +81,9 @@ def _require_trusted(request: Request) -> None:
 
 
 def _required(data: dict, *fields: str) -> list:
-    missing = [f for f in fields if not data.get(f)]
+    # Presence, not truthiness: a legitimate falsy value (an empty
+    # event_types list) must not read as missing.
+    missing = [f for f in fields if f not in data or data[f] is None]
     if missing:
         raise HTTPException(
             status_code=400, detail=f"missing required field(s): {', '.join(missing)}"
@@ -108,14 +121,25 @@ def build_replication_router(
     async def register_inbound(request: Request, data: dict) -> dict:
         _require_trusted(request)
         source_id, epoch = _required(data, "source_id", "epoch")
-        with session_scope() as session:
-            try:
+        try:
+            with session_scope() as session:
                 # The minted secret rides this one response over the tailnet
                 # (WireGuard-encrypted transport) and is never listed or
                 # logged again (§5).
-                return _ingest.register_inbound_stream(session, source_id, epoch)
-            except ValueError as exc:
-                raise HTTPException(status_code=409, detail=str(exc)) from None
+                registered = _ingest.register_inbound_stream(
+                    session, source_id, epoch
+                )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+        except IntegrityError:
+            # Two concurrent registrations raced past the existence check; the
+            # PK collision surfaces at the scope-exit commit — same verdict as
+            # the checked path, not a 500.
+            raise HTTPException(
+                status_code=409,
+                detail=f"inbound stream ({source_id!r}, {epoch!r}) already exists",
+            ) from None
+        return registered
 
     @router.get(f"{admin_prefix}/inbound")
     async def list_inbound(request: Request) -> list[dict]:
@@ -151,6 +175,11 @@ def build_replication_router(
         target_url, secret, event_types, epoch = _required(
             data, "target_url", "secret", "event_types", "epoch"
         )
+        if not isinstance(event_types, list):
+            # A bare string would list()-explode into characters downstream.
+            raise HTTPException(
+                status_code=400, detail="event_types must be a list of event names"
+            )
         with session_scope() as session:
             return _emit.create_outbound_subscription(
                 session,
@@ -195,5 +224,23 @@ def build_replication_router(
         _require_trusted(request)
         with session_scope() as session:
             return _ingest.list_parked(session)
+
+    # --- dead-letters: the sender-side mirror (§3.1) --------------------------
+
+    @router.get(f"{admin_prefix}/rejected")
+    async def rejected(request: Request) -> list[dict]:
+        _require_trusted(request)
+        with session_scope() as session:
+            return _emit.list_rejected(session)
+
+    @router.post(f"{admin_prefix}/rejected/requeue")
+    async def requeue_rejected(request: Request, data: dict) -> dict:
+        _require_trusted(request)
+        (row_id,) = _required(data, "id")
+        with session_scope() as session:
+            try:
+                return _emit.requeue_rejected(session, row_id)
+            except ValueError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from None
 
     return router
