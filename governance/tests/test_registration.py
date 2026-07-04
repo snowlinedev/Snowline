@@ -70,6 +70,27 @@ def test_register_posts_the_right_manifest():
     assert m["health_path"] == "/health"
     # The surface mapping: /mcp -> the platform's `main` named surface.
     assert m["surfaces"] == {"/mcp": "main", "/shadow/mcp": "shadow"}
+    # The `ui` block (ui-shell.md §3, issue #55) — governance's shadow-
+    # discussions contribution: one `stat` widget + two pages (`table` list,
+    # `thread` detail keyed on the branch id).
+    ui = m["ui"]
+    assert ui["contract_version"] == 1
+    assert [w["id"] for w in ui["widgets"]] == ["shadow-activity"]
+    widget = ui["widgets"][0]
+    assert widget["slot"] == "home"
+    assert widget["kind"] == "stat"
+    assert widget["data"] == "/ui-api/widgets/shadow-activity"
+    assert widget["refresh_seconds"] == 30
+    assert [p["id"] for p in ui["pages"]] == ["shadow-branches", "shadow-branch"]
+    table_page, thread_page = ui["pages"]
+    assert table_page["route"] == "/shadow"
+    assert table_page["nav"] is True
+    assert table_page["kind"] == "table"
+    assert table_page["data"] == "/ui-api/pages/branches"
+    assert thread_page["route"] == "/shadow/{branch_id}"
+    assert thread_page["nav"] is False
+    assert thread_page["kind"] == "thread"
+    assert thread_page["data"] == "/ui-api/pages/branches/{branch_id}"
 
 
 def test_register_idempotent_on_conflict():
@@ -263,3 +284,10 @@ def test_manifest_is_accepted_by_the_platform_model():
     m = PluginManifest(**registration.build_manifest("http://gov.example:8801"))
     assert m.name == "governance"
     assert m.surfaces == {"/mcp": "main", "/shadow/mcp": "shadow"}
+    # The `ui` block validates against the platform's own UIBlock/UIWidget/
+    # UIPage models too (issue #55) — the same contract both sides share.
+    assert m.ui is not None
+    assert m.ui.contract_version == 1
+    assert [w.id for w in m.ui.widgets] == ["shadow-activity"]
+    assert [p.id for p in m.ui.pages] == ["shadow-branches", "shadow-branch"]
+    assert [p.route for p in m.ui.pages] == ["/shadow", "/shadow/{branch_id}"]

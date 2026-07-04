@@ -30,6 +30,7 @@ from fastapi import FastAPI
 from snowline_governance import config, registration
 from snowline_governance.mcp_surface import build_main_surface, build_shadow_surface
 from snowline_governance.scope_client import ScopeClient
+from snowline_governance.ui_api import router as ui_api_router
 
 
 class _HeartbeatHttpxLogFilter(logging.Filter):
@@ -119,6 +120,13 @@ def create_app(
     @app.get("/health")
     async def health() -> dict:
         return {"status": "ok", "plugin": registration.PLUGIN_NAME}
+
+    # The `/ui-api` read routes (ui-shell.md §3/§5, issue #55) — the platform's
+    # `/ui-api/<plugin>/...` proxy forwards here. Registered as a plain FastAPI
+    # route BEFORE the catch-all MCP mounts below, same reason `/health` wins
+    # over the `/` mount: Starlette matches routes before mounts in registration
+    # order, and a mount at `/` would otherwise swallow every path.
+    app.include_router(ui_api_router)
 
     # Mount the FastMCP surfaces so the served endpoints are exactly the paths the
     # manifest advertises: `/mcp` (main) and `/shadow/mcp` (shadow). FastMCP's
