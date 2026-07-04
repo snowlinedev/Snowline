@@ -19,9 +19,9 @@ Env vars:
                                      deploy knob tunes every plugin's cadence.
 """
 
-import logging
-import math
 import os
+
+from snowline_plugin_sdk import registration as sdk_registration
 
 # Local libpq defaults (unix socket, current OS user, no password) — mirrors the
 # platform/monolith DB config. A SEPARATE database from the platform's: governance
@@ -34,10 +34,6 @@ DEFAULT_PLATFORM_URL = "http://127.0.0.1:8848"
 
 # Where this plugin advertises itself to the platform (the manifest `base_url`).
 DEFAULT_BASE_URL = "http://127.0.0.1:8801"
-
-# Registration heartbeat cadence (issue #39) — matches the platform's health-poll
-# default, so a platform restart heals in roughly one health round.
-DEFAULT_REGISTRATION_HEARTBEAT_SECONDS = 15.0
 
 
 def database_url() -> str:
@@ -53,42 +49,10 @@ def base_url() -> str:
 
 
 def registration_heartbeat_seconds() -> float:
-    """The heartbeat cadence. LENIENT on a malformed/absurd value (warn + fall
-    back), unlike the platform's fail-loud config rule: the heartbeat is the
-    self-healing mechanism issue #39 exists for, so a typo in this shared env
-    var must not kill the loop (a dead heartbeat = a hollow gateway after the
-    next platform restart) — and a zero/negative value must not hot-loop POSTs."""
-    raw = os.environ.get("SNOWLINE_REGISTRATION_HEARTBEAT_SECONDS")
-    if raw is None:
-        return DEFAULT_REGISTRATION_HEARTBEAT_SECONDS
-    try:
-        value = float(raw)
-    except ValueError:
-        logging.getLogger(__name__).warning(
-            "malformed SNOWLINE_REGISTRATION_HEARTBEAT_SECONDS=%r — using the "
-            "default %ss",
-            raw,
-            DEFAULT_REGISTRATION_HEARTBEAT_SECONDS,
-        )
-        return DEFAULT_REGISTRATION_HEARTBEAT_SECONDS
-    if not math.isfinite(value):
-        # "inf"/"nan" parse as floats and slip past the < 1.0 floor, but
-        # anyio.sleep(inf/nan) never returns — a silent dead heartbeat, the
-        # exact failure this lenient parse exists to prevent. Treat like
-        # malformed input.
-        logging.getLogger(__name__).warning(
-            "non-finite SNOWLINE_REGISTRATION_HEARTBEAT_SECONDS=%r — using the "
-            "default %ss",
-            raw,
-            DEFAULT_REGISTRATION_HEARTBEAT_SECONDS,
-        )
-        return DEFAULT_REGISTRATION_HEARTBEAT_SECONDS
-    if value < 1.0:
-        logging.getLogger(__name__).warning(
-            "SNOWLINE_REGISTRATION_HEARTBEAT_SECONDS=%r is below the 1s floor "
-            "— clamping (the heartbeat cannot be disabled by env; stop the "
-            "plugin instead)",
-            raw,
-        )
-        return 1.0
-    return value
+    """The heartbeat cadence — the one shared deploy knob
+    (`SNOWLINE_REGISTRATION_HEARTBEAT_SECONDS`, unprefixed, issue #39). Delegates
+    to the SDK's shared lenient+finite parser (issue #50), so the "one deploy
+    knob tunes every plugin" promise is one parser, not per-plugin copies: a
+    malformed/non-finite/sub-1s value warns and falls back rather than killing
+    the self-healing loop."""
+    return sdk_registration.heartbeat_seconds_from_env()

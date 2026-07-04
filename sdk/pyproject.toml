@@ -3,11 +3,21 @@ name = "snowline-plugin-sdk"
 version = "0.1.0"
 description = "Snowline plugin SDK — the published contract dependency: signed-event verification + the vendored event-type/contract-version registry"
 requires-python = ">=3.12"
-# No runtime third-party dependency: verify_event needs only the stdlib
-# (`hmac`/`hashlib`/`json`). The typed MCP request/response client (`client.py`
-# in the frozen monolith, which depends on `mcp`) is DEFERRED — the platform's
-# surfaces differ from the monolith's `/core`, so the typed client is a follow-up.
+# No runtime third-party dependency in the BASE package: verify_event + the
+# contract/UI constant registries need only the stdlib, and importing
+# `snowline_plugin_sdk` (the package root) must stay light so base installs don't
+# grow deps. The typed MCP request/response client (`client.py` in the frozen
+# monolith, which depends on `mcp`) is DEFERRED — the platform's surfaces differ
+# from the monolith's `/core`, so the typed client is a follow-up.
 dependencies = []
+
+[project.optional-dependencies]
+# The registration heartbeat (`snowline_plugin_sdk.registration`, issue #50) and
+# its test harness (`.testing`) are the ONLY parts that need an HTTP client, so
+# they ride an extra: `snowline-plugin-sdk[client]` pulls httpx + anyio while the
+# base install (and importing the package root) stays dependency-free. Pins match
+# the workspace (governance/memory declare httpx>=0.27; anyio is transitive).
+client = ["httpx>=0.27", "anyio>=4"]
 
 [dependency-groups]
 dev = ["pytest>=8.0"]

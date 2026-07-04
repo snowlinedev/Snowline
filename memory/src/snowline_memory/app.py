@@ -26,22 +26,17 @@ from pathlib import Path
 
 import anyio
 from fastapi import FastAPI
+from snowline_plugin_sdk.registration import HeartbeatHttpxLogFilter
 
 from snowline_memory import config, registration
 from snowline_memory.mcp_surface import build_main_surface
 
-
-class _HeartbeatHttpxLogFilter(logging.Filter):
-    """Drops httpx's per-request INFO line for the registration heartbeat's
-    `POST …/plugins` (one line per beat, forever) while letting every OTHER
-    httpx request trace through."""
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        msg = record.getMessage()
-        return not ("POST" in msg and "/plugins" in msg)
-
-
-_HEARTBEAT_HTTPX_FILTER = _HeartbeatHttpxLogFilter()
+# Drops httpx's per-request INFO line for the registration heartbeat's
+# `POST …/plugins` (one line per beat, forever) while letting every OTHER httpx
+# request trace through — capping the whole `httpx` logger at WARNING would mute
+# other httpx traffic too. The filter now lives in the SDK (issue #50), shared
+# with governance + the other plugins.
+_HEARTBEAT_HTTPX_FILTER = HeartbeatHttpxLogFilter()
 
 
 def _migrate_to_head() -> None:

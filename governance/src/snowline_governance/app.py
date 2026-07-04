@@ -26,26 +26,20 @@ from pathlib import Path
 
 import anyio
 from fastapi import FastAPI
+from snowline_plugin_sdk.registration import HeartbeatHttpxLogFilter
 
 from snowline_governance import config, registration
 from snowline_governance.mcp_surface import build_main_surface, build_shadow_surface
 from snowline_governance.scope_client import ScopeClient
 from snowline_governance.ui_api import router as ui_api_router
 
-
-class _HeartbeatHttpxLogFilter(logging.Filter):
-    """Drops httpx's per-request INFO line for the registration heartbeat's
-    `POST …/plugins` (one line per beat, forever) while letting every OTHER
-    httpx request trace through — governance also talks httpx for scope reads
-    and the webhook_delivery_loop's outbound deliveries, and muting those would
-    leave live debugging blind."""
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        msg = record.getMessage()
-        return not ("POST" in msg and "/plugins" in msg)
-
-
-_HEARTBEAT_HTTPX_FILTER = _HeartbeatHttpxLogFilter()
+# Drops httpx's per-request INFO line for the registration heartbeat's
+# `POST …/plugins` (one line per beat, forever) while letting every OTHER httpx
+# request trace through — governance also talks httpx for scope reads and the
+# webhook_delivery_loop's outbound deliveries, and muting those (a process-wide
+# WARNING cap) would leave live debugging blind. The filter now lives in the SDK
+# (issue #50), shared with memory + the other plugins.
+_HEARTBEAT_HTTPX_FILTER = HeartbeatHttpxLogFilter()
 
 
 def _migrate_to_head() -> None:
