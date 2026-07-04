@@ -902,7 +902,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "mcp" },
     { name = "psycopg", extra = ["binary"] },
-    { name = "snowline-plugin-sdk", extra = ["client"] },
+    { name = "snowline-plugin-sdk", extra = ["client", "replication"] },
     { name = "sqlalchemy" },
     { name = "uvicorn" },
 ]
@@ -918,7 +918,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.110" },
     { name = "mcp", specifier = ">=1.2" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.1" },
-    { name = "snowline-plugin-sdk", extras = ["client"], editable = "sdk" },
+    { name = "snowline-plugin-sdk", extras = ["client", "replication"], editable = "sdk" },
     { name = "sqlalchemy", specifier = ">=2.0" },
     { name = "uvicorn", specifier = ">=0.29" },
 ]

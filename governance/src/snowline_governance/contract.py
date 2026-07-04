@@ -26,8 +26,21 @@ from __future__ import annotations
 EVENT_DECISION_RECORDED: str = "decision.recorded"
 EVENT_DECISION_SUPERSEDED: str = "decision.superseded"
 
+# Memory's replication vocabulary (replication-continuity §4 coverage note, #80).
+# Governance does not EMIT these — but EVENT_TYPES is the whole platform's
+# drift-guarded vocabulary, not just governance's own: §3.2 pins every plugin's
+# event types into BOTH copies (this producer copy and the SDK's) in one commit,
+# so the drift guard (`tests/test_contract_drift.py`) keeps them byte-equal.
+EVENT_MEMORY_SET: str = "memory.set"
+EVENT_MEMORY_FORGOTTEN: str = "memory.forgotten"
+
 EVENT_TYPES: frozenset[str] = frozenset(
-    {EVENT_DECISION_RECORDED, EVENT_DECISION_SUPERSEDED}
+    {
+        EVENT_DECISION_RECORDED,
+        EVENT_DECISION_SUPERSEDED,
+        EVENT_MEMORY_SET,
+        EVENT_MEMORY_FORGOTTEN,
+    }
 )
 
 # The published contract version, stamped into every emitted payload. A consumer

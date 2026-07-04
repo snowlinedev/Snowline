@@ -15,8 +15,21 @@ Pure constants + one pure function — no imports beyond stdlib.
 EVENT_DECISION_RECORDED: str = "decision.recorded"
 EVENT_DECISION_SUPERSEDED: str = "decision.superseded"
 
+# Memory's replication vocabulary (replication-continuity §4 coverage note, #80).
+# Memory is a per-name last-writer-wins register with tombstoned deletes: `set`
+# carries the winning write, `forgotten` the tombstone. EVERY event type any
+# plugin introduces lands in BOTH pinned EVENT_TYPES copies in one commit (§3.2),
+# so this registry stays the whole platform's vocabulary — not just governance's.
+EVENT_MEMORY_SET: str = "memory.set"
+EVENT_MEMORY_FORGOTTEN: str = "memory.forgotten"
+
 EVENT_TYPES: frozenset[str] = frozenset(
-    {EVENT_DECISION_RECORDED, EVENT_DECISION_SUPERSEDED}
+    {
+        EVENT_DECISION_RECORDED,
+        EVENT_DECISION_SUPERSEDED,
+        EVENT_MEMORY_SET,
+        EVENT_MEMORY_FORGOTTEN,
+    }
 )
 
 # Version 2 (replication-continuity §3.2, #77): the stream envelope — `epoch`,
