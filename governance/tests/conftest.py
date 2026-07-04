@@ -33,6 +33,16 @@ MIGRATIONS = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _shadow_turns_stay_off(monkeypatch):
+    """The turn-runner must NEVER start inside the suite: full-lifespan tests
+    (test_app_http, test_ui_api) enter the real app lifespan, and a dev shell's
+    `export SNOWLINE_SHADOW_TURNS_ENABLED=1` (natural while working on #71)
+    would otherwise spawn real codex subprocesses against seeded branches
+    mid-test. Symmetric to how those tests pin SNOWLINE_WEBHOOK_DISABLED."""
+    monkeypatch.setenv("SNOWLINE_SHADOW_TURNS_ENABLED", "0")
+
+
 def _db_name(url: str) -> str:
     return sa.make_url(url).database
 

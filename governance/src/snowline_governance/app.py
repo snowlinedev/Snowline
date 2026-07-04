@@ -81,9 +81,21 @@ def create_app(
             # timer and signs+POSTs them; disable via SNOWLINE_WEBHOOK_DISABLED.
             # The scope is cancelled on exit so the loop tears down cleanly.
             from snowline_governance.replication import webhook_delivery_loop
+            from snowline_governance.turns import shadow_turn_loop
 
             tg = await stack.enter_async_context(anyio.create_task_group())
             tg.start_soon(webhook_delivery_loop)
+            # The shadow turn-runner (spec §6, issue #71) rides the same task
+            # group. It self-gates OFF unless SNOWLINE_SHADOW_TURNS_ENABLED is
+            # set (default false → returns immediately; the tests also pin the
+            # var off via an autouse fixture, so a dev shell's export can't
+            # start real codex turns mid-suite). An injected ScopeClient is
+            # passed through for tests; in production (scope_client=None) the
+            # loop builds its OWN HttpScopeClient from the same config the
+            # surfaces use — same platform URL, separate client instance.
+            # Cancellation on lifespan exit abandons an in-flight turn thread
+            # (it finishes in the background; see shadow_turn_loop).
+            tg.start_soon(shadow_turn_loop, scope_client)
             if getattr(app.state, "register_on_startup", True):
                 # The registration HEARTBEAT (issue #39): first beat immediately
                 # (the boot registration), then a re-assert every interval so a
