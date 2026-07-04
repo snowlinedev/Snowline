@@ -22,7 +22,13 @@ from snowline_memory.app import create_app
 
 
 def _app():
-    return create_app(migrate_on_startup=False, register_on_startup=False)
+    # No store in these transport tests — the replication delivery loop (which
+    # would open a session each tick) stays off alongside migrate/register.
+    return create_app(
+        migrate_on_startup=False,
+        register_on_startup=False,
+        replicate_on_startup=False,
+    )
 
 
 def _http(app) -> httpx.AsyncClient:

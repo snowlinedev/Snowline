@@ -30,7 +30,7 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from snowline_governance import branching, replication
+from snowline_governance import branching, concurrence, replication, replication_stream
 from snowline_governance.contract import (
     EVENT_DECISION_RECORDED,
     EVENT_DECISION_SUPERSEDED,
@@ -183,6 +183,11 @@ def record_decision(
     replication.emit_decision_event(
         session, EVENT_DECISION_RECORDED, row, scope_slug
     )
+    # STREAM emit (replication-continuity §3.2, #79): the same write on the
+    # replication-class outbox, v2 envelope, emit-time seq (no-op unpaired).
+    replication_stream.emit(
+        session, EVENT_DECISION_RECORDED, replication_stream.decision_payload(row)
+    )
     return {
         "id": str(row.id),
         "scope": scope_slug,
@@ -236,6 +241,13 @@ def supersede_decision(
     replication.emit_decision_event(
         session, EVENT_DECISION_SUPERSEDED, row, prior.scope_slug
     )
+    # STREAM emit (replication-continuity §3.2, #79) — the superseding leaf's
+    # payload carries `supersedes_id`, the link apply preserves.
+    replication_stream.emit(
+        session,
+        EVENT_DECISION_SUPERSEDED,
+        replication_stream.decision_payload(row),
+    )
     return {
         "id": str(row.id),
         "scope": prior.scope_slug,
@@ -260,9 +272,15 @@ def get_decision(session: Session, decision_id: str) -> dict:
     d = session.get(Decision, key)
     if d is None:
         raise DecisionNotFoundError(f"no decision with id {decision_id!r}")
-    superseded_by = session.scalar(
-        select(Decision.id).where(Decision.supersedes_id == d.id)
-    )
+    # The supersession DAG is BRANCHING (≥2 children is a permanent state after
+    # a §6 partition race), so the scalar pick must be deterministic — the
+    # NEWEST superseder, id-tiebroken — or converged stores would answer
+    # differently. `concurrent_with` below is where a competing pair surfaces.
+    superseded_by = session.scalars(
+        select(Decision.id)
+        .where(Decision.supersedes_id == d.id)
+        .order_by(Decision.recorded_at.desc(), Decision.id.desc())
+    ).first()
     return {
         "id": str(d.id),
         "scope": d.scope_slug,
@@ -271,6 +289,10 @@ def get_decision(session: Session, decision_id: str) -> dict:
         "at": d.recorded_at.isoformat() if d.recorded_at else None,
         "supersedes": str(d.supersedes_id) if d.supersedes_id else None,
         "superseded_by": str(superseded_by) if superseded_by else None,
+        # §6.1 concurrent-sibling markers: the OTHER member of each still-
+        # unreconciled flagged pair. Empty once a supersession touches either
+        # member (the flag is derived, so it clears on both sides).
+        "concurrent_with": concurrence.concurrent_with(session, d.id),
         "shadow_origin": (
             {"node_id": d.shadow_origin_node_id, "label": d.shadow_origin_label}
             if d.shadow_origin_label
@@ -327,11 +349,17 @@ def list_decisions(
     rows = list(session.scalars(stmt))
     superseder: dict[uuid.UUID, uuid.UUID] = {}
     if include_superseded:
+        # Ascending order + overwrite ⇒ the retained entry is the NEWEST
+        # superseder (id-tiebroken) — the same deterministic pick as
+        # `get_decision`'s `superseded_by` (branching DAG: ≥2 children is a
+        # reachable permanent state).
         for prior_id, succ_id in session.execute(
-            select(Decision.supersedes_id, Decision.id).where(
+            select(Decision.supersedes_id, Decision.id)
+            .where(
                 Decision.scope_id == sid,
                 Decision.supersedes_id.is_not(None),
             )
+            .order_by(Decision.recorded_at, Decision.id)
         ):
             superseder[prior_id] = succ_id
     return {

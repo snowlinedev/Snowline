@@ -303,6 +303,58 @@ def test_forget_normalizes_underscore_name(db_session):
     assert memory.list_memories(db_session)["items_total"] == 0
 
 
+# --- tombstones + local resurrection (#80) ----------------------------------
+
+
+def test_forget_keeps_a_tombstone_row(db_session):
+    # #80: `forget` no longer HARD-DELETES — it tombstones (so a late-arriving
+    # older `set` can't resurrect the memory). The row survives, marked
+    # `forgotten`, and is simply excluded from every read.
+    from sqlalchemy import select
+
+    from snowline_memory.models import Memory
+
+    memory.remember(db_session, content="x", name="doomed")
+    memory.forget(db_session, "doomed")
+
+    row = db_session.scalar(select(Memory).where(Memory.name == "doomed"))
+    assert row is not None and row.forgotten is True
+    assert memory.list_memories(db_session)["items_total"] == 0
+    assert memory.recall(db_session)["items_total"] == 0
+    assert memory.memory_digest(db_session)["items_total"] == 0
+
+
+def test_local_remember_after_forget_resurrects(clean_db):
+    # A fresh local `remember` (newer clock) wins the LWW compare over the
+    # tombstone and brings the memory back — in place (same row, `created` False).
+    # Separate transactions so the authoring clock advances, as in production.
+    from snowline_memory.db import session_scope
+
+    with session_scope() as s:
+        memory.remember(s, content="v1", name="phoenix")
+    with session_scope() as s:
+        memory.forget(s, "phoenix")
+    with session_scope() as s:
+        assert memory.list_memories(s)["items_total"] == 0
+    with session_scope() as s:
+        again = memory.remember(s, content="v2", name="phoenix")
+        assert again["created"] is False  # same register, un-tombstoned
+    with session_scope() as s:
+        out = memory.recall(s)
+        assert out["items_total"] == 1
+        assert out["memories"][0]["content"] == "v2"
+
+
+def test_rapid_remember_then_forget_same_transaction(db_session):
+    # The monotonic-clock guard (`_monotonic_local_at`): a `forget` immediately
+    # after a `remember` in the SAME transaction must not tie the microsecond and
+    # lose — the forget must land.
+    memory.remember(db_session, content="x", name="fleeting")
+    out = memory.forget(db_session, "fleeting")
+    assert out["forgotten"] is True
+    assert memory.list_memories(db_session)["items_total"] == 0
+
+
 # --- issue #47: pin every row/header shape's exact key set -------------------
 #
 # The plugin's serializers already emit `scope`/`kind` (unlike the old monolith

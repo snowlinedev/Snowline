@@ -26,8 +26,63 @@ from __future__ import annotations
 EVENT_DECISION_RECORDED: str = "decision.recorded"
 EVENT_DECISION_SUPERSEDED: str = "decision.superseded"
 
+# Full-write-surface coverage (replication-continuity §4 / §9 item 3, #79):
+# one event type per lifecycle write, so two instances' governance stores can
+# converge from events alone. The SHADOW graph events cover every shadow write
+# (the conversation appender is ONE write path — `_append_conversation_event` —
+# so message + agent.error share one event type); `shadow.graduated` is the
+# provenance stamp both graduation shapes perform AFTER the decision event
+# (node-level carries a `node_id`, branch-level carries none). The ARTIFACT
+# events cover the spec/plan/reference docs — governance's "specs" ARE
+# artifacts (`doc_kind`), there is no separate spec store.
+EVENT_SHADOW_BRANCH_CREATED: str = "shadow.branch_created"
+EVENT_SHADOW_BRANCH_ARCHIVED: str = "shadow.branch_archived"
+EVENT_SHADOW_NOTES_SET: str = "shadow.notes_set"
+EVENT_SHADOW_NODE_ADDED: str = "shadow.node_added"
+EVENT_SHADOW_CITATION_ADDED: str = "shadow.citation_added"
+EVENT_SHADOW_CONVERSATION_APPENDED: str = "shadow.conversation_appended"
+EVENT_SHADOW_GRADUATED: str = "shadow.graduated"
+EVENT_ARTIFACT_REGISTERED: str = "artifact.registered"
+EVENT_ARTIFACT_REVISED: str = "artifact.revised"
+EVENT_ARTIFACT_RESOLVED: str = "artifact.resolved"
+EVENT_ARTIFACT_MATURITY_SET: str = "artifact.maturity_set"
+EVENT_ARTIFACT_GOVERNS_SET: str = "artifact.governs_set"
+# The platform's own adoption (replication-continuity §8, §9 item 5, issue
+# #81): the scope namespace dogfoods the same contract it offers plugins.
+# Governance does not emit these — they're vendored here ONLY so this copy
+# stays equal to the SDK's (the drift guard below), which is what proves the
+# producer/consumer registries can never silently fork.
+EVENT_SCOPE_CREATED: str = "scope.created"
+EVENT_SCOPE_UPDATED: str = "scope.updated"
+# Memory's replication vocabulary (replication-continuity §4 coverage note, #80).
+# Governance does not EMIT these — but EVENT_TYPES is the whole platform's
+# drift-guarded vocabulary, not just governance's own: §3.2 pins every plugin's
+# event types into BOTH copies (this producer copy and the SDK's) in one commit,
+# so the drift guard (`tests/test_contract_drift.py`) keeps them byte-equal.
+EVENT_MEMORY_SET: str = "memory.set"
+EVENT_MEMORY_FORGOTTEN: str = "memory.forgotten"
+
 EVENT_TYPES: frozenset[str] = frozenset(
-    {EVENT_DECISION_RECORDED, EVENT_DECISION_SUPERSEDED}
+    {
+        EVENT_DECISION_RECORDED,
+        EVENT_DECISION_SUPERSEDED,
+        EVENT_SHADOW_BRANCH_CREATED,
+        EVENT_SHADOW_BRANCH_ARCHIVED,
+        EVENT_SHADOW_NOTES_SET,
+        EVENT_SHADOW_NODE_ADDED,
+        EVENT_SHADOW_CITATION_ADDED,
+        EVENT_SHADOW_CONVERSATION_APPENDED,
+        EVENT_SHADOW_GRADUATED,
+        EVENT_ARTIFACT_REGISTERED,
+        EVENT_ARTIFACT_REVISED,
+        EVENT_ARTIFACT_RESOLVED,
+        EVENT_ARTIFACT_MATURITY_SET,
+        EVENT_ARTIFACT_GOVERNS_SET,
+        EVENT_SCOPE_CREATED,
+        EVENT_SCOPE_UPDATED,
+        EVENT_MEMORY_SET,
+        EVENT_MEMORY_FORGOTTEN,
+    }
 )
 
 # The published contract version, stamped into every emitted payload. A consumer
@@ -36,4 +91,8 @@ EVENT_TYPES: frozenset[str] = frozenset(
 # Version 2 (replication-continuity §3.2, #77): the stream envelope — `epoch`,
 # EMIT-time `seq`, `peer_seen` — a breaking addition, bumped in BOTH pinned
 # copies in one commit (the drift guard keeps them equal).
+# DEPLOY ORDERING: this version rides the legacy bus's payloads too
+# (`build_decision_event` stamps it), and an SDK-v1 consumer's `verify_event`
+# rejects it — the bus's attempt cap (default 5) then dead-letters those
+# deliveries. Upgrade webhook consumers before or together with governance.
 CONTRACT_VERSION: int = 2

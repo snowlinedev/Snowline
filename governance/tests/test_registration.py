@@ -47,12 +47,29 @@ def test_register_posts_the_right_manifest():
     # `thread` detail keyed on the branch id).
     ui = m["ui"]
     assert ui["contract_version"] == 1
-    assert [w["id"] for w in ui["widgets"]] == ["shadow-activity"]
+    assert [w["id"] for w in ui["widgets"]] == [
+        "shadow-activity",
+        "unreconciled-decisions",
+    ]
     widget = ui["widgets"][0]
     assert widget["slot"] == "home"
     assert widget["kind"] == "stat"
     assert widget["data"] == "/ui-api/widgets/shadow-activity"
     assert widget["refresh_seconds"] == 30
+    # The §6.1 unreconciled-pairs stat (replication-continuity, #79).
+    unreconciled = ui["widgets"][1]
+    assert unreconciled["slot"] == "home"
+    assert unreconciled["kind"] == "stat"
+    assert unreconciled["data"] == "/ui-api/widgets/unreconciled-decisions"
+    # The replication opt-in block (replication-continuity §4, #79): advisory
+    # metadata the pairing step reads — contract version + ingest route + the
+    # FULL drift-guarded event vocabulary.
+    from snowline_governance.contract import CONTRACT_VERSION, EVENT_TYPES
+
+    rep = m["replication"]
+    assert rep["contract_version"] == CONTRACT_VERSION
+    assert rep["ingest_path"] == "/events/ingest"
+    assert rep["events"] == sorted(EVENT_TYPES)
     assert [p["id"] for p in ui["pages"]] == ["shadow-branches", "shadow-branch"]
     table_page, thread_page = ui["pages"]
     assert table_page["route"] == "/shadow"
@@ -103,7 +120,10 @@ def test_manifest_is_accepted_by_the_platform_model():
     # UIPage models too (issue #55) — the same contract both sides share.
     assert m.ui is not None
     assert m.ui.contract_version == 1
-    assert [w.id for w in m.ui.widgets] == ["shadow-activity"]
+    assert [w.id for w in m.ui.widgets] == [
+        "shadow-activity",
+        "unreconciled-decisions",
+    ]
     assert [p.id for p in m.ui.pages] == ["shadow-branches", "shadow-branch"]
     assert [p.route for p in m.ui.pages] == ["/shadow", "/shadow/{branch_id}"]
     # The thread page's composer validates against the platform's UIComposer /

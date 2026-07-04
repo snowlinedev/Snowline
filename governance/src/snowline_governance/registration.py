@@ -32,6 +32,8 @@ import logging
 from snowline_plugin_sdk import registration as sdk_registration
 
 from snowline_governance import config
+from snowline_governance.contract import CONTRACT_VERSION, EVENT_TYPES
+from snowline_governance.replication_stream import INGEST_PATH
 
 log = logging.getLogger("snowline_governance.registration")
 
@@ -65,6 +67,16 @@ def build_manifest(base_url: str | None = None) -> dict:
         # read-real grounding, NO real-write) composes onto `shadow` — the
         # isolation mirrors the MCP isolation (decision 8a7f0a11).
         "surfaces": {"/mcp": "main", "/shadow/mcp": "shadow"},
+        # Replication opt-in (replication-continuity §4, #79): ADVISORY
+        # metadata the §5 pairing step reads — the platform never routes
+        # events. The block is additive; a platform predating #78's registry
+        # storage simply drops it. The event vocabulary is the full
+        # drift-guarded registry (write-surface coverage).
+        "replication": {
+            "contract_version": CONTRACT_VERSION,
+            "ingest_path": INGEST_PATH,
+            "events": sorted(EVENT_TYPES),
+        },
         "ui": {
             "contract_version": 1,
             "widgets": [
@@ -74,6 +86,17 @@ def build_manifest(base_url: str | None = None) -> dict:
                     "kind": "stat",
                     "title": "Open shadow branches",
                     "data": "/ui-api/widgets/shadow-activity",
+                    "refresh_seconds": 30,
+                },
+                # §6.1 surfacing (replication-continuity, #79): the open
+                # concurrent-sibling pair count — first-class state on the
+                # home grid, not a log line. Zero is the standing invariant.
+                {
+                    "id": "unreconciled-decisions",
+                    "slot": "home",
+                    "kind": "stat",
+                    "title": "Unreconciled decisions",
+                    "data": "/ui-api/widgets/unreconciled-decisions",
                     "refresh_seconds": 30,
                 },
             ],

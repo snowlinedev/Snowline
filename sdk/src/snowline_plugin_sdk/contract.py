@@ -15,14 +15,67 @@ Pure constants + one pure function — no imports beyond stdlib.
 EVENT_DECISION_RECORDED: str = "decision.recorded"
 EVENT_DECISION_SUPERSEDED: str = "decision.superseded"
 
+# Full-write-surface coverage (replication-continuity §4 / §9 item 3, #79) —
+# governance's shadow-graph, artifact (spec/plan/reference doc), and graduation
+# provenance events, one per lifecycle write. Vendored EQUAL to the producer's
+# copy (`snowline_governance.contract`) — both packages, one commit; the drift
+# guard keeps them from silently forking.
+EVENT_SHADOW_BRANCH_CREATED: str = "shadow.branch_created"
+EVENT_SHADOW_BRANCH_ARCHIVED: str = "shadow.branch_archived"
+EVENT_SHADOW_NOTES_SET: str = "shadow.notes_set"
+EVENT_SHADOW_NODE_ADDED: str = "shadow.node_added"
+EVENT_SHADOW_CITATION_ADDED: str = "shadow.citation_added"
+EVENT_SHADOW_CONVERSATION_APPENDED: str = "shadow.conversation_appended"
+EVENT_SHADOW_GRADUATED: str = "shadow.graduated"
+EVENT_ARTIFACT_REGISTERED: str = "artifact.registered"
+EVENT_ARTIFACT_REVISED: str = "artifact.revised"
+EVENT_ARTIFACT_RESOLVED: str = "artifact.resolved"
+EVENT_ARTIFACT_MATURITY_SET: str = "artifact.maturity_set"
+EVENT_ARTIFACT_GOVERNS_SET: str = "artifact.governs_set"
+# The platform's own adoption (replication-continuity §8, §9 item 5, issue
+# #81): the scope namespace dogfoods the same contract it offers plugins.
+EVENT_SCOPE_CREATED: str = "scope.created"
+EVENT_SCOPE_UPDATED: str = "scope.updated"
+# Memory's replication vocabulary (replication-continuity §4 coverage note, #80).
+# Memory is a per-name last-writer-wins register with tombstoned deletes: `set`
+# carries the winning write, `forgotten` the tombstone. EVERY event type any
+# plugin introduces lands in BOTH pinned EVENT_TYPES copies in one commit (§3.2),
+# so this registry stays the whole platform's vocabulary — not just governance's.
+EVENT_MEMORY_SET: str = "memory.set"
+EVENT_MEMORY_FORGOTTEN: str = "memory.forgotten"
+
 EVENT_TYPES: frozenset[str] = frozenset(
-    {EVENT_DECISION_RECORDED, EVENT_DECISION_SUPERSEDED}
+    {
+        EVENT_DECISION_RECORDED,
+        EVENT_DECISION_SUPERSEDED,
+        EVENT_SHADOW_BRANCH_CREATED,
+        EVENT_SHADOW_BRANCH_ARCHIVED,
+        EVENT_SHADOW_NOTES_SET,
+        EVENT_SHADOW_NODE_ADDED,
+        EVENT_SHADOW_CITATION_ADDED,
+        EVENT_SHADOW_CONVERSATION_APPENDED,
+        EVENT_SHADOW_GRADUATED,
+        EVENT_ARTIFACT_REGISTERED,
+        EVENT_ARTIFACT_REVISED,
+        EVENT_ARTIFACT_RESOLVED,
+        EVENT_ARTIFACT_MATURITY_SET,
+        EVENT_ARTIFACT_GOVERNS_SET,
+        EVENT_SCOPE_CREATED,
+        EVENT_SCOPE_UPDATED,
+        EVENT_MEMORY_SET,
+        EVENT_MEMORY_FORGOTTEN,
+    }
 )
 
 # Version 2 (replication-continuity §3.2, #77): the stream envelope — `epoch`,
 # EMIT-time `seq`, `peer_seen` — is a breaking addition over v1's
 # delivery-time-seq shape. Without the bump, a v1 peer would silently accept
 # and misprocess a v2 event under `check_contract_version`'s <= rule.
+# DEPLOY ORDERING: governance's legacy fire-and-forget bus stamps this version
+# into its (v1-shaped) payloads too, and a still-deployed SDK-v1 consumer's
+# `verify_event` REJECTS version 2 — under the bus's attempt cap (default 5)
+# those deliveries dead-letter. Upgrade webhook consumers to this SDK before
+# or together with governance.
 CONTRACT_VERSION: int = 2
 
 

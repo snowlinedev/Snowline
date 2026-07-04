@@ -11,6 +11,7 @@ import json
 from datetime import datetime, timedelta
 
 import httpx
+import pytest
 from sqlalchemy import select
 
 from snowline_plugin_sdk.replication import emit
@@ -230,3 +231,93 @@ def test_park_and_duplicate_acks_advance_the_cursor(session):
 
     assert _deliver(session, PeerTransport(park_then_dup)) == 2
     assert all(r.status == "delivered" for r in _rows(session))
+
+
+@pytest.mark.parametrize(
+    "respond_4xx",
+    [
+        lambda: httpx.Response(403),  # receiver trust gate (§5.1's config trap)
+        lambda: httpx.Response(404, text="not found"),  # router not mounted yet
+        lambda: httpx.Response(429, json={"detail": "slow down"}),  # proxy shape
+        lambda: httpx.Response(400, json={"status": "refused"}),  # not the vocabulary
+    ],
+)
+def test_stream_level_4xx_holds_the_backlog_instead_of_cascading(
+    session, respond_4xx
+):
+    """The dead-letter gate: ONLY the ingest vocabulary's rejection body
+    dead-letters. A bare/foreign-shaped 4xx (trust-gate 403, pre-mount 404,
+    proxy 429…) is a stream-level condition — every row stays pending under
+    backoff (the pre-fix behavior rejected a 3-row backlog in 3 ticks: a
+    recoverable misconfiguration permanently destroying data), and the whole
+    backlog delivers once the condition clears."""
+    _setup(session)
+    for i in range(3):
+        emit.emit_event(session, "thing.recorded", {"n": i})
+
+    def misconfigured(request):
+        if request.method == "GET":
+            return httpx.Response(405)
+        return respond_4xx()
+
+    # Three ticks (each past the head's backoff): nothing rejects, ever.
+    now = NOW
+    for _ in range(3):
+        row = _rows(session)[0]
+        now = max(now, row.next_attempt_at or now)
+        assert _deliver(session, PeerTransport(misconfigured), now=now) == 0
+        assert [r.status for r in _rows(session)] == ["pending"] * 3
+
+    # The misconfiguration clears: the full backlog delivers in order.
+    healed = PeerTransport(_ok)
+    now = max(now, _rows(session)[0].next_attempt_at or now)
+    assert _deliver(session, healed, now=now) == 3
+    posts = [r for r in healed.requests if r.method == "POST"]
+    assert [json.loads(p.content)["seq"] for p in posts] == [1, 2, 3]
+    assert all(r.status == "delivered" for r in _rows(session))
+
+
+def test_requeue_rejected_resumes_the_wedged_stream(session):
+    """A true vocabulary rejection wedges its stream (later seqs draw
+    out-of-order refusals from the receiver's gate, never dead-letters);
+    `list_rejected` surfaces it and `requeue_rejected` puts it back at the
+    head, letting the whole backlog resume."""
+    _setup(session)
+    emit.emit_event(session, "thing.recorded", {"n": 1})
+    emit.emit_event(session, "thing.recorded", {"n": 2})
+
+    def reject_seq_1(request):
+        if request.method == "GET":
+            return httpx.Response(405)
+        seq = json.loads(request.content)["seq"]
+        if seq == 1:
+            return httpx.Response(
+                401, json={"status": "rejected", "reason": "bad_signature"}
+            )
+        return httpx.Response(
+            409, json={"status": "refused", "reason": "out_of_order", "expected_seq": 1}
+        )
+
+    # Tick 1: seq 1 dead-letters; seq 2 is not attempted this tick.
+    assert _deliver(session, PeerTransport(reject_seq_1)) == 0
+    assert [r.status for r in _rows(session)] == ["rejected", "pending"]
+
+    # Tick 2: seq 2 becomes the head and draws an ordering REFUSAL — the wedge
+    # is loud but nothing else dead-letters.
+    assert _deliver(session, PeerTransport(reject_seq_1)) == 0
+    assert [r.status for r in _rows(session)] == ["rejected", "pending"]
+
+    rejected = emit.list_rejected(session)
+    assert [(r["seq"], r["source_id"], r["epoch"]) for r in rejected] == [
+        (1, "test.plugin", "e1")
+    ]
+    assert "bad_signature" in rejected[0]["last_error"]
+
+    # Fix the cause, requeue the head: the stream resumes in order.
+    emit.requeue_rejected(session, rejected[0]["id"])
+    assert emit.list_rejected(session) == []
+    healed = PeerTransport(_ok)
+    now = NOW + timedelta(seconds=600)  # past seq 2's backoff
+    assert _deliver(session, healed, now=now) == 2
+    posts = [r for r in healed.requests if r.method == "POST"]
+    assert [json.loads(p.content)["seq"] for p in posts] == [1, 2]

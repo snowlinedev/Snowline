@@ -13,9 +13,10 @@ dependencies = [
     "httpx>=0.27",
     # The MCP surface (FastMCP, streamable HTTP) — mirrors the monolith.
     "mcp>=1.2",
-    # The shared registration heartbeat (issue #50) — the `[client]` extra pulls
-    # httpx + anyio for `snowline_plugin_sdk.registration`.
-    "snowline-plugin-sdk[client]",
+    # The shared registration heartbeat (issue #50, `[client]`) and the adopted
+    # replication stream contract (issue #79, `[replication]`:
+    # `snowline_plugin_sdk.replication` — outbox/ingest/admin surface).
+    "snowline-plugin-sdk[client,replication]",
 ]
 
 [dependency-groups]
