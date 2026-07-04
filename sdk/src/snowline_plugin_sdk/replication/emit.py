@@ -40,6 +40,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import uuid
 from collections.abc import Callable
 from contextlib import AbstractContextManager
@@ -474,9 +475,102 @@ def _response_error(resp) -> str:
 # watch. The admin surface exposes both next to /parked.
 
 
+class RequeueRefusedError(ValueError):
+    """Raised by `requeue_rejected`/`requeue_rejected_bulk` when the target
+    subscription is retired (issue #108: rotation is retain-not-refuse, so a
+    retired subscription's rows are discoverable but must never be silently
+    flipped back to `pending` under it — nothing serves that stream anymore,
+    so the row would be undeliverable limbo: not parked, not rejected, never
+    delivered). A `ValueError` subclass so any caller that only distinguishes
+    "not found" from "success" still sees a 4xx-shaped failure; `admin.py`
+    catches this SPECIFIC type first to answer 409 with `.detail` instead of
+    the generic 404."""
+
+    def __init__(self, message: str, *, detail: dict):
+        super().__init__(message)
+        self.detail = detail
+
+
+# The ingest vocabulary's rejection reason, as embedded by `_response_error`
+# into `last_error` (`f"HTTP {code} {resp.json()}"` — a Python dict repr of
+# `{"status": "rejected", "reason": "<reason>"}`, since `_is_vocabulary_
+# rejection` gates entry into `rejected` status on exactly that shape). No
+# separate column: the reason is already fully determined by this string for
+# every row that reaches `rejected`, so the bulk requeue's optional reason
+# filter parses it out rather than duplicating storage.
+_REJECTION_REASON_RE = re.compile(r"'reason':\s*'([^']+)'")
+
+
+def _rejection_reason(last_error: str | None) -> str | None:
+    if not last_error:
+        return None
+    match = _REJECTION_REASON_RE.search(last_error)
+    return match.group(1) if match else None
+
+
+def _find_active_successor(
+    session: Session, sub: ReplicationSubscription
+) -> ReplicationSubscription | None:
+    """The live stream that replaced a retired one, when — and only when —
+    it's unambiguous: the SINGLE active subscription sharing both `source_id`
+    (this instance's fixed emit identity) and `target_url` (the same peer).
+    Re-pairing with the same peer retires the old row and mints a fresh epoch
+    under a new one; `source_id` alone would be ambiguous the moment this
+    instance pairs a second, different peer under the same identity. Returns
+    None on zero or multiple candidates — the caller still refuses the
+    requeue, it just can't name one successor to point at."""
+    candidates = session.scalars(
+        select(ReplicationSubscription).where(
+            ReplicationSubscription.source_id == sub.source_id,
+            ReplicationSubscription.target_url == sub.target_url,
+            ReplicationSubscription.active.is_(True),
+            ReplicationSubscription.id != sub.id,
+        )
+    ).all()
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _guard_active_subscription(
+    session: Session, sub: ReplicationSubscription
+) -> None:
+    """Issue #108's guard: refuse a requeue targeting a retired subscription.
+    Rotation is retain-not-refuse (the retired row and its delivery log stay,
+    ee5794e), so the successor — when unambiguous — is discoverable and named
+    in the refusal; the operator's fix is to requeue against the successor
+    (or re-pair) instead of onto a stream nothing serves."""
+    if sub.active:
+        return
+    successor = _find_active_successor(session, sub)
+    detail = {
+        "reason": "subscription_retired",
+        "subscription_id": str(sub.id),
+        "source_id": sub.source_id,
+        "epoch": sub.epoch,
+        "retired_at": sub.retired_at.isoformat() if sub.retired_at else None,
+    }
+    if successor is not None:
+        detail["successor_subscription_id"] = str(successor.id)
+        detail["successor_epoch"] = successor.epoch
+        message = (
+            f"outbound subscription {sub.id} ({sub.source_id}/{sub.epoch}) is "
+            f"retired; requeue against its successor {successor.id} "
+            f"({successor.source_id}/{successor.epoch}) instead"
+        )
+    else:
+        message = (
+            f"outbound subscription {sub.id} ({sub.source_id}/{sub.epoch}) is "
+            "retired and no single active successor exists for this peer — "
+            "re-pair before requeueing"
+        )
+    raise RequeueRefusedError(message, detail=detail)
+
+
 def list_rejected(session: Session) -> list[dict]:
     """Every dead-lettered outbox row, oldest first, labelled with its stream
-    identity (payload omitted — it can be large; the row id keys the requeue)."""
+    identity (payload omitted — it can be large; the row id keys the requeue).
+    `reason` is the ingest vocabulary's rejection reason, parsed out of
+    `last_error` — the same value the bulk requeue's `reason` filter matches
+    against."""
     rows = session.execute(
         select(ReplicationOutboxRow, ReplicationSubscription)
         .join(
@@ -496,6 +590,7 @@ def list_rejected(session: Session) -> list[dict]:
             "event_type": row.event_type,
             "attempts": row.attempts,
             "last_error": row.last_error,
+            "reason": _rejection_reason(row.last_error),
             "created_at": row.created_at.isoformat() if row.created_at else None,
         }
         for row, sub in rows
@@ -507,8 +602,10 @@ def requeue_rejected(session: Session, row_id: str) -> dict:
     (the recovery for a wedged stream — the receiver's gate still expects this
     seq, so requeueing the head lets the whole backlog resume). Due
     immediately; `last_error` keeps the rejection until the next outcome
-    overwrites it. Raises ValueError on an unknown id or a non-rejected row —
-    an operator action, deliberate like `reapply_parked`."""
+    overwrites it. Raises ValueError on an unknown id or a non-rejected row,
+    and `RequeueRefusedError` (issue #108) when the row's subscription has
+    since been retired — an operator action, deliberate like
+    `reapply_parked`."""
     row = session.get(ReplicationOutboxRow, _as_uuid(row_id))
     if row is None:
         raise ValueError(f"no replication outbox row with id {row_id!r}")
@@ -516,11 +613,70 @@ def requeue_rejected(session: Session, row_id: str) -> dict:
         raise ValueError(
             f"outbox row {row_id!r} is {row.status!r}, not 'rejected'"
         )
+    sub = session.get(ReplicationSubscription, row.subscription_id)
+    if sub is None:
+        raise ValueError(
+            f"outbox row {row_id!r} has no subscription {row.subscription_id!r}"
+        )
+    _guard_active_subscription(session, sub)
     row.status = "pending"
     row.attempts = 0
     row.next_attempt_at = None
     session.flush()
     return {"id": str(row.id), "seq": row.seq, "status": row.status}
+
+
+def requeue_rejected_bulk(
+    session: Session,
+    subscription_id: str,
+    *,
+    event_type: str | None = None,
+    reason: str | None = None,
+) -> dict:
+    """Set-at-a-time requeue, scoped to one stream (issue #107): every
+    `rejected` row on `subscription_id`, optionally narrowed to one
+    `event_type` and/or one rejection `reason`, flips back to `pending` —
+    same semantics as `requeue_rejected`, just applied to the whole matching
+    set at once. Built for the canonical mass-rejection shape: a producer
+    ships a new event type before this consumer upgrades, and every row of
+    that type dead-letters until the fix lands — recovery today is one call
+    per row; this is one call for the lot. Returns the count requeued.
+
+    RETIRED-SUBSCRIPTION GUARD (issue #108): if the target subscription is
+    retired, the WHOLE call refuses via `RequeueRefusedError` — nothing is
+    requeued, matching `requeue_rejected`'s per-row refusal. Skip-and-report
+    was considered and rejected: a bulk call that silently requeues 0 of N
+    rows onto a retired target reads as "nothing needed action" instead of
+    "your target moved," which is exactly the silent-limbo failure mode this
+    guard exists to kill. Refuse loudly, once, for the whole set."""
+    sub = session.get(ReplicationSubscription, _as_uuid(subscription_id))
+    if sub is None:
+        raise ValueError(
+            f"no replication subscription with id {subscription_id!r}"
+        )
+    _guard_active_subscription(session, sub)
+
+    stmt = select(ReplicationOutboxRow).where(
+        ReplicationOutboxRow.subscription_id == sub.id,
+        ReplicationOutboxRow.status == "rejected",
+    )
+    if event_type is not None:
+        stmt = stmt.where(ReplicationOutboxRow.event_type == event_type)
+    rows = session.scalars(stmt).all()
+    if reason is not None:
+        rows = [r for r in rows if _rejection_reason(r.last_error) == reason]
+
+    for row in rows:
+        row.status = "pending"
+        row.attempts = 0
+        row.next_attempt_at = None
+    session.flush()
+    return {
+        "subscription_id": str(sub.id),
+        "source_id": sub.source_id,
+        "epoch": sub.epoch,
+        "requeued": len(rows),
+    }
 
 
 async def replication_delivery_loop(

@@ -285,3 +285,144 @@ def test_rejected_view_and_requeue_over_http(make_instance):
         json={"id": "00000000-0000-0000-0000-000000000000"},
     )
     assert missing.status_code == 404
+
+
+def _reject_transport(reason: str, status: int):
+    import httpx as _httpx
+
+    def respond(request: _httpx.Request) -> _httpx.Response:
+        if request.method == "GET":
+            return _httpx.Response(405)
+        return _httpx.Response(status, json={"status": "rejected", "reason": reason})
+
+    return respond
+
+
+def test_requeue_rejected_bulk_over_http(make_instance):
+    """Issue #107 over HTTP: a whole cascade of rejected rows on one stream
+    requeues in one call, returning the count."""
+    import httpx as _httpx
+
+    from snowline_plugin_sdk.replication import emit
+
+    sessions = make_instance()
+
+    @contextmanager
+    def session_scope():
+        session = sessions()
+        try:
+            yield session
+            session.commit()
+        finally:
+            session.close()
+
+    app = FastAPI()
+    app.include_router(build_replication_router(session_scope, lambda s, e: None))
+
+    with session_scope() as s:
+        sub = emit.create_outbound_subscription(
+            s, "http://peer/events/ingest", "sec", ["thing.recorded"], epoch="e1"
+        )
+        emit.emit_event(s, "thing.recorded", {"n": 1})
+        emit.emit_event(s, "thing.recorded", {"n": 2})
+
+    with session_scope() as s, _httpx.Client(
+        transport=_httpx.MockTransport(_reject_transport("malformed_envelope", 400))
+    ) as client:
+        emit.deliver_pending(s, client, reachability={})
+        emit.deliver_pending(s, client, reachability={})
+
+    assert len(_request(app, "GET", "/replication-admin/rejected").json()) == 2
+
+    bulk = _request(
+        app, "POST", "/replication-admin/rejected/requeue-bulk",
+        json={"subscription_id": sub["id"]},
+    )
+    assert bulk.status_code == 200
+    assert bulk.json() == {
+        "subscription_id": sub["id"],
+        "source_id": "test.plugin",
+        "epoch": "e1",
+        "requeued": 2,
+    }
+    assert _request(app, "GET", "/replication-admin/rejected").json() == []
+
+    missing = _request(
+        app, "POST", "/replication-admin/rejected/requeue-bulk",
+        json={"subscription_id": "00000000-0000-0000-0000-000000000000"},
+    )
+    assert missing.status_code == 404
+
+
+def test_requeue_refuses_retired_subscription_over_http(make_instance):
+    """Issue #108 over HTTP: both the per-row and the bulk requeue routes
+    refuse a retired subscription with a 409 naming it (and its successor,
+    when a re-pair created one) instead of resuming a stream nothing serves."""
+    import httpx as _httpx
+
+    from snowline_plugin_sdk.replication import emit
+
+    sessions = make_instance()
+
+    @contextmanager
+    def session_scope():
+        session = sessions()
+        try:
+            yield session
+            session.commit()
+        finally:
+            session.close()
+
+    app = FastAPI()
+    app.include_router(build_replication_router(session_scope, lambda s, e: None))
+
+    with session_scope() as s:
+        sub = emit.create_outbound_subscription(
+            s, "http://peer/events/ingest", "sec", ["thing.recorded"], epoch="e1"
+        )
+        emit.emit_event(s, "thing.recorded", {"n": 1})
+
+    with session_scope() as s, _httpx.Client(
+        transport=_httpx.MockTransport(_reject_transport("bad_signature", 401))
+    ) as client:
+        emit.deliver_pending(s, client, reachability={})
+
+    row_id = _request(app, "GET", "/replication-admin/rejected").json()[0]["id"]
+
+    retire = _request(
+        app, "POST", "/replication-admin/outbound/retire", json={"id": sub["id"]}
+    )
+    assert retire.json()["active"] is False
+
+    refused = _request(
+        app, "POST", "/replication-admin/rejected/requeue", json={"id": row_id}
+    )
+    assert refused.status_code == 409
+    assert refused.json()["detail"]["reason"] == "subscription_retired"
+    assert "successor_subscription_id" not in refused.json()["detail"]
+
+    refused_bulk = _request(
+        app, "POST", "/replication-admin/rejected/requeue-bulk",
+        json={"subscription_id": sub["id"]},
+    )
+    assert refused_bulk.status_code == 409
+    assert refused_bulk.json()["detail"]["reason"] == "subscription_retired"
+
+    # Untouched by either refused call.
+    assert len(_request(app, "GET", "/replication-admin/rejected").json()) == 1
+
+    # A re-pair mints a successor for the same peer — now named in the refusal.
+    successor = _request(
+        app, "POST", "/replication-admin/outbound",
+        json={
+            "target_url": "http://peer/events/ingest",
+            "secret": "sec2",
+            "event_types": ["thing.recorded"],
+            "epoch": "e2",
+        },
+    ).json()
+    refused_again = _request(
+        app, "POST", "/replication-admin/rejected/requeue", json={"id": row_id}
+    )
+    assert refused_again.status_code == 409
+    assert refused_again.json()["detail"]["successor_subscription_id"] == successor["id"]

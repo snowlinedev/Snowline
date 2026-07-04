@@ -410,3 +410,192 @@ def test_replication_disabled_env_var_still_works_alongside_enabled(
             await emit.replication_delivery_loop(session_scope)
 
     anyio.run(main)
+
+
+def _reject_with(reason: str, status: int = 400):
+    def _respond(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(405)
+        return httpx.Response(status, json={"status": "rejected", "reason": reason})
+
+    return _respond
+
+
+# --- issue #108: the retired-subscription requeue guard -----------------------
+
+
+def test_requeue_onto_retired_subscription_is_invisible_limbo_without_the_guard(
+    session,
+):
+    """The bug this guard exists to kill, reproduced directly (write this
+    FIRST, per the issue): flipping a rejected row back to `pending` under a
+    RETIRED subscription — exactly what `requeue_rejected` did before the
+    guard existed — produces UNDELIVERABLE limbo. `deliver_pending` only ever
+    queries ACTIVE subscriptions, so the row is invisible to it: not parked,
+    not rejected, never attempted, never delivered."""
+    _setup(session)
+    emit.emit_event(session, "thing.recorded", {"n": 1})
+    assert _deliver(session, PeerTransport(_reject_with("bad_signature", 401))) == 0
+
+    row = _rows(session)[0]
+    assert row.status == "rejected"
+    emit.retire_outbound_subscription(session, str(row.subscription_id))
+
+    # The pre-guard behavior: flip the row back to pending directly, bypassing
+    # any subscription check (what `requeue_rejected` unconditionally did).
+    row.status = "pending"
+    row.attempts = 0
+    row.next_attempt_at = None
+    session.commit()
+
+    healed = PeerTransport(_ok)
+    assert _deliver(session, healed) == 0  # never even attempted
+    assert healed.requests == []
+    assert _rows(session)[0].status == "pending"  # invisible limbo, confirmed
+
+
+def test_requeue_rejected_refuses_a_retired_subscription(session):
+    """The guard (issue #108): `requeue_rejected` refuses — instead of
+    creating the limbo above — when the row's subscription is retired, and
+    the row stays untouched (`rejected`, never flipped to `pending`)."""
+    _setup(session)
+    emit.emit_event(session, "thing.recorded", {"n": 1})
+    assert _deliver(session, PeerTransport(_reject_with("bad_signature", 401))) == 0
+
+    rejected = emit.list_rejected(session)
+    row_id, sub_id = rejected[0]["id"], rejected[0]["subscription_id"]
+    emit.retire_outbound_subscription(session, sub_id)
+
+    with pytest.raises(emit.RequeueRefusedError) as exc_info:
+        emit.requeue_rejected(session, row_id)
+    detail = exc_info.value.detail
+    assert detail["reason"] == "subscription_retired"
+    assert detail["subscription_id"] == sub_id
+    assert "successor_subscription_id" not in detail  # no re-pair happened
+
+    assert [r["id"] for r in emit.list_rejected(session)] == [row_id]  # untouched
+
+
+def test_requeue_rejected_names_the_successor_after_a_rotation(session):
+    """Rotation is retain-not-refuse (ee5794e): re-pairing with the same peer
+    retires the old subscription and mints a fresh-epoch successor, which
+    stays discoverable. The refusal names it, pointing the operator at the
+    live stream instead of the dead one."""
+    sub = _setup(session)
+    emit.emit_event(session, "thing.recorded", {"n": 1})
+    assert _deliver(session, PeerTransport(_reject_with("bad_signature", 401))) == 0
+
+    row_id = emit.list_rejected(session)[0]["id"]
+    emit.retire_outbound_subscription(session, sub["id"])
+    successor = emit.create_outbound_subscription(
+        session, sub["target_url"], "new-secret", ["thing.recorded"], epoch="e2"
+    )
+
+    with pytest.raises(emit.RequeueRefusedError) as exc_info:
+        emit.requeue_rejected(session, row_id)
+    detail = exc_info.value.detail
+    assert detail["successor_subscription_id"] == successor["id"]
+    assert detail["successor_epoch"] == "e2"
+
+
+# --- issue #107: bulk requeue-by-stream ----------------------------------------
+
+
+def test_requeue_rejected_bulk_resumes_a_vocabulary_cascade(session):
+    """The canonical mass-rejection shape (#107): a producer ships a new event
+    type before this consumer upgrades, so every row of that type
+    dead-letters until the fix lands. One bulk call requeues the whole
+    cascade and returns the count requeued."""
+    _setup(session)
+    for n in range(3):
+        emit.emit_event(session, "thing.recorded", {"n": n})
+
+    reject_all = PeerTransport(_reject_with("malformed_envelope"))
+    # Each tick dead-letters exactly the stream head (it wedges behind it);
+    # three ticks are needed to reject all three queued rows.
+    for _ in range(3):
+        _deliver(session, reject_all)
+    assert [r.status for r in _rows(session)] == ["rejected"] * 3
+
+    sub_id = emit.list_rejected(session)[0]["subscription_id"]
+    result = emit.requeue_rejected_bulk(session, sub_id)
+    assert result == {
+        "subscription_id": sub_id,
+        "source_id": "test.plugin",
+        "epoch": "e1",
+        "requeued": 3,
+    }
+    assert [r.status for r in _rows(session)] == ["pending"] * 3
+    assert emit.list_rejected(session) == []
+
+
+def test_requeue_rejected_bulk_filters_by_event_type_and_reason(session):
+    """Filters are respected: only the rows matching `event_type` (and/or
+    `reason`) requeue; the rest stay rejected for a later, separate call."""
+    with_types = emit.create_outbound_subscription(
+        session,
+        "http://peer.example/events/ingest",
+        "s2",
+        ["thing.recorded", "other.thing"],
+        epoch="e2",
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(405)
+        event_type = json.loads(request.content)["event_type"]
+        if event_type == "thing.recorded":
+            return httpx.Response(
+                400, json={"status": "rejected", "reason": "malformed_envelope"}
+            )
+        return httpx.Response(
+            401, json={"status": "rejected", "reason": "bad_signature"}
+        )
+
+    emit.emit_event(session, "thing.recorded", {"n": 1})  # seq1 on sub "e2"
+    emit.emit_event(session, "other.thing", {"n": 2})  # seq2 on sub "e2"
+    emit.emit_event(session, "thing.recorded", {"n": 3})  # seq3 on sub "e2"
+
+    transport = PeerTransport(respond)
+    for _ in range(3):
+        _deliver(session, transport)
+    assert [r.status for r in _rows(session)] == ["rejected"] * 3
+
+    # Narrow by event_type: only the two thing.recorded rows requeue.
+    result = emit.requeue_rejected_bulk(
+        session, with_types["id"], event_type="thing.recorded"
+    )
+    assert result["requeued"] == 2
+    remaining = emit.list_rejected(session)
+    assert [(r["event_type"], r["reason"]) for r in remaining] == [
+        ("other.thing", "bad_signature")
+    ]
+
+    # Narrow the leftover by reason: the last row requeues too.
+    result = emit.requeue_rejected_bulk(
+        session, with_types["id"], reason="bad_signature"
+    )
+    assert result["requeued"] == 1
+    assert emit.list_rejected(session) == []
+
+
+def test_requeue_rejected_bulk_refuses_whole_call_on_retired_subscription(session):
+    """The bulk decision for issue #108: a retired target refuses the WHOLE
+    call (nothing requeued) rather than skip-and-report a partial count —
+    consistent with the per-row guard's refuse-loudly posture."""
+    _setup(session)
+    emit.emit_event(session, "thing.recorded", {"n": 1})
+    assert _deliver(session, PeerTransport(_reject_with("malformed_envelope"))) == 0
+
+    sub_id = emit.list_rejected(session)[0]["subscription_id"]
+    emit.retire_outbound_subscription(session, sub_id)
+
+    with pytest.raises(emit.RequeueRefusedError) as exc_info:
+        emit.requeue_rejected_bulk(session, sub_id)
+    assert exc_info.value.detail["reason"] == "subscription_retired"
+    assert len(emit.list_rejected(session)) == 1  # untouched
+
+
+def test_requeue_rejected_bulk_unknown_subscription(session):
+    with pytest.raises(ValueError, match="no replication subscription"):
+        emit.requeue_rejected_bulk(session, "00000000-0000-0000-0000-000000000000")

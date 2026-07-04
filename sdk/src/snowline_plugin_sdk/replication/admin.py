@@ -240,6 +240,28 @@ def build_replication_router(
         with session_scope() as session:
             try:
                 return _emit.requeue_rejected(session, row_id)
+            except _emit.RequeueRefusedError as exc:
+                # More specific than the plain ValueError below (it IS one) —
+                # caught first so a retired-subscription refusal (§108) answers
+                # 409 with the successor pointer, not a bare 404.
+                raise HTTPException(status_code=409, detail=exc.detail) from None
+            except ValueError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from None
+
+    @router.post(f"{admin_prefix}/rejected/requeue-bulk")
+    async def requeue_rejected_bulk(request: Request, data: dict) -> dict:
+        _require_trusted(request)
+        (subscription_id,) = _required(data, "subscription_id")
+        with session_scope() as session:
+            try:
+                return _emit.requeue_rejected_bulk(
+                    session,
+                    subscription_id,
+                    event_type=data.get("event_type"),
+                    reason=data.get("reason"),
+                )
+            except _emit.RequeueRefusedError as exc:
+                raise HTTPException(status_code=409, detail=exc.detail) from None
             except ValueError as exc:
                 raise HTTPException(status_code=404, detail=str(exc)) from None
 
