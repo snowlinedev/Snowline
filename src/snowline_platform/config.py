@@ -1,17 +1,26 @@
 """Platform configuration — env-driven, with no hardcoded trust.
 
 `SNOWLINE_TRUSTED_CIDRS` is a comma-separated list of CIDRs the platform trusts
-as its network gate. It defaults to Tailscale's tailnet range so the tailnet is
-trusted out of the box; override it to narrow trust (e.g. a single tailnet IP)
-or to add ranges. Trust is configuration, never hardcoded into the request path.
+as its network gate. It defaults to Tailscale's tailnet range plus IPv4/IPv6
+loopback (replication-continuity.md §5.1's serve→loopback bind posture) so a
+`tailscale serve` → loopback front — where every request, local agent and
+cross-instance deliveries alike, arrives with a loopback peer IP — is trusted
+out of the box; override it to narrow trust (e.g. a single tailnet IP) or to
+add ranges. This mirrors the SDK replication admin router's default
+(`snowline_plugin_sdk.replication.admin.DEFAULT_TRUSTED_CIDRS`) so a first boot
+doesn't 403 loopback deliveries and pairing-CLI calls (issue #93) — keep the
+two in sync. Trust is configuration, never hardcoded into the request path.
 """
 
 import os
 import pathlib
 import re
 
-# Tailscale's tailnet (CGNAT) range — the default trusted network.
-DEFAULT_TRUSTED_CIDRS = "100.64.0.0/10"
+# Tailscale's tailnet (CGNAT) range plus IPv4/IPv6 loopback — the default
+# trusted network (replication-continuity.md §5.1). Kept in lockstep with the
+# SDK's `snowline_plugin_sdk.replication.admin.DEFAULT_TRUSTED_CIDRS` (issue
+# #93; see `tests/test_config.py::test_default_matches_sdk_admin_default`).
+DEFAULT_TRUSTED_CIDRS = "100.64.0.0/10,127.0.0.0/8,::1"
 
 # Local libpq defaults: unix socket, current OS user, no password — mirrors the
 # monolith's substrate config. Scopes are the platform's first persisted data.
