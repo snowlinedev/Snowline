@@ -158,8 +158,48 @@ def test_reseed_precondition_a_spoke_outbox_must_be_empty(tmp_path):
             subscription_id=sub_id, seq=1, event_type="decision.recorded",
             payload={}, status="pending",
         ))
-    with pytest.raises(seed.SeedError, match="undelivered outbox"):
+    with pytest.raises(seed.SeedError, match="PENDING outbox"):
         seed.check_reseed_preconditions(client, cfg, report=lambda _m: None)
+
+
+def test_reseed_precondition_a_rejects_dead_lettered_outbox(tmp_path):
+    """A `rejected` (dead-lettered) spoke write was refused by the primary and
+    will never apply — an empty-of-pending outbox does NOT make it convergent, so
+    the precondition must fail on it too (review finding: status=='pending' alone
+    let a dead-lettered write slip past into a data-losing re-seed)."""
+    sp, primary, spoke, client = _seed_participant(tmp_path)
+    cfg = _cfg([sp])
+    with spoke.scope() as s:
+        s.add(ReplicationSubscription(
+            target_url="http://prim/x", secret="s", event_types=["decision.recorded"],
+            source_id="roam.governance", epoch="e", active=True,
+        ))
+        s.flush()
+        sub_id = s.scalars(select(ReplicationSubscription)).one().id
+        s.add(ReplicationOutboxRow(
+            subscription_id=sub_id, seq=1, event_type="decision.recorded",
+            payload={}, status="rejected",
+        ))
+    with pytest.raises(seed.SeedError, match="REJECTED"):
+        seed.check_reseed_preconditions(client, cfg, report=lambda _m: None)
+
+
+def test_reseed_precondition_a_ignores_delivered_outbox(tmp_path):
+    """A `delivered` outbox row is convergent — it must NOT block a re-seed."""
+    sp, primary, spoke, client = _seed_participant(tmp_path)
+    cfg = _cfg([sp])
+    with spoke.scope() as s:
+        s.add(ReplicationSubscription(
+            target_url="http://prim/x", secret="s", event_types=["decision.recorded"],
+            source_id="roam.governance", epoch="e", active=True,
+        ))
+        s.flush()
+        sub_id = s.scalars(select(ReplicationSubscription)).one().id
+        s.add(ReplicationOutboxRow(
+            subscription_id=sub_id, seq=1, event_type="decision.recorded",
+            payload={}, status="delivered",
+        ))
+    seed.check_reseed_preconditions(client, cfg, report=lambda _m: None)  # no raise
 
 
 def test_reseed_precondition_b_primary_parked_must_be_empty(tmp_path):
@@ -237,6 +277,79 @@ def test_libpq_and_sqlalchemy_url_normalization():
     assert seed._libpq_url("postgresql:///db") == "postgresql:///db"
     assert seed._sqlalchemy_url("postgresql:///db") == "postgresql+psycopg:///db"
     assert seed._sqlalchemy_url("sqlite:///x.db") == "sqlite:///x.db"
+
+
+def test_libpq_url_and_env_lifts_password_off_argv():
+    """Review finding: passwords must ride PGPASSWORD, not pg_dump/pg_restore
+    argv (visible in `ps`)."""
+    url, env = seed._libpq_url_and_env("postgresql+psycopg://user:sekret@host:5432/db")
+    assert env == {"PGPASSWORD": "sekret"}
+    assert "sekret" not in url
+    assert url == "postgresql://user@host:5432/db"
+    # No password (socket/peer auth) → empty overlay, url unchanged.
+    assert seed._libpq_url_and_env("postgresql:///db") == ("postgresql:///db", {})
+
+
+def test_dump_and_restore_aborts_on_pg_restore_error(tmp_path, monkeypatch):
+    """Review finding: `pg_restore --exit-on-error`, and ANY non-zero exit aborts
+    the seed BEFORE scrub/boot — a partially-restored store must never proceed
+    (silent data loss). `--if-exists` already downgrades the only benign noise,
+    so the old (0,1) window admitted genuine restore failures."""
+    sp, _p, _s, _c = _seed_participant(tmp_path)
+    calls: list[list[str]] = []
+
+    class _Proc:
+        def __init__(self, rc):
+            self.returncode = rc
+            self.stdout = ""
+            self.stderr = "pg_restore: error: could not execute query"
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        return _Proc(1 if argv[0] == "pg_restore" else 0)  # restore fails
+
+    monkeypatch.setattr(seed.subprocess, "run", fake_run)
+    with pytest.raises(seed.SeedError, match="pg_restore"):
+        seed.dump_and_restore(sp, report=lambda _m: None)
+
+    restore_argv = next(c for c in calls if c[0] == "pg_restore")
+    assert "--exit-on-error" in restore_argv
+    assert "--clean" in restore_argv and "--if-exists" in restore_argv
+
+
+def test_prime_forward_retires_orphan_on_rerun(tmp_path):
+    """Review finding: a prime that failed mid-sequence then re-runs mints a fresh
+    epoch; without a guard it leaves an orphaned old outbound subscription whose
+    old-epoch deliveries dead-letter. The re-run must retire the orphan first."""
+    sp, primary, _spoke, client = _seed_participant(tmp_path)
+    e1, _ = seed.prime_forward(client, sp, report=lambda _m: None)
+    e2, _ = seed.prime_forward(client, sp, report=lambda _m: None)
+    assert e1 != e2
+    with primary.scope() as s:
+        subs = s.scalars(select(ReplicationSubscription)).all()
+    active = [x for x in subs if x.active]
+    assert len(active) == 1 and active[0].epoch == e2  # only the fresh one is live
+    assert any((not x.active) and x.epoch == e1 for x in subs)  # orphan retired, not deleted
+
+
+def test_run_reverse_pair_refuses_version_mismatch(tmp_path):
+    """Review finding: the §7 reverse-pair reached the handshake directly,
+    bypassing the §10 contract_version refuse. It must refuse a mismatch too."""
+    from snowline_platform.replication_pairing import PairingError
+
+    from ._replication_helpers import make_platform, plugin_entry
+
+    sp, primary, _spoke, _c = _seed_participant(tmp_path)  # primary gov contract_version=2
+    roam_platform = make_platform(plugins=[
+        plugin_entry("governance", "http://roam-gov", contract_version=3,
+                     events=["decision.recorded"]),
+    ])
+    roam_gov = make_participant()
+    client = RoutedClient({
+        "prim-gov": primary.app, "roam-platform": roam_platform.app, "roam-gov": roam_gov.app,
+    })
+    with pytest.raises(PairingError, match="contract_version mismatch"):
+        seed.run_reverse_pair(client, _cfg([sp]), report=lambda _m: None)
 
 
 # --- helpers ------------------------------------------------------------------
