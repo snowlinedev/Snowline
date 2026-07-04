@@ -298,3 +298,46 @@ def test_register_returns_secret_once_and_never_lists_it(session):
     assert "secret" not in listed[0] and "previous_secret" not in listed[0]
     with pytest.raises(ValueError, match="already exists"):
         _register(session)
+
+
+def test_double_rotation_keeps_the_sender_verified_secret(session):
+    """The double-rotate race: the pairing CLI crashes between mint and carry,
+    the operator re-runs the rotation. The re-rotate must KEEP the secret the
+    sender provably still signs with (s1) and discard only the never-delivered
+    mint (s2) — overwriting previous_secret with s2 would strand the sender at
+    s1 → 401s."""
+    s1 = _register(session)["secret"]
+    _ingest(session, s1, 1)
+
+    s2 = ingest.rotate_inbound_secret(session, *STREAM)["secret"]
+    s3 = ingest.rotate_inbound_secret(session, *STREAM)["secret"]
+    session.commit()
+    assert len({s1, s2, s3}) == 3
+    assert _stream(session).previous_secret == s1  # NOT s2
+
+    # The sender (still on s1) keeps flowing through both rotations…
+    status, resp = _ingest(session, s1, 2)
+    assert (status, resp["status"]) == (200, "applied")
+    # …the lost mint never verifies…
+    status, resp = _ingest(session, s2, 3)
+    assert (status, resp["reason"]) == (401, "bad_signature")
+    # …and the carried replacement completes the rotation normally.
+    status, resp = _ingest(session, s3, 3)
+    assert (status, resp["status"]) == (200, "applied")
+    assert _stream(session).previous_secret is None  # s1 retired
+    status, resp = _ingest(session, s1, 4)
+    assert (status, resp["reason"]) == (401, "bad_signature")
+
+
+def test_peer_seen_is_validated_like_seq(session):
+    """`peer_seen` flows raw into the apply seam and §6.1's concurrency
+    detection consumes it — a non-int / negative value is a 400 rejection, not
+    silently applied."""
+    secret = _register(session)["secret"]
+    for bad in ("garbage", -1, None, True):
+        body, sig = _delivery(secret, 1, peer_seen=bad)
+        status, resp = ingest.ingest_delivery(session, body, sig, Applied())
+        assert (status, resp["reason"]) == (400, "malformed_envelope"), bad
+    # …and the stream is untouched: the valid seq 1 still applies.
+    status, resp = _ingest(session, secret, 1)
+    assert (status, resp["status"]) == (200, "applied")

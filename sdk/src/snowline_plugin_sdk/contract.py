@@ -23,6 +23,11 @@ EVENT_TYPES: frozenset[str] = frozenset(
 # EMIT-time `seq`, `peer_seen` — is a breaking addition over v1's
 # delivery-time-seq shape. Without the bump, a v1 peer would silently accept
 # and misprocess a v2 event under `check_contract_version`'s <= rule.
+# DEPLOY ORDERING: governance's legacy fire-and-forget bus stamps this version
+# into its (v1-shaped) payloads too, and a still-deployed SDK-v1 consumer's
+# `verify_event` REJECTS version 2 — under the bus's attempt cap (default 5)
+# those deliveries dead-letter. Upgrade webhook consumers to this SDK before
+# or together with governance.
 CONTRACT_VERSION: int = 2
 
 
