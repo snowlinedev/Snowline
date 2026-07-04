@@ -325,6 +325,29 @@ class ReplicationBlock(BaseModel):
         description="the event-type vocabulary this plugin emits, declared "
         "so pairing (§5) can warn on vocabulary skew between instances",
     )
+    advertised_base_url: str | None = Field(
+        default=None,
+        description="optional peer-reachable address for this plugin's "
+        "replication surfaces over the tailnet, when it differs from the "
+        "loopback base_url advertised to this plugin's own registry (§4.1). "
+        "Pairing (§5) prefers it; absent, pairing falls back to the "
+        "port-preserving rewrite of base_url. None = no override (the "
+        "fallback applies)",
+    )
+
+    @field_validator("advertised_base_url")
+    @classmethod
+    def _valid_advertised_base_url(cls, v: str | None) -> str | None:
+        # Same shape rule as PluginManifest.base_url — it IS a base_url, just
+        # the peer-facing one — so a malformed value fails loud at registration
+        # rather than becoming an unreachable pairing target.
+        if v is None:
+            return v
+        if not (v.startswith("http://") or v.startswith("https://")):
+            raise ValueError(
+                f"advertised_base_url {v!r} must start with http:// or https://"
+            )
+        return v.rstrip("/")
 
 
 class PluginManifest(BaseModel):

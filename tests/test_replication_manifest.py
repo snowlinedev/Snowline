@@ -73,6 +73,32 @@ def test_unknown_top_level_replication_field_rejected():
         _manifest(_replication(bogus=True))
 
 
+def test_advertised_base_url_absent_defaults_to_none():
+    # The field is optional (§4.1): a plugin that never declares it pairs by the
+    # port-preserving fallback (#96), so absence must be a clean None.
+    m = _manifest(_replication())
+    assert m.replication.advertised_base_url is None
+
+
+def test_advertised_base_url_present_and_stored():
+    m = _manifest(_replication(advertised_base_url="http://roam.tailnet:8801"))
+    assert m.replication.advertised_base_url == "http://roam.tailnet:8801"
+
+
+def test_advertised_base_url_trailing_slash_stripped():
+    # Same normalization as PluginManifest.base_url — it IS a base_url — so the
+    # pairing CLI can join paths without doubled slashes.
+    m = _manifest(_replication(advertised_base_url="https://roam.tailnet:8801/"))
+    assert m.replication.advertised_base_url == "https://roam.tailnet:8801"
+
+
+def test_advertised_base_url_malformed_rejected():
+    # Same http(s) shape rule as base_url: a malformed value fails loud at
+    # registration rather than becoming an unreachable pairing target.
+    with pytest.raises(ValidationError, match="advertised_base_url"):
+        _manifest(_replication(advertised_base_url="roam.tailnet:8801"))
+
+
 def test_registry_stores_replication_block():
     # The registry stores the whole manifest object, so once the field exists
     # on PluginManifest, storage is automatic — this pins that down as a
