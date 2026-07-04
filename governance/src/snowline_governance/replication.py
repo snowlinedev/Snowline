@@ -21,8 +21,10 @@ the WRONG one for replication streams (delivery order is not authoring order; a
 re-created subscription restarts at 1). Replication-class subscriptions use the
 SDK's `snowline_plugin_sdk.replication` emit module instead: `seq` allocated at
 EMIT time in the domain write's transaction, streams keyed `(source_id, epoch)`,
-`peer_seen` in the envelope, contract version 2. Governance adopts it in §9
-item 3 (#79); THIS module remains the fire-and-forget bus until then.
+`peer_seen` in the envelope, contract version 2. Governance ADOPTED it in §9
+item 3 (#79) — the stream emit hook lives in `replication_stream.py`, the
+ingest apply in `replication_apply.py`; THIS module stays the fire-and-forget
+webhook bus, decisions-only, unchanged.
 Signatures stay DELIVERY-time over the exact bytes POSTed in both classes —
 §5's hitless rotation depends on it.
 

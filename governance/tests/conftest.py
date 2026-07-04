@@ -43,12 +43,26 @@ def _shadow_turns_stay_off(monkeypatch):
     monkeypatch.setenv("SNOWLINE_SHADOW_TURNS_ENABLED", "0")
 
 
+@pytest.fixture(autouse=True)
+def _replication_delivery_stays_off(monkeypatch):
+    """The SDK replication delivery loop (app lifespan, #79) must not tick
+    inside the suite — same rationale as the webhook/turn pins. The tests that
+    exercise delivery call `deliver_pending` directly, which this flag does not
+    gate."""
+    monkeypatch.setenv("SNOWLINE_REPLICATION_DISABLED", "1")
+
+
 def _db_name(url: str) -> str:
     return sa.make_url(url).database
 
 
 def _maintenance_url(url: str) -> str:
-    return str(sa.make_url(url).set(database="postgres"))
+    # render_as_string, NOT str(): str() masks the password as `***`, which the
+    # maintenance engine would then send literally — a password-bearing test DB
+    # URL could never connect.
+    return sa.make_url(url).set(database="postgres").render_as_string(
+        hide_password=False
+    )
 
 
 def alembic_config() -> Config:
@@ -135,7 +149,11 @@ def clean_db(migrated_db):
                 "TRUNCATE decisions, artifacts, artifact_versions, "
                 "artifact_governs, shadow_branches, shadow_nodes, "
                 "shadow_node_citations, shadow_conversation_events, "
-                "webhook_subscriptions, webhook_deliveries "
+                "webhook_subscriptions, webhook_deliveries, "
+                "decision_concurrences, replication_lww_registers, "
+                "replication_subscriptions, replication_outbox, "
+                "replication_stream_counters, replication_inbound_streams, "
+                "replication_parked_events "
                 "RESTART IDENTITY CASCADE"
             )
         )

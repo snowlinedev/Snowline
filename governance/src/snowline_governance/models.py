@@ -435,6 +435,62 @@ class ShadowConversationEvent(Base):
     )
 
 
+# --- REPLICATION conflict state (replication-continuity §6/§6.1, #79) --------
+#
+# GOVERNANCE-OWNED domain tables (on `Base`, NOT the SDK's `ReplicationBase`):
+# they carry domain meaning — which decisions collided, which register value is
+# current — and must travel with the store in a §7 `pg_dump`, unlike the SDK's
+# envelope plumbing that the seed scrubs.
+
+
+class DecisionConcurrence(Base):
+    """One §6.1 concurrent-sibling flag: two decisions authored on opposite sides
+    of a partition, in overlapping scope (the applicability chain). Written at
+    INGEST by the detection walk (`replication_apply`), symmetrically on both
+    instances — each side derives the same pair from the same causal facts, so
+    the markers converge without replicating themselves.
+
+    The pair is stored NORMALIZED (`decision_id` < `concurrent_with_id` as
+    UUIDs), one row per unordered pair — both sides compute the identical row.
+    The row is never deleted: "unreconciled" is DERIVED (both members still
+    leaves), so recording the reconciling supersession clears the flag on both
+    sides the moment that ordinary event applies — no marker write needed
+    (§6.1: reconciliation is ordinary governance)."""
+
+    __tablename__ = "decision_concurrences"
+
+    # Normalized pair: decision_id is the lesser UUID, concurrent_with_id the
+    # greater — plain values (soft refs into `decisions`; the members may arrive
+    # in either order across the two streams, so no FK ordering assumption).
+    decision_id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    concurrent_with_id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class LwwRegister(Base):
+    """The §6 last-writer-wins state for ONE mutable field of one row — the
+    "contested row" bookkeeping that lets both sides resolve a same-object race
+    as a pure function of the two events (LWW by event timestamp, `source_id`
+    tiebreak), regardless of arrival order.
+
+    Written by LOCAL lifecycle writes (via `replication_stream.emit`) and by
+    WINNING applies (`replication_apply`): `(written_at, source_id)` is the
+    current value's authoring coordinate, `event_ref` the authoring event's
+    `event_id` — the id a resolved-conflict WARNING pairs with the incoming
+    event's (§6: logged with BOTH event ids). Only the LWW-register event types
+    (notes/maturity/governs/graduation stamps) keep registers; append-only
+    events need none."""
+
+    __tablename__ = "replication_lww_registers"
+
+    object_kind: Mapped[str] = mapped_column(String, primary_key=True)
+    object_id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    field: Mapped[str] = mapped_column(String, primary_key=True)
+    written_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    source_id: Mapped[str] = mapped_column(String, nullable=False)
+    event_ref: Mapped[str] = mapped_column(String, nullable=False)
+
+
 # --- the WEBHOOK BUS (spec §7) — the EMIT side ------------------------------
 #
 # Governance emits signed `decision.recorded` / `decision.superseded` events on a

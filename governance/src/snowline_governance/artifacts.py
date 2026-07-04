@@ -37,7 +37,14 @@ import uuid
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from snowline_governance import branching
+from snowline_governance import branching, replication_stream
+from snowline_governance.contract import (
+    EVENT_ARTIFACT_GOVERNS_SET,
+    EVENT_ARTIFACT_MATURITY_SET,
+    EVENT_ARTIFACT_REGISTERED,
+    EVENT_ARTIFACT_RESOLVED,
+    EVENT_ARTIFACT_REVISED,
+)
 from snowline_governance.models import (
     ARTIFACT_BACKEND_GIT,
     ARTIFACT_BACKEND_INLINE,
@@ -325,12 +332,18 @@ def register_artifact(
     )
     session.add(artifact)
     session.flush()
-    session.add(
-        ArtifactVersion(artifact_id=artifact.id, body_snapshot=body)
-    )
+    initial = ArtifactVersion(artifact_id=artifact.id, body_snapshot=body)
+    session.add(initial)
     if governs is not None:
         _apply_governs(session, artifact, governs, resolved_scopes)
     session.flush()
+    # STREAM emit (replication-continuity §4 coverage, #79): ONE creation write
+    # — artifact + initial version + governs — one event, same transaction.
+    replication_stream.emit(
+        session,
+        EVENT_ARTIFACT_REGISTERED,
+        replication_stream.artifact_registered_payload(session, artifact, initial),
+    )
     return _artifact_dict(session, artifact)
 
 
@@ -372,16 +385,20 @@ def revise_artifact(
                 f"version {supersedes!r} is not a version of this artifact"
             )
         sup_id = sup.id
-    session.add(
-        ArtifactVersion(
-            artifact_id=a.id,
-            supersedes_id=sup_id,
-            relation=relation,
-            body_snapshot=body_snapshot,
-            summary=summary,
-        )
+    version = ArtifactVersion(
+        artifact_id=a.id,
+        supersedes_id=sup_id,
+        relation=relation,
+        body_snapshot=body_snapshot,
+        summary=summary,
     )
+    session.add(version)
     session.flush()
+    replication_stream.emit(
+        session,
+        EVENT_ARTIFACT_REVISED,
+        replication_stream.artifact_revised_payload(version),
+    )
     return _artifact_dict(session, a)
 
 
@@ -411,6 +428,13 @@ def resolve_artifact(session: Session, artifact_id: str, version_id: str) -> dic
         )
     target.status = "superseded"
     session.flush()
+    # STREAM emit — a one-way status flip (monotone; apply is idempotent, no
+    # LWW register needed: two sides flipping DIFFERENT losers both converge).
+    replication_stream.emit(
+        session,
+        EVENT_ARTIFACT_RESOLVED,
+        replication_stream.artifact_resolved_payload(a.id, target.id),
+    )
     return _artifact_dict(session, a)
 
 
@@ -426,6 +450,14 @@ def set_maturity(session: Session, artifact_id: str, maturity: str) -> dict:
     a = _require_artifact(session, artifact_id)
     a.maturity = maturity
     session.flush()
+    # STREAM emit — an in-place LWW register write (§6): the hook records this
+    # write's (at, source) coordinate so a partitioned race resolves the same
+    # way on both sides.
+    replication_stream.emit(
+        session,
+        EVENT_ARTIFACT_MATURITY_SET,
+        replication_stream.maturity_set_payload(a),
+    )
     return _artifact_dict(session, a)
 
 
@@ -444,6 +476,13 @@ def set_governs(
     `scope_id` (#11). Returns the refreshed artifact."""
     a = _require_artifact(session, artifact_id)
     _apply_governs(session, a, governs, resolved_scopes)
+    # STREAM emit — the governs SET is one LWW register (the write is a
+    # wholesale replace, so the whole set is the contested value).
+    replication_stream.emit(
+        session,
+        EVENT_ARTIFACT_GOVERNS_SET,
+        replication_stream.governs_set_payload(session, a),
+    )
     return _artifact_dict(session, a)
 
 

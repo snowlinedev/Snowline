@@ -26,8 +26,45 @@ from __future__ import annotations
 EVENT_DECISION_RECORDED: str = "decision.recorded"
 EVENT_DECISION_SUPERSEDED: str = "decision.superseded"
 
+# Full-write-surface coverage (replication-continuity §4 / §9 item 3, #79):
+# one event type per lifecycle write, so two instances' governance stores can
+# converge from events alone. The SHADOW graph events cover every shadow write
+# (the conversation appender is ONE write path — `_append_conversation_event` —
+# so message + agent.error share one event type); `shadow.graduated` is the
+# provenance stamp both graduation shapes perform AFTER the decision event
+# (node-level carries a `node_id`, branch-level carries none). The ARTIFACT
+# events cover the spec/plan/reference docs — governance's "specs" ARE
+# artifacts (`doc_kind`), there is no separate spec store.
+EVENT_SHADOW_BRANCH_CREATED: str = "shadow.branch_created"
+EVENT_SHADOW_BRANCH_ARCHIVED: str = "shadow.branch_archived"
+EVENT_SHADOW_NOTES_SET: str = "shadow.notes_set"
+EVENT_SHADOW_NODE_ADDED: str = "shadow.node_added"
+EVENT_SHADOW_CITATION_ADDED: str = "shadow.citation_added"
+EVENT_SHADOW_CONVERSATION_APPENDED: str = "shadow.conversation_appended"
+EVENT_SHADOW_GRADUATED: str = "shadow.graduated"
+EVENT_ARTIFACT_REGISTERED: str = "artifact.registered"
+EVENT_ARTIFACT_REVISED: str = "artifact.revised"
+EVENT_ARTIFACT_RESOLVED: str = "artifact.resolved"
+EVENT_ARTIFACT_MATURITY_SET: str = "artifact.maturity_set"
+EVENT_ARTIFACT_GOVERNS_SET: str = "artifact.governs_set"
+
 EVENT_TYPES: frozenset[str] = frozenset(
-    {EVENT_DECISION_RECORDED, EVENT_DECISION_SUPERSEDED}
+    {
+        EVENT_DECISION_RECORDED,
+        EVENT_DECISION_SUPERSEDED,
+        EVENT_SHADOW_BRANCH_CREATED,
+        EVENT_SHADOW_BRANCH_ARCHIVED,
+        EVENT_SHADOW_NOTES_SET,
+        EVENT_SHADOW_NODE_ADDED,
+        EVENT_SHADOW_CITATION_ADDED,
+        EVENT_SHADOW_CONVERSATION_APPENDED,
+        EVENT_SHADOW_GRADUATED,
+        EVENT_ARTIFACT_REGISTERED,
+        EVENT_ARTIFACT_REVISED,
+        EVENT_ARTIFACT_RESOLVED,
+        EVENT_ARTIFACT_MATURITY_SET,
+        EVENT_ARTIFACT_GOVERNS_SET,
+    }
 )
 
 # The published contract version, stamped into every emitted payload. A consumer

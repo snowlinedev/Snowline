@@ -96,6 +96,28 @@ def test_shadow_activity_widget_empty_db(monkeypatch, clean_db):
     assert body["label"] == "open shadow branches"
 
 
+def test_unreconciled_decisions_widget_counts_open_pairs(monkeypatch, clean_db):
+    """The §6.1 stat (replication-continuity, #79): open concurrent-sibling
+    pairs; a supersession over either member clears the pair from the count
+    (derived, not stored)."""
+    from snowline_governance import concurrence, decisions
+
+    with session_scope() as s:
+        a = decisions.record_decision(s, "acme/widget", _sid("acme/widget"), "A")
+        b = decisions.record_decision(s, "acme/widget", _sid("acme/widget"), "B")
+        concurrence.flag_pair(s, uuid.UUID(a["id"]), uuid.UUID(b["id"]))
+
+    resp = _get_sync(_app(monkeypatch), "/ui-api/widgets/unreconciled-decisions")
+    assert resp.status_code == 200
+    assert resp.json() == {"value": 1, "label": "unreconciled decisions"}
+
+    # Reconciliation is an ordinary supersession — the flag derives away.
+    with session_scope() as s:
+        decisions.supersede_decision(s, b["id"], "A stands")
+    resp = _get_sync(_app(monkeypatch), "/ui-api/widgets/unreconciled-decisions")
+    assert resp.json()["value"] == 0
+
+
 # --- page: branches table -------------------------------------------------
 
 

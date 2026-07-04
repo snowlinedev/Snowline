@@ -30,7 +30,7 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from snowline_governance import branching, replication
+from snowline_governance import branching, concurrence, replication, replication_stream
 from snowline_governance.contract import (
     EVENT_DECISION_RECORDED,
     EVENT_DECISION_SUPERSEDED,
@@ -183,6 +183,11 @@ def record_decision(
     replication.emit_decision_event(
         session, EVENT_DECISION_RECORDED, row, scope_slug
     )
+    # STREAM emit (replication-continuity §3.2, #79): the same write on the
+    # replication-class outbox, v2 envelope, emit-time seq (no-op unpaired).
+    replication_stream.emit(
+        session, EVENT_DECISION_RECORDED, replication_stream.decision_payload(row)
+    )
     return {
         "id": str(row.id),
         "scope": scope_slug,
@@ -236,6 +241,13 @@ def supersede_decision(
     replication.emit_decision_event(
         session, EVENT_DECISION_SUPERSEDED, row, prior.scope_slug
     )
+    # STREAM emit (replication-continuity §3.2, #79) — the superseding leaf's
+    # payload carries `supersedes_id`, the link apply preserves.
+    replication_stream.emit(
+        session,
+        EVENT_DECISION_SUPERSEDED,
+        replication_stream.decision_payload(row),
+    )
     return {
         "id": str(row.id),
         "scope": prior.scope_slug,
@@ -271,6 +283,10 @@ def get_decision(session: Session, decision_id: str) -> dict:
         "at": d.recorded_at.isoformat() if d.recorded_at else None,
         "supersedes": str(d.supersedes_id) if d.supersedes_id else None,
         "superseded_by": str(superseded_by) if superseded_by else None,
+        # §6.1 concurrent-sibling markers: the OTHER member of each still-
+        # unreconciled flagged pair. Empty once a supersession touches either
+        # member (the flag is derived, so it clears on both sides).
+        "concurrent_with": concurrence.concurrent_with(session, d.id),
         "shadow_origin": (
             {"node_id": d.shadow_origin_node_id, "label": d.shadow_origin_label}
             if d.shadow_origin_label

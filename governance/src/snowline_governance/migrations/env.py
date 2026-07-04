@@ -1,5 +1,6 @@
 from alembic import context
 from sqlalchemy import engine_from_config, pool
+from snowline_plugin_sdk.replication.models import ReplicationBase
 
 from snowline_governance.config import database_url
 from snowline_governance.models import Base
@@ -7,7 +8,10 @@ from snowline_governance.models import Base
 config = context.config
 config.set_main_option("sqlalchemy.url", database_url())
 
-target_metadata = Base.metadata
+# Governance's own metadata PLUS the adopted SDK replication tables
+# (replication-continuity §4, #79) — so autogenerate compares against the full
+# set this chain owns instead of proposing drops of the SDK tables.
+target_metadata = [Base.metadata, ReplicationBase.metadata]
 
 
 def run_migrations_offline() -> None:

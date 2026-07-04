@@ -37,7 +37,8 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from snowline_governance import decisions, shadow
+from snowline_governance import decisions, replication_stream, shadow
+from snowline_governance.contract import EVENT_SHADOW_GRADUATED
 from snowline_governance.models import Decision, ShadowBranch, ShadowNode
 
 
@@ -71,6 +72,17 @@ def _record_and_stamp(
     dec.shadow_origin_label = address
     node.graduated_decision_id = dec.id
     session.flush()
+    # STREAM emit (replication-continuity §4 coverage, #79): the provenance
+    # stamp is its own lifecycle write, AFTER the decision's own event on the
+    # same stream. Node-level, so the node's `graduated_decision_id` is
+    # LWW-guarded (both sides may graduate the same node across a partition).
+    replication_stream.emit(
+        session,
+        EVENT_SHADOW_GRADUATED,
+        replication_stream.graduated_payload(
+            rec["id"], str(node.id), address, None
+        ),
+    )
     return rec["id"]
 
 
@@ -231,6 +243,14 @@ def _record_and_stamp_branch(
     dec.shadow_origin_label = address  # node_id stays NULL (branch-level)
     dec.shadow_origin_kind = kind
     session.flush()
+    # STREAM emit — branch-level stamp: no node_id, `kind` discriminates the
+    # graduation end decision from a rejection (no LWW register: each side
+    # stamps the decision it minted itself, so there is no shared row to race).
+    replication_stream.emit(
+        session,
+        EVENT_SHADOW_GRADUATED,
+        replication_stream.graduated_payload(rec["id"], None, address, kind),
+    )
     return rec["id"]
 
 

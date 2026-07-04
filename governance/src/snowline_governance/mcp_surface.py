@@ -38,7 +38,7 @@ import anyio
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-from snowline_governance import artifacts, decisions, graduation, shadow
+from snowline_governance import artifacts, concurrence, decisions, graduation, shadow
 from snowline_governance.db import session_scope
 from snowline_governance.scope_client import (
     HttpScopeClient,
@@ -207,6 +207,22 @@ def _register_read_tools(mcp: FastMCP, client: ScopeClient) -> None:
         return await anyio.to_thread.run_sync(
             _list_artifacts_sync, governs, limit
         )
+
+    def _unreconciled_decisions_sync(limit):
+        with session_scope() as session:
+            return concurrence.unreconciled_pairs(session, limit=limit)
+
+    @mcp.tool()
+    async def unreconciled_decisions(limit: int = 50) -> dict:
+        """Decision pairs flagged as CONCURRENT SIBLINGS at replication ingest
+        (replication-continuity §6.1): authored on both instances during a
+        partition, in the same scope or along one applicability chain — they
+        may semantically collide, and neither supersedes the other yet. Review
+        each pair; reconciliation is ordinary governance (record a
+        `supersede_decision` over the losing member — the flag clears on both
+        instances once that replicates). Read-only; empty is the healthy state.
+        """
+        return await anyio.to_thread.run_sync(_unreconciled_decisions_sync, limit)
 
     def _applicable_artifacts_sync(scope, limit):
         with session_scope() as session:
