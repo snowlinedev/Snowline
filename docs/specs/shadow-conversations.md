@@ -126,11 +126,16 @@ Shell (dashboard `thread` component):
 A background loop in governance (rides the lifespan task group beside
 `webhook_delivery_loop`; OFF in tests, gated by env):
 
-- **Pending turn:** a branch whose LAST `message` event has
+- **Pending turn:** a branch whose LAST conversation event is a `message` with
   `author: "human"` and no in-flight claim. Claim = an in-process set +
   a stale-claim timeout (a crashed turn un-claims after
   `SNOWLINE_SHADOW_TURN_TIMEOUT`, default 300 s); one turn per branch at a
   time, `SNOWLINE_SHADOW_TURN_CONCURRENCY` (default 1) across branches.
+  **Answered semantics** (a choice this spec left open, fixed by #71): a branch
+  is pending ONLY when its LAST event is a human `message`. A delivered agent
+  `message` OR an `agent.error` (a failed turn) as the last event ANSWERS the
+  turn — the human must post a fresh message to retry. So a failed turn is
+  terminal, never auto-retried, and a persistently-failing turn can't hot-loop.
 - **Context assembly:** branch name/scope/narrative notes, its nodes +
   citations, the conversation log tail, and the scope's applicable decisions
   (the grounding that makes a shadow reply worth having). Clamped to a
