@@ -49,4 +49,8 @@ EVENT_TYPES: frozenset[str] = frozenset(
 # Version 2 (replication-continuity §3.2, #77): the stream envelope — `epoch`,
 # EMIT-time `seq`, `peer_seen` — a breaking addition, bumped in BOTH pinned
 # copies in one commit (the drift guard keeps them equal).
+# DEPLOY ORDERING: this version rides the legacy bus's payloads too
+# (`build_decision_event` stamps it), and an SDK-v1 consumer's `verify_event`
+# rejects it — the bus's attempt cap (default 5) then dead-letters those
+# deliveries. Upgrade webhook consumers before or together with governance.
 CONTRACT_VERSION: int = 2
