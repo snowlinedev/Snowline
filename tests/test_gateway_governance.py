@@ -43,7 +43,12 @@ _GOV_DB_URL = os.environ.get(
 
 
 def _maintenance_url(url: str) -> str:
-    return str(sa.make_url(url).set(database="postgres"))
+    # render_as_string, NOT str(): str() masks the password as `***`, which the
+    # maintenance engine would then send literally — a password-bearing test DB
+    # URL could never connect (issue #94).
+    return sa.make_url(url).set(database="postgres").render_as_string(
+        hide_password=False
+    )
 
 
 def _db_name(url: str) -> str:

@@ -39,7 +39,12 @@ def _db_name(url: str) -> str:
 
 
 def _maintenance_url(url: str) -> str:
-    return str(sa.make_url(url).set(database="postgres"))
+    # render_as_string, NOT str(): str() masks the password as `***`, which the
+    # maintenance engine would then send literally — a password-bearing test DB
+    # URL could never connect.
+    return sa.make_url(url).set(database="postgres").render_as_string(
+        hide_password=False
+    )
 
 
 def alembic_config() -> Config:
