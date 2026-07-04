@@ -153,6 +153,31 @@ per-plugin degradation, never whole-platform. Worst case for a private plugin
 that stays single-home: this spec is its *reference* for adopting the SDK
 modules later, and until then it accepts hub-only availability.
 
+### 4.1 Non-replicating plugins — registration is per-instance
+
+Each instance is a complete Snowline with its **own registry**; "registered"
+is never a global fact. A plugin that doesn't replicate still chooses, per
+instance, whether to appear on that instance's surfaces. Two sanctioned
+shapes:
+
+- **Single-home, cross-registered** — one process on one machine, registered
+  (and heartbeating) with *every* instance that should compose it,
+  advertising the right `base_url` per target: loopback to the platform it
+  shares a machine with (§5.1), its tailnet address to the other. This is
+  just gateway.md §5's cross-tailnet addressing exercised from the spoke.
+  Tailnet up → its tools work everywhere, proxied; tailnet down → health
+  marks it unreachable on the remote instance and only its tools route-around.
+- **Per-machine, locally registered** — for a plugin whose "store" is the
+  machine itself (walkthrough-mcp: the local `simctl` simulators), run an
+  independent instance on each Mac, each registering only with its local
+  platform over loopback. Nothing replicates because nothing is shared; the
+  spoke's copy works fully offline against its own machine.
+
+Which shape a machine-bound plugin takes is *its* semantic call — "drive the
+hub machine's simulators" is the first; "drive the simulators wherever I am"
+is the second — decided in the plugin's repo, not here. Both compose without
+platform changes.
+
 **Event coverage is the real per-plugin work.** The bus today emits only
 `decision.recorded` / `decision.superseded`. Full-store convergence means
 each opted-in plugin covers its write surface with events:
