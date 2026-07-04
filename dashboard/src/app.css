@@ -45,6 +45,24 @@
   font-weight: 600;
 }
 
+/* registered-page nav groups (ui-shell.md §6): native pages first, then one
+ * small heading per contributing plugin. */
+.nav-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin-top: var(--space-3);
+}
+
+.nav-group-heading {
+  margin: 0;
+  padding: 0 var(--space-3);
+  color: var(--ink-muted);
+  font-size: var(--font-small);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
 .shell-main {
   flex: 1;
   min-width: 0;
@@ -121,6 +139,45 @@
   margin-top: var(--space-1);
 }
 
+.stat .stat-delta {
+  font-size: var(--font-small);
+  margin-top: var(--space-1);
+}
+
+/* Semantic intent colors (§4.1 stat/list `intent`) — always paired with a
+ * text label or, for the list dot, adjacent link text: never color alone
+ * (ACCESSIBILITY.md 1.4.1). */
+.intent-good {
+  color: var(--status-up);
+}
+
+.intent-bad {
+  color: var(--status-down);
+}
+
+.intent-neutral {
+  color: var(--ink-muted);
+}
+
+.kind-list .dot.intent-good {
+  background: var(--status-up);
+}
+
+.kind-list .dot.intent-bad {
+  background: var(--status-down);
+}
+
+.kind-list .dot.intent-neutral {
+  background: var(--status-unknown);
+}
+
+.kind-list .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
 /* kind: list */
 .kind-list {
   list-style: none;
@@ -140,10 +197,13 @@
   border-bottom: none;
 }
 
-.kind-list .meta {
-  margin-left: auto;
+.meta {
   color: var(--ink-muted);
   font-size: var(--font-small);
+}
+
+.kind-list .meta {
+  margin-left: auto;
 }
 
 /* kind: table — wide tables scroll inside their own container (1.4.10:
@@ -175,6 +235,95 @@
 
 .kind-table tr:last-child td {
   border-bottom: none;
+}
+
+/* kind: thread — ordered authored markdown nodes (the shadow discussion
+ * view) */
+.thread-title {
+  margin: 0 0 var(--space-2);
+  font-size: var(--font-body);
+}
+
+.thread-meta {
+  margin-bottom: var(--space-3);
+}
+
+.thread-nodes {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.thread-node {
+  border-top: 1px solid var(--hairline);
+  padding-top: var(--space-3);
+}
+
+.thread-node:first-child {
+  border-top: none;
+  padding-top: 0;
+}
+
+.thread-node-header {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+
+.thread-node-author {
+  font-weight: 600;
+}
+
+.thread-node-kind,
+.thread-node-at {
+  color: var(--ink-muted);
+  font-size: var(--font-small);
+}
+
+.thread-node-citations {
+  margin-top: var(--space-2);
+}
+
+/* kind: document */
+.document-title {
+  margin: 0 0 var(--space-2);
+  font-size: var(--font-body);
+}
+
+.document-meta {
+  margin-bottom: var(--space-3);
+}
+
+/* markdown: the safe subset renderer (kinds.tsx) — spacing only, no raw
+ * markup ever reaches here. */
+.markdown p,
+.markdown ul,
+.markdown ol,
+.markdown h4,
+.markdown h5,
+.markdown h6 {
+  margin: 0 0 var(--space-2);
+}
+
+.markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.markdown ul,
+.markdown ol {
+  padding-left: var(--space-5);
+}
+
+.markdown code {
+  background: var(--surface-card);
+  border: 1px solid var(--hairline);
+  border-radius: 4px;
+  padding: 0 4px;
+  font-size: 0.95em;
 }
 
 /* status chip: dot + text label, never color alone */

@@ -12,6 +12,7 @@ export default defineConfig({
       "/plugins": "http://127.0.0.1:8850",
       "/scopes": "http://127.0.0.1:8850",
       "/surfaces": "http://127.0.0.1:8850",
+      "/ui-api": "http://127.0.0.1:8850",
     },
   },
   test: {
