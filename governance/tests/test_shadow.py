@@ -413,7 +413,7 @@ def test_get_branch_conversation_tail_caps_and_includes_errors(db_session):
     for i in range(total):
         shadow.add_message(db_session, branch["id"], f"m{i}", "human")
     # An agent.error event counts as conversation (spec §2) and appears in the tail.
-    _append_error_event(db_session, branch["id"], total + 1, "boom")
+    shadow.append_error(db_session, branch["id"], "boom")
 
     tail = shadow.get_branch(db_session, slug, "line-a")["conversation"]
     assert len(tail) == shadow.CONVERSATION_TAIL_LIMIT
@@ -424,20 +424,33 @@ def test_get_branch_conversation_tail_caps_and_includes_errors(db_session):
     assert last["seq"] == total + 1
 
 
-def _append_error_event(session, branch_id, seq, error_text):
-    """Seed an `agent.error` conversation event directly (phase 2's turn-runner
-    that writes these is a later PR — spec §6)."""
-    from snowline_governance.models import ShadowConversationEvent
+def test_append_error_allocates_seq_and_respects_archive(db_session):
+    # append_error shares the ONE seq allocator with add_message — interleaved
+    # appends of both kinds get strictly increasing seqs — and an archived
+    # branch takes no further error events either.
+    slug = "acme/widget"
+    branch = shadow.create_branch(db_session, slug, _sid(slug), "line-b")
+    m1 = shadow.add_message(db_session, branch["id"], "hi", "human")
+    e1 = shadow.append_error(db_session, branch["id"], "codex timed out")
+    m2 = shadow.add_message(db_session, branch["id"], "retry?", "human")
+    assert [m1["seq"], e1["seq"], m2["seq"]] == [1, 2, 3]
+    assert e1["kind"] == shadow.CONVERSATION_ERROR_KIND
+    assert e1["payload"] == {"error": "codex timed out"}
+    # Blank error text still yields a visible message, never an empty bubble.
+    e2 = shadow.append_error(db_session, branch["id"], "   ")
+    assert e2["payload"]["error"]
+    shadow.archive_branch(db_session, slug, "line-b")
+    with pytest.raises(shadow.BranchArchivedError):
+        shadow.append_error(db_session, branch["id"], "late failure")
 
-    session.add(
-        ShadowConversationEvent(
-            branch_id=uuid.UUID(str(branch_id)),
-            seq=seq,
-            kind="agent.error",
-            payload={"error": error_text},
-        )
-    )
-    session.flush()
+
+def test_add_message_rejects_unknown_author(db_session):
+    # The author enum guards the thread renderer's you/agent mapping — an MCP
+    # caller can't invent a third author kind (or spoof arbitrary strings).
+    slug = "acme/widget"
+    branch = shadow.create_branch(db_session, slug, _sid(slug), "line-c")
+    with pytest.raises(shadow.MessageValidationError, match="author"):
+        shadow.add_message(db_session, branch["id"], "hi", "narrative")
 
 
 # --- MCP parity (shadow-conversations §5) — in-memory FastMCP round-trip ------

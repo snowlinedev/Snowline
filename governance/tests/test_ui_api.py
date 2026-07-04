@@ -288,8 +288,6 @@ def test_branch_thread_merges_conversation_chronologically(monkeypatch, clean_db
 
 
 def test_branch_thread_renders_agent_message_and_error(monkeypatch, clean_db):
-    from snowline_governance.models import ShadowConversationEvent
-
     with session_scope() as s:
         branch = shadow.create_branch(
             s, "acme/widget", _sid("acme/widget"), "line-a"
@@ -297,16 +295,9 @@ def test_branch_thread_renders_agent_message_and_error(monkeypatch, clean_db):
     with session_scope() as s:
         shadow.add_message(s, branch["id"], "an agent turn", "agent")
     with session_scope() as s:
-        # An agent.error event (phase 2's turn-runner writes these; seeded here)
-        # renders fail-visible as an "error" node.
-        s.add(
-            ShadowConversationEvent(
-                branch_id=uuid.UUID(branch["id"]),
-                seq=2,
-                kind="agent.error",
-                payload={"error": "codex timed out"},
-            )
-        )
+        # An agent.error event (phase 2's turn-runner writes these via the same
+        # service) renders fail-visible as an "error" node.
+        shadow.append_error(s, branch["id"], "codex timed out")
 
     nodes = _get_sync(
         _app(monkeypatch), f"/ui-api/pages/branches/{branch['id']}"

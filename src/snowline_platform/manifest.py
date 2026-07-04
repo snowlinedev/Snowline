@@ -187,8 +187,9 @@ class UIComposer(BaseModel):
     )
     disabled_when: str | None = Field(
         default=None,
-        description="a thread `meta` flag name the shell reads to grey out "
-        "the composer (e.g. 'archived') — the plugin owns the semantics",
+        description="a flag name the shell looks for in the thread "
+        "response's top-level `flags` list to grey out the composer "
+        "(e.g. 'archived') — the plugin owns the semantics",
     )
 
     _valid_endpoint = field_validator("endpoint")(_valid_ui_endpoint)

@@ -42,6 +42,7 @@ from snowline_plugin_sdk.ui import UI_WRITE_BODY_LIMIT
 
 from snowline_governance.models import (
     DEFAULT_SHADOW_BRANCH_STATUS,
+    SHADOW_BRANCH_STATUS_ARCHIVED,
     Decision,
     ShadowBranch,
     ShadowConversationEvent,
@@ -58,6 +59,10 @@ CONVERSATION_KINDS: tuple[str, ...] = (
     CONVERSATION_MESSAGE_KIND,
     CONVERSATION_ERROR_KIND,
 )
+# The only message authors: the UI composer's browser seam writes `human`; MCP
+# sessions and the turn-runner write `agent`. Enforced at `add_message` so the
+# thread renderer's you/agent mapping can't be fed a third value.
+CONVERSATION_AUTHORS: frozenset[str] = frozenset({"human", "agent"})
 # The `get_branch` MCP tail cap (spec §5): the last ~50 conversation events so a
 # re-entering session sees what was said without dragging the whole log.
 CONVERSATION_TAIL_LIMIT = 50
@@ -361,8 +366,8 @@ def archive_branch(session: Session, scope_slug: str, name: str) -> dict:
     Idempotent: re-archiving an already-archived branch is a no-op that returns it,
     PINNING `archived_at` to the original archival (deliberately not refreshed)."""
     branch = _get_branch_row(session, scope_slug, name)
-    if branch.status != "archived":
-        branch.status = "archived"
+    if branch.status != SHADOW_BRANCH_STATUS_ARCHIVED:
+        branch.status = SHADOW_BRANCH_STATUS_ARCHIVED
         # The timestamp columns in this schema are naive UTC (server `func.now()`),
         # so stamp a naive UTC value — a tz-aware one would round-trip differently
         # than the naive value a later read returns.
@@ -484,40 +489,79 @@ def add_message(
 ) -> dict:
     """Append a `message` event to a branch's durable conversation log (spec §2).
 
-    `author` is `human` (the UI composer's browser seam) or `agent` (an MCP
-    session logging a turn); the payload is `{"author": author, "markdown":
-    markdown}`. `markdown` must be non-blank and within the proxy's body cap
-    (`UI_WRITE_BODY_LIMIT`, measured as UTF-8 byte length — the SAME boundary the
-    /ui-api POST proxy enforces, imported not hardcoded so the two can't drift);
-    a violation raises `MessageValidationError` (a `ValueError`, → 422 at the
-    route). Unknown/malformed `branch_id` raises `BranchNotFoundError` (→ 404) and
-    an archived branch raises `BranchArchivedError` (→ 409).
-
-    `seq` allocation (spec §2): the branch row is `SELECT ... FOR UPDATE`-locked
-    (the natural serialization point — turns are rare, no advisory-lock
-    machinery), then `max(seq)+1` scoped to this branch. Returns the appended
-    event via `_conversation_event_dict` (carrying its `seq` — a write receipt)."""
+    `author` must be `human` (the UI composer's browser seam) or `agent` (an
+    MCP session or the turn-runner logging a turn) — anything else raises
+    `MessageValidationError`, so the thread renderer's you/agent mapping can't
+    be fed a third value. The payload is `{"author": author, "markdown":
+    markdown}`. `markdown` must be non-blank and ≤ `UI_WRITE_BODY_LIMIT` UTF-8
+    bytes — NOTE this caps the markdown FIELD, while the /ui-api proxy caps the
+    whole JSON body at the same constant, so the effective browser-path ceiling
+    is a few bytes lower (the JSON envelope); this service cap is the MCP
+    path's boundary and the browser path's backstop. Violations raise
+    `MessageValidationError` (a `ValueError`, → 422 at the route);
+    unknown/malformed `branch_id` raises `BranchNotFoundError` (→ 404); an
+    archived branch raises `BranchArchivedError` (→ 409). Returns the appended
+    event (carrying its `seq` — a write receipt)."""
+    if author not in CONVERSATION_AUTHORS:
+        raise MessageValidationError(
+            f"author must be one of {sorted(CONVERSATION_AUTHORS)!r}, "
+            f"got {author!r}"
+        )
     if not isinstance(markdown, str) or not markdown.strip():
         raise MessageValidationError("message markdown must be a non-empty string")
-    # UTF-8 byte length — the exact boundary the /ui-api POST proxy caps at, so a
-    # message that fits the proxy fits here and vice versa (no encoding drift).
     if len(markdown.encode("utf-8")) > UI_WRITE_BODY_LIMIT:
         raise MessageValidationError(
             f"message markdown exceeds {UI_WRITE_BODY_LIMIT} bytes"
         )
+    return _append_conversation_event(
+        session,
+        branch_id,
+        CONVERSATION_MESSAGE_KIND,
+        {"author": author, "markdown": markdown},
+    )
 
+
+def append_error(
+    session: Session,
+    branch_id: uuid.UUID | str,
+    error: str,
+) -> dict:
+    """Append an `agent.error` event (spec §2) — a failed/timed-out agent turn
+    made VISIBLE in the thread (fail-visible, ui-shell §4.4), never a silent
+    stall. Shipped alongside its two readers (`_conversation_tail_dict` and the
+    thread merge) so the payload key can't drift when the turn-runner (#71)
+    starts writing it: the payload is `{"error": error}`. Same 404/409
+    semantics as `add_message` (an archived branch takes no further turns)."""
+    error = (error or "").strip() or "agent turn failed (no detail)"
+    return _append_conversation_event(
+        session, branch_id, CONVERSATION_ERROR_KIND, {"error": error}
+    )
+
+
+def _append_conversation_event(
+    session: Session,
+    branch_id: uuid.UUID | str,
+    kind: str,
+    payload: dict,
+) -> dict:
+    """The ONE conversation-log appender — every event kind allocates `seq`
+    through this lock, so there is exactly one allocator to reason about
+    (a second copy could drift and hand out duplicate seqs under concurrency).
+
+    `seq` allocation (spec §2): the branch row is `SELECT ... FOR UPDATE`-locked
+    (the natural serialization point — turns are rare, no advisory-lock
+    machinery), then `max(seq)+1` scoped to this branch. The archived check
+    sits UNDER the lock, so a concurrent `archive_branch` can't slip an event
+    in (no TOCTOU). Locking the BRANCH row (not the event rows) works even for
+    the first event, when no event row exists to lock; the DB unique
+    `(branch_id, seq)` is the backstop."""
     bid = _parse_uuid(branch_id, BranchNotFoundError, "branch id")
-    # FOR UPDATE on the branch row: the concurrency-safety point (spec §2). Two
-    # racing appends serialize on this lock, so the max(seq)+1 read-then-write
-    # below can't hand out a duplicate seq (the DB unique (branch_id, seq) is the
-    # backstop). Locking the BRANCH row (not the event rows) works even for the
-    # first message, when no event row exists to lock.
     branch = session.scalar(
         select(ShadowBranch).where(ShadowBranch.id == bid).with_for_update()
     )
     if branch is None:
         raise BranchNotFoundError(f"no shadow branch with id {branch_id!r}")
-    if branch.status == "archived":
+    if branch.status == SHADOW_BRANCH_STATUS_ARCHIVED:
         raise BranchArchivedError(
             f"shadow branch {branch.scope_slug}:{branch.name!r} is archived"
         )
@@ -531,10 +575,7 @@ def add_message(
         or 0
     ) + 1
     event = ShadowConversationEvent(
-        branch_id=bid,
-        seq=next_seq,
-        kind=CONVERSATION_MESSAGE_KIND,
-        payload={"author": author, "markdown": markdown},
+        branch_id=bid, seq=next_seq, kind=kind, payload=payload
     )
     session.add(event)
     session.flush()

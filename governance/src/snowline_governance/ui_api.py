@@ -50,6 +50,7 @@ from snowline_governance import shadow
 from snowline_governance.db import session_scope
 from snowline_governance.models import (
     DEFAULT_SHADOW_BRANCH_STATUS,
+    SHADOW_BRANCH_STATUS_ARCHIVED,
     ShadowBranch,
     ShadowNode,
 )
@@ -239,8 +240,8 @@ def _branch_thread_sync(branch_id: str) -> dict:
         # presence of the literal string "archived" in this list — that is the
         # exact contract the dashboard shell (#69) consumes to grey out the
         # composer. Absent/empty when the branch is active.
-        if branch.status == "archived":
-            result["flags"] = ["archived"]
+        if branch.status == SHADOW_BRANCH_STATUS_ARCHIVED:
+            result["flags"] = [SHADOW_BRANCH_STATUS_ARCHIVED]
         return result
 
 
