@@ -14,6 +14,17 @@ export type UIWidget = {
   refresh_seconds?: number;
 };
 
+/** `thread` pages may declare a composer (shadow-conversations.md §4): an
+ * input-shaped write target, distinct from the button-shaped `actions` §4.3
+ * reserves. `endpoint` is plugin-relative, proxied exactly like `data` (§5);
+ * `disabled_when` names a `flags` entry (thread GET response) that greys the
+ * composer off. */
+export type UIComposer = {
+  endpoint: string;
+  placeholder?: string;
+  disabled_when?: string;
+};
+
 export type UIPage = {
   id: string;
   route: string;
@@ -21,6 +32,7 @@ export type UIPage = {
   nav: boolean;
   kind: string;
   data: string;
+  composer?: UIComposer | null;
 };
 
 export type UIBlock = {
@@ -87,3 +99,50 @@ export function uiApiUrl(plugin: string, data: string): string {
 
 export const fetchUiData = (plugin: string, data: string) =>
   get<unknown>(uiApiUrl(plugin, data));
+
+/** A proxy-POST failure (ui-shell.md §5 / shadow-conversations.md §3):
+ * carries the upstream HTTP status alongside the server's `detail` message
+ * (FastAPI's standard error shape) so callers can map specific statuses to
+ * user-facing copy — 409 archived, 413/422 body-shape, 503 plugin down —
+ * without re-parsing the response themselves. */
+export class UiApiError extends Error {
+  readonly status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "UiApiError";
+    this.status = status;
+  }
+}
+
+async function post<T>(path: string, body: unknown): Promise<T> {
+  const resp = await fetch(path, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    let detail = `${path} → ${resp.status}`;
+    try {
+      const data: unknown = await resp.json();
+      if (
+        data &&
+        typeof data === "object" &&
+        typeof (data as { detail?: unknown }).detail === "string"
+      ) {
+        detail = (data as { detail: string }).detail;
+      }
+    } catch {
+      // Non-JSON (or empty) error body — keep the generic status message.
+    }
+    throw new UiApiError(resp.status, detail);
+  }
+  return (await resp.json()) as T;
+}
+
+/** The write half of the `/ui-api` proxy (ui-shell.md §5, activated by
+ * shadow-conversations.md §3): same plugin-relative -> platform-proxied URL
+ * shape as `fetchUiData`, but POSTs a JSON body to a declared write endpoint
+ * (today: `composer.endpoint`). Rejects with `UiApiError` on a non-2xx
+ * response. */
+export const postUiApi = (plugin: string, endpoint: string, body: unknown) =>
+  post<unknown>(uiApiUrl(plugin, endpoint), body);

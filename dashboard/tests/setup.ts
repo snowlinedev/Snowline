@@ -75,6 +75,17 @@ export const FIXTURES: Record<string, unknown> = {
                 nav: false,
                 kind: "thread",
                 data: "/ui-api/pages/branches/{branch}",
+                // shadow-conversations.md §4: the composer declaration — the
+                // shared thread fixture below carries no `flags`, so this
+                // renders enabled. Also exercises the axe matrix (a11y.test)
+                // and the fail-visible/refetch tests (registered-ui.test,
+                // composer.test) through the SAME registered page, not a
+                // one-off fixture.
+                composer: {
+                  endpoint: "/ui-api/pages/branches/{branch}/messages",
+                  placeholder: "Reply in this branch…",
+                  disabled_when: "archived",
+                },
               },
             ],
           },

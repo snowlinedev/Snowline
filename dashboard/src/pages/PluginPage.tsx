@@ -10,18 +10,26 @@ import { useParams } from "react-router-dom";
 import type { PluginEntry, UIPage } from "../api";
 import { Card, RegisteredKind, useUiData } from "../kinds/kinds";
 import { Layout } from "../shell/Layout";
-import { contractSupported, templateData } from "../registry";
+import { THREAD_COMPOSER_POLL_SECONDS, contractSupported, templateData } from "../registry";
 
 export function PluginPage(props: { plugin: PluginEntry; page: UIPage }) {
   const params = useParams();
   const dataPath = templateData(props.page.data, params);
   const contractOk = contractSupported(props.plugin);
+  // shadow-conversations.md §4: only thread pages that declare a composer
+  // poll (5s, paused when hidden) — every other page/kind keeps its
+  // fetch-once-on-mount behavior unchanged.
+  const composer = props.page.composer ?? undefined;
+  const pollsForComposer = props.page.kind === "thread" && composer != null;
   const loadable = useUiData(
     props.plugin.name,
     dataPath,
     props.page.kind,
     contractOk,
+    pollsForComposer ? THREAD_COMPOSER_POLL_SECONDS : undefined,
+    pollsForComposer,
   );
+  const composerPath = composer ? templateData(composer.endpoint, params) : undefined;
 
   return (
     <Layout title={props.page.title ?? props.page.id}>
@@ -32,6 +40,9 @@ export function PluginPage(props: { plugin: PluginEntry; page: UIPage }) {
           kind={props.page.kind}
           contractOk={contractOk}
           loadable={loadable}
+          composer={composer}
+          composerPath={composerPath}
+          onComposerSent={loadable.reload}
         />
       </Card>
     </Layout>
