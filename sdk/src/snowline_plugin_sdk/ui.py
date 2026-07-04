@@ -50,6 +50,14 @@ PAGE_KINDS: frozenset[str] = frozenset(
 # deliberately absent from both copies until it ships.
 UI_KINDS: frozenset[str] = WIDGET_KINDS | PAGE_KINDS
 
+# --- Composer (thread pages' write seam, shadow-conversations.md §4) -------
+#
+# The field vocabulary of a `thread` page's optional `composer` object —
+# mirrors `UI_KINDS`' drift-guard treatment: the platform
+# (`snowline_platform.manifest.COMPOSER_FIELDS`) is the source of truth,
+# pinned equal to this copy by `test_ui_contract_drift.py`.
+COMPOSER_FIELDS: frozenset[str] = frozenset({"endpoint", "placeholder", "disabled_when"})
+
 # --- Response-contract shapes, by kind (§4.1/§4.2) --------------------------
 #
 # Each entry documents the plugin-side JSON response body a widget/page's
@@ -108,11 +116,31 @@ THREAD_SHAPE: dict[str, str] = {
     "meta": "required — small header metadata block",
     "nodes": f"required — ordered list of {THREAD_NODE_SHAPE!r}",
 }
+# Not part of the response body — `composer` is a manifest-side page
+# declaration (see COMPOSER_SHAPE below), documented alongside THREAD_SHAPE
+# because it's specific to the `thread` kind.
 
 DOCUMENT_SHAPE: dict[str, str] = {
     "title": "required",
     "markdown": "required — the document body, rendered as markdown",
     "meta": "optional",
+}
+
+# `thread` pages' optional `composer` object (shadow-conversations.md §4): an
+# input-shaped POST target rendered as a markdown textarea + send button at
+# the thread foot. NOT an §4.3 action (button-shaped, confirm semantics) —
+# but both ride the same proxy-POST enablement and endpoint-allowlist posture
+# (ui-shell.md §5). Registration-time validation (platform
+# `manifest.py`/`UIComposer`): 422 if declared on a non-`thread` page kind,
+# if `endpoint` doesn't start with '/ui-api/', if `endpoint` references a
+# '{param}' not present in the page's `route`, or on any field not listed
+# here.
+COMPOSER_SHAPE: dict[str, str] = {
+    "endpoint": "required — a /ui-api-relative POST target; may template "
+    "'{param}' segments matching the page's route params",
+    "placeholder": "optional — composer textarea placeholder text",
+    "disabled_when": "optional — a thread `meta` flag name the shell reads "
+    "to grey out the composer (e.g. 'archived')",
 }
 
 # Kind name -> its response-contract shape doc, for a plugin author to look
@@ -163,4 +191,6 @@ __all__ = [
     "DOCUMENT_SHAPE",
     "UI_KIND_SHAPES",
     "ACTION_SHAPE",
+    "COMPOSER_FIELDS",
+    "COMPOSER_SHAPE",
 ]

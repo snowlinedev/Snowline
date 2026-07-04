@@ -14,6 +14,7 @@ from __future__ import annotations
 import httpx
 from starlette.testclient import TestClient
 
+from snowline_platform import ui_api
 from snowline_platform.app import create_app
 from snowline_platform.manifest import PluginManifest
 from snowline_platform.registry import PluginRegistry, PluginStatus
@@ -36,6 +37,36 @@ def _app(registry: PluginRegistry) -> object:
 def _registry(status: PluginStatus | None = None) -> PluginRegistry:
     reg = PluginRegistry()
     reg.upsert(PluginManifest(name="gov", base_url="http://plugin-host:9999"))
+    if status is not None:
+        reg.set_status("gov", status)
+    return reg
+
+
+def _registry_with_composer(status: PluginStatus | None = None) -> PluginRegistry:
+    """A plugin that declared a `thread` page with a `composer` — the only
+    POST write target the proxy's structural allowlist admits (shadow-
+    conversations.md §3/§4)."""
+    reg = PluginRegistry()
+    reg.upsert(
+        PluginManifest(
+            name="gov",
+            base_url="http://plugin-host:9999",
+            ui={
+                "pages": [
+                    {
+                        "id": "shadow-branch",
+                        "route": "/shadow/{branch}",
+                        "kind": "thread",
+                        "data": "/ui-api/pages/branches/{branch}",
+                        "composer": {
+                            "endpoint": "/ui-api/pages/branches/{branch}/messages",
+                            "placeholder": "Reply in this branch…",
+                        },
+                    }
+                ]
+            },
+        )
+    )
     if status is not None:
         reg.set_status("gov", status)
     return reg
@@ -94,9 +125,11 @@ def test_proxy_unknown_status_and_up_status_proceed():
         assert TestClient(app).get("/ui-api/gov/pages/branches").status_code == 200
 
 
-def test_proxy_post_is_405():
+def test_proxy_put_is_still_405():
+    # Only GET and POST are wired (ui-shell.md §5); every other verb keeps
+    # the normal Starlette method-not-allowed behavior.
     app = _app(_registry())
-    r = TestClient(app).post("/ui-api/gov/pages/branches")
+    r = TestClient(app).put("/ui-api/gov/pages/branches")
     assert r.status_code == 405
 
 
@@ -140,3 +173,215 @@ def test_proxy_shares_one_client_across_requests():
     assert client.get("/ui-api/gov/b").status_code == 200
     # No per-request client was created — the seeded one is still in use.
     assert app.state.ui_api_client is seeded
+
+
+# --- POST: the write seam (shadow-conversations.md §3) ----------------------
+
+
+def test_proxy_post_reaches_declared_composer_endpoint_and_round_trips_body():
+    app = _app(_registry_with_composer())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "plugin-host"
+        assert request.url.path == "/ui-api/pages/branches/abc/messages"
+        assert request.headers["content-type"] == "application/json"
+        assert request.content == b'{"markdown": "hi"}'
+        return httpx.Response(201, json={"seq": 1, "markdown": "hi"})
+
+    _wire_mock_upstream(app, handler)
+    r = TestClient(app).post(
+        "/ui-api/gov/pages/branches/abc/messages",
+        content=b'{"markdown": "hi"}',
+        headers={"content-type": "application/json"},
+    )
+    assert r.status_code == 201
+    assert r.json() == {"seq": 1, "markdown": "hi"}
+
+
+def test_proxy_post_undeclared_path_is_403():
+    app = _app(_registry_with_composer())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not reach the upstream for an undeclared path")
+
+    _wire_mock_upstream(app, handler)
+    r = TestClient(app).post(
+        "/ui-api/gov/pages/branches/abc/some-other-route",
+        json={"markdown": "hi"},
+    )
+    assert r.status_code == 403
+
+
+def test_proxy_post_with_no_composer_declared_is_403():
+    # A plugin with no `ui` block at all has no declared write endpoints —
+    # every POST 403s.
+    app = _app(_registry())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not reach the upstream")
+
+    _wire_mock_upstream(app, handler)
+    r = TestClient(app).post("/ui-api/gov/pages/branches", json={"x": 1})
+    assert r.status_code == 403
+
+
+def test_proxy_post_unregistered_plugin_is_404():
+    app = _app(PluginRegistry())
+    r = TestClient(app).post("/ui-api/ghost/anything", json={})
+    assert r.status_code == 404
+    assert "ghost" in r.json()["detail"]
+
+
+def test_proxy_post_down_plugin_is_503_without_a_network_call():
+    app = _app(_registry_with_composer(status=PluginStatus.DOWN))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not reach the upstream for a DOWN plugin")
+
+    _wire_mock_upstream(app, handler)
+    r = TestClient(app).post(
+        "/ui-api/gov/pages/branches/abc/messages", json={"markdown": "hi"}
+    )
+    assert r.status_code == 503
+
+
+def test_proxy_post_non_json_content_type_is_415():
+    app = _app(_registry_with_composer())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not reach the upstream for a bad content-type")
+
+    _wire_mock_upstream(app, handler)
+    r = TestClient(app).post(
+        "/ui-api/gov/pages/branches/abc/messages",
+        content=b"markdown=hi",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+    assert r.status_code == 415
+
+
+def test_proxy_post_json_with_charset_content_type_is_accepted():
+    app = _app(_registry_with_composer())
+    _wire_mock_upstream(app, lambda r: httpx.Response(200, json={"ok": True}))
+    r = TestClient(app).post(
+        "/ui-api/gov/pages/branches/abc/messages",
+        content=b'{"markdown": "hi"}',
+        headers={"content-type": "application/json; charset=utf-8"},
+    )
+    assert r.status_code == 200
+
+
+def test_proxy_post_oversize_body_by_content_length_is_413():
+    # The Content-Length precheck rejects before ever reading the stream.
+    app = _app(_registry_with_composer())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not reach the upstream for an oversize body")
+
+    _wire_mock_upstream(app, handler)
+    oversize = b"a" * (ui_api.POST_BODY_LIMIT + 1)
+    r = TestClient(app).post(
+        "/ui-api/gov/pages/branches/abc/messages",
+        content=oversize,
+        headers={"content-type": "application/json"},
+    )
+    assert r.status_code == 413
+
+
+def test_proxy_post_at_body_limit_is_accepted():
+    # Exactly at the cap is fine — only strictly OVER it 413s.
+    app = _app(_registry_with_composer())
+    _wire_mock_upstream(app, lambda r: httpx.Response(200, json={"ok": True}))
+    prefix, suffix = b'{"m": "', b'"}'
+    at_limit = prefix + b"a" * (ui_api.POST_BODY_LIMIT - len(prefix) - len(suffix)) + suffix
+    assert len(at_limit) == ui_api.POST_BODY_LIMIT
+    r = TestClient(app).post(
+        "/ui-api/gov/pages/branches/abc/messages",
+        content=at_limit,
+        headers={"content-type": "application/json"},
+    )
+    assert r.status_code == 200
+
+
+def test_proxy_post_oversize_body_with_lying_content_length_is_413():
+    # A Content-Length that UNDERSTATES the real body must not slip through —
+    # the streamed read enforces the cap regardless of the header.
+    app = _app(_registry_with_composer())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not reach the upstream for an oversize body")
+
+    _wire_mock_upstream(app, handler)
+    oversize = b"a" * (ui_api.POST_BODY_LIMIT + 1)
+    r = TestClient(app).post(
+        "/ui-api/gov/pages/branches/abc/messages",
+        content=oversize,
+        headers={
+            "content-type": "application/json",
+            "content-length": "1",
+        },
+    )
+    assert r.status_code == 413
+
+
+def test_proxy_post_template_param_matches_exactly_one_segment():
+    app = _app(_registry_with_composer())
+    _wire_mock_upstream(app, lambda r: httpx.Response(200, json={"ok": True}))
+    # One concrete segment for {branch} — matches.
+    r = TestClient(app).post(
+        "/ui-api/gov/pages/branches/abc/messages",
+        json={"markdown": "hi"},
+    )
+    assert r.status_code == 200
+
+
+def test_proxy_post_template_param_is_not_greedy():
+    app = _app(_registry_with_composer())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("an extra path segment must not match the template")
+
+    _wire_mock_upstream(app, handler)
+    # Two segments where the template's {branch} expects exactly one —
+    # segment COUNT must match, so this must NOT match
+    # /pages/branches/{branch}/messages and 403s.
+    r = TestClient(app).post(
+        "/ui-api/gov/pages/branches/a/b/messages",
+        json={"markdown": "hi"},
+    )
+    assert r.status_code == 403
+
+
+def test_proxy_post_dot_segment_cannot_bypass_the_allowlist():
+    # A `{branch}` template slot matches exactly one segment, non-greedily —
+    # but pre-normalization it would also happily "match" a literal '..'.
+    # The match MUST run against the same normalized path that gets
+    # forwarded, so a dot-segment can't satisfy the {branch} slot on paper
+    # while resolving to a completely different, undeclared upstream path.
+    app = _app(_registry_with_composer())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(
+            "a dot-segment must never reach the upstream via a bypassed "
+            "allowlist check"
+        )
+
+    _wire_mock_upstream(app, handler)
+    r = TestClient(app).post(
+        "/ui-api/gov/pages/branches/%2e%2e/messages",
+        json={"markdown": "hi"},
+    )
+    assert r.status_code in (403, 404)
+
+
+def test_proxy_post_upstream_connect_error_is_502():
+    app = _app(_registry_with_composer())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    _wire_mock_upstream(app, handler)
+    r = TestClient(app).post(
+        "/ui-api/gov/pages/branches/abc/messages", json={"markdown": "hi"}
+    )
+    assert r.status_code == 502

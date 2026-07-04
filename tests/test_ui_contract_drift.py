@@ -32,3 +32,9 @@ def test_ui_kind_vocabulary_equals_sdk():
     assert platform_manifest.UI_WIDGET_KINDS == sdk_ui.WIDGET_KINDS
     assert platform_manifest.UI_PAGE_KINDS == sdk_ui.PAGE_KINDS
     assert platform_manifest.UI_KINDS == sdk_ui.UI_KINDS
+
+
+def test_composer_fields_equals_sdk():
+    # thread pages' write seam (shadow-conversations.md §4) — same
+    # never-silently-fork discipline as the kind vocabulary above.
+    assert platform_manifest.COMPOSER_FIELDS == sdk_ui.COMPOSER_FIELDS

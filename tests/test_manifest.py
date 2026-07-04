@@ -33,6 +33,19 @@ def _page(**overrides) -> dict:
     } | overrides
 
 
+def _composer(**overrides) -> dict:
+    return {"endpoint": "/ui-api/pages/p1/messages"} | overrides
+
+
+def _thread_page(**overrides) -> dict:
+    return {
+        "id": "thread1",
+        "route": "/branches/{branch}",
+        "kind": "thread",
+        "data": "/ui-api/pages/branches/{branch}",
+    } | overrides
+
+
 def _manifest(ui: dict | None) -> PluginManifest:
     return PluginManifest(name="gov", base_url="http://x", ui=ui)
 
@@ -126,3 +139,140 @@ def test_unknown_kind_registers_ok():
 def test_future_contract_version_registers_ok():
     m = _manifest({"contract_version": 999, "widgets": [_widget()]})
     assert m.ui.contract_version == 999
+
+
+# --- composer (shadow-conversations.md §4) ----------------------------------
+
+
+def test_valid_composer_on_thread_page_registers():
+    m = _manifest(
+        {
+            "pages": [
+                _thread_page(
+                    composer={
+                        "endpoint": "/ui-api/pages/branches/{branch}/messages",
+                        "placeholder": "Reply in this branch…",
+                        "disabled_when": "archived",
+                    }
+                )
+            ]
+        }
+    )
+    composer = m.ui.pages[0].composer
+    assert composer.endpoint == "/ui-api/pages/branches/{branch}/messages"
+    assert composer.placeholder == "Reply in this branch…"
+    assert composer.disabled_when == "archived"
+
+
+def test_composer_optional_fields_default_none():
+    m = _manifest(
+        {
+            "pages": [
+                _thread_page(
+                    composer={"endpoint": "/ui-api/pages/branches/{branch}/messages"}
+                )
+            ]
+        }
+    )
+    composer = m.ui.pages[0].composer
+    assert composer.placeholder is None
+    assert composer.disabled_when is None
+
+
+def test_composer_with_no_route_params_is_fine():
+    m = _manifest(
+        {
+            "pages": [
+                _page(
+                    id="p1",
+                    route="/p1",
+                    kind="thread",
+                    data="/ui-api/pages/p1",
+                    composer=_composer(),
+                )
+            ]
+        }
+    )
+    assert m.ui.pages[0].composer.endpoint == "/ui-api/pages/p1/messages"
+
+
+def test_composer_on_non_thread_page_rejected():
+    with pytest.raises(ValidationError, match="only valid on 'thread' pages"):
+        _manifest({"pages": [_page(kind="table", composer=_composer())]})
+
+
+def test_composer_endpoint_must_start_with_ui_api():
+    with pytest.raises(ValidationError, match="must start with '/ui-api/'"):
+        _manifest(
+            {"pages": [_thread_page(composer=_composer(endpoint="/mcp/messages"))]}
+        )
+
+
+@pytest.mark.parametrize(
+    "bad_endpoint",
+    [
+        "/ui-api/pages/branches/{branch}/",  # trailing slash
+        "/ui-api/pages//messages",  # empty segment
+        "/ui-api/pages/{}/messages",  # empty param name
+        "/ui-api/pages/{branch/messages",  # unclosed brace
+        "/ui-api/pages/branch}/messages",  # stray brace
+        "/ui-api/pages/{1branch}/messages",  # invalid identifier
+    ],
+)
+def test_composer_endpoint_malformed_segment_rejected(bad_endpoint):
+    with pytest.raises(ValidationError):
+        _manifest(
+            {"pages": [_thread_page(composer=_composer(endpoint=bad_endpoint))]}
+        )
+
+
+def test_composer_unknown_field_rejected():
+    with pytest.raises(ValidationError):
+        _manifest(
+            {
+                "pages": [
+                    _thread_page(
+                        composer={
+                            "endpoint": "/ui-api/pages/branches/{branch}/messages",
+                            "bogus": True,
+                        }
+                    )
+                ]
+            }
+        )
+
+
+def test_composer_endpoint_param_not_in_route_rejected():
+    with pytest.raises(ValidationError, match="not present in route"):
+        _manifest(
+            {
+                "pages": [
+                    _thread_page(
+                        composer=_composer(
+                            endpoint="/ui-api/pages/branches/{other}/messages"
+                        )
+                    )
+                ]
+            }
+        )
+
+
+def test_composer_endpoint_may_use_fewer_params_than_route():
+    # The route can carry MORE params than the endpoint uses — only params
+    # the endpoint references must be present in the route, not the reverse.
+    m = _manifest(
+        {
+            "pages": [
+                _page(
+                    id="p1",
+                    route="/branches/{branch}/nodes/{node_id}",
+                    kind="thread",
+                    data="/ui-api/pages/branches/{branch}/nodes/{node_id}",
+                    composer=_composer(
+                        endpoint="/ui-api/pages/branches/{branch}/messages"
+                    ),
+                )
+            ]
+        }
+    )
+    assert m.ui.pages[0].composer.endpoint == "/ui-api/pages/branches/{branch}/messages"

@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # Plugin names are used in gateway routes (/<name>/mcp/...), so keep them a
 # url-safe slug: lowercase alphanumerics and hyphens, starting alphanumeric.
@@ -35,6 +35,14 @@ UI_CONTRACT_VERSION: int = 1
 UI_WIDGET_KINDS: frozenset[str] = frozenset({"stat", "list"})
 UI_PAGE_KINDS: frozenset[str] = frozenset({"table", "thread", "document"})
 UI_KINDS: frozenset[str] = UI_WIDGET_KINDS | UI_PAGE_KINDS
+
+# `thread` pages' optional `composer` block (shadow-conversations.md §4) — the
+# first activation of the write seam ui-shell.md §4.3/§5 reserved. Same
+# drift-guard treatment as UI_KINDS above: the SDK ships an identical
+# COMPOSER_FIELDS constant, pinned equal by test_ui_contract_drift.py, so a
+# plugin author has one documented field vocabulary and the two copies can't
+# silently fork.
+COMPOSER_FIELDS: frozenset[str] = frozenset({"endpoint", "placeholder", "disabled_when"})
 
 # Route path-param segments template verbatim into `data` (ui-shell.md §3):
 # `{name}` where `name` is a simple identifier. A literal segment is a
@@ -79,6 +87,50 @@ def _valid_ui_data(data: str) -> str:
     return data
 
 
+def _path_param_names(path: str) -> set[str]:
+    """The `{name}` template segment names in a route/endpoint path (both use
+    the same '{param}' segment shape, ui-shell.md §3)."""
+    return {
+        segment[1:-1]
+        for segment in path.strip("/").split("/")
+        if _ROUTE_PARAM_RE.match(segment)
+    }
+
+
+def _valid_ui_endpoint(endpoint: str) -> str:
+    # A composer/action endpoint is a POST write target proxied through
+    # /ui-api (shadow-conversations.md §3) — same '/ui-api/' confinement rule
+    # as `data`, plus the same per-segment shape rule `_valid_ui_route` uses
+    # for `route` (either a literal token or a whole '{name}' param segment),
+    # since the proxy's write-path matcher (ui_api.py) walks it segment by
+    # segment the same way.
+    if not endpoint.startswith("/ui-api/"):
+        raise ValueError(f"composer endpoint {endpoint!r} must start with '/ui-api/'")
+    if endpoint.endswith("/"):
+        raise ValueError(
+            f"composer endpoint {endpoint!r} must not end with a trailing '/'"
+        )
+    for segment in endpoint[1:].split("/"):
+        if not segment:
+            raise ValueError(
+                f"composer endpoint {endpoint!r} has an empty path segment "
+                "(a stray '//')"
+            )
+        if "{" in segment or "}" in segment:
+            if not _ROUTE_PARAM_RE.match(segment):
+                raise ValueError(
+                    f"composer endpoint {endpoint!r} has a malformed path param "
+                    f"{segment!r} — expected a whole '{{name}}' segment with a "
+                    "valid identifier"
+                )
+        elif not _ROUTE_LITERAL_RE.match(segment):
+            raise ValueError(
+                f"composer endpoint {endpoint!r} has an invalid path segment "
+                f"{segment!r}"
+            )
+    return endpoint
+
+
 def _no_duplicate_ids(items: list, what: str) -> None:
     ids = [item.id for item in items]
     dupes = sorted({i for i in ids if ids.count(i) > 1})
@@ -107,6 +159,36 @@ class UIWidget(BaseModel):
     _valid_data = field_validator("data")(_valid_ui_data)
 
 
+class UIComposer(BaseModel):
+    """A `thread` page's optional write seam (shadow-conversations.md §4): an
+    input-shaped POST target rendered as a markdown textarea + send button at
+    the thread foot. NOT an §4.3 `action` (those are button-shaped with
+    confirm semantics) — but both share the same proxy-POST enablement and
+    endpoint-allowlist posture (ui-shell.md §5).
+
+    `extra="forbid"` — an unknown field (typo, or a future field an older
+    platform doesn't know) rejects the whole manifest (422), same fail-loud
+    posture as `UIBlock`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    endpoint: str = Field(
+        description="plugin-relative POST target, proxied via /ui-api (§5); "
+        "may contain '{param}' segments matching the page's route params"
+    )
+    placeholder: str | None = Field(
+        default=None, description="composer textarea placeholder text"
+    )
+    disabled_when: str | None = Field(
+        default=None,
+        description="a thread `meta` flag name the shell reads to grey out "
+        "the composer (e.g. 'archived') — the plugin owns the semantics",
+    )
+
+    _valid_endpoint = field_validator("endpoint")(_valid_ui_endpoint)
+
+
 class UIPage(BaseModel):
     """One page contribution (ui-shell.md §3/§4.2)."""
 
@@ -124,9 +206,38 @@ class UIPage(BaseModel):
         "posture as UIWidget.kind"
     )
     data: str = Field(description="plugin-relative path, proxied via /ui-api (§5)")
+    composer: UIComposer | None = Field(
+        default=None,
+        description="optional write seam, valid only on 'thread' pages "
+        "(shadow-conversations.md §4)",
+    )
 
     _valid_data = field_validator("data")(_valid_ui_data)
     _valid_route = field_validator("route")(_valid_ui_route)
+
+    @model_validator(mode="after")
+    def _valid_composer_for_kind(self) -> "UIPage":
+        if self.composer is None:
+            return self
+        # composer is input-shaped and only makes sense on the thread view
+        # (§4.3); a composer on any other kind is a manifest authoring error,
+        # not a shell-version concern, so it fails loud at registration —
+        # unlike an unknown `kind` string itself, which fails visible (§4.4).
+        if self.kind != "thread":
+            raise ValueError(
+                f"composer is only valid on 'thread' pages (page {self.id!r} "
+                f"has kind {self.kind!r})"
+            )
+        route_params = _path_param_names(self.route)
+        endpoint_params = _path_param_names(self.composer.endpoint)
+        unknown = endpoint_params - route_params
+        if unknown:
+            raise ValueError(
+                f"composer endpoint {self.composer.endpoint!r} references "
+                f"param(s) {sorted(unknown)!r} not present in route "
+                f"{self.route!r}"
+            )
+        return self
 
 
 class UIBlock(BaseModel):
