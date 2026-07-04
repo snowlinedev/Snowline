@@ -1,0 +1,142 @@
+"""The /ui-api proxy (ui-shell.md §5).
+
+The seam: `ui_api._client` lazily creates + caches an `httpx.AsyncClient` on
+`app.state.ui_api_client` on first use. Pre-seeding that attribute with an
+`httpx.AsyncClient(transport=httpx.MockTransport(...))` — the same technique
+`test_health.py` uses for the health poller's client — is the cleanest way to
+stand in for a live plugin's `/ui-api` surface without a socket: no need for
+the gateway's MCP-specific `UpstreamConnector` abstraction, since this proxy
+speaks plain HTTP/JSON, not MCP.
+"""
+
+from __future__ import annotations
+
+import httpx
+from starlette.testclient import TestClient
+
+from snowline_platform.app import create_app
+from snowline_platform.manifest import PluginManifest
+from snowline_platform.registry import PluginRegistry, PluginStatus
+from snowline_platform.trust import Principal, TrustResolver
+
+
+class _AlwaysTrust:
+    def resolve(self, peer_ip, headers):
+        return Principal(id="test-owner", source="test")
+
+
+def _app(registry: PluginRegistry) -> object:
+    return create_app(
+        resolver=TrustResolver([_AlwaysTrust()]),
+        registry=registry,
+        migrate_on_startup=False,
+    )
+
+
+def _registry(status: PluginStatus | None = None) -> PluginRegistry:
+    reg = PluginRegistry()
+    reg.upsert(PluginManifest(name="gov", base_url="http://plugin-host:9999"))
+    if status is not None:
+        reg.set_status("gov", status)
+    return reg
+
+
+def _wire_mock_upstream(app, handler) -> None:
+    app.state.ui_api_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    )
+
+
+def test_proxy_happy_path_forwards_status_body_query_and_content_type():
+    app = _app(_registry())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # The mapping rule: GET /ui-api/<plugin>/<path> -> GET
+        # <base_url>/ui-api/<path> — the plugin name is consumed by lookup,
+        # never forwarded into the upstream path.
+        assert request.url.host == "plugin-host"
+        assert request.url.path == "/ui-api/pages/branches"
+        assert request.url.params["x"] == "1"
+        return httpx.Response(200, json={"rows": []})
+
+    _wire_mock_upstream(app, handler)
+    r = TestClient(app).get("/ui-api/gov/pages/branches?x=1")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("application/json")
+    assert r.json() == {"rows": []}
+
+
+def test_proxy_unregistered_plugin_is_404():
+    app = _app(PluginRegistry())
+    r = TestClient(app).get("/ui-api/ghost/pages/branches")
+    assert r.status_code == 404
+    assert "ghost" in r.json()["detail"]
+
+
+def test_proxy_down_plugin_is_503_without_a_network_call():
+    app = _app(_registry(status=PluginStatus.DOWN))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not reach the upstream for a DOWN plugin")
+
+    _wire_mock_upstream(app, handler)
+    r = TestClient(app).get("/ui-api/gov/pages/branches")
+    assert r.status_code == 503
+
+
+def test_proxy_unknown_status_and_up_status_proceed():
+    # UNKNOWN (fresh registration, not yet health-checked) and UP both route
+    # through — only an explicit DOWN short-circuits (mirrors the gateway's
+    # discover_upstreams routability rule).
+    for status in (None, PluginStatus.UP):
+        app = _app(_registry(status=status))
+        _wire_mock_upstream(app, lambda r: httpx.Response(200, json={}))
+        assert TestClient(app).get("/ui-api/gov/pages/branches").status_code == 200
+
+
+def test_proxy_post_is_405():
+    app = _app(_registry())
+    r = TestClient(app).post("/ui-api/gov/pages/branches")
+    assert r.status_code == 405
+
+
+def test_proxy_upstream_connect_error_is_502():
+    app = _app(_registry())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    _wire_mock_upstream(app, handler)
+    r = TestClient(app).get("/ui-api/gov/pages/branches")
+    assert r.status_code == 502
+    assert "gov" in r.json()["detail"]
+
+
+def test_proxy_traversal_cannot_escape_ui_api_prefix():
+    app = _app(_registry())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Whatever the client sent, the upstream request always lands under
+        # /ui-api/ — never at the plugin's /mcp or any other route.
+        assert request.url.path == "/ui-api/mcp"
+        return httpx.Response(200, json={"ok": True})
+
+    _wire_mock_upstream(app, handler)
+    # A literal '..' is normalized away by the CLIENT itself before the
+    # request is even sent (httpx's own URL handling collapses dot-segments
+    # client-side) — the percent-encoded form survives to reach the route,
+    # same reasoning as the /ui SPA's own traversal test
+    # (test_surfaces_routes.py's "%2e%2e" case).
+    r = TestClient(app).get("/ui-api/gov/%2e%2e/%2e%2e/mcp")
+    assert r.status_code == 200
+
+
+def test_proxy_shares_one_client_across_requests():
+    app = _app(_registry())
+    _wire_mock_upstream(app, lambda r: httpx.Response(200, json={}))
+    client = TestClient(app)
+    seeded = app.state.ui_api_client
+    assert client.get("/ui-api/gov/a").status_code == 200
+    assert client.get("/ui-api/gov/b").status_code == 200
+    # No per-request client was created — the seeded one is still in use.
+    assert app.state.ui_api_client is seeded
