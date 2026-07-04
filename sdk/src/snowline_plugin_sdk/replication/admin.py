@@ -39,6 +39,7 @@ from sqlalchemy.orm import Session
 
 from snowline_plugin_sdk.replication import emit as _emit
 from snowline_plugin_sdk.replication import ingest as _ingest
+from snowline_plugin_sdk.replication.envelope import REJECTION_REASONS
 
 
 # §5.1's full trusted set: the tailnet CGNAT range + IPv4/IPv6 loopback.
@@ -240,6 +241,41 @@ def build_replication_router(
         with session_scope() as session:
             try:
                 return _emit.requeue_rejected(session, row_id)
+            except _emit.RequeueRefusedError as exc:
+                # More specific than the plain ValueError below (it IS one) —
+                # caught first so a retired-subscription refusal (§108) answers
+                # 409 with the successor pointer, not a bare 404.
+                raise HTTPException(status_code=409, detail=exc.detail) from None
+            except ValueError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from None
+
+    @router.post(f"{admin_prefix}/rejected/requeue-bulk")
+    async def requeue_rejected_bulk(request: Request, data: dict) -> dict:
+        _require_trusted(request)
+        (subscription_id,) = _required(data, "subscription_id")
+        reason = data.get("reason")
+        if reason is not None and reason not in REJECTION_REASONS:
+            # A closed vocabulary (only these three reasons can appear on a
+            # rejected row), so a typo is a caller error — 400 up front, not
+            # a silent `{"requeued": 0}` that reads as "already handled",
+            # and not the 404 the generic ValueError mapping below implies.
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"unknown rejection reason {reason!r}; expected one of "
+                    f"{sorted(REJECTION_REASONS)}"
+                ),
+            )
+        with session_scope() as session:
+            try:
+                return _emit.requeue_rejected_bulk(
+                    session,
+                    subscription_id,
+                    event_type=data.get("event_type"),
+                    reason=reason,
+                )
+            except _emit.RequeueRefusedError as exc:
+                raise HTTPException(status_code=409, detail=exc.detail) from None
             except ValueError as exc:
                 raise HTTPException(status_code=404, detail=str(exc)) from None
 
