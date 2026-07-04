@@ -111,16 +111,22 @@ is new machinery, not a tuning change: the bus today has NO backoff at all
 with exponential growth to a ceiling of ~the delivery interval × 10. Two
 companions keep it correct:
 
-- **Reconnect reset** — any successful delivery or ingest involving a peer
-  resets the backoff on every queued row for that peer's streams, so a
-  healed partition flushes the whole backlog promptly. This is what makes
-  §10's "within one delivery interval of reconnect" criterion satisfiable;
-  without it, a ceiling'd backoff could idle ~10 intervals after the link
-  returns.
+- **Reconnect reset** — backoff is per-row, but reachability is per-PEER:
+  each delivery tick opens with a cheap per-peer probe (a health touch on
+  the peer's ingest), and a peer transitioning unreachable→reachable resets
+  the backoff on every queued row for that peer's streams; any successful
+  delivery or ingest does the same. The probe is load-bearing: a reset that
+  only *reacts* to a successful delivery can never produce the first one —
+  on a quiet heal with every row at the ceiling, nothing would fire for ~10
+  intervals. With the probe, the next tick detects the heal and flushes the
+  backlog — which is what makes §10's "within one delivery interval of
+  reconnect" criterion satisfiable.
 - **Dead-letter stays reserved for *rejections*** — a delivered event the
   receiver refused (bad signature, contract-version mismatch) — which
-  indicate a bug, not a partition. Receiver-side authentic-but-unappliable
-  events park instead (§8.1).
+  indicate a bug, not a partition. An ORDERING refusal (§3.2's "expected
+  seq N") is explicitly NOT a rejection — it is retryable by definition and
+  never dead-letters. Receiver-side authentic-but-unappliable events park
+  instead (§8.1).
 
 ### 3.2 Stream identity — emit-time seq, epochs, causal context
 
@@ -128,8 +134,12 @@ The bus today allocates `seq` per-SUBSCRIPTION at DELIVERY time
 (`deliver_pending`). That is the right shape for fire-and-forget webhooks and
 the wrong one for replication: delivery order is not authoring order, a
 re-created subscription restarts at 1, and a watermark keyed off `source_id`
-alone would reject a re-paired stream wholesale as already-seen. v1 therefore
-pins the following envelope semantics (all SDK-owned):
+alone would reject a re-paired stream wholesale as already-seen. **This
+section AMENDS the recorded bus contract** — governance-plugin.md §7 and
+replication.py's carve notes (decision `97907576`, #630) document
+delivery-time seq as the standing behavior; replication is the requirement
+that changes it, and both records gain a pointer here when §9 item 1 lands.
+v1 therefore pins the following envelope semantics (all SDK-owned):
 
 - **`seq` is allocated at EMIT time, in the domain write's transaction** — a
   per-stream counter incremented alongside the outbox insert. The stream's
@@ -146,10 +156,25 @@ pins the following envelope semantics (all SDK-owned):
   recoverable (§3.1, §8.1) — instead of being skipped and later discarded as
   already-seen. Ordering can never silently drop an event.
 - **Causal context** — each event carries `peer_seen`: the highest seq of the
-  RECEIVER's stream the author had applied when it authored this event ("I
-  had seen your stream up to X"). One integer in the two-instance topology.
-  This is what makes concurrency *computable* (§6.1) instead of guessed from
-  wall clocks.
+  RECEIVER's stream the author had **applied** when it authored this event
+  ("I had seen your stream up to X"). One integer in the two-instance
+  topology. This is what makes concurrency *computable* (§6.1) instead of
+  guessed from wall clocks. Note the two counters this forces apart once
+  parking (§8.1) exists: the **delivery gate** (the watermark, which parking
+  advances so the stream flows) and **`applied_seq`** (the highest seq
+  actually applied — what `peer_seen` reports). A parked event advances the
+  gate but never `applied_seq`; conflating them would let a parked-unseen
+  event masquerade as seen and silently blind §6.1's detection.
+- **This envelope is contract version 2.** The fields above (epoch,
+  emit-time seq, `peer_seen`) are breaking additions, and
+  `check_contract_version` accepts anything ≤ its own version — so without a
+  bump, a v1 peer would silently accept and misprocess a v2 event, and
+  §3.1's contract-mismatch dead-letter could never fire between an old and
+  new peer. `CONTRACT_VERSION` moves to 2 in BOTH pinned copies
+  (`snowline_governance.contract` and the SDK's — the drift-guard test keeps
+  them equal), and every new event type this spec introduces (§4 memory, §8
+  scopes, governance's shadow/artifacts/specs) lands in the drift-guarded
+  `EVENT_TYPES` registries the same way: both packages, one commit.
 - **Origin suppression (hard rule)** — an ingest-applied write NEVER
   re-emits. The SDK apply path runs the domain write with the emit hook
   disabled; events exist only for locally-originated writes. Without this
@@ -170,7 +195,7 @@ pairing**. This keeps the server thin and makes participation strictly opt-in:
 
 ```json
 "replication": {
-  "contract_version": 1,
+  "contract_version": 2,
   "ingest_path": "/events/ingest",
   "events": ["decision.recorded", "decision.superseded"]
 }
@@ -276,7 +301,11 @@ each opted-in plugin covers its write surface with events:
   **replication-admin surface** alongside `ingest_path` — create/list/retire
   inbound stream registrations and outbound subscriptions. This supersedes
   the bus's "no remote surface" posture for replication-class subscriptions
-  only, and it stays OFF MCP: agents never manage plumbing.
+  only, and it stays OFF MCP: agents never manage plumbing. (That posture is
+  RECORDED in two places — the SDK's `events.py` docstring and governance
+  `replication.py`'s subscription-management note, both stating "no remote
+  surface in v1" — and both gain a pointer here when the surface lands, so
+  no standing doc keeps asserting the opposite.)
 - `snowline replicate pair <peer-platform-url>` runs **once per pair** and
   drives both sides over that admin surface. For every plugin whose manifest
   declares `replication` on both instances, per direction, it performs the
@@ -299,6 +328,12 @@ each opted-in plugin covers its write surface with events:
   switch, and retires the old on the first new-signed delivery — no epoch
   change, no re-seed. A leaked secret's blast radius is forged events on one
   stream *from inside the tailnet*; rotation is the remediation.
+  **Sign-time is contract, not implementation detail:** signatures are
+  computed at DELIVERY time over the exact bytes POSTed (the bus's existing
+  behavior) — retire-on-first-new-signed depends on it, because after a swap
+  the entire queued backlog re-signs with the new secret. An SDK
+  reimplementation that signed at emit time would strand a partitioned
+  peer's old-signed backlog past retirement and dead-letter it; don't.
 - Delivery flows over the tailnet exactly like every other plugin call; the
   trust gate applies unchanged. No new auth surface — the HMAC secret
   authenticates the *stream*, the tailnet authenticates the *network*.
@@ -319,11 +354,18 @@ exposure delegated to tailscaled. Rationale:
   is trusted as `owner` today; extending the trusted set to loopback makes
   that equivalence explicit and tailscaled-independent. **Config trap:**
   `SNOWLINE_TRUSTED_CIDRS` REPLACES the default when set — state the full
-  list, `SNOWLINE_TRUSTED_CIDRS="100.64.0.0/10,127.0.0.0/8,::1"`; setting
-  only the loopback entries silently un-trusts the tailnet and 403s every
-  cross-instance delivery and cross-tailnet plugin call. Possession of the
-  machine implies possession of its tailnet identity (the node key lives on
-  it).
+  list, `SNOWLINE_TRUSTED_CIDRS="100.64.0.0/10,127.0.0.0/8,::1"`. And be
+  clear which entry is load-bearing for what: behind this posture's
+  `tailscale serve`→loopback front, EVERY request — the local agent and
+  cross-tailnet deliveries alike — reaches the app with a *loopback* peer
+  IP, so the loopback entries are what admit cross-instance traffic; the
+  tailnet range matters for direct-bind setups and source-preserving
+  proxies, not because deliveries arrive with `100.x` sources here.
+  Dropping the loopback entries is the outage. One sharp edge: a dual-stack
+  bind can report IPv4-mapped peers (`::ffff:127.0.0.1`), which match
+  neither plain entry — pin the listener to one address family. Possession
+  of the machine implies possession of its tailnet identity (the node key
+  lives on it).
 - **Never bind `0.0.0.0` on the roaming spoke.** The CIDR gate fails closed,
   but a wildcard bind parks a pre-auth listener on every hotel LAN the
   laptop joins. Loopback-only binds keep the untrusted-network surface at
@@ -359,6 +401,16 @@ partition** (in practice: a supersession/forget race against oneself).
   LWW-by-timestamp assumes sane clocks (two NTP-synced owner Macs); the
   tiebreak keeps even a skewed race deterministic, and §6.1 surfaces the
   pair for human review regardless of which write won.
+- **What "the same object" means, concretely.** The object is the ROW a
+  domain event *mutates*, not the event itself: for supersession events it
+  is decision X's supersession status, not the new decisions A and B. So
+  "X superseded by A on the hub and by B on the spoke" takes BOTH paths, by
+  design: the automatic LWW resolves X's status (the newer supersession
+  wins) so the store converges without waiting for a human, AND §6.1 flags
+  A-vs-B as concurrent siblings so the human reviews the pair. A losing
+  event is **applied-then-overridden, never skipped** — its append half
+  (decision B exists) must survive; only its mutation of the contested row
+  yields to the winner.
 - **Every resolved conflict is logged at WARNING with both event ids** — the
   volume should be ~zero; if it isn't, that is a design signal to surface,
   not noise to suppress.
@@ -433,9 +485,20 @@ lost. The procedure:
    in the write's transaction (§3.2), the dumped store carries its own
    stream counter — the snapshot provably contains every event up to that
    counter's value.
-3. **Set watermarks from the snapshot**: the spoke initializes each stream's
-   watermark to the counter value the restored store carries. Events emitted
-   after the dump (seq above it) are waiting in the primary's outbox and
+3. **Scrub, then set watermarks** — the restored store is the PRIMARY's
+   store, replication state and all: its outbound subscription rows
+   (spoke-targeted, live secrets included — step 1 *guarantees* they're in
+   the dump), pending outbox deliveries, inbound watermarks, parked events.
+   Booting on those is corruption: the spoke's delivery loop would drain the
+   primary's cloned outbox under the primary's identity — origin suppression
+   guards the emit hook, not the delivery loop. So the seed script (never a
+   manual step): read each restored emit counter — keyed by the primary's
+   `source_id`, which is exactly the spoke's inbound stream — initialize the
+   spoke's inbound watermark and `applied_seq` for that stream to it, then
+   **truncate every cloned replication table** (subscriptions, outbox,
+   watermarks, parked events) before first boot. The spoke's own outbound
+   counters start fresh under its own `source_id`. Events emitted after the
+   dump (seq above the counter) are waiting in the primary's outbox and
    deliver normally — the snapshot-to-stream handoff is gapless and
    exactly-once.
 4. From then on the spoke tracks by events alone. Re-seeding after long
@@ -478,8 +541,14 @@ generous against any real scope-stream lag), after which the event is
 **parked**:
 
 - The event moves whole into a `parked_events` table (stream, seq, payload,
-  reason, parked-at) and the watermark advances past it — the stream flows
-  again.
+  reason, parked-at) and the **delivery gate** advances past it — the stream
+  flows again. `applied_seq` does NOT advance (§3.2): the event was gated
+  through, not applied.
+- **The sender is told.** A park response ACKs the delivery exactly like a
+  success, so the sender's per-stream cursor advances to N+1; a redelivery
+  of any seq at or below the delivery gate is likewise ACKed as a no-op. A
+  parked event never stalls its sender — the §3.2 "cursor does not advance
+  past an undelivered seq" rule reads park and no-op ACKs as delivered.
 - Parking is **loud, first-class state**, surfaced like §6.1's unreconciled
   view (tool + UI widget + health signal) — never just a log line. An empty
   parked set is the standing invariant to watch.
@@ -561,9 +630,13 @@ events. The two never overlap.
   once (snapshot or stream — never neither, never both applied twice).
 - Re-seeding under a fresh epoch (§3.2/§7) is fully accepted — no event of
   the new stream is rejected by the old epoch's watermark.
-- An event whose apply keeps failing parks after the bound (§8.1): its
-  stream resumes past it, the parked view shows it, and re-applying it after
-  the cause is fixed succeeds.
+- An event whose apply keeps failing parks after the bound (§8.1): the park
+  ACKs to the sender (its cursor advances past the parked seq), the stream
+  resumes, the parked view shows it, `applied_seq` does NOT advance, and
+  re-applying it after the cause is fixed succeeds.
+- After the §7 scrub, the spoke's first boot delivers nothing it didn't
+  author: no cloned subscription, outbox row, watermark, or parked event
+  survives the restore.
 - Seeding per §7 yields a spoke that converges from events alone thereafter.
 
 ## 11. Out of scope
