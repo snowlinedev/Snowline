@@ -130,7 +130,9 @@ A background loop in governance (rides the lifespan task group beside
   `author: "human"` and no in-flight claim. Claim = an in-process set +
   a stale-claim timeout (a crashed turn un-claims after
   `SNOWLINE_SHADOW_TURN_TIMEOUT`, default 300 s); one turn per branch at a
-  time, `SNOWLINE_SHADOW_TURN_CONCURRENCY` (default 1) across branches.
+  time, `SNOWLINE_SHADOW_TURN_BATCH` (default 1) pending branches are
+  drained per tick, processed SEQUENTIALLY (true parallel turns are a
+  deliberate non-feature until a real backlog exists).
   **Answered semantics** (a choice this spec left open, fixed by #71): a branch
   is pending ONLY when its LAST event is a human `message`. A delivered agent
   `message` OR an `agent.error` (a failed turn) as the last event ANSWERS the
@@ -150,7 +152,16 @@ A background loop in governance (rides the lifespan task group beside
   thread SHOWS the failure.
 - **Env:** `SNOWLINE_SHADOW_TURNS_ENABLED` (default false),
   `SNOWLINE_SHADOW_TURN_POLL_SECONDS` (default 5),
-  `_TIMEOUT`, `_CONCURRENCY`, `SNOWLINE_SHADOW_TURN_MODEL` (passed to codex).
+  `_TIMEOUT`, `_BATCH`, `SNOWLINE_SHADOW_TURN_MODEL` (passed to codex).
+- **Security posture (documented, not solved):** the prompt contains
+  verbatim branch content, and `--sandbox read-only` restricts codex's
+  WRITES, not reads — so a prompt-injected turn could read host files and
+  leak them into its logged reply (the log IS the only exfil channel; the
+  sandbox blocks network). Accepted under the current trust model: a
+  single-operator tailnet where everyone who can post a branch message
+  already has host-level access. The runner uses an empty scratch cwd as
+  casual-context hygiene. REVISIT TRIGGER: any multi-user or off-host
+  message source (e.g. exposing the composer beyond the tailnet).
 - **Out of scope for the first turn-runner:** the agent driving shadow MCP
   verbs (adding nodes/citations from inside a turn). The reply is markdown
   into the log; crystallizing a discussion into nodes stays with interactive

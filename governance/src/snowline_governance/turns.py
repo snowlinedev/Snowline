@@ -22,7 +22,7 @@ rather than `config.py`, which holds only the shared DB/platform URLs):
   SNOWLINE_SHADOW_TURN_POLL_SECONDS — poll cadence (default 5; lenient).
   SNOWLINE_SHADOW_TURN_TIMEOUT      — per-turn hard timeout AND stale-claim age
                                       (default 300; lenient).
-  SNOWLINE_SHADOW_TURN_CONCURRENCY  — max branches processed per tick (default 1).
+  SNOWLINE_SHADOW_TURN_BATCH  — max branches processed per tick (default 1).
   SNOWLINE_SHADOW_TURN_MODEL        — passed to codex `-m` (default unset → omit).
   SNOWLINE_SHADOW_CODEX_BIN         — codex binary name (default "codex"),
                                       resolved via `shutil.which` each poll.
@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 import anyio
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from snowline_governance import decisions, shadow
@@ -112,14 +112,14 @@ def _turn_timeout() -> float:
     return _lenient_float("SNOWLINE_SHADOW_TURN_TIMEOUT", 300.0)
 
 
-def _concurrency() -> int:
-    raw = os.environ.get("SNOWLINE_SHADOW_TURN_CONCURRENCY")
+def _batch_limit() -> int:
+    raw = os.environ.get("SNOWLINE_SHADOW_TURN_BATCH")
     if raw is None:
         return 1
     try:
         return max(1, int(raw))
     except ValueError:
-        log.warning("malformed SNOWLINE_SHADOW_TURN_CONCURRENCY=%r — using 1", raw)
+        log.warning("malformed SNOWLINE_SHADOW_TURN_BATCH=%r — using 1", raw)
         return 1
 
 
@@ -142,6 +142,10 @@ class PendingBranch(NamedTuple):
     branch_id: uuid.UUID
     scope_slug: str
     name: str
+    # The human message's seq — the answered-ness fingerprint: if the branch's
+    # max seq moved past this while the (long) turn ran, someone else already
+    # answered or the human said more, and this turn's stale reply is dropped.
+    last_seq: int
 
 
 def find_pending_branches(session: Session) -> list[PendingBranch]:
@@ -163,6 +167,7 @@ def find_pending_branches(session: Session) -> list[PendingBranch]:
             ShadowBranch.name,
             ShadowConversationEvent.kind,
             ShadowConversationEvent.payload,
+            ShadowConversationEvent.seq,
         )
         .join(
             ShadowConversationEvent,
@@ -175,9 +180,9 @@ def find_pending_branches(session: Session) -> list[PendingBranch]:
         .order_by(ShadowBranch.id, ShadowConversationEvent.seq.desc())
     )
     pending: list[PendingBranch] = []
-    for bid, slug, name, kind, payload in session.execute(stmt):
+    for bid, slug, name, kind, payload, seq in session.execute(stmt):
         if kind == CONVERSATION_MESSAGE_KIND and (payload or {}).get("author") == "human":
-            pending.append(PendingBranch(bid, slug, name))
+            pending.append(PendingBranch(bid, slug, name, seq))
     return pending
 
 
@@ -188,8 +193,11 @@ def _claimable(
     claims: dict[uuid.UUID, float], branch_id: uuid.UUID, now: float, timeout: float
 ) -> bool:
     """Is `branch_id` free to claim? Free if unclaimed, OR the existing claim is
-    STALE — older than `timeout` (a crashed turn that never released its claim
-    un-claims after the turn timeout, spec §6). `now`/claim times are
+    STALE — older than `timeout`. HONEST SCOPE: claims are in-process and
+    per-tick (set and released within one sequential tick), so today this
+    guards only against a future overlap of ticks/turns — NOT crash recovery
+    (a process crash clears the dict with the process; the DB's answered-ness
+    semantics are what make a re-run safe). `now`/claim times are
     `time.monotonic()` (immune to wall-clock jumps)."""
     claimed_at = claims.get(branch_id)
     if claimed_at is None:
@@ -393,7 +401,13 @@ def clamp_prompt(ctx: TurnContext, budget: int = PROMPT_CHAR_BUDGET) -> str:
     # end — the opposite of what must survive.
     tail = f"\n\n## Respond to this message\n**human**: {ctx.latest_human}"
     head = budget - len(tail)
-    return (text[:head] + tail) if head > 0 else tail[:budget]
+    if head > 0:
+        return text[:head] + tail
+    # The question ALONE exceeds the budget (a near-cap 64 KiB message vs the
+    # ~24k default). Keep the question's HEAD — its opening frames the ask —
+    # and mark the cut explicitly rather than silently slicing off the end.
+    marker = "\n…[message truncated to fit the turn budget]"
+    return tail[: budget - len(marker)] + marker
 
 
 # --- the codex inference seam (the ONLY LLM call in this module) ------------
@@ -416,6 +430,7 @@ def _invoke_codex(
     is fine."""
     fd, out_path = tempfile.mkstemp(prefix="snowline-turn-", suffix=".md")
     os.close(fd)
+    scratch_dir = tempfile.mkdtemp(prefix="snowline-turn-")
     try:
         cmd = [
             binary,
@@ -431,6 +446,12 @@ def _invoke_codex(
         ]
         if model:
             cmd += ["-m", model]
+        # An EMPTY scratch cwd (-C): the turn is pure reasoning over the stdin
+        # prompt — nothing in the repo/home directory is legitimately useful to
+        # it, and `--sandbox read-only` restricts WRITES, not reads. This does
+        # not contain a determined prompt-injection (see spec §6's posture),
+        # but it removes the casually-in-reach local context.
+        cmd += ["-C", scratch_dir]
         cmd.append("-")  # read the prompt from stdin
 
         proc = subprocess.Popen(
@@ -461,6 +482,7 @@ def _invoke_codex(
         return reply
     finally:
         Path(out_path).unlink(missing_ok=True)
+        shutil.rmtree(scratch_dir, ignore_errors=True)
 
 
 # --- one turn --------------------------------------------------------------
@@ -472,6 +494,7 @@ def process_turn(
     branch_id: uuid.UUID,
     scope_slug: str,
     name: str,
+    last_seq: int,
     binary: str,
     model: str | None,
     timeout: float,
@@ -500,6 +523,25 @@ def process_turn(
     # 3. Write in a FRESH session (re-checking archived via the service's guard).
     try:
         with session_scope() as session:
+            # Answered-ness re-check: the codex call is LONG (up to the turn
+            # timeout). If the branch's log advanced past the human message we
+            # answered (an agent MCP session replied, or the human said more),
+            # this reply is stale — drop it; the next tick re-reads with the
+            # fuller context. Shrinks the duplicate-reply window from the full
+            # turn duration to microseconds (the residual race is accepted).
+            current = session.scalar(
+                select(func.max(ShadowConversationEvent.seq)).where(
+                    ShadowConversationEvent.branch_id == branch_id
+                )
+            )
+            if current != last_seq:
+                log.info(
+                    "shadow turn: branch %s advanced past seq %s while the "
+                    "turn ran; dropping the stale reply",
+                    branch_id,
+                    last_seq,
+                )
+                return
             if reply is not None:
                 try:
                     shadow.add_message(session, branch_id, reply, "agent")
@@ -536,15 +578,15 @@ def _tick(
     scope_client: ScopeClient,
     claims: dict[uuid.UUID, float],
     *,
-    concurrency: int,
+    batch_limit: int,
     timeout: float,
     binary: str,
     model: str | None,
 ) -> None:
-    """One poll tick: find pending branches, claim up to `concurrency`
+    """One poll tick: find pending branches, claim up to `batch_limit`
     unclaimed/stale ones, and process each. Processing is SEQUENTIAL within the
     tick (the loop runs one tick at a time off a single worker thread), so
-    effective concurrency is capped by the loop shape — `concurrency` only bounds
+    effective batch limit is capped by the loop shape — `batch_limit` only bounds
     how many pending branches a single tick drains. Each claim is released in a
     `finally`; the stale-claim reclaim (`_claimable`) is the backstop for a hard
     crash that skips the `finally`."""
@@ -554,7 +596,7 @@ def _tick(
 
     processed = 0
     for pb in pending:
-        if processed >= concurrency:
+        if processed >= batch_limit:
             break
         if not _claimable(claims, pb.branch_id, now, timeout):
             continue
@@ -565,6 +607,7 @@ def _tick(
                 branch_id=pb.branch_id,
                 scope_slug=pb.scope_slug,
                 name=pb.name,
+                last_seq=pb.last_seq,
                 binary=binary,
                 model=model,
                 timeout=timeout,
@@ -609,16 +652,23 @@ async def shadow_turn_loop(scope_client: ScopeClient | None = None) -> None:
                     warned_missing = True
             else:
                 warned_missing = False
+                # abandon_on_cancel: lifespan shutdown must not wait out an
+                # in-flight codex turn (up to the turn timeout — minutes). The
+                # abandoned thread finishes in the background; its write either
+                # lands before process exit or is lost, which the answered-ness
+                # semantics tolerate (the human message stays last → the next
+                # boot's tick re-runs the turn).
                 await anyio.to_thread.run_sync(
                     functools.partial(
                         _tick,
                         scope_client,
                         claims,
-                        concurrency=_concurrency(),
+                        batch_limit=_batch_limit(),
                         timeout=_turn_timeout(),
                         binary=binary,
                         model=_turn_model(),
-                    )
+                    ),
+                    abandon_on_cancel=True,
                 )
         except Exception:
             log.exception("shadow turn tick failed; loop continues")

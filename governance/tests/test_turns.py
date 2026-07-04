@@ -261,7 +261,7 @@ def test_process_turn_success_appends_agent_message(clean_db, monkeypatch):
         lambda prompt, **kw: "Consider RS256 over HS256 — asymmetric keys.",
     )
     turns.process_turn(
-        _NoopScopeClient(), branch_id=bid, scope_slug=slug, name="line-a",
+        _NoopScopeClient(), branch_id=bid, scope_slug=slug, last_seq=1, name="line-a",
         binary="codex", model=None, timeout=5.0,
     )
 
@@ -270,6 +270,32 @@ def test_process_turn_success_appends_agent_message(clean_db, monkeypatch):
     assert conv[-1]["author"] == "agent"
     assert conv[-1]["markdown"] == "Consider RS256 over HS256 — asymmetric keys."
     assert _last_event_kind(bid) == CONVERSATION_MESSAGE_KIND
+
+
+def test_process_turn_drops_stale_reply_when_branch_advanced(clean_db, monkeypatch):
+    # Answered-ness re-check: if the log moved past the human message we
+    # answered (another agent replied, or the human said more) while the long
+    # codex call ran, the stale reply is DROPPED — no duplicate agent replies.
+    slug = "acme/widget"
+    bid = _seed_branch_with_human_msg(slug, "line-stale", "should we use jwt?")
+
+    def _reply_and_advance(prompt, **kw):
+        # Simulate a concurrent answer landing mid-turn.
+        with session_scope() as s:
+            shadow.add_message(s, bid, "someone else answered first", "agent")
+        return "my now-stale reply"
+
+    monkeypatch.setattr(turns, "_invoke_codex", _reply_and_advance)
+    turns.process_turn(
+        _NoopScopeClient(), branch_id=bid, scope_slug=slug, last_seq=1, name="line-stale",
+        binary="codex", model=None, timeout=5.0,
+    )
+
+    conv = _conversation(slug, "line-stale")
+    assert [e["markdown"] for e in conv] == [
+        "should we use jwt?",
+        "someone else answered first",
+    ]
 
 
 def test_process_turn_failure_appends_agent_error(clean_db, monkeypatch):
@@ -281,7 +307,7 @@ def test_process_turn_failure_appends_agent_error(clean_db, monkeypatch):
 
     monkeypatch.setattr(turns, "_invoke_codex", _boom)
     turns.process_turn(
-        _NoopScopeClient(), branch_id=bid, scope_slug=slug, name="line-b",
+        _NoopScopeClient(), branch_id=bid, scope_slug=slug, last_seq=1, name="line-b",
         binary="codex", model=None, timeout=5.0,
     )
 
@@ -303,7 +329,7 @@ def test_process_turn_oversized_reply_becomes_agent_error(clean_db, monkeypatch)
         turns, "_invoke_codex", lambda prompt, **kw: "x" * (65 * 1024),
     )
     turns.process_turn(
-        _NoopScopeClient(), branch_id=bid, scope_slug=slug, name="line-big",
+        _NoopScopeClient(), branch_id=bid, scope_slug=slug, last_seq=1, name="line-big",
         binary="codex", model=None, timeout=5.0,
     )
 
@@ -326,7 +352,7 @@ def test_process_turn_archived_mid_turn_drops_reply(clean_db, monkeypatch):
     )
     # Must NOT raise — BranchArchivedError is caught and the reply dropped.
     turns.process_turn(
-        _NoopScopeClient(), branch_id=bid, scope_slug=slug, name="line-c",
+        _NoopScopeClient(), branch_id=bid, scope_slug=slug, last_seq=1, name="line-c",
         binary="codex", model=None, timeout=5.0,
     )
 

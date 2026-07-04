@@ -87,11 +87,14 @@ def create_app(
             tg.start_soon(webhook_delivery_loop)
             # The shadow turn-runner (spec §6, issue #71) rides the same task
             # group. It self-gates OFF unless SNOWLINE_SHADOW_TURNS_ENABLED is
-            # set (default false → returns immediately), so tests and
-            # unconfigured deploys never run it. It shares the app's injected
-            # ScopeClient (None in production → the loop builds its own
-            # HttpScopeClient from config), so grounding reads reuse the same
-            # platform pointer. Cancelled on lifespan exit with the group.
+            # set (default false → returns immediately; the tests also pin the
+            # var off via an autouse fixture, so a dev shell's export can't
+            # start real codex turns mid-suite). An injected ScopeClient is
+            # passed through for tests; in production (scope_client=None) the
+            # loop builds its OWN HttpScopeClient from the same config the
+            # surfaces use — same platform URL, separate client instance.
+            # Cancellation on lifespan exit abandons an in-flight turn thread
+            # (it finishes in the background; see shadow_turn_loop).
             tg.start_soon(shadow_turn_loop, scope_client)
             if getattr(app.state, "register_on_startup", True):
                 # The registration HEARTBEAT (issue #39): first beat immediately
