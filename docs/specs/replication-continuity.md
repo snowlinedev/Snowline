@@ -242,8 +242,11 @@ With one authority, one human, and append-mostly domains, conflicts reduce to
 one shape: **the same logical object modified on both sides during a
 partition** (in practice: a supersession/forget race against oneself).
 
-- Plain concurrent *appends* are not conflicts — both records exist on both
-  sides after heal, exactly as if authored sequentially.
+- Plain concurrent *appends* are not conflicts *mechanically* — both records
+  exist on both sides after heal, exactly as if authored sequentially. But
+  two decisions authored on opposite sides of a partition can conflict
+  *semantically* (one should supersede the other) while converging cleanly;
+  §6.1 exists to catch exactly that.
 - For a genuine race on one object, resolution is **deterministic and
   primary-ordered**: the primary applies events in its ingest order; the
   spoke converges to the primary's outcome. Ties on the same object resolve
@@ -252,6 +255,50 @@ partition** (in practice: a supersession/forget race against oneself).
 - **Every resolved conflict is logged at WARNING with both event ids** — the
   volume should be ~zero; if it isn't, that is a design signal to surface,
   not noise to suppress.
+
+### 6.1 Concurrent siblings — catching semantic conflict after a long partition
+
+The scenario §6's rules do NOT cover: the hub↔spoke link is down for a
+while, and the owner (or a second user) with access to *both* instances
+records decisions on each that semantically collide — one should supersede
+the other. Mechanically these are distinct UUIDs appending cleanly; without
+help, both stand as live decisions and nothing says so.
+
+Whether two decisions *actually* conflict is not machine-decidable — but
+"authored concurrently, in overlapping scope, during a divergence window"
+is, cheaply. So the split follows core principle #1: **detection is
+mechanical, adjudication belongs to the LLM.**
+
+- **Detection, at ingest (governance-plugin behavior).** The bus already
+  gives each side the peer's last-delivery point (the watermark state a
+  partition freezes). When ingest applies a `decision.recorded` event, any
+  *locally-authored* decision newer than that point is *concurrent* with it.
+  The collision surface is the **applicability chain, not just same-scope**:
+  a decision at a parent scope governs descendants, so the incoming decision
+  is checked against concurrent local decisions in any scope along either
+  one's ancestors-until-isolated walk (the walk governance already performs
+  for `applicable_decisions`). Detection runs symmetrically on both sides
+  and is deliberately over-inclusive — a heuristic net, not a judgment.
+- **Surfacing, as first-class state — not a log line.** Each flagged pair
+  gets a `concurrent_with` marker on both decisions and appears in an
+  `unreconciled` read view on the governance surface (tool + UI widget), so
+  the daily-driver agent *sees* it in the flow of work. A WARNING in a log
+  nobody tails on vacation is not surfacing.
+- **Reconciliation is ordinary governance.** The owner (or the agent, asked
+  to review the pair) resolves it the way governance already resolves
+  disagreement: record a supersession — which is a normal event, replicates
+  normally, and clears the flag on both sides once the supersession edge
+  exists between the pair (or the pair is explicitly marked compatible).
+  No new write primitive, no automatic resolution: the platform never
+  guesses which decision was "right."
+- **Scope of the mechanism.** This is a governance-plugin concern, not SDK
+  machinery — semantic conflict is domain-specific. The SDK contract stays
+  envelope-level; PM (or any opted-in plugin) defines its own analogue if
+  its domain has one, with this section as the reference pattern. §6's
+  premise ("one human, ~zero conflicts") weakens the day a second user
+  appears — this mechanism is the guard that makes that day survivable,
+  while §11's CRDT revisit trigger remains for genuinely concurrent
+  multi-writer semantics.
 
 ## 7. Seeding a spoke
 
@@ -295,7 +342,8 @@ next delivery pass rather than dropping data.
    read-only reference. Unbounded-retry subscription class (§3.1).
 2. **Manifest**: additive `replication` block + registry storage (advisory).
 3. **Governance** adopts SDK ingest (emit exists); extends event coverage to
-   shadow/artifacts/specs.
+   shadow/artifacts/specs; concurrent-sibling detection + `unreconciled`
+   view (§6.1).
 4. **Memory** adopts emit + ingest (`memory.recorded` / `memory.forgotten`).
 5. **Platform scopes** adopt the contract (§8).
 6. **Pairing CLI** + seed procedure (§5, §7); stand up `roam` on the laptop.
@@ -316,6 +364,12 @@ next delivery pass rather than dropping data.
 - Writes to the *same* object on both sides during a partition: both sides
   converge to the same state after heal, the resolution matches §6's rule,
   and a WARNING with both event ids was logged.
+- *Distinct* decisions recorded on each side during a partition, in the same
+  scope or along one applicability chain: after heal, both instances flag
+  the pair as concurrent siblings and the `unreconciled` view returns it
+  (§6.1); recording a supersession between them clears the flag on both
+  sides. A concurrent pair in *unrelated, non-inheriting* scopes is NOT
+  flagged.
 - A spoke-authored scope followed immediately by a spoke-authored decision in
   it replicates in order (or self-heals via §8's retryable-unknown-slug rule).
 - Pairing refuses (with a clear message) a plugin pair with mismatched
