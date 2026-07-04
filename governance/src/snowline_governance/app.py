@@ -26,9 +26,12 @@ from pathlib import Path
 import anyio
 from fastapi import FastAPI
 from snowline_plugin_sdk.registration import install_heartbeat_httpx_filter
+from snowline_plugin_sdk.replication.admin import build_replication_router
 
-from snowline_governance import config, registration
+from snowline_governance import config, registration, replication_apply
+from snowline_governance.db import session_scope
 from snowline_governance.mcp_surface import build_main_surface, build_shadow_surface
+from snowline_governance.replication_stream import INGEST_PATH
 from snowline_governance.scope_client import ScopeClient
 from snowline_governance.ui_api import router as ui_api_router
 
@@ -82,9 +85,18 @@ def create_app(
             # The scope is cancelled on exit so the loop tears down cleanly.
             from snowline_governance.replication import webhook_delivery_loop
             from snowline_governance.turns import shadow_turn_loop
+            from snowline_plugin_sdk.replication.emit import (
+                replication_delivery_loop,
+            )
 
             tg = await stack.enter_async_context(anyio.create_task_group())
             tg.start_soon(webhook_delivery_loop)
+            # The replication-class delivery loop (replication-continuity
+            # §3.1, #79): drains the SDK outbox toward paired peers with the
+            # unbounded-retry/capped-backoff class. A no-op ticker until
+            # pairing creates subscriptions; disable via
+            # SNOWLINE_REPLICATION_DISABLED.
+            tg.start_soon(replication_delivery_loop, session_scope)
             # The shadow turn-runner (spec §6, issue #71) rides the same task
             # group. It self-gates OFF unless SNOWLINE_SHADOW_TURNS_ENABLED is
             # set (default false → returns immediately; the tests also pin the
@@ -121,6 +133,21 @@ def create_app(
     # over the `/` mount: Starlette matches routes before mounts in registration
     # order, and a mount at `/` would otherwise swallow every path.
     app.include_router(ui_api_router)
+
+    # The replication ingest + admin surface (replication-continuity §4/§5,
+    # #79): the SDK router over governance's OWN session_scope (one delivery
+    # per request transaction — the ingest contract) and its domain apply.
+    # Registered BEFORE the catch-all MCP mounts for the same
+    # routes-before-mounts reason as /health and /ui-api. Tailnet-gated inside
+    # the router; the stream HMAC authenticates each delivery. Admin stays OFF
+    # MCP — agents never manage plumbing.
+    app.include_router(
+        build_replication_router(
+            session_scope,
+            replication_apply.build_apply(scope_client),
+            ingest_path=INGEST_PATH,
+        )
+    )
 
     # Mount the FastMCP surfaces so the served endpoints are exactly the paths the
     # manifest advertises: `/mcp` (main) and `/shadow/mcp` (shadow). FastMCP's

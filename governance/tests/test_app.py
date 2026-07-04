@@ -42,6 +42,9 @@ def test_main_surface_exposes_the_decision_and_artifact_tools():
         "get_decision",
         "list_decisions",
         "applicable_decisions",
+        # §6.1 unreconciled view (replication-continuity, #79) — a read on the
+        # shared read set (registered on BOTH surfaces).
+        "unreconciled_decisions",
         # graduation (shadow → real) — real writes, main-only (decision 99b92e1d).
         # Node-level + branch-level (graduate_branch / record_branch_rejection).
         "graduate",

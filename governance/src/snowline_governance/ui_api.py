@@ -46,7 +46,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import func, select
 
-from snowline_governance import shadow
+from snowline_governance import concurrence, shadow
 from snowline_governance.db import session_scope
 from snowline_governance.models import (
     DEFAULT_SHADOW_BRANCH_STATUS,
@@ -81,6 +81,23 @@ async def shadow_activity_widget() -> dict:
     """`stat` contract (§4.1): the count of open (non-archived) shadow
     branches across every scope — the home-grid activity pulse."""
     return await anyio.to_thread.run_sync(_shadow_activity_sync)
+
+
+def _unreconciled_widget_sync() -> dict:
+    with session_scope() as session:
+        count = concurrence.unreconciled_count(session)
+    return {"value": count, "label": "unreconciled decisions"}
+
+
+@router.get("/widgets/unreconciled-decisions")
+async def unreconciled_decisions_widget() -> dict:
+    """`stat` contract (§4.1): the count of OPEN §6.1 concurrent-sibling pairs
+    (replication-continuity — decisions authored on both instances during a
+    partition, in overlapping scope, with no supersession between them yet).
+    Zero is the healthy standing state; anything else is first-class work the
+    daily-driver should see in the flow (the `unreconciled_decisions` tool
+    carries the detail)."""
+    return await anyio.to_thread.run_sync(_unreconciled_widget_sync)
 
 
 # --- page: branches table ------------------------------------------------

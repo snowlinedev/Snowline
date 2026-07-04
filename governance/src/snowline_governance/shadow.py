@@ -40,6 +40,15 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from snowline_plugin_sdk.ui import UI_WRITE_BODY_LIMIT
 
+from snowline_governance import replication_stream
+from snowline_governance.contract import (
+    EVENT_SHADOW_BRANCH_ARCHIVED,
+    EVENT_SHADOW_BRANCH_CREATED,
+    EVENT_SHADOW_CITATION_ADDED,
+    EVENT_SHADOW_CONVERSATION_APPENDED,
+    EVENT_SHADOW_NODE_ADDED,
+    EVENT_SHADOW_NOTES_SET,
+)
 from snowline_governance.models import (
     DEFAULT_SHADOW_BRANCH_STATUS,
     SHADOW_BRANCH_STATUS_ARCHIVED,
@@ -300,6 +309,12 @@ def create_branch(
     )
     session.add(branch)
     session.flush()
+    # STREAM emit (replication-continuity §4 coverage, #79) — same transaction.
+    replication_stream.emit(
+        session,
+        EVENT_SHADOW_BRANCH_CREATED,
+        replication_stream.branch_created_payload(branch),
+    )
     return _branch_dict(branch, nodes=[])
 
 
@@ -350,6 +365,13 @@ def set_narrative_notes(
     branch = _get_branch_row(session, scope_slug, name)
     branch.narrative_notes = narrative_notes
     session.flush()
+    # STREAM emit — an in-place LWW register write (§6): the emit hook also
+    # records this write's (at, source) coordinate for conflict resolution.
+    replication_stream.emit(
+        session,
+        EVENT_SHADOW_NOTES_SET,
+        replication_stream.notes_set_payload(branch),
+    )
     return _branch_dict(branch)
 
 
@@ -373,6 +395,14 @@ def archive_branch(session: Session, scope_slug: str, name: str) -> dict:
         # than the naive value a later read returns.
         branch.archived_at = datetime.now(timezone.utc).replace(tzinfo=None)
         session.flush()
+        # STREAM emit — inside the flip, so an idempotent re-archive emits
+        # nothing (there was no write). Apply converges `archived_at` to the
+        # EARLIEST archival (the "pinned to the original" semantics, §6).
+        replication_stream.emit(
+            session,
+            EVENT_SHADOW_BRANCH_ARCHIVED,
+            replication_stream.branch_archived_payload(branch),
+        )
     return _branch_dict(branch)
 
 
@@ -395,6 +425,11 @@ def add_node(
     )
     session.add(node)
     session.flush()
+    replication_stream.emit(
+        session,
+        EVENT_SHADOW_NODE_ADDED,
+        replication_stream.node_added_payload(node),
+    )
     return _node_dict(node)
 
 
@@ -463,6 +498,11 @@ def add_citation(
     )
     session.add(citation)
     session.flush()
+    replication_stream.emit(
+        session,
+        EVENT_SHADOW_CITATION_ADDED,
+        replication_stream.citation_added_payload(citation),
+    )
     return _citation_dict(citation)
 
 
@@ -579,6 +619,14 @@ def _append_conversation_event(
     )
     session.add(event)
     session.flush()
+    # STREAM emit — one event type for the ONE appender (message + agent.error
+    # both come through here). The payload omits `seq` (locally re-allocated at
+    # apply; see replication_stream's docstring).
+    replication_stream.emit(
+        session,
+        EVENT_SHADOW_CONVERSATION_APPENDED,
+        replication_stream.conversation_appended_payload(event),
+    )
     return _conversation_event_dict(event)
 
 
