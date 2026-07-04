@@ -20,32 +20,17 @@ the surface is up.
 from __future__ import annotations
 
 import contextlib
-import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import anyio
 from fastapi import FastAPI
+from snowline_plugin_sdk.registration import install_heartbeat_httpx_filter
 
 from snowline_governance import config, registration
 from snowline_governance.mcp_surface import build_main_surface, build_shadow_surface
 from snowline_governance.scope_client import ScopeClient
 from snowline_governance.ui_api import router as ui_api_router
-
-
-class _HeartbeatHttpxLogFilter(logging.Filter):
-    """Drops httpx's per-request INFO line for the registration heartbeat's
-    `POST …/plugins` (one line per beat, forever) while letting every OTHER
-    httpx request trace through — governance also talks httpx for scope reads
-    and the webhook_delivery_loop's outbound deliveries, and muting those would
-    leave live debugging blind."""
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        msg = record.getMessage()
-        return not ("POST" in msg and "/plugins" in msg)
-
-
-_HEARTBEAT_HTTPX_FILTER = _HeartbeatHttpxLogFilter()
 
 
 def _migrate_to_head() -> None:
@@ -73,13 +58,10 @@ def create_app(
     schema); `register_on_startup=False` skips the platform registration
     heartbeat (tests assert registration separately, against a stubbed
     platform)."""
-    # httpx logs every request at INFO — with the registration heartbeat that is
-    # one line per beat forever (defeating the DEBUG steady-state logging).
-    # Capping the whole httpx logger at WARNING would also mute the scope reads
-    # and webhook_delivery_loop's httpx traffic, so instead drop ONLY the
-    # heartbeat's POST /plugins lines (idempotent — one module-level filter
-    # instance, and addFilter dedupes).
-    logging.getLogger("httpx").addFilter(_HEARTBEAT_HTTPX_FILTER)
+    # Drop ONLY the heartbeat's per-beat `POST …/plugins` INFO line from the
+    # httpx logger — governance's scope reads and webhook deliveries still
+    # trace through (idempotent; rationale lives with the filter in the SDK).
+    install_heartbeat_httpx_filter()
     main_surface = build_main_surface(scope_client=scope_client)
     shadow_surface = build_shadow_surface(scope_client=scope_client)
 

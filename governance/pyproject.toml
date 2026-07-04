@@ -9,10 +9,13 @@ dependencies = [
     "sqlalchemy>=2.0",
     "psycopg[binary]>=3.1",
     "alembic>=1.13",
-    # Talks to the platform's scope HTTP API; registers with the platform.
+    # Talks to the platform's scope HTTP API (scope_client, replication).
     "httpx>=0.27",
     # The MCP surface (FastMCP, streamable HTTP) — mirrors the monolith.
     "mcp>=1.2",
+    # The shared registration heartbeat (issue #50) — the `[client]` extra pulls
+    # httpx + anyio for `snowline_plugin_sdk.registration`.
+    "snowline-plugin-sdk[client]",
 ]
 
 [dependency-groups]
@@ -24,3 +27,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/snowline_governance"]
+
+[tool.uv.sources]
+# `snowline-plugin-sdk` is a workspace MEMBER (repo-root pyproject declares the
+# workspace); wire it as such so `uv sync` resolves the local source.
+snowline-plugin-sdk = { workspace = true }
