@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -338,14 +339,28 @@ class ReplicationBlock(BaseModel):
     @field_validator("advertised_base_url")
     @classmethod
     def _valid_advertised_base_url(cls, v: str | None) -> str | None:
-        # Same shape rule as PluginManifest.base_url — it IS a base_url, just
-        # the peer-facing one — so a malformed value fails loud at registration
-        # rather than becoming an unreachable pairing target.
+        # It IS a base_url — the peer-facing one — so it shares
+        # PluginManifest.base_url's shape rule (require an http(s) scheme, strip
+        # a trailing slash; see `_valid_base_url`) and additionally forbids a
+        # query or fragment, making it STRICTER than base_url. The extra rule is
+        # load-bearing here and not on base_url: pairing uses this value VERBATIM
+        # and then SUFFIXES the admin prefix / ingest_path onto it (§5), so
+        # `http://h?x=1` or `http://h#f` would suffix into a corrupted URL
+        # (`http://h?x=1/replication-admin`). A non-empty PATH is allowed on
+        # purpose — a path-based serve front (§4.1) is a reason to declare this
+        # field, and the ingest/admin suffix is meant to land under that path.
         if v is None:
             return v
         if not (v.startswith("http://") or v.startswith("https://")):
             raise ValueError(
                 f"advertised_base_url {v!r} must start with http:// or https://"
+            )
+        parts = urlsplit(v)
+        if parts.query or parts.fragment:
+            raise ValueError(
+                f"advertised_base_url {v!r} must not carry a query or fragment — "
+                "pairing suffixes the admin/ingest path onto it (§5), which a "
+                "query or fragment would corrupt"
             )
         return v.rstrip("/")
 

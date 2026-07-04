@@ -712,8 +712,16 @@ events. The two never overlap.
   flagged.
 - A spoke-authored scope followed immediately by a spoke-authored decision in
   it replicates in order (or self-heals via §8's retryable-unknown-slug rule).
-- Pairing refuses (with a clear message) a plugin pair with mismatched
-  `contract_version`, and warns on one-sided opt-in.
+- Pairing refuses (with a clear message) any participant pair with mismatched
+  `contract_version` — a plugin pair OR the platform's own scope stream, which
+  self-describes its contract at pairing time (§8/#95) and is refused on skew
+  exactly like a plugin, rather than deferring the skew to a delivery-time
+  `version_hold` — and warns on one-sided opt-in.
+- Pairing survives a mixed-version rollout: a peer platform that predates the
+  scope-stream self-manifest (§8) is discovered by falling back to the pre-#95
+  synthesized participant (its contract_version left unknown, so the check
+  defers to delivery-time, and a loud WARN names the remedy), so ONE
+  un-upgraded peer never blocks pairing of the other participants.
 - After pairing, BOTH directions verify: an event signed by either sender is
   accepted by its receiver (the handshake put the secret on the verifying
   side); rotating a stream's secret is hitless — old-signed deliveries are

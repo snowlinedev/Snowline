@@ -8,7 +8,11 @@ vocabulary warnings, run-once idempotency, and an end-to-end convergence check
 
 from __future__ import annotations
 
+import logging
+
 import pytest
+from fastapi import FastAPI
+from fastapi.responses import PlainTextResponse
 from sqlalchemy import select
 
 from snowline_platform import replication_pairing as pairing
@@ -306,6 +310,81 @@ def test_platform_stream_vocabulary_skew_warns_but_pairs():
     plan = pairing.plan_pairing(local, peer)
     assert "platform" in plan.vocab_warnings
     assert "platform" in plan.to_pair
+
+
+def _peer_platform_app(*, self_manifest, plugins=()):
+    """A platform-shaped app whose `/replication/manifest` behavior is under
+    test. `self_manifest` is 'absent' (no route → 404, a pre-#95 peer),
+    'malformed' (a 200 that is not JSON), or a dict body (e.g. missing a
+    required key). `/plugins` returns `plugins` so discovery reaches the
+    platform read after the plugin loop."""
+    app = FastAPI()
+
+    @app.get("/plugins")
+    async def _plugins() -> dict:  # noqa: D401 - test fixture route
+        return {"plugins": list(plugins)}
+
+    if self_manifest == "malformed":
+        @app.get("/replication/manifest")
+        async def _malformed() -> PlainTextResponse:  # noqa: D401
+            return PlainTextResponse("<html>not json</html>")
+    elif isinstance(self_manifest, dict):
+        @app.get("/replication/manifest")
+        async def _body() -> dict:  # noqa: D401
+            return self_manifest
+    # 'absent' → no route mounted → FastAPI 404
+    return app
+
+
+def test_platform_self_manifest_404_falls_back_and_pairing_proceeds(caplog):
+    """#95 migration path: a peer platform predating the self-manifest (404) is
+    SYNTHESIZED the pre-#95 way (scope vocabulary, §8 ingest path,
+    contract_version UNKNOWN) with a loud WARN — and, crucially, the 404 does
+    NOT block discovery/pairing of the OTHER participants (the plugin is still
+    discovered and planned). Skew defers to a delivery-time hold, as before #95."""
+    gov = plugin_entry("governance", "http://127.0.0.1:8801", events=["decision.recorded"])
+    client = RoutedClient({
+        "prim-platform": _peer_platform_app(self_manifest="absent", plugins=[gov]),
+        "roam-platform": make_platform(plugins=[gov]).app,  # local serves a real manifest
+    })
+    with caplog.at_level(logging.WARNING, logger="snowline_platform.replication_pairing"):
+        peer = pairing.discover_participants(
+            client, "http://prim-platform", "primary", reachable_host="prim-platform"
+        )
+    # The 404 platform is synthesized, NOT a blocker — the plugin came through too.
+    assert set(peer) == {"governance", "platform"}
+    plat = peer["platform"]
+    assert plat.source_id == "primary.platform"
+    assert plat.ingest_url == "http://prim-platform/replication/events/ingest"
+    assert plat.events == ("scope.created", "scope.updated")
+    assert plat.contract_version is None  # unknown → the pre-#95 pairing-time skip
+    assert any("predates the replication self-manifest" in r.message for r in caplog.records)
+
+    # Pairing PROCEEDS for every participant: the None platform version is not a
+    # mismatch (it defers), so nothing is refused and both are planned.
+    local = pairing.discover_participants(client, "http://roam-platform", "roam")
+    plan = pairing.plan_pairing(local, peer)
+    assert set(plan.to_pair) == {"governance", "platform"}
+    assert not plan.refused
+
+
+def test_platform_self_manifest_malformed_json_raises_labeled_error():
+    """A 200 whose body is not JSON is a broken peer self-manifest — a LABELED
+    PairingError naming the URL, not a raw JSONDecodeError stack trace."""
+    client = RoutedClient({"prim-platform": _peer_platform_app(self_manifest="malformed")})
+    with pytest.raises(pairing.PairingError, match="broken replication self-manifest"):
+        pairing.discover_participants(client, "http://prim-platform", "primary")
+
+
+def test_platform_self_manifest_missing_field_raises_labeled_error():
+    """A 200 JSON object missing a required key (here `ingest_path`) is an
+    incomplete self-manifest — a LABELED PairingError naming the missing field,
+    not a raw KeyError from `_participant`. (The plugin path is guarded by
+    ReplicationBlock at registration; this raw-JSON read is not.)"""
+    body = {"contract_version": 2, "events": ["scope.created", "scope.updated"]}
+    client = RoutedClient({"prim-platform": _peer_platform_app(self_manifest=body)})
+    with pytest.raises(pairing.PairingError, match="incomplete replication self-manifest.*ingest_path"):
+        pairing.discover_participants(client, "http://prim-platform", "primary")
 
 
 def test_rehost_preserves_port_and_path():

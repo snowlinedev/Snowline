@@ -51,8 +51,10 @@ log = logging.getLogger("snowline_platform.replication_pairing")
 # tailnet-gated self-manifest endpoint (issue #95), the same block shape a
 # plugin declares, which this CLI reads through the IDENTICAL construction path
 # (`_participant`) so the platform's scope stream is version/vocabulary-checked
-# at pairing exactly like a plugin's — no synthesized constants, no skipped
-# refuse (that was #90's special case, now deleted).
+# at pairing exactly like a plugin's — #90's synthesized-constants special case
+# is gone, except for one localized MIGRATION fallback: a peer platform that
+# predates this endpoint (404) is synthesized the pre-#95 way in a single branch
+# of `_platform_manifest`, so a mixed-version rollout can still pair.
 PLATFORM_PARTICIPANT = "platform"
 PLATFORM_MANIFEST_PATH = "/replication/manifest"
 
@@ -202,12 +204,67 @@ def _resolve_base(
 
 
 def _platform_manifest(client, platform_url: str) -> dict:
-    """The platform's replication self-manifest (§8, issue #95) — the same block
-    shape a plugin declares, read from its tailnet-gated endpoint so the CLI
-    builds the platform Participant through the identical `_participant` path."""
-    resp = client.get(f"{platform_url}{PLATFORM_MANIFEST_PATH}")
-    _raise_for_status(resp, f"GET {platform_url}{PLATFORM_MANIFEST_PATH}")
-    return resp.json()
+    """Read the platform's replication self-manifest (§8, issue #95) — the same
+    block shape a plugin declares — so the CLI builds the platform Participant
+    through the identical `_participant` path.
+
+    This runs INSIDE `discover_participants`, before the participants dict
+    returns, so a raise here would block pairing of EVERY participant (plugins
+    included) on one misbehaving peer platform. The non-happy peer states are
+    therefore handled deliberately:
+
+      * 404 — a peer platform predating #95 has no self-manifest. FALL BACK to
+        the pre-#95 synthesized platform participant (scope vocabulary + §8
+        ingest path, contract_version UNKNOWN) and WARN. A pre-upgrade peer has
+        no version to advertise, and blocking a rollout-window pairing is worse
+        than deferring the check — so the scope-stream skew defers to a
+        delivery-time version_hold exactly as it did before #95.
+      * 200 + non-JSON, or a JSON non-object, or a JSON object missing a
+        required field — a LABELED `PairingError` naming the URL and the fault
+        (the operator fixes the peer), never a raw JSONDecodeError/KeyError
+        stack trace. The plugin path needs no such guard: its block is validated
+        by `ReplicationBlock` at registration; this raw-JSON read is not."""
+    url = f"{platform_url}{PLATFORM_MANIFEST_PATH}"
+    resp = client.get(url)
+    if resp.status_code == 404:
+        log.warning(
+            "peer platform at %s predates the replication self-manifest (#95); "
+            "its scope-stream contract_version can't be checked at pairing, so "
+            "skew will surface later as a delivery-time version_hold (pre-#95 "
+            "behavior) — upgrade the peer's platform to restore pairing-time "
+            "checks",
+            platform_url,
+        )
+        # The pre-#95 synthesized platform block, built HERE so this 404 branch
+        # is the only re-introduced platform-specific code: scope vocabulary +
+        # §8 ingest path, version UNKNOWN (None → the pre-#95 pairing-time skip).
+        # It still flows through the shared `_participant` constructor.
+        return {
+            "contract_version": None,
+            "ingest_path": "/replication/events/ingest",
+            "events": ["scope.created", "scope.updated"],
+        }
+    _raise_for_status(resp, f"GET {url}")
+    try:
+        block = resp.json()
+    except Exception as exc:  # noqa: BLE001 - any non-JSON body
+        snippet = (getattr(resp, "text", "") or "")[:200]
+        raise PairingError(
+            f"GET {url} returned a broken replication self-manifest (not JSON): "
+            f"{snippet!r}"
+        ) from exc
+    if not isinstance(block, dict):
+        raise PairingError(
+            f"GET {url} returned an unexpected replication self-manifest "
+            f"(expected a JSON object, got {type(block).__name__}): {block!r}"
+        )
+    missing = [k for k in ("contract_version", "ingest_path", "events") if k not in block]
+    if missing:
+        raise PairingError(
+            f"GET {url} returned an incomplete replication self-manifest — "
+            f"missing required field(s) {missing}: {block!r}"
+        )
+    return block
 
 
 # --- the §5 handshake ---------------------------------------------------------
