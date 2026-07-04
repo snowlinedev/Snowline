@@ -6,7 +6,7 @@ process lifetime (issue #39). The platform registry is in-memory, so a platform
 restart empties it and only a re-assert from the plugin side heals the composed
 surfaces. This module is that shared mechanism, extracted from the byte-identical
 hand-mirrors that had accreted in `governance/` and `memory/` (and a third in
-`snowline-pm`, a fourth in TypeScript in `walkthrough-mcp`).
+the owner's private plugin repo, a fourth in TypeScript in `walkthrough-mcp`).
 
 It lives in the SDK's `[client]` extra (`snowline-plugin-sdk[client]`, pulling
 `httpx` + `anyio`) and is imported EXPLICITLY — the SDK package root stays

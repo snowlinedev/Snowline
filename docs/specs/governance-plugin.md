@@ -121,8 +121,7 @@ Event-type registry + `CONTRACT_VERSION` are the published contract (the
 
 ## 8. Out of scope (these are other plugins / the platform)
 
-- The PM layer — work items, initiatives, phases, roadmap, `whats_next`,
-  briefing, triage, recurring work, task sinks.
+- The owner's private domain layer — lives in the private plugin's own repo.
 - GitHub / Todoist integration and reconcile.
 - The drift / triage **carriers** (separate carrier plugins).
 - **Scopes** — owned by the platform, not governance.
@@ -133,9 +132,9 @@ Built by carving the already-clean governance modules from the frozen monolith
 as read-only reference — `decisions`, `shadow`, `branching`, `replication`
 (EMIT), `replication_ingest`, the substrate-core models (`models_core` minus
 `Scope`), the artifact layer, and the `snowline-plugin-sdk` — and writing the
-de-PM'd versions of the entangled bits fresh (the MCP surfaces split main/shadow
+disentangled versions of the coupled bits fresh (the MCP surfaces split main/shadow
 per the monolith's pattern; an inline-capable `artifacts` without the
-`scope_config`/git-PM edges; scopes referenced from the platform, not owned).
+monolith's `scope_config`/git edges; scopes referenced from the platform, not owned).
 Schema stays compatible with the monolith so existing decisions/scopes can be
 migrated into the running instance later.
 
@@ -150,4 +149,4 @@ migrated into the running instance later.
   create/add/cite/graduate all work, with tests.
 - Emits signed, versioned `decision.*` events a subscriber can verify with the
   SDK.
-- Imports no PM code (import-pure); runs against a substrate-only DB.
+- Imports no monolith code (import-pure); runs against a substrate-only DB.

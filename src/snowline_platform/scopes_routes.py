@@ -1,6 +1,6 @@
 """HTTP read/resolve surface for the scope namespace (spec §4).
 
-Out-of-process plugins (governance, PM) cannot import the platform, so they
+Out-of-process plugins (governance, memory) cannot import the platform, so they
 fetch the scope tree over HTTP:
 
   GET  /scopes                      list (optional ?org=)

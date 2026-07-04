@@ -31,7 +31,7 @@ Already true everywhere, and this spec pins it as a commitment:
 - The gateway's composed surfaces run `StreamableHTTPSessionManager(...,
   stateless=True)` (`gateway_app.py`).
 - Governance (main + shadow) and memory build `FastMCP(...,
-  stateless_http=True)`; pm mirrors the same construction.
+  stateless_http=True)`; private plugins mirror the same construction.
 - The gateway opens **per-request** upstream sessions (`gateway.py`) — no
   gateway↔plugin session outlives a call.
 
@@ -74,7 +74,7 @@ attempted; retry covers the UP/UNKNOWN-but-restarting window that health
 polling is too slow to see. Retries log at DEBUG (steady-state silence), with
 a WARNING only when retries were exhausted.
 
-**Effect once shipped:** plugin deploys (governance, memory, pm) become
+**Effect once shipped:** plugin deploys (governance, memory, private plugins) become
 invisible — a tool call issued mid-kickstart pauses ~a second instead of
 failing. Platform deploys remain visible (the socket itself; layer 3).
 

@@ -1,7 +1,7 @@
 """The artifact substrate — register / revise / resolve / read of governing docs.
 
 Carried (functionality-first, NOT imported) from the frozen monolith's
-`snowline_server.artifacts`, de-PM'd and INLINE-ONLY (spec §4 / §6.3, toward
+`snowline_server.artifacts`, disentangled and INLINE-ONLY (spec §4 / §6.3, toward
 issue #5). An `Artifact` is a governance node (identity + `doc_kind` + content
 `backend` + `maturity` + the `governs` mapping); its CONTENT lives on the version
 DAG, and the *current* version is the DERIVED leaf (the shared `branching.py`

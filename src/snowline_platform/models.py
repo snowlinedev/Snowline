@@ -8,7 +8,7 @@ One `Base` / one metadata for the platform — scopes are its first persisted da
 and the migration chain targets this metadata. The `Scope` schema is kept
 **compatible with the frozen monolith's `scopes` table** (already trimmed to
 identity + tree + isolation in monolith #650) so existing scope rows import
-cleanly into a running platform instance later (spec §2, §6). PM/governance
+cleanly into a running platform instance later (spec §2, §6). Plugin-domain
 freight that the monolith moved to side tables (external_key, code_sweep,
 roadmap_position, spec_repo) does NOT live here — it belongs to the plugins.
 """

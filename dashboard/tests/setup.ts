@@ -92,10 +92,10 @@ export const FIXTURES: Record<string, unknown> = {
         },
       },
       {
-        name: "pm",
+        name: "sidecar",
         status: "down",
         manifest: {
-          name: "pm",
+          name: "sidecar",
           base_url: "http://127.0.0.1:8802",
           mcp_path: "/mcp",
           health_path: "/health",
@@ -141,7 +141,7 @@ export const FIXTURES: Record<string, unknown> = {
   },
   "/surfaces": {
     surfaces: [
-      { name: "main", route: "/mcp", allowlist: "*", plugins: ["governance", "pm"] },
+      { name: "main", route: "/mcp", allowlist: "*", plugins: ["governance", "sidecar"] },
       { name: "core", route: "/core/mcp", allowlist: ["governance"], plugins: ["governance"] },
     ],
   },

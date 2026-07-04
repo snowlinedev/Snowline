@@ -4,7 +4,7 @@ The platform's first persisted table — the scope namespace (architecture.md §
 scope-namespace spec §2). Columns/types are kept COMPATIBLE with the frozen
 monolith's trimmed-core `scopes` table (monolith #650: identity + tree +
 isolation) so existing scope rows import cleanly into a running platform instance
-later (spec §6). PM/governance freight (external_key, code_sweep, roadmap,
+later (spec §6). Plugin-domain freight (external_key, code_sweep, roadmap,
 spec_repo) lives in the plugins, not here.
 
 Revision ID: a1b2c3d4e5f6

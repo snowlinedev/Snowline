@@ -285,7 +285,7 @@ def discover_upstreams(
     plugin allowlist — ``None`` means no allowlist (allow every plugin, the
     default, backward-compatible behavior); a `frozenset` restricts which
     plugins the surface aggregates (e.g. a governance-only `core` surface
-    without the private PM plugin). A plugin whose name is NOT in the allowlist
+    without a private plugin). A plugin whose name is NOT in the allowlist
     is skipped here — at the aggregation step, so it is absent from BOTH
     `list_tools` and `call_tool` routing (a filtered plugin's tool is
     unroutable, surfaced as the same clear error as any not-on-this-surface
@@ -296,8 +296,8 @@ def discover_upstreams(
     only.
 
     **Projection onto allowlisted surfaces (issue #38):** an allowlist is an
-    operator statement of COMPOSITION ("`core` = governance's tools, without
-    PM"), but no real plugin's manifest maps anything onto an operator-invented
+    operator statement of COMPOSITION ("`core` = governance's tools only"),
+    but no real plugin's manifest maps anything onto an operator-invented
     surface name (governance maps only ``/mcp → main`` + ``/shadow/mcp →
     shadow``), so a pure filter over manifest mappings served an EMPTY surface
     — found live, minutes after #37 deployed. So an allowlisted surface

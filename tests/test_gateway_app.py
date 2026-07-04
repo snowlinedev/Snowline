@@ -143,7 +143,7 @@ def test_isolation_over_http_shadow_lacks_main_only_tool():
 
 def test_surface_allowlist_over_http_core_is_governance_only(monkeypatch):
     """Issues #36+#38 end-to-end over the REAL streamable-HTTP transport, with
-    REAL-shaped manifests (governance maps main+shadow, pm maps main — nothing
+    REAL-shaped manifests (governance maps main+shadow, sidecar maps main — nothing
     maps `core` natively; fake `/core/mcp: core` manifests are the exact shape
     that masked #38): with `core` in BOTH envs (`SNOWLINE_SURFACES` mounts it,
     `SNOWLINE_SURFACE_PLUGINS` constrains it — the documented two-line contract,
@@ -156,7 +156,7 @@ def test_surface_allowlist_over_http_core_is_governance_only(monkeypatch):
 
     gov_main = make_stub_plugin("governance", ["record_decision", "get_decision"])
     gov_shadow = make_stub_plugin("governance", ["add_node", "get_decision"])
-    pm = make_stub_plugin("pm", ["create_work_item"])
+    sidecar = make_stub_plugin("sidecar", ["create_sidecar_item"])
     reg = PluginRegistry()
     reg.upsert(
         PluginManifest(
@@ -167,13 +167,13 @@ def test_surface_allowlist_over_http_core_is_governance_only(monkeypatch):
     )
     reg.upsert(
         PluginManifest(
-            name="pm", base_url="http://pm", surfaces={"/mcp": "main"}
+            name="sidecar", base_url="http://sidecar", surfaces={"/mcp": "main"}
         )
     )
     servers = {
         "http://gov/mcp": gov_main,
         "http://gov/shadow/mcp": gov_shadow,
-        "http://pm/mcp": pm,
+        "http://sidecar/mcp": sidecar,
     }
 
     async def _list(session):
@@ -212,11 +212,11 @@ def test_surface_allowlist_over_http_core_is_governance_only(monkeypatch):
 
     # /mcp is the full composed daily driver — both plugins.
     assert "governance__record_decision" in main
-    assert "pm__create_work_item" in main
+    assert "sidecar__create_sidecar_item" in main
     # /core/mcp serves governance's PROJECTED main tools (issue #38: not empty)
-    # — PM is physically absent.
+    # — sidecar is physically absent.
     assert core == {"governance__record_decision", "governance__get_decision"}
-    assert not any(name.startswith("pm__") for name in core)
+    assert not any(name.startswith("sidecar__") for name in core)
     # /shadow/mcp has NO allowlist — pure manifest semantics, native shadow
     # tools only; governance's main tools must not leak here via projection.
     assert shadow == {"governance__add_node", "governance__get_decision"}

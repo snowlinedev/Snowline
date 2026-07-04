@@ -14,7 +14,7 @@
 
 The platform's daily driver runs on one Mac mini behind the tailnet. While the
 owner was on vacation, that host dropped off the tailnet — and with it *every*
-capability: no decision recall, no memory, no PM. One unreachable box was a
+capability: no decision recall, no memory, no private plugin. One unreachable box was a
 total outage for an architecture whose whole premise is durable cross-session
 context.
 
@@ -31,8 +31,8 @@ Considered and rejected:
   ideal: a cloud primary still needs connectivity from wherever the owner is —
   on a plane it is exactly as unreachable as the mini. It also front-loads the
   container posture deploy-continuity.md §6 deliberately deferred, and the
-  fleet stays mixed regardless (the private PM plugin lives on owner boxes by
-  design; walkthrough-mcp needs macOS `simctl`). **Deferred, not dead**: the
+  fleet stays mixed regardless (the owner's private plugin deploys only to
+  owner-controlled boxes; walkthrough-mcp needs macOS `simctl`). **Deferred, not dead**: the
   design below treats an instance as "a full stack at a tailnet address," so a
   fly node later is *just another peer*, not a rearchitecture. Revisit
   triggers: a second daily-driver user; wanting a third always-on replica;
@@ -228,11 +228,11 @@ pairing**. This keeps the server thin and makes participation strictly opt-in:
 
 **What opting in requires of a plugin (the replication-safe checklist):**
 
-1. **Runs on both instances** — its store exists on each side. (The private
-   PM plugin qualifies: both the mini and the laptop are owner boxes, so the
-   code-and-data-never-leave-the-owner posture of architecture.md §3.3 is
-   preserved. Cross-tailnet registration already makes "which box" a URL
-   detail.)
+1. **Runs on both instances** — its store exists on each side. (The owner's
+   private plugin qualifies: both instances are owner-controlled machines, so
+   the closed-source posture of architecture.md §3.3 — code never published,
+   deployed only to owner-controlled infrastructure — is preserved.
+   Cross-tailnet registration already makes "which box" a URL detail.)
 2. **UUID (or globally-unique) primary keys** — two sides author without
    coordination.
 3. **Writes expressible as domain events with a deterministic merge** —
@@ -300,8 +300,8 @@ each opted-in plugin covers its write surface with events:
   converges **per name** by the same LWW-by-event-timestamp rule as §6.
   A memory named X is *semantically* a last-writer-wins register, so
   LWW-with-tombstones is its correct convergence under checklist item 3.
-- **pm (private)**: its own vocabulary, defined in its own repo against the
-  SDK contract; the platform never sees the payloads' semantics.
+- **private plugins**: their own vocabulary, defined in their own repos
+  against the SDK contract; the platform never sees the payloads' semantics.
 
 ## 5. Pairing and topology
 
@@ -310,8 +310,8 @@ each opted-in plugin covers its write surface with events:
 - **Pairing is a CLI step, not an MCP surface** — but it can no longer be
   purely programmatic: subscriptions are rows in each plugin's OWN store
   (the bus's `create_subscription` has deliberately no remote surface), and
-  a platform-level CLI cannot reach into governance's, memory's, and pm's
-  databases. So the SDK's ingest module ships a small tailnet-gated HTTP
+  a platform-level CLI cannot reach into governance's, memory's, and a private
+  plugin's databases. So the SDK's ingest module ships a small tailnet-gated HTTP
   **replication-admin surface** alongside `ingest_path` — create/list/retire
   inbound stream registrations and outbound subscriptions. This supersedes
   the bus's "no remote surface" posture for replication-class subscriptions
@@ -476,7 +476,7 @@ mechanical, adjudication belongs to the LLM.**
   guesses which decision was "right."
 - **Scope of the mechanism.** This is a governance-plugin concern, not SDK
   machinery — semantic conflict is domain-specific. The SDK contract stays
-  envelope-level; PM (or any opted-in plugin) defines its own analogue if
+  envelope-level; any other opted-in plugin defines its own analogue if
   its domain has one, with this section as the reference pattern. §6's
   premise ("one human, ~zero conflicts") weakens the day a second user
   appears — this mechanism is the guard that makes that day survivable,
@@ -555,8 +555,8 @@ it offers plugins: `scope.created` / `scope.updated` events through the same
 SDK emit/ingest modules, the same pairing step, the same watermark semantics.
 Scopes are slow-changing and append-mostly (slugs are never reused;
 `update_scope` is rare), so this is the contract's easiest adopter — and
-building it platform-side proves the SDK seam before the PM plugin adopts it
-privately. Slug collisions across a partition (same new slug authored on both
+building it platform-side proves the SDK seam before any private plugin
+adopts it privately. Slug collisions across a partition (same new slug authored on both
 sides) fail loud at ingest and require manual resolution — acceptably rare
 for a single owner.
 
@@ -625,8 +625,8 @@ events. The two never overlap.
    coverage note).
 5. **Platform scopes** (#81) adopt the contract (§8).
 6. **Pairing CLI** (#82) + seed procedure (§5, §7); stand up `roam` on the laptop.
-7. **PM plugin** adopts privately against the published SDK — this spec is
-   its behavior reference; no platform work required.
+7. **Private plugins** adopt the contract privately against the published
+   SDK — this spec is their behavior reference; no platform work required.
 
 ## 10. Acceptance criteria
 

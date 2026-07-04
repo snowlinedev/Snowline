@@ -34,16 +34,16 @@ def test_surfaces_reports_mounts_allowlists_and_composed_plugins(monkeypatch):
         )
     )
     reg.upsert(
-        PluginManifest(name="pm", base_url="http://p:1", surfaces={"/mcp": "main"})
+        PluginManifest(name="sidecar", base_url="http://p:1", surfaces={"/mcp": "main"})
     )
 
     body = TestClient(_app(reg)).get("/surfaces").json()
     by_name = {s["name"]: s for s in body["surfaces"]}
     assert by_name["main"]["route"] == "/mcp"
     assert by_name["main"]["allowlist"] == "*"
-    assert by_name["main"]["plugins"] == ["governance", "pm"]
+    assert by_name["main"]["plugins"] == ["governance", "sidecar"]
     # core allowlists governance only; the ROOT_SURFACE projection (#38) maps
-    # governance's main mapping onto it, pm is filtered out.
+    # governance's main mapping onto it, sidecar is filtered out.
     assert by_name["core"]["route"] == "/core/mcp"
     assert by_name["core"]["allowlist"] == ["governance"]
     assert by_name["core"]["plugins"] == ["governance"]

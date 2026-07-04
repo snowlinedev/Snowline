@@ -17,8 +17,8 @@ tailnet trust edge as everything else — that shows:
 - **Platform-native views**: the plugin registry (status, heartbeat freshness,
   manifests), the mounted gateway surfaces + allowlists, and the scope tree.
 - **Plugin-contributed views**, starting with governance's **shadow decision
-  discussions** (branch list → discussion thread with citations), later the PM
-  roadmap.
+  discussions** (branch list → discussion thread with citations), later a
+  private plugin's pages.
 
 The UI must look and behave as ONE product ("somewhat unified looking" is the
 founding requirement), be WCAG 2.2 AA by default (§7), and stay useful over
@@ -144,7 +144,7 @@ but **deferred** until the read views prove out.
 ### 4.3 Actions (contract reserved v1, shell support later)
 
 Rows, thread nodes, and pages may declare **actions** — the declarative write
-path the PM roadmap will need (complete item, add to initiative):
+path later plugin pages will need (complete an item, reorder a board):
 
 ```jsonc
 "actions": [{ "label": "Complete", "endpoint": "/ui-api/items/{id}/complete",
@@ -153,9 +153,10 @@ path the PM roadmap will need (complete item, add to initiative):
 
 The shell renders buttons/menus and POSTs through the §5 proxy; the plugin owns
 all semantics. Reorderable tables/boards (drag-to-reorder as a `table`/`board`
-capability flag + reorder endpoint) are the same idea and land with the pm
-work. **v1 shells render read-only** and ignore `actions` — but the field is
-in the kind schemas from day one so pm lands as registration, not redesign.
+capability flag + reorder endpoint) are the same idea and land with the
+private plugin's work. **v1 shells render read-only** and ignore `actions` — but the field is
+in the kind schemas from day one so that work lands as registration, not
+redesign.
 
 The first ACTIVATION of this seam is input-shaped rather than button-shaped:
 the `thread` kind's **`composer`** (`shadow-conversations.md` §4) — a declared
@@ -246,7 +247,7 @@ colorblind-safe series palette.
 3. **First registered contribution** (governance): `/ui-api` JSON routes over
    the existing shadow service layer; `stat` widget + `table` branches page +
    `thread`/`document` branch view.
-4. **Later** (pm repo, tracked there): roadmap pages via `table`/`board` +
+4. **Later** (private plugin repo, tracked there): its pages via `table`/`board` +
    the action contract; shell grows action rendering then.
 
 ## 9. Out of scope (v1)
@@ -254,7 +255,7 @@ colorblind-safe series palette.
 - Writes from the browser (action *rendering*; the contract shape ships in v1
   schemas). *Superseded for the composer path: `shadow-conversations.md`
   activates proxy POST + the thread composer; button-shaped `actions`
-  rendering still lands with the pm work.*
+  rendering still lands with the private plugin's work.*
 - Remote-module escape hatch (documented direction only).
 - `search` page kind; websockets/SSE liveness (poll first); mobile-dedicated
   layouts (responsive reflow only); theming beyond light/dark.

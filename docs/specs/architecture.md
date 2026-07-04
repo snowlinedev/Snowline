@@ -20,7 +20,7 @@ runtime**, the place where capabilities actually meet.
   **health/supervision** + the **scope namespace** + the **trust gate**. Small,
   but real — it owns the universal primitive (scopes) and composes everything.
 - **Plugins**: independent modules, each exposing **MCP surface(s) + a UX** over
-  its **own store**. Governance is the flagship; later: a private PM, a GitHub
+  its **own store**. Governance is the flagship; later: private plugins, a GitHub
   plugin, drift/triage carriers.
 - **Dependency direction**: plugins depend on the platform (they register and use
   scopes); the platform depends on no plugin.
@@ -38,8 +38,9 @@ runtime**, the place where capabilities actually meet.
 3. **Plugins are out-of-process, addressed by URL.** Local or cross-tailnet —
    the platform proxies over HTTP either way. New plugins **register without a
    platform restart** (hot-pluggable). Cross-machine cleanly enforces the
-   public/private split: a private plugin runs on the owner's own box and
-   registers over the tailnet, so its code + data never touch the public host.
+   public/private split: a private plugin's code is never published — it
+   deploys only to owner-controlled infrastructure (a home box, or a cloud
+   machine in the owner's account) and registers over the tailnet.
 4. **Surfaces are composed, isolation is structural.** The platform exposes
    **named MCP surfaces** (`main`, plus isolated ones like `shadow`); plugins map
    their own surfaces onto them; the gateway aggregates per surface. A tool only
@@ -48,7 +49,7 @@ runtime**, the place where capabilities actually meet.
    The surface SET is config (`SNOWLINE_SURFACES`), and per-surface plugin
    membership can be subset with `SNOWLINE_SURFACE_PLUGINS` (e.g. `main=*;core=governance`)
    so a surface can be composed with or without a given plugin — the split's
-   "governance-only, no PM" `core` surface alongside the full `main` — without
+   governance-only `core` surface alongside the full `main` — without
    editing any plugin manifest (allowlist at the aggregation step; see `gateway.md`).
 5. **Trust is a pluggable gate.** A configurable trusted-CIDR network gate (the
    tailnet) today, OAuth as a drop-in provider later — behind one seam. The
@@ -68,8 +69,9 @@ runtime**, the place where capabilities actually meet.
 
 ## 5. Topology + how it's built
 
-- **Public** `snowlinedev/Snowline` = the platform; **governance** is public; the
-  owner's **PM plugin is private** (runs cross-tailnet). Built **in public**.
+- **Public** `snowlinedev/Snowline` = the platform; **governance** is public;
+  the owner's **private plugin is closed-source** (registers cross-tailnet from
+  owner-controlled infrastructure). Built **in public**.
 - The prior monolith is **frozen** — it keeps running as the owner's daily driver
   until migration, but receives no new work. The platform is built fresh and kept
   **schema-compatible** with the monolith so existing governance data (decisions,

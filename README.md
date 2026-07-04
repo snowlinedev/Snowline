@@ -1,13 +1,13 @@
 # Snowline
 
 An agent-native **platform**: it hosts capabilities — governance/decision memory,
-project management, integrations — as **MCP-server plugins**, composes their
+working memory, integrations — as **MCP-server plugins**, composes their
 surfaces into one endpoint an agent (Claude) connects to, and owns the shared
 **scope** namespace every plugin hangs off.
 
 The design bet: keep the server-side **thin** — plugins are structured read/write
 MCP surfaces over their own stores, and the **LLM is the integration runtime**
-(the place where governance, PM, and the rest actually meet). The platform's job
+(the place where governance, memory, and the rest actually meet). The platform's job
 is to compose plugin surfaces + UIs, supervise the plugin processes, gate access,
 and hold the scope namespace.
 

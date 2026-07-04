@@ -35,7 +35,7 @@ DEFAULT_SURFACES = "main,shadow"
 # registered plugins a named surface is allowed to aggregate. The empty default
 # means every surface aggregates every plugin — today's behavior, fully backward
 # compatible. Set e.g. ``"main=*;core=governance"`` to compose a governance-only
-# `core` surface (no PM) alongside the full `main` daily driver.
+# `core` surface alongside the full `main` daily driver.
 DEFAULT_SURFACE_PLUGINS = ""
 
 
@@ -46,8 +46,8 @@ class ConfigError(ValueError):
     best-effort-parsing because the dangerous failure mode is a typo SILENTLY
     widening a surface: e.g. ``core=goverance`` (misspelled) would leave the
     misspelled name matching no plugin — but a more permissive parser could just
-    as easily drop the whole entry and fall back to allow-all, quietly making the
-    private PM plugin reachable on a surface meant to be governance-only. A hard
+    as easily drop the whole entry and fall back to allow-all, quietly making a
+    private plugin reachable on a surface meant to be governance-only. A hard
     startup error is strictly safer than a surface that exposes more than
     intended, so the parser validates strictly."""
 

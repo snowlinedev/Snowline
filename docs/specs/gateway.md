@@ -36,10 +36,10 @@ The surface SET is configuration (`SNOWLINE_SURFACES`); surface MEMBERSHIP is
 manifest-driven — every plugin that maps a path onto a named surface lands there.
 `SNOWLINE_SURFACE_PLUGINS` lets the platform **subset** that membership per
 surface, so a surface can be composed **with or without** a given plugin without
-touching any plugin manifest. This is the product split's daily need: the public
-Snowline drives GitHub directly, while the private PM plugin is the owner's
-bespoke roadmap engine — a `core` surface must be able to express
-"governance-only, no PM" while `main` stays the full composed daily driver. It's
+touching any plugin manifest. This is the product split's daily need: the platform and
+governance are public while the owner's private plugin is not — a `core`
+surface must be able to express "governance-only, without the private plugin"
+while `main` stays the full composed daily driver. It's
 an allowlist at the aggregation step (decision `70b415fd`: named surfaces, gateway
 aggregates), not a new model.
 
@@ -50,7 +50,7 @@ aggregates), not a new model.
   aggregates every plugin — fully backward compatible.
 - **Fail loud — the env is fully validated at boot.** This is an EXCLUSION
   boundary, so a config mistake must kill startup, never silently widen a
-  surface (e.g. leave PM reachable on a governance-only surface). `create_app`
+  surface (e.g. leave a private plugin reachable on a governance-only surface). `create_app`
   (via `build_surface_mounts` → `config.surface_plugins()` +
   `config.validate_surface_plugins()`) raises `ConfigError` for ALL of:
   - malformed shape — no `=`, empty name/allowlist, duplicate surface, stray
@@ -74,7 +74,7 @@ aggregates), not a new model.
   *registered*.
 - **Projection: an allowlisted surface composes ROOT_SURFACE mappings as the
   fallback (issue #38).** An allowlist is an operator statement of composition
-  ("`core` = governance, without PM"), but no real plugin's manifest maps
+  ("`core` = governance only"), but no real plugin's manifest maps
   anything onto an operator-invented surface name (governance maps only
   `/mcp → main` + `/shadow/mcp → shadow`) — a pure filter over manifest
   mappings therefore mounted an EMPTY `/core/mcp`, found live minutes after
@@ -110,7 +110,7 @@ aggregates), not a new model.
 
   `ROOT_SURFACE` (`main`) stays the one always-present magic name.
 
-Result: `http://<host>:8850/core/mcp` serves governance-without-PM — governance's
+Result: `http://<host>:8850/core/mcp` serves the governance-only composition — governance's
 projected `main` tools — over the tailnet while `/mcp` stays the full composed
 daily driver.
 
@@ -150,7 +150,7 @@ just a different URL.
   same tool name — namespace by plugin, or reject at registration? (Decide before
   the second plugin shares `main`.)
 - **Cross-plugin grounding** (one plugin's read tools placed onto another's
-  surface — e.g. PM reads on `shadow`) — deferred; additive per-tool-group
+  surface — e.g. another plugin's reads on `shadow`) — deferred; additive per-tool-group
   placement if ever needed.
 - **In-process fast path**: not pursued — out-of-process + URL addressing is what
   enables hot-plug and cross-machine; the gateway stays a proxy.

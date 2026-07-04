@@ -83,7 +83,8 @@ def test_whitespace_tolerant(monkeypatch):
 )
 def test_malformed_fails_loud(monkeypatch, raw):
     """Every malformed shape raises `ConfigError` — we never silently drop or
-    widen a surface (a typo must fail at startup, not quietly expose PM)."""
+    widen a surface (a typo must fail at startup, not quietly expose a private
+    plugin)."""
     monkeypatch.setenv("SNOWLINE_SURFACE_PLUGINS", raw)
     with pytest.raises(ConfigError):
         config.surface_plugins()

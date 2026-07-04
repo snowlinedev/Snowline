@@ -79,11 +79,11 @@ carried into the platform's read surface.)
 ## 7. Implementation note (carve from the frozen monolith)
 
 Carve the model + walk + tree from the monolith (read-only reference at
-`/Users/seanlynch/Projects/Snowline/snowline`): `models_core.Scope` (minus PM
+`/Users/seanlynch/Projects/Snowline/snowline`): `models_core.Scope` (minus plugin-domain
 freight), and `graph.py`'s `get_scope` / `ancestor_scopes_until_isolated` /
 `scope_tree`. Stand up the platform's **DB layer** — Postgres + SQLAlchemy +
 Alembic, mirroring the monolith's `substrate/db.py` + alembic setup — since
-scopes are the platform's first persisted data. Import-pure (no PM code).
+scopes are the platform's first persisted data. Import-pure (no monolith imports).
 
 ## 8. Acceptance criteria
 
@@ -96,4 +96,4 @@ scopes are the platform's first persisted data. Import-pure (no PM code).
   ancestor chain over it.
 - `create` enforces bare-slug⇔org and keeps `parent_id` consistent with the slug
   hierarchy.
-- Tests pass against a Postgres test DB; the package imports no PM code.
+- Tests pass against a Postgres test DB; the package imports no monolith code.
