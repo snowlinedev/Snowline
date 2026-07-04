@@ -978,6 +978,8 @@ client = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "anyio" },
+    { name = "httpx" },
     { name = "pytest" },
 ]
 
@@ -989,7 +991,11 @@ requires-dist = [
 provides-extras = ["client"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=8.0" }]
+dev = [
+    { name = "anyio", specifier = ">=4" },
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "pytest", specifier = ">=8.0" },
+]
 
 [[package]]
 name = "sqlalchemy"

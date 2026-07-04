@@ -52,11 +52,11 @@ snowline-memory = { workspace = true }
 snowline-plugin-sdk = { workspace = true }
 
 [tool.pytest.ini_options]
-# Run both the platform's tests (tests/) and the governance member's
-# (governance/tests/) in one `uv run python -m pytest` from the repo root.
+# Run every workspace member's tests in one `uv run python -m pytest` from the
+# repo root.
 testpaths = ["tests", "governance/tests", "memory/tests", "sdk/tests"]
-# importlib mode: the two test trees each have a `conftest.py` and a
-# `test_import_purity.py` (same basename, different dir). The default prepend
+# importlib mode: all four test trees have a `test_import_purity.py` and three
+# have a `conftest.py` (same basenames, different dirs). The default prepend
 # import mode collides on the basename / package name; importlib imports each by
-# file path, so the two trees coexist without `__init__.py` gymnastics.
+# file path, so the trees coexist without `__init__.py` gymnastics.
 addopts = "--import-mode=importlib"

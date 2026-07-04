@@ -38,6 +38,7 @@ import contextlib
 import logging
 import math
 import os
+import re
 from collections.abc import Callable
 from functools import partial
 
@@ -53,23 +54,27 @@ DEFAULT_HEARTBEAT_SECONDS = 15.0
 _parser_log = logging.getLogger("snowline_plugin_sdk.registration")
 
 
-def heartbeat_seconds_from_env(
-    *, default: float = DEFAULT_HEARTBEAT_SECONDS
-) -> float:
+def heartbeat_seconds_from_env(*, log: logging.Logger | None = None) -> float:
     """The heartbeat cadence, read from the shared `SNOWLINE_REGISTRATION_HEARTBEAT_SECONDS`
     env var. LENIENT on a malformed/absurd value (warn + fall back), unlike the
     platform's fail-loud config rule: the heartbeat is the self-healing mechanism
     issue #39 exists for, so a typo in this shared env var must not kill the loop
     (a dead heartbeat = a hollow gateway after the next platform restart) — and a
     zero/negative value must not hot-loop POSTs.
+
+    `log` attributes the fallback warnings to the calling plugin's own logger
+    (an operator watching `snowline_<plugin>.*` must see a fat-fingered env var);
+    it defaults to this module's logger for direct/anonymous callers.
     """
+    log = log or _parser_log
+    default = DEFAULT_HEARTBEAT_SECONDS
     raw = os.environ.get(HEARTBEAT_ENV_VAR)
     if raw is None:
         return default
     try:
         value = float(raw)
     except ValueError:
-        _parser_log.warning(
+        log.warning(
             "malformed SNOWLINE_REGISTRATION_HEARTBEAT_SECONDS=%r — using the "
             "default %ss",
             raw,
@@ -81,7 +86,7 @@ def heartbeat_seconds_from_env(
         # anyio.sleep(inf/nan) never returns — a silent dead heartbeat, the
         # exact failure this lenient parse exists to prevent. Treat like
         # malformed input.
-        _parser_log.warning(
+        log.warning(
             "non-finite SNOWLINE_REGISTRATION_HEARTBEAT_SECONDS=%r — using the "
             "default %ss",
             raw,
@@ -89,7 +94,7 @@ def heartbeat_seconds_from_env(
         )
         return default
     if value < 1.0:
-        _parser_log.warning(
+        log.warning(
             "SNOWLINE_REGISTRATION_HEARTBEAT_SECONDS=%r is below the 1s floor "
             "— clamping (the heartbeat cannot be disabled by env; stop the "
             "plugin instead)",
@@ -106,9 +111,26 @@ class HeartbeatHttpxLogFilter(logging.Filter):
     outbound deliveries, and muting the whole `httpx` logger at WARNING would
     leave live debugging blind."""
 
+    # httpx's line is 'HTTP Request: POST <url> "HTTP/1.1 200 OK"'; anchor on
+    # the URL's path ENDING in /plugins so an unrelated outbound POST whose URL
+    # merely contains the substring (…/api/plugins/events) still traces through.
+    _HEARTBEAT_LINE_RE = re.compile(r'POST \S+/plugins "')
+
     def filter(self, record: logging.LogRecord) -> bool:
-        msg = record.getMessage()
-        return not ("POST" in msg and "/plugins" in msg)
+        return not self._HEARTBEAT_LINE_RE.search(record.getMessage())
+
+
+# One shared instance for the whole process: `addFilter` dedupes by identity,
+# so repeated installs (per create_app, uvicorn reload, several plugins
+# co-hosted in one test process) attach exactly one filter.
+_HEARTBEAT_HTTPX_FILTER = HeartbeatHttpxLogFilter()
+
+
+def install_heartbeat_httpx_filter() -> None:
+    """Attach the heartbeat filter to the `httpx` logger (idempotent). Call once
+    from the plugin's app module — without it, httpx logs one INFO line per beat
+    forever."""
+    logging.getLogger("httpx").addFilter(_HEARTBEAT_HTTPX_FILTER)
 
 
 def register_with_platform(
@@ -136,7 +158,9 @@ def register_with_platform(
             resp = client.post(url, json=manifest, timeout=timeout)
         else:
             resp = httpx.post(url, json=manifest, timeout=timeout)
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, httpx.InvalidURL) as exc:
+        # InvalidURL is NOT an HTTPError subclass — without it a fat-fingered
+        # platform_url would escape the "never raises" contract.
         log.warning("plugin registration to %s failed (will retry): %s", url, exc)
         return False
     if resp.status_code == httpx.codes.CONFLICT:
@@ -168,7 +192,7 @@ async def registration_heartbeat(
     *,
     plugin_name: str,
     log: logging.Logger,
-    interval: float,
+    interval: float | None = None,
     client: httpx.Client | None = None,
 ) -> None:
     """Re-assert this plugin's registration every `interval` seconds until
@@ -178,6 +202,13 @@ async def registration_heartbeat(
     (or 3am crash-restart) heals within one interval instead of requiring this
     plugin to also be kickstarted.
 
+    `interval=None` (the production path) resolves through the shared lenient
+    env parse, so the default lives HERE, not re-derived in every plugin
+    wrapper. A directly-passed interval may be sub-second (tests), but a
+    non-finite or negative one is rejected onto the env parse — `sleep(inf)` is
+    a silently dead heartbeat and `sleep(<0)` raises out of the loop, the two
+    failures the parser's guards exist to prevent.
+
     `manifest_builder` is called once per beat to produce the manifest to POST
     (kept a callable so it re-reads the plugin's config each beat). Each beat is
     `register_with_platform` (which never raises), run off the event loop because
@@ -185,7 +216,15 @@ async def registration_heartbeat(
     machinery around it. A failed beat is already logged by
     `register_with_platform`; the loop just keeps beating. Cancellation (lifespan
     shutdown) unwinds cleanly through the `anyio.sleep`."""
-    beat_every = interval
+    if interval is None:
+        interval = heartbeat_seconds_from_env(log=log)
+    elif not math.isfinite(interval) or interval < 0:
+        log.warning(
+            "invalid heartbeat interval %r passed directly — falling back to "
+            "the shared env parse",
+            interval,
+        )
+        interval = heartbeat_seconds_from_env(log=log)
     own_client = client is None
     confirmed = False
     try:
@@ -222,11 +261,11 @@ async def registration_heartbeat(
                     log.info(
                         "plugin %r registration confirmed; heartbeat every %ss",
                         plugin_name,
-                        beat_every,
+                        interval,
                     )
             except Exception:  # backstop — one bad beat must not kill the loop
                 log.exception("registration heartbeat beat failed; continuing")
-            await anyio.sleep(beat_every)
+            await anyio.sleep(interval)
     finally:
         if own_client and client is not None:
             # An abandoned in-flight beat may still hold this client when a

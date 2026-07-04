@@ -17,11 +17,12 @@ Env vars:
                                      (issue #39). Shared (unprefixed) across
                                      plugins, like SNOWLINE_PLATFORM_URL — one
                                      deploy knob tunes every plugin's cadence.
+                                     Parsed (leniently) by
+                                     `snowline_plugin_sdk.registration`, not
+                                     here — this module stays stdlib-only.
 """
 
 import os
-
-from snowline_plugin_sdk import registration as sdk_registration
 
 # Local libpq defaults (unix socket, current OS user, no password) — mirrors the
 # platform/monolith DB config. A SEPARATE database from the platform's: governance
@@ -46,13 +47,3 @@ def platform_url() -> str:
 
 def base_url() -> str:
     return os.environ.get("SNOWLINE_GOVERNANCE_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
-
-
-def registration_heartbeat_seconds() -> float:
-    """The heartbeat cadence — the one shared deploy knob
-    (`SNOWLINE_REGISTRATION_HEARTBEAT_SECONDS`, unprefixed, issue #39). Delegates
-    to the SDK's shared lenient+finite parser (issue #50), so the "one deploy
-    knob tunes every plugin" promise is one parser, not per-plugin copies: a
-    malformed/non-finite/sub-1s value warns and falls back rather than killing
-    the self-healing loop."""
-    return sdk_registration.heartbeat_seconds_from_env()

@@ -81,17 +81,15 @@ async def registration_heartbeat(
     """Re-assert memory's registration on the shared heartbeat (issue #39) — a
     thin call into `snowline_plugin_sdk.registration.registration_heartbeat`,
     which owns the beat-on-boot / lazy per-loop client / #51 hardening. `interval`
-    defaults to `config.registration_heartbeat_seconds()` (the shared lenient
-    parse); the manifest is rebuilt each beat so a config change is picked up."""
+    defaults inside the SDK to the shared lenient env parse
+    (`SNOWLINE_REGISTRATION_HEARTBEAT_SECONDS`), with the fallback warnings
+    attributed to memory's own logger; the manifest is rebuilt each beat so a
+    config change is picked up."""
     await sdk_registration.registration_heartbeat(
         lambda: build_manifest(base_url),
         platform_url or config.platform_url(),
         plugin_name=PLUGIN_NAME,
         log=log,
-        interval=(
-            interval
-            if interval is not None
-            else config.registration_heartbeat_seconds()
-        ),
+        interval=interval,
         client=client,
     )

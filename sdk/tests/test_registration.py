@@ -88,6 +88,20 @@ def test_register_returns_false_on_server_error():
     assert _register(handler) is False
 
 
+def test_register_never_raises_on_malformed_platform_url():
+    # httpx.InvalidURL is NOT an httpx.HTTPError subclass — a fat-fingered
+    # SNOWLINE_PLATFORM_URL must still honor the "never raises" contract.
+    assert (
+        registration.register_with_platform(
+            MANIFEST,
+            "http://user:@:bad:url",
+            plugin_name="test",
+            log=LOG,
+        )
+        is False
+    )
+
+
 # --- registration_heartbeat -------------------------------------------------
 
 
@@ -189,6 +203,45 @@ def test_heartbeat_confirms_first_beat_exactly_once(caplog):
     assert len(confirmations) == 1
 
 
+def test_heartbeat_interval_defaults_to_env_parse(monkeypatch):
+    # `interval=None` (the production path) resolves through the shared lenient
+    # env parse INSIDE the SDK — plugin wrappers pass interval straight through
+    # instead of re-deriving the default. First beat fires immediately, so one
+    # beat completes without waiting out the parsed interval.
+    monkeypatch.setenv("SNOWLINE_REGISTRATION_HEARTBEAT_SECONDS", "30")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={})
+
+    got = run_heartbeat_until(
+        registration.registration_heartbeat,
+        handler,
+        beats=1,
+        **_heartbeat_kwargs(interval=None),
+    )
+    assert got >= 1
+
+
+def test_heartbeat_rejects_nonfinite_direct_interval(monkeypatch, caplog):
+    # A non-finite interval passed DIRECTLY (not via env) would make
+    # anyio.sleep(inf) a silently dead heartbeat — the loop must warn and fall
+    # back to the env parse instead of trusting it.
+    monkeypatch.setenv("SNOWLINE_REGISTRATION_HEARTBEAT_SECONDS", "30")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={})
+
+    with caplog.at_level(logging.WARNING, logger="snowline_plugin_sdk.registration"):
+        got = run_heartbeat_until(
+            registration.registration_heartbeat,
+            handler,
+            beats=1,
+            **_heartbeat_kwargs(interval=float("inf")),
+        )
+    assert got >= 1
+    assert any("invalid heartbeat interval" in r.getMessage() for r in caplog.records)
+
+
 # --- heartbeat_seconds_from_env (the one shared deploy knob) -----------------
 
 
@@ -213,6 +266,23 @@ def test_heartbeat_interval_env_is_lenient(monkeypatch):
     assert registration.heartbeat_seconds_from_env() == 15.0  # non-finite → default
     monkeypatch.setenv("SNOWLINE_REGISTRATION_HEARTBEAT_SECONDS", "30")
     assert registration.heartbeat_seconds_from_env() == 30.0
+
+
+def test_heartbeat_interval_warnings_attribute_to_the_callers_logger(
+    monkeypatch, caplog
+):
+    # The fallback warning must land on the PLUGIN's own logger when one is
+    # passed (an operator watching `snowline_<plugin>.*` must see a
+    # fat-fingered env var), defaulting to the SDK logger otherwise.
+    monkeypatch.setenv("SNOWLINE_REGISTRATION_HEARTBEAT_SECONDS", "15s")
+    plugin_log = logging.getLogger("snowline_testplugin.registration")
+    with caplog.at_level(logging.WARNING):
+        registration.heartbeat_seconds_from_env(log=plugin_log)
+    assert any(
+        r.name == "snowline_testplugin.registration"
+        and "malformed" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 # --- HeartbeatHttpxLogFilter ------------------------------------------------
@@ -244,7 +314,33 @@ def test_httpx_filter_drops_only_heartbeat_post_plugins_lines():
     webhook_post_line = _record(
         'HTTP Request: POST http://example.com/webhook "HTTP/1.1 200 OK"'
     )
+    # A URL that merely CONTAINS "/plugins" mid-path (an outbound delivery to
+    # some unrelated service) must still trace through — the filter anchors on
+    # the path ENDING in /plugins.
+    plugins_substring_line = _record(
+        'HTTP Request: POST https://hub.example/api/plugins/events "HTTP/1.1 500 ..."'
+    )
 
     assert log_filter.filter(heartbeat_line) is False
     assert log_filter.filter(scope_read_line) is True
     assert log_filter.filter(webhook_post_line) is True
+    assert log_filter.filter(plugins_substring_line) is True
+
+
+def test_install_heartbeat_httpx_filter_is_idempotent():
+    # Repeated installs (per create_app, several plugins in one process) must
+    # attach exactly ONE filter instance to the shared `httpx` logger.
+    httpx_logger = logging.getLogger("httpx")
+    before = list(httpx_logger.filters)
+    try:
+        registration.install_heartbeat_httpx_filter()
+        registration.install_heartbeat_httpx_filter()
+        added = [f for f in httpx_logger.filters if f not in before]
+        assert len(added) <= 1  # <=: an app import may have installed it already
+        assert sum(
+            1
+            for f in httpx_logger.filters
+            if isinstance(f, registration.HeartbeatHttpxLogFilter)
+        ) == 1
+    finally:
+        httpx_logger.filters = before
