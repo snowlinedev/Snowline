@@ -199,22 +199,41 @@ def _validate_kind_for_slug(slug: str, kind: str) -> None:
         )
 
 
+# A sentinel distinguishing "not provided" (derive/leave-as-is) from an
+# EXPLICIT value, including explicit `None` — `create`/`update` both need this
+# (see each's `parent` docs); shared so replication's apply seam and any
+# future caller can rely on one identity.
+_UNSET = object()
+
+
 def create(
     session: Session,
     slug: str,
     name: str,
     kind: str,
     *,
-    parent: str | None = None,
+    parent: str | None = _UNSET,
     isolated: bool = False,
     status: str = "active",
     scope_id: uuid.UUID | None = None,
 ) -> Scope:
     """Create a scope (spec §3). Enforces the bare-slug⇔org invariant and
-    derives/validates `parent_id` from the slug hierarchy: an explicit `parent`
-    slug is resolved (must exist); otherwise a hierarchical slug's parent is its
-    `rsplit('/', 1)[0]` prefix, linked to that ROW if it exists (the slug
-    hierarchy and `parent_id` are kept consistent — spec §5).
+    resolves `parent_id`:
+
+      * NOT PROVIDED (`_UNSET`, the default) — derive from the slug's
+        hierarchical `rsplit('/', 1)[0]` prefix, linking to that ROW if it
+        exists, else leaving `parent_id` None (the legacy convenience human/API
+        callers rely on — the slug hierarchy and `parent_id` stay consistent,
+        spec §5).
+      * an explicit SLUG — resolved; must already exist.
+      * explicit `None` (or `""`) — NO parent, NO derivation. This is what
+        `apply_scope_event` always passes: a replicated scope's `parent_id`
+        must replay the ORIGIN's own resolved value verbatim. Without this
+        distinction from `_UNSET`, a replica that happens to hold an
+        UNRELATED local scope matching the slug's prefix would silently
+        derive-attach it — a permanent `parent_id` divergence between
+        instances for the SAME scope UUID that poisons §6.1's ancestor walk
+        (a fresh-eyes review on #87 caught this before it shipped).
 
     Emits `scope.created` (spec §8) in this SAME transaction — a no-op until a
     replication subscription exists (§9 item 5/6, pairing not yet built).
@@ -239,22 +258,27 @@ def create(
     is_bare = "/" not in slug
     parent_id: uuid.UUID | None = None
     if kind == "org":
-        # An org is the top of the tree — it has no parent.
-        if parent:
+        # An org is the top of the tree — an explicit, non-empty parent is a
+        # caller error either way; `_UNSET` (nothing given) is fine.
+        if parent is not _UNSET and parent:
             raise InvalidScopeFieldError(
                 f"an org scope has no parent (got {parent!r} for {slug!r})"
             )
+    elif parent is _UNSET:
+        # Not provided: derive from the slug's prefix, linking to that row
+        # if present — the legacy convenience for ordinary callers.
+        if not is_bare:
+            prow = resolve(session, slug.rsplit("/", 1)[0])
+            if prow is not None:
+                parent_id = prow.id
     elif parent:
+        # An explicit, non-empty parent slug: must already exist.
         validate_slug(parent)
         prow = resolve(session, parent)
         if prow is None:
             raise ScopeNotFoundError(f"parent scope {parent!r} does not exist")
         parent_id = prow.id
-    elif not is_bare:
-        # Derive the parent from the slug's prefix; link to the row if present.
-        prow = resolve(session, slug.rsplit("/", 1)[0])
-        if prow is not None:
-            parent_id = prow.id
+    # else: parent is explicitly None/"" — parent_id stays None, NO derivation.
 
     kwargs = dict(
         slug=slug,
@@ -271,9 +295,6 @@ def create(
     session.flush()
     emit_event(session, EVENT_SCOPE_CREATED, to_replication_payload(scope))
     return scope
-
-
-_UNSET = object()
 
 
 def update(

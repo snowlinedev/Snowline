@@ -144,6 +144,35 @@ def test_apply_append_mostly_happy_path_parent_by_slug(db_session):
     assert (status, resp["status"]) == (200, "duplicate")
 
 
+def test_apply_dangling_child_does_not_derive_a_local_parent(db_session):
+    """Regression: a replicated scope's `parent_id` must replay the ORIGIN's
+    OWN resolved value verbatim, never re-derived from whatever THIS instance
+    happens to locally hold under the same slug prefix.
+
+    Setup: the replica already has its own "acme" (a genuinely unrelated
+    scope — different id, coincidentally the same slug). The origin authored
+    "acme/repo" with NO parent at all (its own "acme" didn't exist when it was
+    created there, so `payload["parent"]` is `None`). Applying that create
+    here must leave `parent_id` at `None` too — matching the origin — instead
+    of silently attaching the replica's unrelated local "acme". Silently
+    diverging here would poison §6.1: governance's ancestor walk goes through
+    `parent_id`, so the two instances would compute different applicability
+    for the SAME scope after a heal."""
+    local_acme = scopes.create(db_session, slug="acme", name="Local Acme", kind="org")
+    db_session.commit()
+
+    secret = _register(db_session)["secret"]
+    dangling_payload = _payload("acme/repo", "Repo", "project", parent=None)
+    status, resp = _deliver(
+        db_session, secret, EVENT_SCOPE_CREATED, dangling_payload, 1
+    )
+    assert (status, resp["status"]) == (200, "applied")
+
+    replica_repo = scopes.resolve(db_session, "acme/repo")
+    assert replica_repo.parent_id is None
+    assert replica_repo.parent_id != local_acme.id
+
+
 # --- the named cross-partition slug collision (§8) ----------------------------
 
 
