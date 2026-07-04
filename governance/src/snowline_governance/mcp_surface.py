@@ -73,6 +73,8 @@ not-yet-real decision), `add_citation` (inward-only: a node may cite another \
 node in its OWN branch, or a real decision — never the reverse), \
 `list_citations`, `archive_branch` (the active→archived status flip — a pure \
 shadow op; record WHY first via the main surface's `record_branch_rejection`), \
+`add_message` (append a turn to the branch's durable conversation log — the same \
+log the UI composer writes; `get_branch` returns its recent tail), \
 and `shadow_corpus_search` (full-text over the shadow content \
 + the real decisions backlinked to a shadow line). Read-real grounding: \
 `get_decision`, `list_decisions`, `applicable_decisions`, `get_artifact`, \
@@ -778,6 +780,29 @@ def build_shadow_surface(scope_client: ScopeClient | None = None) -> FastMCP:
         """The citations a node makes (its outgoing inward references) — the
         dependency set a future graduation's cherry-pick closure walks."""
         return await anyio.to_thread.run_sync(_list_citations_sync, node_id)
+
+    def _add_message_sync(scope, name, markdown, author):
+        with session_scope() as session:
+            # Address the branch by <scope>:<name> (the shadow surface's
+            # convention) → its stable id, then append through the SAME
+            # `shadow.add_message` service the /ui-api route calls (no duplicated
+            # logic; the FOR UPDATE seq allocation lives once in the service).
+            branch = shadow._get_branch_row(session, scope, name)
+            return shadow.add_message(session, branch.id, markdown, author)
+
+    @mcp.tool()
+    async def add_message(
+        scope: str, name: str, markdown: str, author: str = "agent"
+    ) -> dict:
+        """Append a message to a branch's durable conversation log (the same log
+        the UI composer writes, shadow-conversations §5) so an agent session logs
+        its conversational turns the same way. `author` defaults to `agent` for MCP
+        callers; pass `human` to log a human turn. Returns the appended event with
+        its per-branch `seq`. Raises on an unknown branch, an archived branch, or
+        blank/oversize markdown (capped at the /ui-api proxy's body limit)."""
+        return await anyio.to_thread.run_sync(
+            _add_message_sync, scope, name, markdown, author
+        )
 
     def _corpus_search_sync(query, scope, limit):
         scope_id = None

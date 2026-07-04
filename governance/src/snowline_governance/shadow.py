@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+from snowline_plugin_sdk.ui import UI_WRITE_BODY_LIMIT
 
 from snowline_governance.models import (
     DEFAULT_SHADOW_BRANCH_STATUS,
@@ -47,6 +48,19 @@ from snowline_governance.models import (
     ShadowNode,
     ShadowNodeCitation,
 )
+
+# The conversation-event kinds this surface writes/reads (spec §2): a `message`
+# (human OR agent) and an `agent.error` (a failed phase-2 turn, kept VISIBLE in
+# the thread — fail-visible, ui-shell §4.4). Both count as "conversation".
+CONVERSATION_MESSAGE_KIND = "message"
+CONVERSATION_ERROR_KIND = "agent.error"
+CONVERSATION_KINDS: tuple[str, ...] = (
+    CONVERSATION_MESSAGE_KIND,
+    CONVERSATION_ERROR_KIND,
+)
+# The `get_branch` MCP tail cap (spec §5): the last ~50 conversation events so a
+# re-entering session sees what was said without dragging the whole log.
+CONVERSATION_TAIL_LIMIT = 50
 
 # Corpus search limit budget — local constants (the monolith shares search.py's
 # SEARCH_* budget; governance has no real `search` surface, so they live here).
@@ -65,7 +79,19 @@ class DuplicateBranchError(Exception):
 
 
 class BranchNotFoundError(Exception):
-    """No shadow branch with the given `<scope>:<name>` address."""
+    """No shadow branch with the given `<scope>:<name>` address (or branch id)."""
+
+
+class BranchArchivedError(Exception):
+    """The branch is archived — a concluded speculation line accepts no new
+    conversation (spec §5: the composer is already disabled via `disabled_when`,
+    but the service owns the semantics). The `/ui-api` route turns this into 409."""
+
+
+class MessageValidationError(ValueError):
+    """A conversation message is blank or exceeds the proxy's body cap
+    (`UI_WRITE_BODY_LIMIT`). A `ValueError` subclass so the route can map it to
+    422 the same way it treats malformed input."""
 
 
 class NodeNotFoundError(Exception):
@@ -130,6 +156,41 @@ def _citation_dict(c: ShadowNodeCitation) -> dict:
     }
 
 
+def _conversation_event_dict(event: ShadowConversationEvent) -> dict:
+    """The append receipt (spec §5): id, the per-branch monotonic `seq` (doubles
+    as the resume cursor), `kind`, the untyped `payload`, and `created_at`."""
+    return {
+        "id": str(event.id),
+        "seq": event.seq,
+        "kind": event.kind,
+        "payload": event.payload,
+        "created_at": (
+            event.created_at.isoformat() if event.created_at else None
+        ),
+    }
+
+
+def _conversation_tail_dict(event: ShadowConversationEvent) -> dict:
+    """A normalized conversation entry for the `get_branch` MCP tail (spec §5) —
+    `{seq, author, markdown, at}`. A `message` carries its payload `author`
+    (`human`/`agent` — kept raw, honest for an agent reading the log, NOT the
+    UI's `you`/`agent` display mapping) and `markdown`; an `agent.error` renders
+    as an `agent` entry whose `markdown` is the error text (fail-visible §2)."""
+    payload = event.payload or {}
+    if event.kind == CONVERSATION_ERROR_KIND:
+        author = "agent"
+        markdown = payload.get("error", "")
+    else:
+        author = payload.get("author")
+        markdown = payload.get("markdown", "")
+    return {
+        "seq": event.seq,
+        "author": author,
+        "markdown": markdown,
+        "at": event.created_at.isoformat() if event.created_at else None,
+    }
+
+
 # --- internal helpers ------------------------------------------------------
 
 
@@ -163,6 +224,34 @@ def _branch_nodes(session: Session, branch_id: uuid.UUID) -> list[ShadowNode]:
             .order_by(ShadowNode.created_at, ShadowNode.id)
         )
     )
+
+
+def _branch_conversation_events(
+    session: Session,
+    branch_id: uuid.UUID,
+    *,
+    kinds: tuple[str, ...] = CONVERSATION_KINDS,
+    tail: int | None = None,
+) -> list[ShadowConversationEvent]:
+    """A branch's conversation events, oldest-first by the monotonic `seq`
+    (chronological — `seq` is allocated in `created_at` order). Narrowed to
+    `kinds` (default: message + agent.error, the two conversation kinds §2).
+    `tail=N` returns the LAST N (still oldest-first) — the `get_branch` tail cap."""
+    stmt = select(ShadowConversationEvent).where(
+        ShadowConversationEvent.branch_id == branch_id,
+        ShadowConversationEvent.kind.in_(kinds),
+    )
+    if tail is not None:
+        # Last `tail` by seq, then reversed to oldest-first (a window read, not
+        # the whole log).
+        rows = list(
+            session.scalars(
+                stmt.order_by(ShadowConversationEvent.seq.desc()).limit(tail)
+            )
+        )
+        rows.reverse()
+        return rows
+    return list(session.scalars(stmt.order_by(ShadowConversationEvent.seq)))
 
 
 def _resolve_list_limit(
@@ -228,12 +317,24 @@ def list_branches(
 
 
 def get_branch(session: Session, scope_slug: str, name: str) -> dict:
-    """A branch with its nodes (the verdicts) and narrative notes (the
-    reasoning) — the re-entry surface for a speculation line (§4). Raises
-    `BranchNotFoundError` if the address is unknown."""
+    """A branch with its nodes (the verdicts), narrative notes (the reasoning),
+    and a `conversation` tail — the re-entry surface for a speculation line (§4).
+    Raises `BranchNotFoundError` if the address is unknown.
+
+    MCP parity (spec §5): the `conversation` tail is the LAST
+    `CONVERSATION_TAIL_LIMIT` conversation events (messages + agent errors),
+    oldest-first, each `{seq, author, markdown, at}` — so a Claude Code session
+    re-entering the branch sees what was said in the UI (acceptance §7.6)."""
     branch = _get_branch_row(session, scope_slug, name)
     nodes = _branch_nodes(session, branch.id)
-    return _branch_dict(branch, nodes=nodes)
+    out = _branch_dict(branch, nodes=nodes)
+    out["conversation"] = [
+        _conversation_tail_dict(ev)
+        for ev in _branch_conversation_events(
+            session, branch.id, tail=CONVERSATION_TAIL_LIMIT
+        )
+    ]
+    return out
 
 
 def set_narrative_notes(
@@ -370,6 +471,74 @@ def list_citations(session: Session, node_id: str) -> list[dict]:
         .order_by(ShadowNodeCitation.created_at, ShadowNodeCitation.id)
     )
     return [_citation_dict(c) for c in rows]
+
+
+# --- conversation (spec §2/§5) ---------------------------------------------
+
+
+def add_message(
+    session: Session,
+    branch_id: uuid.UUID | str,
+    markdown: str,
+    author: str,
+) -> dict:
+    """Append a `message` event to a branch's durable conversation log (spec §2).
+
+    `author` is `human` (the UI composer's browser seam) or `agent` (an MCP
+    session logging a turn); the payload is `{"author": author, "markdown":
+    markdown}`. `markdown` must be non-blank and within the proxy's body cap
+    (`UI_WRITE_BODY_LIMIT`, measured as UTF-8 byte length — the SAME boundary the
+    /ui-api POST proxy enforces, imported not hardcoded so the two can't drift);
+    a violation raises `MessageValidationError` (a `ValueError`, → 422 at the
+    route). Unknown/malformed `branch_id` raises `BranchNotFoundError` (→ 404) and
+    an archived branch raises `BranchArchivedError` (→ 409).
+
+    `seq` allocation (spec §2): the branch row is `SELECT ... FOR UPDATE`-locked
+    (the natural serialization point — turns are rare, no advisory-lock
+    machinery), then `max(seq)+1` scoped to this branch. Returns the appended
+    event via `_conversation_event_dict` (carrying its `seq` — a write receipt)."""
+    if not isinstance(markdown, str) or not markdown.strip():
+        raise MessageValidationError("message markdown must be a non-empty string")
+    # UTF-8 byte length — the exact boundary the /ui-api POST proxy caps at, so a
+    # message that fits the proxy fits here and vice versa (no encoding drift).
+    if len(markdown.encode("utf-8")) > UI_WRITE_BODY_LIMIT:
+        raise MessageValidationError(
+            f"message markdown exceeds {UI_WRITE_BODY_LIMIT} bytes"
+        )
+
+    bid = _parse_uuid(branch_id, BranchNotFoundError, "branch id")
+    # FOR UPDATE on the branch row: the concurrency-safety point (spec §2). Two
+    # racing appends serialize on this lock, so the max(seq)+1 read-then-write
+    # below can't hand out a duplicate seq (the DB unique (branch_id, seq) is the
+    # backstop). Locking the BRANCH row (not the event rows) works even for the
+    # first message, when no event row exists to lock.
+    branch = session.scalar(
+        select(ShadowBranch).where(ShadowBranch.id == bid).with_for_update()
+    )
+    if branch is None:
+        raise BranchNotFoundError(f"no shadow branch with id {branch_id!r}")
+    if branch.status == "archived":
+        raise BranchArchivedError(
+            f"shadow branch {branch.scope_slug}:{branch.name!r} is archived"
+        )
+
+    next_seq = (
+        session.scalar(
+            select(func.max(ShadowConversationEvent.seq)).where(
+                ShadowConversationEvent.branch_id == bid
+            )
+        )
+        or 0
+    ) + 1
+    event = ShadowConversationEvent(
+        branch_id=bid,
+        seq=next_seq,
+        kind=CONVERSATION_MESSAGE_KIND,
+        payload={"author": author, "markdown": markdown},
+    )
+    session.add(event)
+    session.flush()
+    return _conversation_event_dict(event)
 
 
 # --- shadow-scoped corpus search (spec §5) ---------------------------------

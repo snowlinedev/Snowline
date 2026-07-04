@@ -63,6 +63,14 @@ def test_register_posts_the_right_manifest():
     assert thread_page["nav"] is False
     assert thread_page["kind"] == "thread"
     assert thread_page["data"] == "/ui-api/pages/branches/{branch_id}"
+    # The composer write seam (shadow-conversations §4/§5): its endpoint's
+    # `{branch_id}` param matches the page's own route param (platform validation
+    # enforces endpoint-params ⊆ route-params), and `disabled_when: "archived"` is
+    # the literal flag the shell keys on.
+    composer = thread_page["composer"]
+    assert composer["endpoint"] == "/ui-api/pages/branches/{branch_id}/messages"
+    assert composer["placeholder"] == "Reply in this branch…"
+    assert composer["disabled_when"] == "archived"
 
 
 def test_heartbeat_reasserts_governance_manifest_every_beat():
@@ -98,3 +106,11 @@ def test_manifest_is_accepted_by_the_platform_model():
     assert [w.id for w in m.ui.widgets] == ["shadow-activity"]
     assert [p.id for p in m.ui.pages] == ["shadow-branches", "shadow-branch"]
     assert [p.route for p in m.ui.pages] == ["/shadow", "/shadow/{branch_id}"]
+    # The thread page's composer validates against the platform's UIComposer /
+    # UIPage._valid_composer_for_kind (endpoint-params ⊆ route-params, PR #72).
+    thread_page = m.ui.pages[1]
+    assert thread_page.composer is not None
+    assert (
+        thread_page.composer.endpoint == "/ui-api/pages/branches/{branch_id}/messages"
+    )
+    assert thread_page.composer.disabled_when == "archived"
