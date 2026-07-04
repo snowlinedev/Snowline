@@ -89,7 +89,9 @@ async def _lifespan(app: FastAPI):
             # (spec §8/§9 item 5, issue #81) are both OFF by default (the
             # test-friendly factory) — the production singleton opts into
             # both. Same task group either way so a single cancel_scope tears
-            # down whichever is running on shutdown.
+            # down whichever is running on shutdown. The replication loop is
+            # gated via its own `enabled` seam (issue #91), not by whether
+            # it's started at all — see below.
             poll_health = getattr(app.state, "poll_health", False)
             replicate = getattr(app.state, "replicate", False)
             if poll_health or replicate:
@@ -103,12 +105,19 @@ async def _lifespan(app: FastAPI):
                                 timeout=config.health_poll_timeout(),
                             )
                         )
-                    if replicate:
-                        # Drains the platform's OWN scope.created/scope.updated
-                        # outbox on a timer, same as any opted-in plugin
-                        # (§3.1) — harmless with zero subscriptions (the
-                        # common case before pairing, #82, lands).
-                        tg.start_soon(replication_delivery_loop, session_scope)
+                    # Drains the platform's OWN scope.created/scope.updated
+                    # outbox on a timer, same as any opted-in plugin (§3.1) —
+                    # harmless with zero subscriptions (the common case
+                    # before pairing, #82, lands). Always started; `enabled`
+                    # is the SDK's own defer/gate seam (issue #91), so
+                    # `replicate=False` (the test-friendly default) makes
+                    # this an immediate no-op instead of the platform
+                    # hand-rolling the gate around whether to start it.
+                    tg.start_soon(
+                        partial(
+                            replication_delivery_loop, session_scope, enabled=replicate
+                        )
+                    )
                     try:
                         yield
                     finally:
@@ -137,10 +146,12 @@ def create_app(
     `migrate_on_startup=False` skips the lifespan boot-migrate (tests provision
     their own schema); `connector` injects the gateway's upstream connector
     (defaults to streamable-HTTP; tests pass an in-memory one). `poll_health`
-    starts the background health poller and `replicate` starts the replication
+    starts the background health poller and `replicate` gates the replication
     delivery loop (spec §8, issue #81) — both OFF by default so unit tests
     don't spawn network traffic or race on status; the production singleton
-    opts into both."""
+    opts into both. `replicate` is forwarded straight through as the SDK
+    loop's own `enabled` seam (issue #91) rather than deciding locally whether
+    to start the loop at all."""
     app = FastAPI(title="Snowline Platform", lifespan=_lifespan)
     app.state.registry = registry or PluginRegistry()
     app.state.migrate_on_startup = migrate_on_startup

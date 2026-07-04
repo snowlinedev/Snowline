@@ -95,7 +95,12 @@ def create_app(
             # §3.1, #79): drains the SDK outbox toward paired peers with the
             # unbounded-retry/capped-backoff class. A no-op ticker until
             # pairing creates subscriptions; disable via
-            # SNOWLINE_REPLICATION_DISABLED.
+            # SNOWLINE_REPLICATION_DISABLED. Unlike platform/memory,
+            # governance never grew its own adopter-side flag for this — it
+            # already goes straight through the SDK's own gate, which is now
+            # also exposed as the loop's `enabled` parameter (issue #91); the
+            # env var remains the supported way to pin it off process-wide
+            # (see the autouse test fixture).
             tg.start_soon(replication_delivery_loop, session_scope)
             # The shadow turn-runner (spec §6, issue #71) rides the same task
             # group. It self-gates OFF unless SNOWLINE_SHADOW_TURNS_ENABLED is
