@@ -274,3 +274,40 @@ async def registration_heartbeat(
             # not data loss). Suppress close-time errors from the race.
             with contextlib.suppress(Exception):
                 client.close()
+
+
+async def registration_heartbeats(
+    targets: list[tuple[str, Callable[[], dict]]],
+    *,
+    plugin_name: str,
+    log: logging.Logger,
+    interval: float | None = None,
+    client: httpx.Client | None = None,
+) -> None:
+    """MULTI-TARGET registration: one heartbeat loop per target platform
+    (replication-continuity §4.1's single-home, cross-registered shape — a
+    plugin process on one machine registering with EVERY instance that should
+    compose it). `targets` is `(platform_url, manifest_builder)` pairs; each
+    builder bakes in the base_url that TARGET should dial — loopback toward
+    the platform this process shares a machine with, its tailnet address
+    toward the others — so "which box" stays a URL detail per instance.
+
+    Each loop is an independent `registration_heartbeat`: one instance being
+    down never stalls the beats to the others (the beat itself never raises),
+    and each target logs its own boot confirmation. A shared `client` is passed
+    through when given (httpx clients are thread-safe); otherwise each loop
+    manages its own, keeping the shutdown close-race handling per loop.
+    Cancellation (lifespan shutdown) unwinds the whole task group cleanly."""
+    async with anyio.create_task_group() as tg:
+        for platform_url, manifest_builder in targets:
+            tg.start_soon(
+                partial(
+                    registration_heartbeat,
+                    manifest_builder,
+                    platform_url,
+                    plugin_name=plugin_name,
+                    log=log,
+                    interval=interval,
+                    client=client,
+                )
+            )

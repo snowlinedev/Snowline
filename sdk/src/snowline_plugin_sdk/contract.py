@@ -19,7 +19,16 @@ EVENT_TYPES: frozenset[str] = frozenset(
     {EVENT_DECISION_RECORDED, EVENT_DECISION_SUPERSEDED}
 )
 
-CONTRACT_VERSION: int = 1
+# Version 2 (replication-continuity §3.2, #77): the stream envelope — `epoch`,
+# EMIT-time `seq`, `peer_seen` — is a breaking addition over v1's
+# delivery-time-seq shape. Without the bump, a v1 peer would silently accept
+# and misprocess a v2 event under `check_contract_version`'s <= rule.
+# DEPLOY ORDERING: governance's legacy fire-and-forget bus stamps this version
+# into its (v1-shaped) payloads too, and a still-deployed SDK-v1 consumer's
+# `verify_event` REJECTS version 2 — under the bus's attempt cap (default 5)
+# those deliveries dead-letter. Upgrade webhook consumers to this SDK before
+# or together with governance.
+CONTRACT_VERSION: int = 2
 
 
 class IncompatibleContractVersion(Exception):
@@ -37,6 +46,12 @@ def check_contract_version(payload_version: int | None) -> None:
       * `<= CONTRACT_VERSION` → ACCEPTED (the SDK is at-or-ahead of the emitter).
       * `>  CONTRACT_VERSION` → REJECTED (the SDK is OLDER than the emitter and
         cannot assume forward compatibility across a major contract bump).
+
+    The <= rule is for consumers of a STABLE envelope (fire-and-forget webhook
+    subscribers via `verify_event`). Replication STREAMS do not use it: a
+    stream's keying fields changed in v2, so `replication.ingest` holds ANY
+    version-skewed envelope retryably in both directions
+    (replication-continuity §3.2) rather than accepting an older one.
     """
     version = 1 if payload_version is None else payload_version
     if version > CONTRACT_VERSION:

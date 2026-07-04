@@ -8,11 +8,16 @@ event as `json.dumps({**payload, "seq": seq}).encode()` with an
 `replication.sign`). This module is the consumer's counterpart: HMAC-verify the
 raw bytes, then parse + version-check.
 
-Subscription REGISTRATION has NO remote surface in v1 — webhook subscriptions
-are created programmatically server-side (`replication.create_subscription`, no
-MCP/CLI surface). Registering a plugin as a subscriber is therefore an operator /
-out-of-band step for v1; this module only verifies and parses the deliveries that
-result.
+Subscription REGISTRATION has NO remote surface for the fire-and-forget webhook
+class — those subscriptions are created programmatically server-side
+(`replication.create_subscription`, no MCP/CLI surface); registering such a
+subscriber is an operator / out-of-band step, and this module only verifies and
+parses the deliveries that result. SUPERSEDED for REPLICATION-CLASS
+subscriptions (replication-continuity spec §5, #77): the SDK's
+`replication.admin` module ships a tailnet-gated replication-admin HTTP surface
+next to `ingest_path` (create/list/retire inbound registrations + outbound
+subscriptions, the receiver-mints-secret handshake, rotation) that the pairing
+CLI drives — still OFF MCP; agents never manage plumbing.
 """
 
 import hashlib

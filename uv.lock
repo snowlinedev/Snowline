@@ -975,26 +975,40 @@ client = [
     { name = "anyio" },
     { name = "httpx" },
 ]
+replication = [
+    { name = "anyio" },
+    { name = "fastapi" },
+    { name = "httpx" },
+    { name = "sqlalchemy" },
+]
 
 [package.dev-dependencies]
 dev = [
     { name = "anyio" },
+    { name = "fastapi" },
     { name = "httpx" },
     { name = "pytest" },
+    { name = "sqlalchemy" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "anyio", marker = "extra == 'client'", specifier = ">=4" },
+    { name = "anyio", marker = "extra == 'replication'", specifier = ">=4" },
+    { name = "fastapi", marker = "extra == 'replication'", specifier = ">=0.110" },
     { name = "httpx", marker = "extra == 'client'", specifier = ">=0.27" },
+    { name = "httpx", marker = "extra == 'replication'", specifier = ">=0.27" },
+    { name = "sqlalchemy", marker = "extra == 'replication'", specifier = ">=2.0" },
 ]
-provides-extras = ["client"]
+provides-extras = ["client", "replication"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "anyio", specifier = ">=4" },
+    { name = "fastapi", specifier = ">=0.110" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "pytest", specifier = ">=8.0" },
+    { name = "sqlalchemy", specifier = ">=2.0" },
 ]
 
 [[package]]

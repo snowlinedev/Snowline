@@ -9,6 +9,7 @@ plugins keep only their plugin-specific manifest/surface assertions and import
 from __future__ import annotations
 
 import logging
+from functools import partial
 
 import anyio
 import httpx
@@ -344,3 +345,58 @@ def test_install_heartbeat_httpx_filter_is_idempotent():
         ) == 1
     finally:
         httpx_logger.filters = before
+
+
+# --- multi-target heartbeats (replication-continuity §4.1, issue #77) --------
+
+
+def test_registration_heartbeats_beat_every_target_with_its_own_base_url():
+    """One loop per target platform, each advertising the base_url THAT target
+    should dial (§4.1's single-home, cross-registered shape): loopback toward
+    the co-located platform, the tailnet address toward the remote one."""
+    beats: dict[str, list[dict]] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        beats.setdefault(request.url.host, []).append(json.loads(request.content))
+        return httpx.Response(200)
+
+    def _manifest(base_url: str):
+        return lambda: {**MANIFEST, "base_url": base_url}
+
+    targets = [
+        ("http://local-platform.example", _manifest("http://127.0.0.1:8899")),
+        ("http://remote-platform.example", _manifest("http://plugin.tailnet:8899")),
+    ]
+
+    async def main():
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(
+                partial(
+                    registration.registration_heartbeats,
+                    targets,
+                    plugin_name="test",
+                    log=LOG,
+                    interval=0.01,
+                    client=mock_client(handler),
+                )
+            )
+            with anyio.fail_after(5):
+                while not all(
+                    len(beats.get(host, [])) >= 2
+                    for host in ("local-platform.example", "remote-platform.example")
+                ):
+                    await anyio.sleep(0.005)
+            tg.cancel_scope.cancel()
+
+    anyio.run(main)
+
+    # Each target saw ITS base_url, on every beat — one instance being down
+    # never having stalled the other is implied by both accumulating beats.
+    assert {m["base_url"] for m in beats["local-platform.example"]} == {
+        "http://127.0.0.1:8899"
+    }
+    assert {m["base_url"] for m in beats["remote-platform.example"]} == {
+        "http://plugin.tailnet:8899"
+    }
