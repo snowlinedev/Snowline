@@ -73,6 +73,51 @@ def test_unknown_top_level_replication_field_rejected():
         _manifest(_replication(bogus=True))
 
 
+def test_advertised_base_url_absent_defaults_to_none():
+    # The field is optional (§4.1): a plugin that never declares it pairs by the
+    # port-preserving fallback (#96), so absence must be a clean None.
+    m = _manifest(_replication())
+    assert m.replication.advertised_base_url is None
+
+
+def test_advertised_base_url_present_and_stored():
+    m = _manifest(_replication(advertised_base_url="http://roam.tailnet:8801"))
+    assert m.replication.advertised_base_url == "http://roam.tailnet:8801"
+
+
+def test_advertised_base_url_trailing_slash_stripped():
+    # Shares base_url's trailing-slash strip (_valid_base_url) so the pairing CLI
+    # can join paths without doubled slashes.
+    m = _manifest(_replication(advertised_base_url="https://roam.tailnet:8801/"))
+    assert m.replication.advertised_base_url == "https://roam.tailnet:8801"
+
+
+def test_advertised_base_url_allows_path_for_path_based_serve_front():
+    # A non-empty PATH is allowed on purpose: a path-based serve front (§4.1) is
+    # a reason to declare the field, and pairing's ingest/admin suffix is meant
+    # to land UNDER that path.
+    m = _manifest(_replication(advertised_base_url="https://roam.tailnet/governance/"))
+    assert m.replication.advertised_base_url == "https://roam.tailnet/governance"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "roam.tailnet:8801",             # no scheme
+        "ftp://roam.tailnet:8801",       # non-http(s) scheme
+        "http://roam.tailnet:8801?x=1",  # query — would corrupt the suffixed URL
+        "http://roam.tailnet:8801#frag",  # fragment — same
+    ],
+)
+def test_advertised_base_url_malformed_rejected(bad):
+    # Stricter than base_url's `_valid_base_url` (scheme + rstrip): because
+    # pairing uses this value VERBATIM and suffixes the admin/ingest path onto
+    # it (§5), a query or fragment must be rejected too — a suffix onto
+    # `...?x=1` / `...#f` corrupts the URL. All fail loud at registration.
+    with pytest.raises(ValidationError, match="advertised_base_url"):
+        _manifest(_replication(advertised_base_url=bad))
+
+
 def test_registry_stores_replication_block():
     # The registry stores the whole manifest object, so once the field exists
     # on PluginManifest, storage is automatic — this pins that down as a

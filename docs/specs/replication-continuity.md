@@ -212,7 +212,8 @@ pairing**. This keeps the server thin and makes participation strictly opt-in:
 "replication": {
   "contract_version": 2,
   "ingest_path": "/events/ingest",
-  "events": ["decision.recorded", "decision.superseded"]
+  "events": ["decision.recorded", "decision.superseded"],
+  "advertised_base_url": "http://roam.tailnet:8801"
 }
 ```
 
@@ -220,6 +221,15 @@ pairing**. This keeps the server thin and makes participation strictly opt-in:
   `base_url` (SDK-provided handler).
 - `events` — the event vocabulary this plugin emits, declared so pairing can
   warn on version/vocabulary skew between the two instances' copies.
+- `advertised_base_url` (optional) — the absolute address a **peer** instance
+  reaches this plugin's replication surfaces at over the tailnet, when that
+  differs from the loopback `base_url` the plugin advertises to its own
+  registry (§4.1). Pairing (§5) prefers it; absent, pairing falls back to the
+  port-preserving host rewrite (the addressing rule in §4.1). "advertised"
+  is the §4.1 verb for a per-target `base_url`; the name says what it is — the
+  address this plugin advertises for cross-tailnet reach — without baking the
+  transport (`tailnet`) into the field, since the reachable front is a serve
+  detail, not a contract one.
 - Absent block = plugin does not replicate. **Gateway and health never read
   the block**; registration changes only by *storing* it — the manifest
   model and registry gain the field (§9 item 2; today's manifest model would
@@ -285,6 +295,36 @@ hub machine's simulators" is the first; "drive the simulators wherever I am"
 is the second — decided in the plugin's repo, not here. Both compose without
 platform changes.
 
+**Cross-tailnet replication addressing — the advertised-address rule.** A
+replicating plugin advertises a **loopback** `base_url` to the platform it
+shares a machine with (§5.1): it binds loopback and lets tailscaled own the
+tailnet path. That loopback address is exactly right for the *local*
+instance's own surfaces, but a **peer** discovering the plugin at pairing time
+(§5) cannot reach a loopback address across the tailnet. Pairing resolves the
+peer-reachable replication address in one of two ways, **in preference
+order**:
+
+1. **The plugin's declared `advertised_base_url`** (manifest `replication`
+   block, §4) — the address a peer reaches this plugin's replication surfaces
+   at, stated by the plugin itself. Pairing uses it verbatim. This is the
+   principled answer whenever the serve posture is *not* a 1:1 port mirror — a
+   non-1:1 port map, a path-based serve front, a distinct tailnet host —
+   because only the plugin knows where it actually lands over the tailnet.
+2. **Fallback: the port-preserving host rewrite.** With no
+   `advertised_base_url`, pairing rewrites the loopback `base_url`'s host onto
+   the peer's tailnet host and **preserves the port** — correct **only** under
+   the runbook's `tailscale serve` posture that maps each loopback port 1:1
+   onto the same tailnet port (`ops/roam/tailscale-serve.sh`). This keeps every
+   existing pair working untouched: a deployment that has never needed
+   `advertised_base_url` behaves exactly as it does today.
+
+**Config trap:** the fallback's 1:1 assumption is silent. A deploy that fronts
+services on non-matching ports, or behind a shared path prefix, will have
+pairing rewrite onto a port that maps to the *wrong* service — or to nothing —
+on the peer, and nothing at the CLI says so. The remedy is not a CLI flag; it
+is the plugin declaring `advertised_base_url`. Declare it whenever the serve
+posture is anything other than the documented 1:1 port mirror.
+
 **Event coverage is the real per-plugin work.** The bus today emits only
 `decision.recorded` / `decision.superseded`. Full-store convergence means
 each opted-in plugin covers its write surface with events:
@@ -333,7 +373,10 @@ each opted-in plugin covers its write surface with events:
   The receiver minting means the verifying side holds the secret by
   construction — a secret that only the sender knows can never verify. The
   CLI warns on any plugin opted in on one side only or with mismatched
-  `contract_version`/vocabulary.
+  `contract_version`/vocabulary. It addresses each peer participant's
+  replication surfaces by the §4.1 advertised-address rule: the participant's
+  declared `advertised_base_url` if present, else the port-preserving rewrite
+  of its loopback `base_url`.
 - **Secrets, concretely.** A secret authenticates one stream for one epoch.
   Storage is a row in each plugin's own store, same posture as the bus today
   (both stores live on owner boxes; at-rest encryption is the host's
@@ -560,6 +603,20 @@ privately. Slug collisions across a partition (same new slug authored on both
 sides) fail loud at ingest and require manual resolution — acceptably rare
 for a single owner.
 
+Because the platform dogfoods the contract, it also **self-describes** it. A
+plugin's `contract_version`/vocabulary is discoverable at pairing time from its
+manifest `replication` block in the registry (§4); the platform has no
+registry entry of its own, so it exposes a small **replication self-manifest**
+endpoint next to its replication surfaces — the same shape as the manifest
+block (`contract_version`, `ingest_path`, `events`), tailnet-gated exactly like
+the §5 admin routes it sits beside. Pairing reads it the way it reads a
+plugin's block, so a skewed platform `contract_version` **refuses at pairing**
+just like a plugin's — rather than the skew surfacing only later as a
+delivery-time `version_hold`. The scope stream carries no peer-reachable
+address distinct from the platform's own base URL (a peer discovers the
+platform *at* that URL), so the self-manifest's `advertised_base_url` is
+absent; the field exists for shape-parity with the plugin block.
+
 **Ordering note:** scope events must be *ingestable before* plugin events
 that reference the new slug arrive. v1 keeps this simple: plugin apply
 functions treat an unknown scope slug as a **retryable** ingest error (the
@@ -655,8 +712,16 @@ events. The two never overlap.
   flagged.
 - A spoke-authored scope followed immediately by a spoke-authored decision in
   it replicates in order (or self-heals via §8's retryable-unknown-slug rule).
-- Pairing refuses (with a clear message) a plugin pair with mismatched
-  `contract_version`, and warns on one-sided opt-in.
+- Pairing refuses (with a clear message) any participant pair with mismatched
+  `contract_version` — a plugin pair OR the platform's own scope stream, which
+  self-describes its contract at pairing time (§8/#95) and is refused on skew
+  exactly like a plugin, rather than deferring the skew to a delivery-time
+  `version_hold` — and warns on one-sided opt-in.
+- Pairing survives a mixed-version rollout: a peer platform that predates the
+  scope-stream self-manifest (§8) is discovered by falling back to the pre-#95
+  synthesized participant (its contract_version left unknown, so the check
+  defers to delivery-time, and a loud WARN names the remedy), so ONE
+  un-upgraded peer never blocks pairing of the other participants.
 - After pairing, BOTH directions verify: an event signed by either sender is
   accepted by its receiver (the handshake put the secret on the verifying
   side); rotating a stream's secret is hitless — old-signed deliveries are

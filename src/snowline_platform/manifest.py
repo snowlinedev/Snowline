@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -325,6 +326,43 @@ class ReplicationBlock(BaseModel):
         description="the event-type vocabulary this plugin emits, declared "
         "so pairing (§5) can warn on vocabulary skew between instances",
     )
+    advertised_base_url: str | None = Field(
+        default=None,
+        description="optional peer-reachable address for this plugin's "
+        "replication surfaces over the tailnet, when it differs from the "
+        "loopback base_url advertised to this plugin's own registry (§4.1). "
+        "Pairing (§5) prefers it; absent, pairing falls back to the "
+        "port-preserving rewrite of base_url. None = no override (the "
+        "fallback applies)",
+    )
+
+    @field_validator("advertised_base_url")
+    @classmethod
+    def _valid_advertised_base_url(cls, v: str | None) -> str | None:
+        # It IS a base_url — the peer-facing one — so it shares
+        # PluginManifest.base_url's shape rule (require an http(s) scheme, strip
+        # a trailing slash; see `_valid_base_url`) and additionally forbids a
+        # query or fragment, making it STRICTER than base_url. The extra rule is
+        # load-bearing here and not on base_url: pairing uses this value VERBATIM
+        # and then SUFFIXES the admin prefix / ingest_path onto it (§5), so
+        # `http://h?x=1` or `http://h#f` would suffix into a corrupted URL
+        # (`http://h?x=1/replication-admin`). A non-empty PATH is allowed on
+        # purpose — a path-based serve front (§4.1) is a reason to declare this
+        # field, and the ingest/admin suffix is meant to land under that path.
+        if v is None:
+            return v
+        if not (v.startswith("http://") or v.startswith("https://")):
+            raise ValueError(
+                f"advertised_base_url {v!r} must start with http:// or https://"
+            )
+        parts = urlsplit(v)
+        if parts.query or parts.fragment:
+            raise ValueError(
+                f"advertised_base_url {v!r} must not carry a query or fragment — "
+                "pairing suffixes the admin/ingest path onto it (§5), which a "
+                "query or fragment would corrupt"
+            )
+        return v.rstrip("/")
 
 
 class PluginManifest(BaseModel):

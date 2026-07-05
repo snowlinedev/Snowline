@@ -21,8 +21,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from snowline_plugin_sdk.contract import CONTRACT_VERSION
 from snowline_plugin_sdk.replication.admin import build_replication_router
 from snowline_plugin_sdk.replication.models import ReplicationBase
+from snowline_platform.replication import SCOPE_EVENTS
 
 # A loopback peer so the SDK admin surface's tailnet gate admits every routed
 # request (§5.1: behind the serve→loopback front, cross-instance traffic arrives
@@ -79,34 +81,56 @@ def make_participant(*, ingest_path: str = "/events/ingest", db_url: str | None 
 
 
 def make_platform(*, plugins: list[dict], db_url: str | None = None,
-                  ingest_path: str = "/replication/events/ingest"):
+                  ingest_path: str = "/replication/events/ingest",
+                  platform_contract_version: int = CONTRACT_VERSION,
+                  platform_events: tuple[str, ...] = SCOPE_EVENTS,
+                  platform_advertised_base_url: str | None = None):
     """A platform-shaped app: a participant app (the platform's own scope stream)
     PLUS a `GET /plugins` registry returning `plugins` (each a
-    `{name,status,manifest}` entry the way `plugins_routes` does)."""
+    `{name,status,manifest}` entry the way `plugins_routes` does) PLUS the §8
+    replication self-manifest at `GET /replication/manifest` (issue #95) the
+    pairing CLI reads to version-check the platform stream. The
+    `platform_contract_version`/`platform_events` knobs let a test skew the
+    platform's declared contract across the two sides, exactly as `plugin_entry`
+    does for a plugin."""
     inst = make_participant(ingest_path=ingest_path, db_url=db_url)
 
     @inst.app.get("/plugins")
     async def list_plugins() -> dict:  # noqa: D401 - test fixture route
         return {"plugins": plugins}
 
+    @inst.app.get("/replication/manifest")
+    async def replication_manifest() -> dict:  # noqa: D401 - test fixture route
+        return {
+            "contract_version": platform_contract_version,
+            "ingest_path": ingest_path,
+            "events": list(platform_events),
+            "advertised_base_url": platform_advertised_base_url,
+        }
+
     return inst
 
 
 def plugin_entry(name: str, base_url: str, *, ingest_path: str = "/events/ingest",
-                 contract_version: int = 2, events: list[str] | None = None) -> dict:
+                 contract_version: int = 2, events: list[str] | None = None,
+                 advertised_base_url: str | None = None) -> dict:
     """A `/plugins` registry entry whose manifest carries a `replication` block —
-    what the pairing CLI reads to discover an opted-in plugin."""
+    what the pairing CLI reads to discover an opted-in plugin. Pass
+    `advertised_base_url` to exercise the §4.1 advertised-address preference."""
+    block: dict = {
+        "contract_version": contract_version,
+        "ingest_path": ingest_path,
+        "events": events if events is not None else [f"{name}.recorded"],
+    }
+    if advertised_base_url is not None:
+        block["advertised_base_url"] = advertised_base_url
     return {
         "name": name,
         "status": "up",
         "manifest": {
             "name": name,
             "base_url": base_url,
-            "replication": {
-                "contract_version": contract_version,
-                "ingest_path": ingest_path,
-                "events": events if events is not None else [f"{name}.recorded"],
-            },
+            "replication": block,
         },
     }
 

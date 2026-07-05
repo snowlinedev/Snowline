@@ -45,15 +45,18 @@ from urllib.parse import urlsplit, urlunsplit
 
 log = logging.getLogger("snowline_platform.replication_pairing")
 
-# The platform's own replication participation (§8) is not in its own `/plugins`
-# registry, so its metadata is not manifest-discoverable the way a plugin's is.
-# These are the platform-side constants the #81 adoption pins: the scope event
-# vocabulary and the admin/ingest paths its `replication.router` mounts. Kept
-# here (not imported from the platform's replication module, which only exists
-# once #81 lands) so this CLI works against any composed stack.
+# The platform's own replication participation (§8) is not in its `/plugins`
+# registry, so — unlike a plugin's — its contract is not discoverable from a
+# manifest block there. Instead the platform SELF-DESCRIBES it at a small
+# tailnet-gated self-manifest endpoint (issue #95), the same block shape a
+# plugin declares, which this CLI reads through the IDENTICAL construction path
+# (`_participant`) so the platform's scope stream is version/vocabulary-checked
+# at pairing exactly like a plugin's — #90's synthesized-constants special case
+# is gone, except for one localized MIGRATION fallback: a peer platform that
+# predates this endpoint (404) is synthesized the pre-#95 way in a single branch
+# of `_platform_manifest`, so a mixed-version rollout can still pair.
 PLATFORM_PARTICIPANT = "platform"
-PLATFORM_EVENTS: tuple[str, ...] = ("scope.created", "scope.updated")
-PLATFORM_INGEST_PATH = "/replication/events/ingest"
+PLATFORM_MANIFEST_PATH = "/replication/manifest"
 
 DEFAULT_ADMIN_PREFIX = "/replication-admin"
 
@@ -70,11 +73,12 @@ class Participant:
 
     `source_id` is the instance-qualified `<instance>.<name>` the SDK stamps at
     emit (§3); `admin_base`/`ingest_url` are the absolute URLs this participant
-    serves the §5 admin surface and its `ingest_path` on. `contract_version` is
-    None only for a participant whose version is not manifest-declared (the
-    platform, whose peer-side version this CLI cannot read — see the module
-    docstring); a None on either side skips the refuse and holds any real skew
-    at delivery time (§3.2)."""
+    serves the §5 admin surface and its `ingest_path` on. `contract_version`
+    comes straight from the participant's declared block — a plugin's manifest
+    `replication` block (§4) or the platform's self-manifest (§8/#95). It is
+    None only for a participant that declares no version at all (a defensive
+    fallback; nothing in a composed stack does today); a None on either side
+    skips the refuse and holds any real skew at delivery time (§3.2)."""
 
     name: str
     admin_base: str
@@ -119,8 +123,11 @@ def discover_participants(
 ) -> dict[str, Participant]:
     """Every replicating participant on the instance at `platform_url`, keyed by
     name. Plugins come from `GET /plugins` (a plugin replicates iff its manifest
-    carries a `replication` block, §4); the platform's scope stream (§8) is added
-    unless `include_platform=False`.
+    carries a `replication` block, §4); the platform's scope stream (§8) is read
+    from its self-manifest endpoint (issue #95) unless `include_platform=False`.
+    BOTH are turned into a Participant the same way (`_participant`), so the
+    platform stream is version/vocabulary-checked at pairing exactly like a
+    plugin's.
 
     `client` is any object with `.get(url) -> response` (an `httpx.Client` in
     production). `platform_url` is the instance's platform base.
@@ -129,11 +136,12 @@ def discover_participants(
     `base_url` to its own platform's registry (it binds loopback; the tailnet
     path is tailscaled's). That loopback base_url is directly usable when
     discovering the LOCAL instance, but NOT when discovering a PEER over the
-    tailnet. `reachable_host` (the peer's tailnet host) rewrites each plugin's
-    base_url host onto it while PRESERVING the port — which is exactly the
-    posture the runbook's `tailscale serve` sets up: each service's loopback
-    port mapped 1:1 onto the same tailnet port. The platform participant is
-    already addressed via `platform_url`, so it is never rewritten."""
+    tailnet. `reachable_host` (the peer's tailnet host) is how a peer's plugin
+    gets a reachable address, by the §4.1 advertised-address rule
+    (`_resolve_base`): the plugin's declared `advertised_base_url` if present,
+    else a port-preserving rewrite of its loopback `base_url` onto
+    `reachable_host`. The platform participant is addressed via `platform_url`
+    (already the reachable address), so it is never advertised-rewritten."""
     platform_url = platform_url.rstrip("/")
     resp = client.get(f"{platform_url}/plugins")
     _raise_for_status(resp, f"GET {platform_url}/plugins")
@@ -144,29 +152,119 @@ def discover_participants(
         if not block:
             continue  # not opted in — degrades alone (§4)
         name = manifest["name"]
-        base = _rehost(manifest["base_url"].rstrip("/"), reachable_host)
-        ingest_path = block["ingest_path"]
-        participants[name] = Participant(
-            name=name,
-            admin_base=f"{base}{admin_prefix}",
-            ingest_url=f"{base}{ingest_path}",
-            source_id=f"{instance_id}.{name}",
-            events=tuple(block.get("events", [])),
-            contract_version=block.get("contract_version"),
-        )
+        base = _resolve_base(block, manifest["base_url"], reachable_host)
+        participants[name] = _participant(name, base, block, instance_id, admin_prefix)
     if include_platform:
-        participants[PLATFORM_PARTICIPANT] = Participant(
-            name=PLATFORM_PARTICIPANT,
-            admin_base=f"{platform_url}{admin_prefix}",
-            ingest_url=f"{platform_url}{PLATFORM_INGEST_PATH}",
-            source_id=f"{instance_id}.{PLATFORM_PARTICIPANT}",
-            events=PLATFORM_EVENTS,
-            # Not manifest-declared on either side; both instances run identical
-            # platform code, so a real skew surfaces as a delivery-time version
-            # hold (§3.2), not a pairing-time refuse.
-            contract_version=None,
+        block = _platform_manifest(client, platform_url)
+        # The platform is discovered AT platform_url (already the reachable
+        # address), so its base is platform_url verbatim — the §4.1 rewrite is a
+        # plugin concern (§8).
+        participants[PLATFORM_PARTICIPANT] = _participant(
+            PLATFORM_PARTICIPANT, platform_url, block, instance_id, admin_prefix
         )
     return participants
+
+
+def _participant(
+    name: str, base: str, block: dict, instance_id: str, admin_prefix: str
+) -> Participant:
+    """Build a Participant from a `replication`-block-shaped dict — the ONE
+    construction path for both a plugin (block from `/plugins`, §4) and the
+    platform (block from its self-manifest, §8/#95), so both carry a real
+    declared `contract_version`/vocabulary and are refused/warned identically at
+    pairing."""
+    base = base.rstrip("/")
+    return Participant(
+        name=name,
+        admin_base=f"{base}{admin_prefix}",
+        ingest_url=f"{base}{block['ingest_path']}",
+        source_id=f"{instance_id}.{name}",
+        events=tuple(block.get("events", [])),
+        contract_version=block.get("contract_version"),
+    )
+
+
+def _resolve_base(
+    block: dict, registry_base_url: str, reachable_host: str | None
+) -> str:
+    """The §4.1 advertised-address rule for a plugin discovered on an instance.
+
+    LOCAL discovery (`reachable_host` None) uses the registry `base_url` as-is —
+    the loopback address is directly reachable. CROSS-TAILNET discovery prefers
+    the plugin's declared `advertised_base_url` (the peer-reachable address it
+    states for itself), and with none falls back to the port-preserving host
+    rewrite. The fallback is BYTE-IDENTICAL to pre-#96 behavior, so a plugin
+    that never declares the field pairs exactly as it does today."""
+    if reachable_host is None:
+        return registry_base_url
+    advertised = block.get("advertised_base_url")
+    if advertised:
+        return advertised
+    return _rehost(registry_base_url.rstrip("/"), reachable_host)
+
+
+def _platform_manifest(client, platform_url: str) -> dict:
+    """Read the platform's replication self-manifest (§8, issue #95) — the same
+    block shape a plugin declares — so the CLI builds the platform Participant
+    through the identical `_participant` path.
+
+    This runs INSIDE `discover_participants`, before the participants dict
+    returns, so a raise here would block pairing of EVERY participant (plugins
+    included) on one misbehaving peer platform. The non-happy peer states are
+    therefore handled deliberately:
+
+      * 404 — a peer platform predating #95 has no self-manifest. FALL BACK to
+        the pre-#95 synthesized platform participant (scope vocabulary + §8
+        ingest path, contract_version UNKNOWN) and WARN. A pre-upgrade peer has
+        no version to advertise, and blocking a rollout-window pairing is worse
+        than deferring the check — so the scope-stream skew defers to a
+        delivery-time version_hold exactly as it did before #95.
+      * 200 + non-JSON, or a JSON non-object, or a JSON object missing a
+        required field — a LABELED `PairingError` naming the URL and the fault
+        (the operator fixes the peer), never a raw JSONDecodeError/KeyError
+        stack trace. The plugin path needs no such guard: its block is validated
+        by `ReplicationBlock` at registration; this raw-JSON read is not."""
+    url = f"{platform_url}{PLATFORM_MANIFEST_PATH}"
+    resp = client.get(url)
+    if resp.status_code == 404:
+        log.warning(
+            "peer platform at %s predates the replication self-manifest (#95); "
+            "its scope-stream contract_version can't be checked at pairing, so "
+            "skew will surface later as a delivery-time version_hold (pre-#95 "
+            "behavior) — upgrade the peer's platform to restore pairing-time "
+            "checks",
+            platform_url,
+        )
+        # The pre-#95 synthesized platform block, built HERE so this 404 branch
+        # is the only re-introduced platform-specific code: scope vocabulary +
+        # §8 ingest path, version UNKNOWN (None → the pre-#95 pairing-time skip).
+        # It still flows through the shared `_participant` constructor.
+        return {
+            "contract_version": None,
+            "ingest_path": "/replication/events/ingest",
+            "events": ["scope.created", "scope.updated"],
+        }
+    _raise_for_status(resp, f"GET {url}")
+    try:
+        block = resp.json()
+    except Exception as exc:  # noqa: BLE001 - any non-JSON body
+        snippet = (getattr(resp, "text", "") or "")[:200]
+        raise PairingError(
+            f"GET {url} returned a broken replication self-manifest (not JSON): "
+            f"{snippet!r}"
+        ) from exc
+    if not isinstance(block, dict):
+        raise PairingError(
+            f"GET {url} returned an unexpected replication self-manifest "
+            f"(expected a JSON object, got {type(block).__name__}): {block!r}"
+        )
+    missing = [k for k in ("contract_version", "ingest_path", "events") if k not in block]
+    if missing:
+        raise PairingError(
+            f"GET {url} returned an incomplete replication self-manifest — "
+            f"missing required field(s) {missing}: {block!r}"
+        )
+    return block
 
 
 # --- the §5 handshake ---------------------------------------------------------
@@ -259,9 +357,10 @@ def handshake_direction(
 
 def _version_mismatch(a: Participant, b: Participant) -> bool:
     """True iff both sides declare a contract_version and they DIFFER. A None on
-    either side (the platform's scope stream, whose version isn't
-    manifest-declared) is not a mismatch — any real skew there holds at delivery
-    time (§3.2)."""
+    either side (a participant that declares no version at all) is not a
+    mismatch — any real skew there holds at delivery time (§3.2). The platform
+    USED to be that None case; it now self-declares (§8/#95) and is refused on
+    skew exactly like a plugin."""
     return (
         a.contract_version is not None
         and b.contract_version is not None
