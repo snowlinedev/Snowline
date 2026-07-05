@@ -34,6 +34,27 @@ MIGRATIONS = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_replication_source_id():
+    """Cross-suite env isolation (#106) — a defensive net. The concrete leak was
+    the seed suite's `_emit` helper writing `SNOWLINE_REPLICATION_SOURCE_ID` via
+    raw `os.environ` (no restore), so under a single-process workspace run the
+    value leaked forward into the governance suite — whose register-class tests
+    expect their lenient `governance` default and saw `primary.governance`. That
+    helper is now fixed at source (monkeypatch.setenv), so no raw writer of this
+    var remains today; but raw-`os.environ` writes with no restore are a
+    recurring class in this suite (see #114 for `SNOWLINE_GOVERNANCE_DATABASE_URL`),
+    so this snapshot/restore stays as a backstop against the next one for THIS
+    var. Not a substitute for fixing writers at source."""
+    key = "SNOWLINE_REPLICATION_SOURCE_ID"
+    prior = os.environ.get(key)
+    yield
+    if prior is None:
+        os.environ.pop(key, None)
+    else:
+        os.environ[key] = prior
+
+
 def _db_name(url: str) -> str:
     return sa.make_url(url).database
 
