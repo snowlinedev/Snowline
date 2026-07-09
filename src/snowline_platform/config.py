@@ -10,6 +10,15 @@ add ranges. This mirrors the SDK replication admin router's default
 (`snowline_plugin_sdk.replication.admin.DEFAULT_TRUSTED_CIDRS`) so a first boot
 doesn't 403 loopback deliveries and pairing-CLI calls (issue #93) — keep the
 two in sync. Trust is configuration, never hardcoded into the request path.
+
+Loopback trust here is deliberate policy, not an incidental widening of
+"the tailnet" — governance decision 35546152 (Snowline#116): on these
+single-owner machines, possession of the box already implies possession of
+its tailnet identity, so this network-position trust is platform-wide by
+design. Two things it does NOT do: public exposure never widens this CIDR
+set — internet-facing access authenticates at an OAuth-terminating edge
+front instead (Snowline#120); and a non-owner tailnet node is ACL-scoped at
+the network layer, never folded into this flat owner-trusted range.
 """
 
 import os
@@ -20,6 +29,8 @@ import re
 # trusted network (replication-continuity.md §5.1). Kept in lockstep with the
 # SDK's `snowline_plugin_sdk.replication.admin.DEFAULT_TRUSTED_CIDRS` (issue
 # #93; see `tests/test_config.py::test_default_matches_sdk_admin_default`).
+# The loopback entries are deliberate, platform-wide policy, not a tailnet-only
+# default with an incidental widening — see governance decision 35546152.
 DEFAULT_TRUSTED_CIDRS = "100.64.0.0/10,127.0.0.0/8,::1"
 
 # Local libpq defaults: unix socket, current OS user, no password — mirrors the

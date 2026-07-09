@@ -519,9 +519,10 @@ def _raise_for_status(resp, what: str) -> None:
             body = f" — {resp.text[:200]}" if getattr(resp, "text", "") else ""
         if resp.status_code == 403:
             body += (
-                " (403: the admin surface is tailnet-gated — is the caller's "
-                "peer IP in SNOWLINE_TRUSTED_CIDRS? behind a tailscale-serve → "
-                "loopback front the platform config default 100.64.0.0/10 must "
-                "be widened to include 127.0.0.0/8,::1 — §5.1)"
+                " (403: the admin surface is tailnet+loopback-gated — is the "
+                "caller's peer IP in SNOWLINE_TRUSTED_CIDRS? the platform "
+                "default already includes both 100.64.0.0/10 and 127.0.0.0/8,::1 "
+                "(§5.1) — an override that omits loopback will 403 a "
+                "tailscale-serve → loopback front's traffic)"
             )
         raise PairingError(f"{what} failed: HTTP {resp.status_code}{body}")

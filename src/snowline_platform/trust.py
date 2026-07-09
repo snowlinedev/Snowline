@@ -2,14 +2,17 @@
 
 Access control is a single PLUGGABLE seam: the request pipeline asks the
 `TrustResolver` "is this request trusted, and who is it?". v1 ships ONE provider
-— a configurable trusted-CIDR network gate (the tailnet range) — and the resolver
-runs providers in order, so OAuth (a per-user token provider) slots in later
+— a configurable trusted-CIDR network gate (the tailnet range PLUS loopback,
+both trusted as owner network-position by deliberate policy, governance
+decision 35546152 — not a tailnet-only default) — and the resolver runs
+providers in order, so OAuth (a per-user token provider) slots in later
 WITHOUT any change downstream.
 
 Two layers stay separate: the NETWORK gate (which CIDRs may reach the platform)
 lives here; APP AUTHZ (what a Principal may *do*) keys on the returned Principal
 elsewhere. OAuth only ever adds an identity provider here; it never touches the
-network gate, which stays Tailscale's job.
+network gate. Public exposure never widens this gate either — it authenticates
+at an edge front instead (Snowline#120).
 """
 
 from __future__ import annotations
@@ -52,13 +55,18 @@ class TrustProvider(Protocol):
 class CidrTrustProvider:
     """v1: trust by source-IP membership in a configured set of CIDRs.
 
-    The tailnet lives in a known range (Tailscale's CGNAT ``100.64.0.0/10``, or
-    a narrower configured set). A source IP inside it is trusted as the single
-    ``owner`` — zero per-client config, which preserves the SSH/daily flow (the
-    opposite of a per-client-header scheme). This is a NETWORK gate: it proves
-    "on the trusted network", not "which user" — sufficient for a single-user
-    v1. Per-user identity (Tailscale serve-headers / LocalAPI WhoIs, or OAuth)
-    is a later provider behind the same seam.
+    The tailnet lives in a known range (Tailscale's CGNAT ``100.64.0.0/10``),
+    and the default set also includes loopback — both are trusted as the
+    single ``owner`` on single-owner machines where possession of the box
+    already implies possession of its tailnet identity (governance decision
+    35546152; loopback is not an incidental widening). Zero per-client config,
+    which preserves the SSH/daily flow (the opposite of a per-client-header
+    scheme). This is a NETWORK gate: it proves "on the trusted network", not
+    "which user" — sufficient for a single-user v1, and only ever narrowed by
+    config, never by folding in a non-owner tailnet node's traffic (those get
+    ACL-scoped at the network layer instead). Per-user identity (Tailscale
+    serve-headers / LocalAPI WhoIs, or OAuth) is a later provider behind the
+    same seam.
     """
 
     source = "tailnet-cidr"

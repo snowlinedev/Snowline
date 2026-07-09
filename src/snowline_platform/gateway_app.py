@@ -64,9 +64,12 @@ __all__ = [
 ]
 
 # DNS-rebinding protection off on the streamable-HTTP transport: the gateway sits
-# behind the platform trust gate (reached on the tailnet), matching the
-# governance plugin's own surfaces. Can be tightened via env in a later
-# increment if the platform is ever exposed beyond the tailnet.
+# behind the platform trust gate (reached on the tailnet or loopback, per
+# governance decision 35546152), matching the governance plugin's own surfaces.
+# Public exposure never widens this CIDR gate to cover it (Snowline#120's
+# OAuth-terminating edge front authenticates instead) — so there is no "tighten
+# the CIDR set" increment triggered by exposure; only a platform-served public
+# path would need a new (bearer-token) TrustProvider alongside this one.
 _SECURITY = TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
 
