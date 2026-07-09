@@ -1,0 +1,40 @@
+[project]
+name = "snowline-remote-front"
+version = "0.0.1"
+description = "Snowline remote front (issue #120, Stage 1) — a thin, stateless public MCP endpoint that terminates OAuth 2.1 for Claude.ai and reverse-proxies Streamable-HTTP MCP to the primary gateway over the tailnet."
+requires-python = ">=3.12"
+dependencies = [
+    # Starlette/uvicorn is the ASGI stack (FastAPI's substrate; the front has no
+    # ORM so it uses Starlette directly). uvicorn only for the deploy entrypoint.
+    "starlette>=0.37",
+    "uvicorn>=0.29",
+    # The reverse-proxy half is a streaming HTTP client of the upstream gateway.
+    "httpx>=0.27",
+    # The OAuth surface is the official MCP Python SDK's auth framework
+    # (`mcp.server.auth`): AS metadata (RFC 8414), protected-resource metadata
+    # (RFC 9728), dynamic client registration (RFC 7591), the authorize/token
+    # handlers (PKCE verified SDK-side), and the bearer 401 middleware. We
+    # implement only the `OAuthAuthorizationServerProvider` storage/token seam
+    # rather than hand-rolling OAuth (the issue's stated biggest risk).
+    "mcp>=1.2",
+]
+
+[project.scripts]
+snowline-remote-front = "snowline_remote_front.__main__:main"
+
+[dependency-groups]
+# Testable STANDALONE (matches the SDK member): a plain `uv run pytest` from this
+# directory runs the whole suite against an in-memory store + a stub upstream, no
+# Postgres, no fly, no tailnet.
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/snowline_remote_front"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--import-mode=importlib"

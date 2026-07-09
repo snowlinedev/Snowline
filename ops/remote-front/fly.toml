@@ -1,0 +1,48 @@
+# fly.io deploy config for the Snowline remote front (issue #120, Stage 1).
+# DEPLOY artifact only — fill the CHANGEME values (see
+# docs/ops/remote-front-runbook.md). App name + region are yours to pick.
+
+app = "snowline-remote-front-CHANGEME"
+primary_region = "sea"
+
+[build]
+  # Build from THIS directory (the workspace member is self-contained here):
+  #   fly deploy -c fly.toml --dockerfile Dockerfile   (run from ops/remote-front)
+  dockerfile = "Dockerfile"
+
+[env]
+  REMOTE_FRONT_HOST = "0.0.0.0"
+  REMOTE_FRONT_PORT = "8080"
+  # The PUBLIC issuer / connector base URL (fly-terminated TLS). Must match the
+  # app's fly hostname exactly, or OAuth discovery URLs won't line up.
+  REMOTE_FRONT_ISSUER_URL = "https://snowline-remote-front-CHANGEME.fly.dev"
+  # The upstream gateway SURFACE over the tailnet — a dedicated, read-heavy
+  # surface, NOT hardwired `main` (issue #120 §4). MagicDNS name resolves via
+  # tailscaled.
+  REMOTE_FRONT_UPSTREAM = "http://MINI-HOSTNAME.CHANGEME.ts.net:8850/remote/mcp"
+  # Persist client registrations + refresh tokens on the volume so a redeploy
+  # never forces re-adding the connector.
+  REMOTE_FRONT_STORE_PATH = "/data/remote-front.db"
+  TS_STATE_DIR = "/data/tailscale"
+  TS_HOSTNAME = "snowline-remote-front"
+
+# Persist the OAuth store + the tailnet node identity across restarts.
+[mounts]
+  source = "remote_front_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false   # availability is chained to the primary; keep it warm
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 250
+    soft_limit = 200
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
