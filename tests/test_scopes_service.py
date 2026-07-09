@@ -124,6 +124,27 @@ def test_create_duplicate_conflicts(db_session):
         scopes.create(db_session, slug="org", name="Org", kind="org")
 
 
+def test_create_converts_flush_race_into_scope_conflict(db_session, monkeypatch):
+    """The `resolve()` pre-check is check-then-act, not atomic (§8 replication
+    review finding): two concurrent creates for the SAME slug (a local create
+    racing an incoming replicated one) can both pass it before either commits.
+    Simulate the race by blinding the pre-check to the winner already sitting
+    in the session, then assert the DB's unique constraint still surfaces the
+    SAME `ScopeConflictError` at flush — not a raw `IntegrityError` that would
+    bypass `apply_scope_event`'s `ParkNow` fast path (#92)."""
+    scopes.create(db_session, slug="org", name="Org", kind="org")
+    db_session.flush()
+    monkeypatch.setattr(scopes, "resolve", lambda session, slug: None)
+    with pytest.raises(scopes.ScopeConflictError):
+        scopes.create(db_session, slug="org", name="Org 2", kind="org")
+    monkeypatch.undo()
+    # The failed flush must not leave the session in a broken transaction —
+    # ordinary work on it afterward should still succeed.
+    scopes.create(db_session, slug="other", name="Other", kind="org")
+    db_session.flush()
+    assert scopes.resolve(db_session, "other") is not None
+
+
 def test_create_org_rejects_parent(db_session):
     with pytest.raises(scopes.InvalidScopeFieldError):
         scopes.create(

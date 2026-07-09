@@ -483,6 +483,33 @@ def test_rotation_is_hitless_and_retires_on_first_new_signed_delivery(session):
     assert (status, resp["reason"]) == (401, "bad_signature")
 
 
+def test_a_new_signed_delivery_whose_apply_fails_does_not_retire_the_secret(
+    session,
+):
+    """A new-signed delivery only retires the old secret once ITS apply also
+    succeeds (§5 code review finding: retirement must not race ahead of the
+    apply outcome) — a failing new-signed delivery leaves `previous_secret`
+    untouched, so the old secret keeps verifying for the sender's still-queued
+    old-signed backlog until a new-signed delivery actually lands clean."""
+    secret_v1 = _register(session)["secret"]
+    _ingest(session, secret_v1, 1)
+    secret_v2 = ingest.rotate_inbound_secret(session, *STREAM)["secret"]
+    session.commit()  # the rotation is its own request/transaction in production
+
+    status, resp = _ingest(session, secret_v2, 2, Applied(fail_on={2}))
+    assert (status, resp["status"]) == (503, "retry")
+    assert _stream(session).previous_secret == secret_v1
+
+    # The old secret still verifies — it was never retired by the failed try.
+    status, resp = _ingest(session, secret_v1, 2)
+    assert (status, resp["status"]) == (200, "applied")
+
+    # A LATER new-signed delivery that applies cleanly completes the rotation.
+    status, resp = _ingest(session, secret_v2, 3)
+    assert (status, resp["status"]) == (200, "applied")
+    assert _stream(session).previous_secret is None
+
+
 def test_register_returns_secret_once_and_never_lists_it(session):
     reg = _register(session)
     assert reg["secret"]
