@@ -10,6 +10,7 @@ this registry.
 from __future__ import annotations
 
 import logging
+import re
 from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
@@ -219,6 +220,24 @@ def create_app(
     # PER-REQUEST, so a bundle built after the platform booted starts serving
     # without a restart (first-deploy ordering), and environments with no
     # bundle 404 cleanly.
+    # Cache policy (/ui): with NO Cache-Control, browsers apply HEURISTIC
+    # freshness — mobile Safari serves a stale index.html referencing a
+    # bundle that no longer exists, which reads as "the deploy didn't take"
+    # on phones. So: everything revalidates every load (no-cache; the etag
+    # makes that a cheap 304) EXCEPT files whose NAME carries vite's content
+    # hash, which may cache forever. `private` (not `public`): /ui sits
+    # behind the trust gate, and a shared cache on the path must not serve
+    # gated content to peers the gate would 403 (decision 35546152 posture).
+    # 404s carry no-cache too — 404 is heuristically cacheable (RFC 9110
+    # §15.5.5), and a cached "no bundle yet" would defeat the per-request
+    # dist resolution below.
+    _NO_CACHE = {"Cache-Control": "no-cache"}
+    _IMMUTABLE = {"Cache-Control": "private, max-age=31536000, immutable"}
+    # vite's default assetFileNames: <name>-<hash>.<ext>. Matching the NAME,
+    # not the assets/ directory, keeps verbatim-copied public/ files (which
+    # keep their stable names wherever they land) on the revalidate path.
+    _HASHED_NAME = re.compile(r"-[A-Za-z0-9_-]{8,}\.[A-Za-z0-9]+$")
+
     @app.get("/ui")
     @app.get("/ui/{rest:path}")
     async def ui(rest: str = "") -> Response:
@@ -227,6 +246,7 @@ def create_app(
             return JSONResponse(
                 {"detail": "no dashboard bundle built"},
                 status_code=status.HTTP_404_NOT_FOUND,
+                headers=_NO_CACHE,
             )
         dist_dir = Path(dist)
         try:
@@ -243,18 +263,21 @@ def create_app(
             and candidate.is_file()
             and candidate.is_relative_to(dist_dir.resolve())
         ):
-            # Cache policy: vite writes content-hashed filenames under
-            # assets/, so those are immutable; everything else (index.html
-            # via the fallback below, favicons, manifest files) must
-            # revalidate every load — with no Cache-Control, browsers apply
-            # HEURISTIC freshness and mobile Safari serves a stale
-            # index.html referencing a bundle that no longer exists, which
-            # reads as "the deploy didn't take" on phones.
-            if candidate.is_relative_to((dist_dir / "assets").resolve()):
-                headers = {"Cache-Control": "public, max-age=31536000, immutable"}
-            else:
-                headers = {"Cache-Control": "no-cache"}
-            return FileResponse(candidate, headers=headers)
+            immutable = bool(_HASHED_NAME.search(candidate.name))
+            return FileResponse(
+                candidate, headers=_IMMUTABLE if immutable else _NO_CACHE
+            )
+        # A miss under assets/ is a dead bundle reference (a shell cached
+        # before a redeploy asking for a hash that no longer exists) — it
+        # must 404, NOT SPA-fallback: serving index.html as a .js module
+        # trips the browser's MIME check and renders a blank dashboard with
+        # only a console error to explain it.
+        if rest.startswith("assets/"):
+            return JSONResponse(
+                {"detail": "no such asset (stale shell? reload the page)"},
+                status_code=status.HTTP_404_NOT_FOUND,
+                headers=_NO_CACHE,
+            )
         index = dist_dir / "index.html"
         if not index.is_file():
             # A half-built dist (vite mid-rebuild, interrupted build) must
@@ -262,8 +285,9 @@ def create_app(
             return JSONResponse(
                 {"detail": "dashboard bundle incomplete — rebuild (npm run build)"},
                 status_code=status.HTTP_404_NOT_FOUND,
+                headers=_NO_CACHE,
             )
-        return FileResponse(index, headers={"Cache-Control": "no-cache"})
+        return FileResponse(index, headers=_NO_CACHE)
 
     return app
 

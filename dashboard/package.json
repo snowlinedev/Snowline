@@ -8,7 +8,7 @@
   },
   "scripts": {
     "dev": "vite",
-    "build": "npm run validate:tokens && tsc -b && vite build",
+    "build": "npm run validate:tokens && tsc -b && vite build --outDir dist.staging --emptyOutDir && node scripts/promote-dist.mjs",
     "preview": "vite preview",
     "validate:tokens": "node scripts/validate-tokens.mjs",
     "test": "npm run validate:tokens && vitest run"
