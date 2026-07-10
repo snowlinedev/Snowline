@@ -32,10 +32,45 @@ class _NoopScopeClient:
     def ancestors(self, slug: str): return []
 
 
+class _ResolvingScopeClient:
+    """Resolves KNOWN slugs to a stable soft reference (`id` = the same uuid5
+    `_sid` uses), the shape the real platform's `/scopes/{slug}` read returns;
+    unknown slugs resolve to `None` (the platform's 404). Lets the create-branch
+    action's scope-resolution path be exercised without a live platform."""
+
+    def __init__(self, known: set[str]):
+        self._known = known
+
+    def resolve(self, slug: str):
+        if slug not in self._known:
+            return None
+        return {
+            "id": str(_sid(slug)),
+            "slug": slug,
+            "name": slug,
+            "kind": "project",
+            "status": "active",
+            "isolated": False,
+            "org": slug.split("/", 1)[0],
+        }
+
+    def ancestors(self, slug: str):
+        return []
+
+
 def _app(monkeypatch):
     monkeypatch.setenv("SNOWLINE_WEBHOOK_DISABLED", "1")
     return create_app(
         scope_client=_NoopScopeClient(),
+        migrate_on_startup=False,
+        register_on_startup=False,
+    )
+
+
+def _app_scoped(monkeypatch, known: set[str] = frozenset({"acme/widget"})):
+    monkeypatch.setenv("SNOWLINE_WEBHOOK_DISABLED", "1")
+    return create_app(
+        scope_client=_ResolvingScopeClient(set(known)),
         migrate_on_startup=False,
         register_on_startup=False,
     )
@@ -460,3 +495,155 @@ def test_post_message_oversize_markdown_is_422(monkeypatch, clean_db):
         {"markdown": "x" * (UI_WRITE_BODY_LIMIT + 1)},
     )
     assert resp.status_code == 422
+
+
+# --- page action: create a branch (ui-shell.md §5 actions[], issue #123) ------
+
+
+def _events_for(branch_id: str) -> list:
+    from sqlalchemy import select
+
+    from snowline_governance.models import ShadowConversationEvent
+
+    with session_scope() as s:
+        return list(
+            s.scalars(
+                select(ShadowConversationEvent)
+                .where(ShadowConversationEvent.branch_id == uuid.UUID(branch_id))
+                .order_by(ShadowConversationEvent.seq)
+            )
+        )
+
+
+def test_create_branch_action_creates_branch_and_returns_navigate(
+    monkeypatch, clean_db
+):
+    resp = _post_sync(
+        _app_scoped(monkeypatch),
+        "/ui-api/pages/branches",
+        {"scope": "acme/widget", "name": "born-in-ui"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["name"] == "born-in-ui"
+    assert body["scope"] == "acme/widget"
+    # The navigate href is plugin-relative and keyed on the new branch's stable
+    # id — the shell re-prefixes it with /<plugin> and lands on the thread page.
+    assert body["navigate"] == f"/shadow/{body['id']}"
+    uuid.UUID(body["id"])  # raises if not a valid uuid
+
+    # It's a real, empty (conversation-less) branch — the thread page renders it.
+    thread = _get_sync(
+        _app_scoped(monkeypatch), f"/ui-api/pages/branches/{body['id']}"
+    ).json()
+    assert thread["title"] == "born-in-ui"
+    assert thread["nodes"] == []
+    # No opening message → no conversation events.
+    assert _events_for(body["id"]) == []
+
+
+def test_create_branch_action_opening_message_lands_as_first_event_seq_1(
+    monkeypatch, clean_db
+):
+    resp = _post_sync(
+        _app_scoped(monkeypatch),
+        "/ui-api/pages/branches",
+        {
+            "scope": "acme/widget",
+            "name": "with-framing",
+            "opening_message": "here is the speculation I want to open",
+        },
+    )
+    assert resp.status_code == 200
+    bid = resp.json()["id"]
+
+    # The opening note is the branch's FIRST conversation event: seq 1, a human
+    # `message`, same seq-allocation path the composer uses.
+    events = _events_for(bid)
+    assert len(events) == 1
+    assert events[0].seq == 1
+    assert events[0].kind == "message"
+    assert events[0].payload == {
+        "author": "human",
+        "markdown": "here is the speculation I want to open",
+    }
+
+    # And it shows in the thread as a "you" message.
+    thread = _get_sync(
+        _app_scoped(monkeypatch), f"/ui-api/pages/branches/{bid}"
+    ).json()
+    assert thread["nodes"][-1] == {
+        "author": "you",
+        "kind": "message",
+        "markdown": "here is the speculation I want to open",
+        "at": thread["nodes"][-1]["at"],
+    }
+
+
+def test_create_branch_action_blank_opening_message_creates_no_event(
+    monkeypatch, clean_db
+):
+    resp = _post_sync(
+        _app_scoped(monkeypatch),
+        "/ui-api/pages/branches",
+        {"scope": "acme/widget", "name": "no-note", "opening_message": "   "},
+    )
+    assert resp.status_code == 200
+    # A whitespace-only note is NOT a message — the branch stays conversation-empty.
+    assert _events_for(resp.json()["id"]) == []
+
+
+def test_create_branch_action_unknown_scope_is_404(monkeypatch, clean_db):
+    resp = _post_sync(
+        _app_scoped(monkeypatch),
+        "/ui-api/pages/branches",
+        {"scope": "acme/nonexistent", "name": "x"},
+    )
+    assert resp.status_code == 404
+    assert "detail" in resp.json()
+
+
+def test_create_branch_action_scope_service_unreachable_is_502(
+    monkeypatch, clean_db
+):
+    """A ScopeServiceError (the platform's scope read unreachable/erroring) maps
+    to a 502 — a transient plumbing failure, not the caller's fault — never a
+    misleading 404 'no such scope' and never a raw 500."""
+    from snowline_governance.scope_client import ScopeServiceError
+
+    class _ErroringScopeClient:
+        def resolve(self, slug: str):
+            raise ScopeServiceError("platform scope service unreachable (test)")
+
+        def ancestors(self, slug: str):
+            return []
+
+    monkeypatch.setenv("SNOWLINE_WEBHOOK_DISABLED", "1")
+    app = create_app(
+        scope_client=_ErroringScopeClient(),
+        migrate_on_startup=False,
+        register_on_startup=False,
+    )
+    resp = _post_sync(
+        app, "/ui-api/pages/branches", {"scope": "acme/widget", "name": "x"}
+    )
+    assert resp.status_code == 502
+    assert "unreachable" in resp.json()["detail"]
+
+
+def test_create_branch_action_blank_scope_or_name_is_422(monkeypatch, clean_db):
+    for bad in ({"scope": "acme/widget", "name": "  "}, {"scope": "", "name": "x"}):
+        resp = _post_sync(_app_scoped(monkeypatch), "/ui-api/pages/branches", bad)
+        assert resp.status_code == 422
+
+
+def test_create_branch_action_duplicate_name_is_409(monkeypatch, clean_db):
+    with session_scope() as s:
+        shadow.create_branch(s, "acme/widget", _sid("acme/widget"), "dupe")
+
+    resp = _post_sync(
+        _app_scoped(monkeypatch),
+        "/ui-api/pages/branches",
+        {"scope": "acme/widget", "name": "dupe"},
+    )
+    assert resp.status_code == 409

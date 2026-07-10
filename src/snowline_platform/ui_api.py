@@ -127,13 +127,12 @@ def _declared_write_templates(entry: RegisteredPlugin) -> list[list[str]]:
     """The plugin-relative path SEGMENTS of every endpoint this plugin
     declared as a POST write target in its manifest `ui` block.
 
-    Today that's `composer.endpoint` on `thread` pages (`shadow-
-    conversations.md` §4). `actions[].endpoint` shares the same posture per
-    spec (§3/§4.3), but `actions` isn't modeled on `UIPage`/`UIWidget` yet —
-    only reserved in the SDK's documentation constants — so there is nothing
-    to collect from it until a later PR adds the field; this function is
-    written to make that a pure addition (one more comprehension), not a
-    matching-logic change.
+    Two sources, same posture (ui-shell.md §5): a `thread` page's
+    `composer.endpoint` (the input-shaped write seam, `shadow-conversations.md`
+    §4) and any page's `actions[].endpoint` (the button/form-shaped write seam,
+    issue #123). Both are structurally identical POST targets — the allowlist
+    doesn't care which flavor declared a path, only that the manifest declared
+    it — so they flatten into one template list the matcher walks uniformly.
 
     Each endpoint was already validated at registration to start with
     `/ui-api/` (`manifest.py`'s `_valid_ui_endpoint`), so stripping that
@@ -143,11 +142,21 @@ def _declared_write_templates(entry: RegisteredPlugin) -> list[list[str]]:
     manifest = entry.manifest
     if manifest.ui is None:
         return []
-    return [
-        page.composer.endpoint[len("/ui-api/") :].split("/")
+
+    def _segments(endpoint: str) -> list[str]:
+        return endpoint[len("/ui-api/") :].split("/")
+
+    templates = [
+        _segments(page.composer.endpoint)
         for page in manifest.ui.pages
         if page.composer is not None
     ]
+    templates += [
+        _segments(action.endpoint)
+        for page in manifest.ui.pages
+        for action in page.actions
+    ]
+    return templates
 
 
 def _segments_match(path_segments: list[str], template_segments: list[str]) -> bool:

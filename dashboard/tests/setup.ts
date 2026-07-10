@@ -67,6 +67,28 @@ export const FIXTURES: Record<string, unknown> = {
                 nav: true,
                 kind: "table",
                 data: "/ui-api/pages/branches",
+                // ui-shell.md §5 actions[]: the "New branch" write affordance
+                // (issue #123) — the shell renders the button + a minimal form
+                // of these declared fields; closed by default, so the axe
+                // matrix audits the button and the registered-ui/actions
+                // suites drive the form open. No `flags`, so it renders live.
+                actions: [
+                  {
+                    id: "new-branch",
+                    label: "New branch",
+                    endpoint: "/ui-api/pages/branches",
+                    fields: [
+                      { name: "scope", label: "Scope", kind: "text", required: true },
+                      { name: "name", label: "Branch name", kind: "text", required: true },
+                      {
+                        name: "opening_message",
+                        label: "Opening note",
+                        kind: "multiline",
+                        required: false,
+                      },
+                    ],
+                  },
+                ],
               },
               {
                 id: "shadow-branch",

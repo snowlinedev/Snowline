@@ -18,9 +18,15 @@ import {
   type KeyboardEvent,
   type ReactNode,
 } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 
-import { fetchUiData, postUiApi, UiApiError, type UIComposer } from "../api";
+import {
+  fetchUiData,
+  postUiApi,
+  UiApiError,
+  type UIAction,
+  type UIComposer,
+} from "../api";
 import { useData, type DataResult, type Loadable } from "../useData";
 
 export function Card(props: { title?: string; children: ReactNode }) {
@@ -756,6 +762,198 @@ export function RegisteredKind(props: {
     default:
       return <UnsupportedKindCard plugin={props.plugin} kind={props.kind} />;
   }
+}
+
+/* ---- page actions (ui-shell.md §5 actions[]) ------------------------------
+ * The button/form-shaped write seam a page declares (issue #123), rendered
+ * GENERICALLY: the shell knows only the declared label, endpoint, and field
+ * list — never anything plugin-specific. A button toggles a minimal form of
+ * the declared fields; submit POSTs the field values through the same
+ * `/ui-api` proxy the composer uses; on a 2xx the shell follows an optional
+ * plugin-relative `navigate` href in the response. */
+
+/** Maps a page-action POST failure to user copy: a 503 down-plugin gets fixed,
+ * reassuring text; everything else (422 validation, 409 conflict, network)
+ * surfaces the server's own message verbatim — fail-visible, never a bare
+ * status code. */
+function actionErrorMessage(err: unknown): string {
+  if (err instanceof UiApiError) {
+    if (err.status === 503) return "This plugin is currently down — try again shortly.";
+    return err.message;
+  }
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** The action response's `navigate` href, CONFINED explicitly (same posture as
+ * the markdown renderer's `safeHref` above, but stricter — a navigate target is
+ * always an in-shell route, never an external link): it must start with a
+ * SINGLE `/`. Everything else is DROPPED — treated as absent, so the form just
+ * closes and no navigation happens. That rejects absolute URLs
+ * (`https://evil.com`), scheme-looking values (`javascript:`, `data:`),
+ * protocol-relative `//host`, and ANY backslash form (browsers treat `/\host`
+ * and `\/host` like `//host`) — explicit here rather than an implicit reliance
+ * on react-router v6 string-`to` semantics and pushState same-origin behavior
+ * staying that way. */
+function safeNavigateHref(nav: string | undefined): string | undefined {
+  if (nav == null) return undefined;
+  if (!nav.startsWith("/") || nav.startsWith("//") || nav.includes("\\")) {
+    return undefined;
+  }
+  return nav;
+}
+
+function PageAction(props: { plugin: string; action: UIAction }) {
+  const navigate = useNavigate();
+  const fields = props.action.fields ?? [];
+  const [open, setOpen] = useState(false);
+  const [values, setValues] = useState<Record<string, string>>({});
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // Ref latch (same rationale as the composer's): a keydown burst + click in
+  // one tick both read a stale `submitting === false` before React commits, so
+  // the state flag alone could double-POST. The ref flips synchronously.
+  const inflight = useRef(false);
+  const id = useId();
+
+  const setField = (name: string, v: string) =>
+    setValues((prev) => ({ ...prev, [name]: v }));
+
+  const missingRequired = fields.some(
+    (f) => f.required && (values[f.name] ?? "").trim() === "",
+  );
+
+  const close = () => {
+    setOpen(false);
+    setError(null);
+    setValues({});
+  };
+
+  const submit = () => {
+    if (submitting || inflight.current || missingRequired) return;
+    inflight.current = true;
+    setSubmitting(true);
+    // Every declared field is sent (an empty optional field as "" — the plugin
+    // owns what that means). The shell never invents fields the manifest
+    // didn't declare.
+    const body: Record<string, string> = {};
+    for (const f of fields) body[f.name] = values[f.name] ?? "";
+    postUiApi(props.plugin, props.action.endpoint, body).then(
+      (resp) => {
+        inflight.current = false;
+        setSubmitting(false);
+        setError(null);
+        const nav =
+          resp && typeof resp === "object" &&
+          typeof (resp as { navigate?: unknown }).navigate === "string"
+            ? (resp as { navigate: string }).navigate
+            : undefined;
+        // `navigate` is plugin-relative (§5) — CONFINED first
+        // (safeNavigateHref: a non-in-shell value is dropped, never
+        // followed), then re-prefixed with `/<plugin>`, same treatment as a
+        // table row `href`. Absent/dropped = nothing to land on, so just
+        // close the form.
+        const to = prefixHref(props.plugin, safeNavigateHref(nav));
+        if (to) navigate(to);
+        else close();
+      },
+      (err) => {
+        inflight.current = false;
+        setSubmitting(false);
+        setError(actionErrorMessage(err));
+      },
+    );
+  };
+
+  if (!open) {
+    return (
+      <button
+        type="button"
+        className="page-action-open"
+        aria-expanded={false}
+        onClick={() => setOpen(true)}
+      >
+        {props.action.label}
+      </button>
+    );
+  }
+
+  return (
+    <form
+      className="page-action-form"
+      onSubmit={(e) => {
+        e.preventDefault();
+        submit();
+      }}
+    >
+      {error != null && (
+        <div className="page-action-error">
+          <StateNote error>{error}</StateNote>
+          <button type="button" onClick={() => setError(null)}>
+            Dismiss
+          </button>
+        </div>
+      )}
+      {fields.map((f) => {
+        const fieldId = `${id}-${f.name}`;
+        const label = f.label ?? f.name;
+        return (
+          <div key={f.name} className="page-action-field">
+            <label htmlFor={fieldId}>
+              {label}
+              {!f.required && <span className="page-action-optional"> (optional)</span>}
+            </label>
+            {f.kind === "multiline" ? (
+              <textarea
+                id={fieldId}
+                className="page-action-input"
+                value={values[f.name] ?? ""}
+                required={f.required}
+                disabled={submitting}
+                onChange={(e) => setField(f.name, e.target.value)}
+              />
+            ) : (
+              <input
+                id={fieldId}
+                type="text"
+                className="page-action-input"
+                value={values[f.name] ?? ""}
+                required={f.required}
+                disabled={submitting}
+                onChange={(e) => setField(f.name, e.target.value)}
+              />
+            )}
+          </div>
+        );
+      })}
+      <div className="page-action-actions">
+        <button
+          type="button"
+          className="page-action-cancel"
+          disabled={submitting}
+          onClick={close}
+        >
+          Cancel
+        </button>
+        <button type="submit" disabled={submitting || missingRequired}>
+          {submitting ? "Submitting…" : props.action.label}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+/** All of a page's declared actions (ui-shell.md §5), rendered above the
+ * page's kind content. Null when the page declares none — the read-only case,
+ * unchanged. */
+export function PageActions(props: { plugin: string; actions: UIAction[] }) {
+  if (props.actions.length === 0) return null;
+  return (
+    <div className="page-actions">
+      {props.actions.map((a) => (
+        <PageAction key={a.id} plugin={props.plugin} action={a} />
+      ))}
+    </div>
+  );
 }
 
 /** Fetch-and-poll hook for a registered contribution's `/ui-api` data. Skips

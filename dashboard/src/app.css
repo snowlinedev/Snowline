@@ -369,6 +369,132 @@
   cursor: pointer;
 }
 
+/* page actions (ui-shell.md §5 actions[]): the button/form-shaped write seam
+ * rendered above a page's kind content. Sizes/colors off the same
+ * density/theme tokens as the composer — no relaxation, comfortable or
+ * compact, light or dark. */
+.page-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-bottom: var(--space-4);
+}
+
+.page-action-open {
+  min-height: var(--control-h);
+  padding: 0 var(--space-4);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-size: var(--font-small);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.page-action-form {
+  flex: 1 1 100%;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  background: var(--surface-page);
+}
+
+.page-action-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.page-action-field label {
+  font-weight: 600;
+  font-size: var(--font-small);
+  color: var(--ink-secondary);
+}
+
+.page-action-optional {
+  font-weight: 400;
+  color: var(--ink-muted);
+}
+
+.page-action-input {
+  min-height: var(--control-h);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  background: var(--surface-card);
+  color: var(--ink-primary);
+  font: inherit;
+}
+
+textarea.page-action-input {
+  min-height: calc(var(--row-h) * 2);
+  resize: vertical;
+}
+
+.page-action-input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.page-action-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.page-action-actions button[type="submit"] {
+  min-height: var(--control-h);
+  padding: 0 var(--space-4);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-size: var(--font-small);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.page-action-actions button[type="submit"]:disabled {
+  background: var(--surface-card);
+  border-color: var(--hairline);
+  color: var(--ink-muted);
+  cursor: not-allowed;
+}
+
+.page-action-cancel {
+  min-height: var(--control-h);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  background: var(--surface-card);
+  color: var(--ink-secondary);
+  font-size: var(--font-small);
+  cursor: pointer;
+}
+
+.page-action-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.page-action-error button {
+  flex-shrink: 0;
+  min-height: var(--control-h);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  background: var(--surface-card);
+  color: var(--ink-secondary);
+  font-size: var(--font-small);
+  cursor: pointer;
+}
+
 /* kind: document */
 .document-title {
   margin: 0 0 var(--space-2);
