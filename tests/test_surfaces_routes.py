@@ -119,3 +119,46 @@ def test_reserved_surface_names_fail_boot(monkeypatch):
     monkeypatch.setenv("SNOWLINE_SURFACES", "main,ui")
     with pytest.raises(ConfigError, match="reserved"):
         _app()
+
+
+def test_ui_cache_headers_split_immutable_hashed_from_revalidating_shell(
+    monkeypatch, tmp_path
+):
+    # index.html (direct and via SPA fallback) must carry Cache-Control:
+    # no-cache — with NO Cache-Control, browsers apply heuristic freshness
+    # and a phone keeps rendering a stale shell pointing at a bundle that no
+    # longer exists after a redeploy. Only files whose NAME carries vite's
+    # content hash are immutable (private: /ui is trust-gated, so a shared
+    # cache must not re-serve it past the gate); a stable-named file that
+    # lands under assets/ (vite copies public/ verbatim) revalidates like
+    # the shell. 404s carry no-cache too (404 is heuristically cacheable),
+    # and a dead assets/ reference 404s instead of SPA-falling-back — an
+    # index.html served as a .js module trips the browser MIME check and
+    # blanks the dashboard.
+    dist = tmp_path / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "index.html").write_text("<html>shell</html>")
+    (dist / "assets" / "app-Belvg2xW.js").write_text("//js")
+    (dist / "assets" / "logo.svg").write_text("<svg/>")
+    (dist / "favicon.svg").write_text("<svg/>")
+    monkeypatch.setenv("SNOWLINE_DASHBOARD_DIST", str(dist))
+
+    client = TestClient(_app())
+    assert client.get("/ui").headers["cache-control"] == "no-cache"
+    assert client.get("/ui/plugins").headers["cache-control"] == "no-cache"
+    assert client.get("/ui/favicon.svg").headers["cache-control"] == "no-cache"
+    assert client.get("/ui/assets/logo.svg").headers["cache-control"] == "no-cache"
+    immutable = client.get("/ui/assets/app-Belvg2xW.js")
+    assert immutable.headers["cache-control"] == "private, max-age=31536000, immutable"
+
+    # Dead bundle reference: 404 + no-cache, never the SPA shell.
+    dead = client.get("/ui/assets/app-00000000.js")
+    assert dead.status_code == 404
+    assert dead.headers["cache-control"] == "no-cache"
+
+    # Bundle-missing 404s are no-cache as well, so a pre-first-build visit
+    # can't stick (test_ui_appears_after_a_late_first_build's guarantee).
+    monkeypatch.setenv("SNOWLINE_DASHBOARD_DIST", str(tmp_path / "never-built"))
+    absent = TestClient(_app()).get("/ui")
+    assert absent.status_code == 404
+    assert absent.headers["cache-control"] == "no-cache"
