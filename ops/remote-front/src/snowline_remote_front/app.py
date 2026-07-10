@@ -61,7 +61,12 @@ def create_app(
     if store is None:
         store = SqliteStore(config.store_path) if config.store_path else InMemoryStore()
 
-    codec = AccessTokenCodec(config.signing_key)
+    # The codec both mints and verifies; `expected_resource` closes the RFC 8707
+    # loop — the provider stamps this resource on every token, and verification
+    # rejects a token bearing any other (or no) `res` claim.
+    codec = AccessTokenCodec(
+        config.signing_key, expected_resource=config.resource_url
+    )
     provider = RemoteFrontProvider(
         store=store,
         codec=codec,
@@ -69,6 +74,8 @@ def create_app(
         subject=config.subject,
         access_ttl=config.access_ttl,
         refresh_ttl=config.refresh_ttl,
+        canonical_resource=config.resource_url,
+        max_clients=config.max_clients,
     )
     verifier = ProviderTokenVerifier(provider)
 

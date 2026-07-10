@@ -17,6 +17,21 @@ TS_PROXY_PORT="${TS_PROXY_PORT:-1055}"
 # see the ACL stanza in docs/ops/remote-front-runbook.md.
 : "${TAILSCALE_AUTHKEY:?TAILSCALE_AUTHKEY is required (fly secret; tag:remote-front)}"
 
+# fly.toml points TS_STATE_DIR at the mounted volume (/data/tailscale), which is
+# EMPTY on first boot — the Dockerfile's mkdir is shadowed by the mount, so the
+# state dir must be created here or tailscaled dies on its state file.
+mkdir -p "${TS_STATE_DIR}" /var/run/tailscale
+
+# The app runs as the unprivileged `app` user (see the setpriv exec below); the
+# fly volume mounts root-owned, so hand the app's store path over. tailscale's
+# own state stays root-owned (tailscaled runs as root, below).
+if [ -n "${REMOTE_FRONT_STORE_PATH:-}" ]; then
+    store_dir="$(dirname "${REMOTE_FRONT_STORE_PATH}")"
+    mkdir -p "${store_dir}"
+    chown app:app "${store_dir}"
+    [ -e "${REMOTE_FRONT_STORE_PATH}" ] && chown app:app "${REMOTE_FRONT_STORE_PATH}"* || true
+fi
+
 /usr/sbin/tailscaled \
     --state="${TS_STATE_DIR}/tailscaled.state" \
     --socket=/var/run/tailscale/tailscaled.sock \
@@ -40,4 +55,9 @@ export https_proxy="http://localhost:${TS_PROXY_PORT}"
 export NO_PROXY="localhost,127.0.0.1,::1"
 export no_proxy="localhost,127.0.0.1,::1"
 
-exec snowline-remote-front
+# Drop privileges for the app process. tailscaled stays root (it owns the
+# volume-backed node state and the entrypoint needed root for the first-boot
+# volume chown anyway), but the PUBLIC-facing process — the one parsing
+# attacker-supplied HTTP — runs as the unprivileged `app` user. It talks to
+# tailscaled only via the localhost HTTP proxy, so it needs no socket access.
+exec setpriv --reuid=app --regid=app --clear-groups snowline-remote-front

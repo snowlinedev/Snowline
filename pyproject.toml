@@ -74,8 +74,10 @@ snowline-remote-front = { workspace = true }
 # Run every workspace member's tests in one `uv run python -m pytest` from the
 # repo root.
 testpaths = ["tests", "governance/tests", "memory/tests", "sdk/tests", "ops/remote-front/tests"]
-# importlib mode: all four test trees have a `test_import_purity.py` and three
-# have a `conftest.py` (same basenames, different dirs). The default prepend
-# import mode collides on the basename / package name; importlib imports each by
-# file path, so the trees coexist without `__init__.py` gymnastics.
+# importlib mode: the platform/governance/memory/sdk trees each have a
+# `test_import_purity.py`, most trees have a `conftest.py`, and remote-front's
+# import-purity check lives inside its `tests/test_store_and_config.py` (same
+# basenames, different dirs). The default prepend import mode collides on the
+# basename / package name; importlib imports each by file path, so the trees
+# coexist without `__init__.py` gymnastics.
 addopts = "--import-mode=importlib"

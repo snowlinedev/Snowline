@@ -41,6 +41,13 @@ DEFAULT_SUBJECT = "owner"
 # unbounded (see proxy.py) so a long-lived SSE stream is not cut off.
 DEFAULT_UPSTREAM_CONNECT_TIMEOUT = 10.0
 
+# Cap on STORED client registrations (open DCR + a public endpoint = a
+# disk-fill vector on the fly volume otherwise). At the cap the store evicts
+# the oldest client with no live refresh token; if every stored client is
+# active, new registrations are refused. 256 is orders of magnitude beyond a
+# single owner's real connector count while keeping worst-case disk use tiny.
+DEFAULT_MAX_CLIENTS = 256
+
 
 @dataclass(frozen=True)
 class Config:
@@ -74,6 +81,8 @@ class Config:
     # volume the file persists, so restarting the app never forces re-adding the
     # connector (issue #120 acceptance).
     store_path: str | None = None
+    # Cap on stored DCR client registrations (see DEFAULT_MAX_CLIENTS).
+    max_clients: int = DEFAULT_MAX_CLIENTS
 
     @property
     def resource_path(self) -> str:
@@ -122,4 +131,7 @@ class Config:
                 or DEFAULT_UPSTREAM_CONNECT_TIMEOUT
             ),
             store_path=env.get("REMOTE_FRONT_STORE_PATH", "").strip() or None,
+            max_clients=int(
+                env.get("REMOTE_FRONT_MAX_CLIENTS") or DEFAULT_MAX_CLIENTS
+            ),
         )

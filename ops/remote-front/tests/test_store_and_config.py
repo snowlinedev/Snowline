@@ -36,6 +36,7 @@ def test_config_from_env_defaults_resource_and_generates_signing_key():
             "REMOTE_FRONT_ISSUER_URL": "https://x.fly.dev/",
             "REMOTE_FRONT_UPSTREAM": "http://mini.ts.net:8850/remote/mcp",
             "REMOTE_FRONT_OWNER_PASSWORD": "hunter2",
+            "REMOTE_FRONT_MAX_CLIENTS": "7",
         }
     )
     assert cfg.issuer_url == "https://x.fly.dev"
@@ -43,6 +44,52 @@ def test_config_from_env_defaults_resource_and_generates_signing_key():
     assert cfg.resource_path == "/mcp"
     # No signing key supplied → an ephemeral one is generated (never empty).
     assert cfg.signing_key
+    assert cfg.max_clients == 7
+
+
+def test_sqlite_prune_evicts_only_tokenless_clients(tmp_path):
+    """The DCR cap's SQLite path: oldest token-LESS clients are evicted to make
+    room; a client holding a live refresh token is never evicted; a store full
+    of active clients reports no room."""
+    import time
+
+    from mcp.server.auth.provider import RefreshToken
+    from mcp.shared.auth import OAuthClientInformationFull
+
+    store = SqliteStore(str(tmp_path / "prune.db"))
+    for i in range(3):
+        store.put_client(
+            OAuthClientInformationFull(
+                client_id=f"client-{i}", redirect_uris=[REDIRECT_URI]
+            )
+        )
+    # The OLDEST client holds a live refresh token — it must survive the prune.
+    store.put_refresh_token(
+        RefreshToken(
+            token="rt-live",
+            client_id="client-0",
+            scopes=[],
+            expires_at=int(time.time()) + 3600,
+        )
+    )
+
+    # Cap 3 with 3 stored: room for one more means evicting exactly one — the
+    # oldest TOKENLESS client (client-1, since client-0 is protected).
+    assert store.prune_clients(3) is True
+    assert store.get_client("client-0") is not None  # active — kept
+    assert store.get_client("client-1") is None  # oldest tokenless — evicted
+    assert store.get_client("client-2") is not None
+
+    # Give every remaining client a token: no room can be made under cap 1.
+    store.put_refresh_token(
+        RefreshToken(
+            token="rt-live-2",
+            client_id="client-2",
+            scopes=[],
+            expires_at=int(time.time()) + 3600,
+        )
+    )
+    assert store.prune_clients(1) is False
 
 
 def test_sqlite_store_survives_restart(tmp_path):

@@ -38,11 +38,23 @@ def _b64u_decode(text: str) -> bytes:
 
 
 class AccessTokenCodec:
-    """Mints and verifies HMAC-signed access tokens with one signing key."""
+    """Mints and verifies HMAC-signed access tokens with one signing key.
 
-    def __init__(self, signing_key: str) -> None:
+    When `expected_resource` is set, `verify` additionally enforces RFC 8707
+    audience binding: the token's `res` claim must equal it (trailing-slash
+    normalized) — a token minted for any other resource, or carrying no `res` at
+    all, does not verify. The provider always stamps the front's canonical
+    resource at mint time, so this is a closed loop with exactly one accepted
+    value; the check is cheap (already-decoded payload) and closes the gap where
+    a token minted by the same key for a DIFFERENT deployment/resource would
+    otherwise authenticate here."""
+
+    def __init__(self, signing_key: str, *, expected_resource: str | None = None) -> None:
         # Domain-separate from anything else that might reuse the same secret.
         self._key = hashlib.sha256(b"snowline-remote-front:at:" + signing_key.encode()).digest()
+        self._expected_resource = (
+            expected_resource.rstrip("/") if expected_resource else None
+        )
 
     def _sign(self, payload_b64: str) -> str:
         mac = hmac.new(self._key, payload_b64.encode("ascii"), hashlib.sha256).digest()
@@ -91,6 +103,10 @@ class AccessTokenCodec:
         expires_at = payload.get("exp")
         if not isinstance(expires_at, int) or expires_at < int(time.time()):
             return None
+        if self._expected_resource is not None:
+            res = payload.get("res")
+            if not isinstance(res, str) or res.rstrip("/") != self._expected_resource:
+                return None
         return AccessToken(
             token=token,
             client_id=payload["cid"],

@@ -28,6 +28,7 @@ from mcp.shared.auth import OAuthClientInformationFull
 class Store(Protocol):
     def get_client(self, client_id: str) -> OAuthClientInformationFull | None: ...
     def put_client(self, client: OAuthClientInformationFull) -> None: ...
+    def prune_clients(self, max_clients: int) -> bool: ...
 
     def get_auth_code(self, code: str) -> AuthorizationCode | None: ...
     def put_auth_code(self, auth_code: AuthorizationCode) -> None: ...
@@ -53,6 +54,24 @@ class InMemoryStore:
     def put_client(self, client: OAuthClientInformationFull) -> None:
         assert client.client_id is not None
         self._clients[client.client_id] = client.model_dump_json()
+
+    def prune_clients(self, max_clients: int) -> bool:
+        """Make room for one more registration under `max_clients` (the open-DCR
+        disk/memory-fill guard): evict oldest-first (dict insertion order), but
+        ONLY clients with no live refresh token — a live connector is never
+        broken by a registration flood. Returns True if there is room."""
+        if len(self._clients) < max_clients:
+            return True
+        active = {
+            RefreshToken.model_validate_json(raw).client_id
+            for raw in self._refresh.values()
+        }
+        for client_id in list(self._clients):
+            if len(self._clients) < max_clients:
+                break
+            if client_id not in active:
+                del self._clients[client_id]
+        return len(self._clients) < max_clients
 
     def get_auth_code(self, code: str) -> AuthorizationCode | None:
         raw = self._codes.get(code)
@@ -121,6 +140,34 @@ class SqliteStore:
     def put_client(self, client: OAuthClientInformationFull) -> None:
         assert client.client_id is not None
         self._put("clients", client.client_id, client.model_dump_json())
+
+    def prune_clients(self, max_clients: int) -> bool:
+        """Same contract as `InMemoryStore.prune_clients` — oldest-first
+        (rowid order) eviction of token-less clients only. json_extract is
+        SQLite's built-in JSON1 (bundled with CPython's sqlite3)."""
+        with self._lock:
+            (count,) = self._conn.execute("SELECT COUNT(*) FROM clients").fetchone()
+            if count < max_clients:
+                return True
+            active = {
+                row[0]
+                for row in self._conn.execute(
+                    "SELECT DISTINCT json_extract(json, '$.client_id') "
+                    "FROM refresh_tokens"
+                )
+            }
+            for (client_id,) in self._conn.execute(
+                "SELECT id FROM clients ORDER BY rowid"
+            ).fetchall():
+                if count < max_clients:
+                    break
+                if client_id not in active:
+                    self._conn.execute(
+                        "DELETE FROM clients WHERE id = ?", (client_id,)
+                    )
+                    count -= 1
+            self._conn.commit()
+            return count < max_clients
 
     def get_auth_code(self, code: str) -> AuthorizationCode | None:
         raw = self._get("auth_codes", code)

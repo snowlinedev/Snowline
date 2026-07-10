@@ -118,18 +118,40 @@ def pkce_pair() -> tuple[str, str]:
     return verifier, challenge
 
 
-async def register_client(client: httpx.AsyncClient) -> dict:
-    resp = await client.post(
-        "/register",
-        json={
-            "redirect_uris": [REDIRECT_URI],
-            "token_endpoint_auth_method": "client_secret_post",
-            "grant_types": ["authorization_code", "refresh_token"],
-            "response_types": ["code"],
-        },
-    )
+async def register_client(
+    client: httpx.AsyncClient, *, client_name: str | None = None
+) -> dict:
+    metadata = {
+        "redirect_uris": [REDIRECT_URI],
+        "token_endpoint_auth_method": "client_secret_post",
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+    }
+    if client_name is not None:
+        metadata["client_name"] = client_name
+    resp = await client.post("/register", json=metadata)
     assert resp.status_code == 201, resp.text
     return resp.json()
+
+
+async def authorize_to_txn(
+    client: httpx.AsyncClient, *, client_id: str, challenge: str
+) -> str:
+    """Run just the /authorize half and return the parked login txn."""
+    authz = await client.get(
+        "/authorize",
+        params={
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": REDIRECT_URI,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": "state-123",
+            "resource": RESOURCE,
+        },
+    )
+    assert authz.status_code == 302, authz.text
+    return parse_qs(urlparse(authz.headers["location"]).query)["txn"][0]
 
 
 async def authorize_to_code(

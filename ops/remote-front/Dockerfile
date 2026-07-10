@@ -10,10 +10,19 @@ FROM python:3.12-slim
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 # tailscaled + tailscale CLI (userspace networking — no NET_ADMIN/tun needed).
+# util-linux supplies `setpriv`, which start.sh uses to drop the app process to
+# the unprivileged user.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl iptables \
+    && apt-get install -y --no-install-recommends ca-certificates curl iptables util-linux \
     && curl -fsSL https://tailscale.com/install.sh | sh \
     && rm -rf /var/lib/apt/lists/*
+
+# The unprivileged user the PUBLIC-facing app process runs as. The container
+# ENTRYPOINT stays root only for deploy glue — first-boot volume ownership and
+# tailscaled (which owns the volume-backed node state) — and start.sh execs the
+# app itself via `setpriv --reuid=app` so no attacker-supplied HTTP is ever
+# parsed by a root process.
+RUN useradd --system --uid 10001 --create-home app
 
 WORKDIR /app
 

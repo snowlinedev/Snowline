@@ -10,6 +10,9 @@ dependencies = [
     "uvicorn>=0.29",
     # The reverse-proxy half is a streaming HTTP client of the upstream gateway.
     "httpx>=0.27",
+    # Imported directly (the login failure throttle sleeps via anyio) — declared
+    # rather than ridden transitively through starlette (matches the SDK's rule).
+    "anyio>=4",
     # The OAuth surface is the official MCP Python SDK's auth framework
     # (`mcp.server.auth`): AS metadata (RFC 8414), protected-resource metadata
     # (RFC 9728), dynamic client registration (RFC 7591), the authorize/token

@@ -78,6 +78,11 @@ async def _authed_post(app):
                 "Authorization": f"Bearer {access}",
                 "Mcp-Session-Id": "client-session-abc",
                 "MCP-Protocol-Version": "2025-06-18",
+                # Edge/forwarding headers a public proxy front sees — these must
+                # NOT reach the tailnet hop.
+                "X-Forwarded-For": "203.0.113.7",
+                "X-Forwarded-Proto": "https",
+                "X-Real-IP": "203.0.113.7",
             },
             json={"jsonrpc": "2.0", "method": "tools/list", "id": 1},
         )
@@ -92,8 +97,12 @@ def test_authenticated_round_trip_passes_session_headers_and_strips_bearer():
     # MCP session headers reached the upstream...
     assert received["mcp-session-id"] == "client-session-abc"
     assert received["mcp-protocol-version"] == "2025-06-18"
-    # ...but our bearer did NOT (the upstream trusts the tailnet by position).
+    # ...but our bearer did NOT (the upstream trusts the tailnet by position)...
     assert "authorization" not in received
+    # ...and neither did the edge's forwarding headers.
+    assert "x-forwarded-for" not in received
+    assert "x-forwarded-proto" not in received
+    assert "x-real-ip" not in received
     # The request body was forwarded intact.
     assert '"tools/list"' in body["received_body"]
     # And the upstream's session header came back through the front.
@@ -148,3 +157,62 @@ def test_upstream_unreachable_returns_clean_502_not_a_hang():
     resp = anyio.run(_upstream_down, app)
     assert resp.status_code == 502
     assert resp.json()["error"] == "upstream_unavailable"
+    # The body is GENERIC: neither the upstream (tailnet) host nor the raw
+    # exception text may leak into a public-facing response.
+    assert "upstream.test" not in resp.text
+    assert "tailnet path down" not in resp.text
+
+
+async def _oversize_post(app):
+    async with front_client(app) as client:
+        grant = await full_grant(client)
+        access = grant["tokens"]["access_token"]
+        return await client.post(
+            "/mcp",
+            headers={"Authorization": f"Bearer {access}"},
+            content=b"x" * 4096,
+        )
+
+
+def test_oversize_request_body_is_413(monkeypatch):
+    import snowline_remote_front.proxy as proxy_module
+
+    monkeypatch.setattr(proxy_module, "MAX_REQUEST_BODY", 1024)
+    app = build_front()
+    resp = anyio.run(_oversize_post, app)
+    assert resp.status_code == 413
+    assert resp.json()["error"] == "payload_too_large"
+
+
+async def _foreign_resource_post(app, token):
+    async with front_client(app) as client:
+        return await client.post(
+            "/mcp",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"jsonrpc": "2.0", "method": "ping", "id": 1},
+        )
+
+
+def test_token_minted_for_another_resource_is_401():
+    # RFC 8707 audience binding: a token signed with the SAME key but stamped
+    # for a DIFFERENT resource (e.g. another deployment sharing a signing key)
+    # must not authenticate here. Same for a token with no `res` at all.
+    from ._helpers import SIGNING_KEY
+    from snowline_remote_front.tokens import AccessTokenCodec
+
+    app = build_front()
+    minting_codec = AccessTokenCodec(SIGNING_KEY)  # mint-only, no res check
+    foreign, _ = minting_codec.mint(
+        client_id="c",
+        subject="owner",
+        scopes=[],
+        ttl=900,
+        resource="http://other.example/mcp",
+    )
+    resless, _ = minting_codec.mint(
+        client_id="c", subject="owner", scopes=[], ttl=900
+    )
+    resp_foreign = anyio.run(_foreign_resource_post, app, foreign)
+    resp_resless = anyio.run(_foreign_resource_post, app, resless)
+    assert resp_foreign.status_code == 401
+    assert resp_resless.status_code == 401

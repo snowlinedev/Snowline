@@ -36,7 +36,10 @@ log = logging.getLogger("snowline_remote_front.proxy")
 # by network position (its CIDR gate), not our bearer — and our access token is
 # meaningless to it. `host`/`content-length` are recomputed by httpx;
 # `accept-encoding` is dropped so the upstream returns identity bytes we can
-# stream through without re-encoding.
+# stream through without re-encoding. Incoming `x-forwarded-*` / `x-real-ip`
+# (fly's edge stamps these with the caller's public IP) are dropped too — the
+# upstream gateway's trust gate reasons about PEER IPs, and a forwarded-for
+# header on the tailnet hop is at best noise, at worst a spoofing channel.
 _STRIP_REQUEST_HEADERS = frozenset(
     {
         "host",
@@ -51,8 +54,16 @@ _STRIP_REQUEST_HEADERS = frozenset(
         "trailer",
         "transfer-encoding",
         "upgrade",
+        "x-real-ip",
     }
 )
+_STRIP_REQUEST_PREFIXES = ("x-forwarded-",)
+
+# Bound the buffered request body (a JSON-RPC message; 10 MiB is far beyond any
+# legitimate MCP payload) so an authenticated-but-hostile client can't balloon
+# the front's memory. Exceeding it is a 413. Module-level so tests can
+# monkeypatch it down.
+MAX_REQUEST_BODY = 10 * 1024 * 1024
 
 # On the way back, `content-type` is carried via StreamingResponse's media_type,
 # and the framing headers are recomputed by the ASGI server — so we drop them to
@@ -71,7 +82,12 @@ _STRIP_RESPONSE_HEADERS = frozenset(
 
 
 def _forward_request_headers(headers) -> list[tuple[str, str]]:
-    return [(k, v) for k, v in headers.items() if k.lower() not in _STRIP_REQUEST_HEADERS]
+    return [
+        (k, v)
+        for k, v in headers.items()
+        if k.lower() not in _STRIP_REQUEST_HEADERS
+        and not k.lower().startswith(_STRIP_REQUEST_PREFIXES)
+    ]
 
 
 def _forward_response_headers(headers: httpx.Headers) -> dict[str, str]:
@@ -93,7 +109,26 @@ class UpstreamProxy:
         method = scope["method"]
         client: httpx.AsyncClient = scope["app"].state.upstream_client
 
-        body = await request.body() if method in ("POST", "PUT", "PATCH") else None
+        body: bytes | None = None
+        if method in ("POST", "PUT", "PATCH"):
+            # Buffer with a hard cap (413 on exceed) — see MAX_REQUEST_BODY.
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in request.stream():
+                total += len(chunk)
+                if total > MAX_REQUEST_BODY:
+                    response = JSONResponse(
+                        {
+                            "error": "payload_too_large",
+                            "error_description": "request body exceeds the proxy limit",
+                        },
+                        status_code=413,
+                    )
+                    await response(scope, receive, send)
+                    return
+                chunks.append(chunk)
+            body = b"".join(chunks)
+
         upstream_request = client.build_request(
             method,
             self._upstream_url,
@@ -105,12 +140,14 @@ class UpstreamProxy:
             upstream_response = await client.send(upstream_request, stream=True)
         except httpx.RequestError as exc:
             # Primary down / tailnet path down: a clean upstream error, not a
-            # hang (issue #120 acceptance).
+            # hang (issue #120 acceptance). Detail goes to the LOG only — the
+            # exception text carries the tailnet hostname, which must not leak
+            # into a public-facing response body.
             log.warning("remote-front: upstream %s unreachable: %s", self._upstream_url, exc)
             response = JSONResponse(
                 {
                     "error": "upstream_unavailable",
-                    "error_description": f"upstream gateway unreachable: {exc}",
+                    "error_description": "upstream gateway unreachable",
                 },
                 status_code=502,
             )
