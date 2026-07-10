@@ -44,6 +44,8 @@ from snowline_plugin_sdk.replication.envelope import REJECTION_REASONS
 
 # §5.1's full trusted set: the tailnet CGNAT range + IPv4/IPv6 loopback.
 # SNOWLINE_TRUSTED_CIDRS REPLACES this when set (the documented config trap).
+# Both ranges are deliberate, platform-wide policy — not a tailnet-only
+# default with loopback as an incidental widening (governance decision 35546152).
 DEFAULT_TRUSTED_CIDRS = "100.64.0.0/10,127.0.0.0/8,::1"
 
 
