@@ -8,7 +8,7 @@
  *
  * No jest-dom in this project (see registered-ui.test.tsx) — assertions use
  * plain queries and property/attribute checks. */
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
@@ -115,6 +115,47 @@ describe("page actions[]", () => {
     // Success → the shell followed the plugin-relative navigate href (prefixed
     // with /governance) to the new branch's thread route.
     await screen.findByText("LANDED HERE");
+  });
+
+  it("drops a non-in-shell navigate href: no navigation, the form just closes", async () => {
+    // The confinement is explicit (kinds.tsx safeNavigateHref), not an
+    // implicit reliance on react-router string-`to` semantics: any navigate
+    // value that isn't a single-leading-`/` path — absolute URLs, schemes,
+    // protocol-relative `//`, and backslash forms browsers treat like `//` —
+    // is treated as ABSENT. (The safe case — a normal "/shadow/b1" navigating
+    // prefixed to /governance/shadow/b1 — is pinned by the "submits the
+    // declared field values" test above.)
+    const UNSAFE = [
+      "https://evil.com/x",
+      "javascript:alert(1)",
+      "data:text/html,hi",
+      "//evil.com/x",
+      "/\\evil.com/x",
+      "\\/evil.com/x",
+      "\\\\evil.com\\x",
+    ];
+    for (const nav of UNSAFE) {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => jsonResponse({ id: "b1", navigate: nav })),
+      );
+      const user = userEvent.setup();
+      const { unmount } = renderInRouter([ACTION]);
+      await user.click(screen.getByRole("button", { name: "New branch" }));
+      await user.type(screen.getByLabelText("Scope"), "acme/widget");
+      await user.type(screen.getByLabelText("Branch name"), "x");
+      await user.click(screen.getByRole("button", { name: "New branch" }));
+
+      // The submit succeeded and the dropped href behaved as ABSENT: the form
+      // closed (fields gone, the open button back) …
+      await waitFor(() => expect(screen.queryByLabelText("Scope")).toBeNull());
+      expect(screen.getByRole("button", { name: "New branch" })).toBeTruthy();
+      // … and no navigation happened (the destination route never rendered,
+      // and no error either — a dropped href is not a failure).
+      expect(screen.queryByText("LANDED HERE")).toBeNull();
+      expect(screen.queryByRole("alert")).toBeNull();
+      unmount();
+    }
   });
 
   it("a failed submit surfaces the server's message and does not navigate", async () => {

@@ -784,6 +784,24 @@ function actionErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** The action response's `navigate` href, CONFINED explicitly (same posture as
+ * the markdown renderer's `safeHref` above, but stricter — a navigate target is
+ * always an in-shell route, never an external link): it must start with a
+ * SINGLE `/`. Everything else is DROPPED — treated as absent, so the form just
+ * closes and no navigation happens. That rejects absolute URLs
+ * (`https://evil.com`), scheme-looking values (`javascript:`, `data:`),
+ * protocol-relative `//host`, and ANY backslash form (browsers treat `/\host`
+ * and `\/host` like `//host`) — explicit here rather than an implicit reliance
+ * on react-router v6 string-`to` semantics and pushState same-origin behavior
+ * staying that way. */
+function safeNavigateHref(nav: string | undefined): string | undefined {
+  if (nav == null) return undefined;
+  if (!nav.startsWith("/") || nav.startsWith("//") || nav.includes("\\")) {
+    return undefined;
+  }
+  return nav;
+}
+
 function PageAction(props: { plugin: string; action: UIAction }) {
   const navigate = useNavigate();
   const fields = props.action.fields ?? [];
@@ -829,10 +847,12 @@ function PageAction(props: { plugin: string; action: UIAction }) {
           typeof (resp as { navigate?: unknown }).navigate === "string"
             ? (resp as { navigate: string }).navigate
             : undefined;
-        // `navigate` is plugin-relative (§5) — re-prefixed with `/<plugin>`,
-        // same treatment as a table row `href`. Absent = nothing to land on,
-        // so just close the form.
-        const to = prefixHref(props.plugin, nav);
+        // `navigate` is plugin-relative (§5) — CONFINED first
+        // (safeNavigateHref: a non-in-shell value is dropped, never
+        // followed), then re-prefixed with `/<plugin>`, same treatment as a
+        // table row `href`. Absent/dropped = nothing to land on, so just
+        // close the form.
+        const to = prefixHref(props.plugin, safeNavigateHref(nav));
         if (to) navigate(to);
         else close();
       },

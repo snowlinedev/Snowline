@@ -603,6 +603,34 @@ def test_create_branch_action_unknown_scope_is_404(monkeypatch, clean_db):
     assert "detail" in resp.json()
 
 
+def test_create_branch_action_scope_service_unreachable_is_502(
+    monkeypatch, clean_db
+):
+    """A ScopeServiceError (the platform's scope read unreachable/erroring) maps
+    to a 502 — a transient plumbing failure, not the caller's fault — never a
+    misleading 404 'no such scope' and never a raw 500."""
+    from snowline_governance.scope_client import ScopeServiceError
+
+    class _ErroringScopeClient:
+        def resolve(self, slug: str):
+            raise ScopeServiceError("platform scope service unreachable (test)")
+
+        def ancestors(self, slug: str):
+            return []
+
+    monkeypatch.setenv("SNOWLINE_WEBHOOK_DISABLED", "1")
+    app = create_app(
+        scope_client=_ErroringScopeClient(),
+        migrate_on_startup=False,
+        register_on_startup=False,
+    )
+    resp = _post_sync(
+        app, "/ui-api/pages/branches", {"scope": "acme/widget", "name": "x"}
+    )
+    assert resp.status_code == 502
+    assert "unreachable" in resp.json()["detail"]
+
+
 def test_create_branch_action_blank_scope_or_name_is_422(monkeypatch, clean_db):
     for bad in ({"scope": "acme/widget", "name": "  "}, {"scope": "", "name": "x"}):
         resp = _post_sync(_app_scoped(monkeypatch), "/ui-api/pages/branches", bad)
