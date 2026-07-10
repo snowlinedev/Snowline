@@ -42,7 +42,7 @@ import uuid
 from datetime import datetime
 
 import anyio
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import func, select
 
@@ -54,6 +54,7 @@ from snowline_governance.models import (
     ShadowBranch,
     ShadowNode,
 )
+from snowline_governance.scope_client import ScopeClient, ScopeServiceError
 
 # A sort sentinel for entries whose timestamp is somehow NULL (should not happen
 # post-commit) — keeps the chronological merge total-orderable without a None
@@ -157,6 +158,105 @@ async def branches_table() -> dict:
     """`table` contract (§4.2): every shadow branch, all scopes, newest-updated
     first. Row `href` targets the branch's `thread` page by `id`."""
     return await anyio.to_thread.run_sync(_branches_table_sync)
+
+
+# --- page action: create a branch (ui-shell.md §5 actions[]) ---------------
+#
+# The WRITE seam behind the shadow-branches page's declared `actions[]` "New
+# branch" entry (registration.build_manifest): the platform proxies a POST here
+# only because the manifest declared this exact path as an action endpoint
+# (structural allowlist, ui_api.py `_declared_write_templates`). It wraps the
+# SAME domain function the shadow MCP `create_branch` tool wraps
+# (`shadow.create_branch`), resolving the scope slug against the platform first
+# — the soft-reference pattern (mcp_surface.py `_resolve_scope`). If an
+# `opening_message` is supplied it lands as the branch's FIRST conversation
+# `message` event (seq 1) via the same `shadow.add_message` path the composer
+# uses, so a line born from the phone opens with the human's framing already in
+# the thread.
+
+
+class _CreateBranchBody(BaseModel):
+    """The "New branch" action POST body (ui-shell.md §5 actions[] contract).
+    The shell submits one key per DECLARED field: `scope` + `name` (required
+    text) and the optional `opening_message` (multiline). `narrative_notes` is
+    accepted too — not a declared UI field today, but the domain function takes
+    it, so an MCP/future caller can seed the notes doc through the same route
+    without a shape change."""
+
+    scope: str
+    name: str
+    narrative_notes: str | None = None
+    opening_message: str | None = None
+
+
+def _create_branch_action_sync(scope_client: ScopeClient, body: _CreateBranchBody) -> dict:
+    scope = (body.scope or "").strip()
+    name = (body.name or "").strip()
+    if not scope or not name:
+        raise HTTPException(
+            status_code=422, detail="both 'scope' and 'name' are required"
+        )
+    try:
+        resolved = scope_client.resolve(scope)
+    except ScopeServiceError as exc:
+        # The platform's scope service was unreachable/erroring — a transient
+        # plumbing failure, not the caller's fault; surface it as a 502 rather
+        # than a misleading 404 "no such scope".
+        raise HTTPException(status_code=502, detail=str(exc)) from None
+    if resolved is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no scope with slug {scope!r} — register it on the platform first",
+        )
+
+    with session_scope() as session:
+        try:
+            branch = shadow.create_branch(
+                session,
+                resolved["slug"],
+                resolved["id"],
+                name,
+                body.narrative_notes or None,
+            )
+        except shadow.DuplicateBranchError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+
+        # An opening note (if non-blank) becomes the branch's FIRST message
+        # event — same seq-allocation path (`add_message` → the single locked
+        # appender) the composer uses, so it lands at seq 1 in the same
+        # transaction as the branch's creation. A blank/absent note leaves the
+        # branch conversation-empty (the composer takes over from there).
+        if body.opening_message and body.opening_message.strip():
+            shadow.add_message(session, branch["id"], body.opening_message, "human")
+
+    # The generic actions[] response contract (ui-shell.md §5): an optional
+    # plugin-relative `navigate` href the shell follows on success — here the
+    # new branch's own `thread` page, keyed on its stable id (same shape the
+    # branches table's row `href` uses). The shell re-prefixes it with
+    # `/<plugin>`; it knows nothing about branches.
+    return {
+        "id": branch["id"],
+        "name": branch["name"],
+        "scope": branch["scope"],
+        "navigate": f"/shadow/{branch['id']}",
+    }
+
+
+@router.post("/pages/branches")
+async def create_branch_action(body: _CreateBranchBody, request: Request) -> dict:
+    """Create a shadow branch from the dashboard's "New branch" action
+    (ui-shell.md §5 actions[], issue #123). Body: `{scope, name,
+    narrative_notes?, opening_message?}`. Resolves `scope` against the platform
+    (404 if unknown, 502 if the scope service is unreachable), creates the
+    branch (409 on a name clash within the scope, 422 on a blank scope/name),
+    and — if `opening_message` is non-blank — appends it as the branch's first
+    `message` event (author `human`, seq 1). Returns `{id, name, scope,
+    navigate}` where `navigate` is the new branch's plugin-relative thread route
+    for the shell to land on."""
+    scope_client: ScopeClient = request.app.state.scope_client
+    return await anyio.to_thread.run_sync(
+        _create_branch_action_sync, scope_client, body
+    )
 
 
 # --- page: one branch's discussion thread ---------------------------------

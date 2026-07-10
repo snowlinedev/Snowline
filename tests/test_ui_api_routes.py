@@ -73,6 +73,41 @@ def _registry_with_composer(status: PluginStatus | None = None) -> PluginRegistr
     return reg
 
 
+def _registry_with_action(status: PluginStatus | None = None) -> PluginRegistry:
+    """A plugin that declared a page `actions[]` entry (ui-shell.md §5, issue
+    #123) — the OTHER POST write target the proxy's structural allowlist admits
+    alongside `composer.endpoint`, admitted by the SAME `_declared_write_
+    templates` collection with no matching-logic difference."""
+    reg = PluginRegistry()
+    reg.upsert(
+        PluginManifest(
+            name="gov",
+            base_url="http://plugin-host:9999",
+            ui={
+                "pages": [
+                    {
+                        "id": "shadow-branches",
+                        "route": "/shadow",
+                        "kind": "table",
+                        "data": "/ui-api/pages/branches",
+                        "actions": [
+                            {
+                                "id": "new-branch",
+                                "label": "New branch",
+                                "endpoint": "/ui-api/pages/branches",
+                                "fields": [{"name": "scope", "required": True}],
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+    )
+    if status is not None:
+        reg.set_status("gov", status)
+    return reg
+
+
 def _wire_mock_upstream(app, handler) -> None:
     app.state.ui_api_client = httpx.AsyncClient(
         transport=httpx.MockTransport(handler)
@@ -407,3 +442,55 @@ def test_proxy_post_upstream_connect_error_is_502():
         "/ui-api/gov/pages/branches/abc/messages", json={"markdown": "hi"}
     )
     assert r.status_code == 502
+
+
+# --- POST: page actions[] endpoints (ui-shell.md §5, issue #123) ------------
+# The action endpoint is admitted by the SAME structural allowlist as the
+# composer — these mirror the composer POST tests for the actions[] flavor.
+
+
+def test_proxy_post_reaches_declared_action_endpoint_and_round_trips_body():
+    app = _app(_registry_with_action())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "plugin-host"
+        assert request.url.path == "/ui-api/pages/branches"
+        assert request.headers["content-type"] == "application/json"
+        assert request.content == b'{"scope": "acme/widget", "name": "x"}'
+        return httpx.Response(200, json={"id": "b1", "navigate": "/shadow/b1"})
+
+    _wire_mock_upstream(app, handler)
+    r = TestClient(app).post(
+        "/ui-api/gov/pages/branches",
+        content=b'{"scope": "acme/widget", "name": "x"}',
+        headers={"content-type": "application/json"},
+    )
+    assert r.status_code == 200
+    assert r.json() == {"id": "b1", "navigate": "/shadow/b1"}
+
+
+def test_proxy_post_undeclared_path_with_action_declared_is_403():
+    # The action declares /ui-api/pages/branches — a DIFFERENT path under the
+    # same plugin is still undeclared and 403s (the allowlist is per concrete
+    # path, not per plugin).
+    app = _app(_registry_with_action())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not reach the upstream for an undeclared path")
+
+    _wire_mock_upstream(app, handler)
+    r = TestClient(app).post(
+        "/ui-api/gov/pages/branches/abc/messages", json={"scope": "x"}
+    )
+    assert r.status_code == 403
+
+
+def test_proxy_post_action_down_plugin_is_503():
+    app = _app(_registry_with_action(status=PluginStatus.DOWN))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not reach the upstream for a DOWN plugin")
+
+    _wire_mock_upstream(app, handler)
+    r = TestClient(app).post("/ui-api/gov/pages/branches", json={"scope": "x"})
+    assert r.status_code == 503

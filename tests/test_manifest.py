@@ -304,3 +304,125 @@ def test_composer_endpoint_may_use_fewer_params_than_route():
         }
     )
     assert m.ui.pages[0].composer.endpoint == "/ui-api/pages/branches/{branch}/messages"
+
+
+# --- page actions[] (ui-shell.md §5, issue #123) ----------------------------
+
+
+def _action(**overrides) -> dict:
+    return {
+        "id": "new-branch",
+        "label": "New branch",
+        "endpoint": "/ui-api/pages/branches",
+        "fields": [
+            {"name": "scope", "kind": "text", "required": True},
+            {"name": "opening_message", "kind": "multiline"},
+        ],
+    } | overrides
+
+
+def test_valid_actions_on_any_page_kind_register():
+    # actions are valid on a `table` page (unlike the thread-only composer) —
+    # the "New branch" affordance lives on the branches TABLE page.
+    m = _manifest({"pages": [_page(actions=[_action()])]})
+    action = m.ui.pages[0].actions[0]
+    assert action.id == "new-branch"
+    assert action.label == "New branch"
+    assert action.endpoint == "/ui-api/pages/branches"
+    assert [f.name for f in action.fields] == ["scope", "opening_message"]
+    # field defaults round-trip.
+    assert action.fields[0].kind == "text" and action.fields[0].required is True
+    assert action.fields[1].kind == "multiline" and action.fields[1].required is False
+
+
+def test_actions_absent_defaults_empty():
+    m = _manifest({"pages": [_page()]})
+    assert m.ui.pages[0].actions == []
+
+
+def test_action_field_label_defaults_none():
+    m = _manifest({"pages": [_page(actions=[_action(fields=[{"name": "scope"}])])]})
+    field = m.ui.pages[0].actions[0].fields[0]
+    assert field.label is None and field.kind == "text"
+
+
+def test_action_endpoint_must_start_with_ui_api():
+    with pytest.raises(ValidationError):
+        _manifest({"pages": [_page(actions=[_action(endpoint="/mcp/create")])]})
+
+
+def test_action_endpoint_param_not_in_route_rejected():
+    # An endpoint templating a param the page route can't supply is a dead
+    # write seam — 422 at registration, not a 403 forever at request time.
+    with pytest.raises(ValidationError):
+        _manifest(
+            {
+                "pages": [
+                    _page(
+                        route="/shadow",
+                        actions=[_action(endpoint="/ui-api/pages/branches/{branch}")],
+                    )
+                ]
+            }
+        )
+
+
+def test_action_endpoint_param_present_in_route_is_fine():
+    m = _manifest(
+        {
+            "pages": [
+                _page(
+                    id="p1",
+                    route="/shadow/{branch}",
+                    data="/ui-api/pages/branches/{branch}",
+                    actions=[_action(endpoint="/ui-api/pages/branches/{branch}/act")],
+                )
+            ]
+        }
+    )
+    assert m.ui.pages[0].actions[0].endpoint == "/ui-api/pages/branches/{branch}/act"
+
+
+def test_duplicate_action_id_rejected():
+    with pytest.raises(ValidationError):
+        _manifest({"pages": [_page(actions=[_action(), _action(label="Dup")])]})
+
+
+def test_duplicate_action_field_name_rejected():
+    with pytest.raises(ValidationError):
+        _manifest(
+            {
+                "pages": [
+                    _page(
+                        actions=[
+                            _action(fields=[{"name": "scope"}, {"name": "scope"}])
+                        ]
+                    )
+                ]
+            }
+        )
+
+
+def test_unknown_action_field_rejected():
+    with pytest.raises(ValidationError):
+        _manifest(
+            {
+                "pages": [
+                    _page(actions=[_action(fields=[{"name": "scope", "nope": 1}])])
+                ]
+            }
+        )
+
+
+def test_unknown_action_key_rejected():
+    with pytest.raises(ValidationError):
+        _manifest({"pages": [_page(actions=[_action(method="POST")])]})
+
+
+def test_unknown_action_field_kind_registers_ok():
+    # `kind` is a FREE string (fail-visible at render), like widget/page kinds —
+    # an unrecognized value must NOT reject the manifest.
+    m = _manifest(
+        {"pages": [_page(actions=[_action(fields=[{"name": "x", "kind": "wat"}])])]}
+    )
+    assert m.ui.pages[0].actions[0].fields[0].kind == "wat"

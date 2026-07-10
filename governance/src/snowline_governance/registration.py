@@ -108,6 +108,46 @@ def build_manifest(base_url: str | None = None) -> dict:
                     "nav": True,
                     "kind": "table",
                     "data": "/ui-api/pages/branches",
+                    # The page-level WRITE seam (ui-shell.md §5 actions[], issue
+                    # #123): a "New branch" affordance so a speculation line can
+                    # be born from the dashboard (phone/MBP over tailnet) without
+                    # opening a Claude Code session. The shell renders the button
+                    # + a minimal form of the DECLARED fields, POSTs the field
+                    # values through the /ui-api proxy to `endpoint` (allowlisted
+                    # exactly like the composer — platform `_declared_write_
+                    # templates`), and on success follows the response's
+                    # `navigate` href to the new branch's thread page. `scope`
+                    # and `name` are required text; `opening_message` is an
+                    # optional multiline note that becomes the branch's first
+                    # conversation message (ui_api.create_branch_action). The
+                    # route carries no params, so the endpoint carries none.
+                    "actions": [
+                        {
+                            "id": "new-branch",
+                            "label": "New branch",
+                            "endpoint": "/ui-api/pages/branches",
+                            "fields": [
+                                {
+                                    "name": "scope",
+                                    "label": "Scope",
+                                    "kind": "text",
+                                    "required": True,
+                                },
+                                {
+                                    "name": "name",
+                                    "label": "Branch name",
+                                    "kind": "text",
+                                    "required": True,
+                                },
+                                {
+                                    "name": "opening_message",
+                                    "label": "Opening note",
+                                    "kind": "multiline",
+                                    "required": False,
+                                },
+                            ],
+                        },
+                    ],
                 },
                 {
                     "id": "shadow-branch",

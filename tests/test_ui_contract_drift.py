@@ -49,6 +49,25 @@ def test_composer_fields_equals_sdk():
     assert set(sdk_ui.COMPOSER_SHAPE) == sdk_ui.COMPOSER_FIELDS
 
 
+def test_action_fields_equal_sdk():
+    # Page actions[] (ui-shell.md §5, issue #123) — same never-silently-fork
+    # discipline as the composer above, and pinned to the REAL enforcement
+    # surfaces (`UIAction`/`UIActionField.model_fields`) so a constant can't
+    # rot into an inert shadow the moment a model grows a field.
+    assert set(platform_manifest.UIAction.model_fields) == (
+        platform_manifest.ACTION_FIELDS
+    )
+    assert set(platform_manifest.UIActionField.model_fields) == (
+        platform_manifest.ACTION_FIELD_FIELDS
+    )
+    assert platform_manifest.ACTION_FIELDS == sdk_ui.ACTION_FIELDS
+    assert platform_manifest.ACTION_FIELD_FIELDS == sdk_ui.ACTION_FIELD_FIELDS
+    assert platform_manifest.ACTION_FIELD_KINDS == sdk_ui.ACTION_FIELD_KINDS
+    # The SDK's human-facing shape docs must cover the same vocabulary.
+    assert set(sdk_ui.ACTION_SHAPE) == sdk_ui.ACTION_FIELDS
+    assert set(sdk_ui.ACTION_FIELD_SHAPE) == sdk_ui.ACTION_FIELD_FIELDS
+
+
 def test_write_body_limit_equals_sdk():
     # The proxy's POST cap is contract, not implementation detail: governance's
     # message route (#70) rejects at the same boundary by importing the SDK

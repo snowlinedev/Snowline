@@ -34,12 +34,23 @@ def test_every_kind_has_a_shape_doc():
     assert set(ui.UI_KIND_SHAPES) == ui.UI_KINDS
 
 
-def test_action_shape_is_reserved_documentation_only():
-    # §4.3: the field ships in the kind schemas from day one, but v1 shells
-    # render read-only and ignore it — this is documentation, not a
-    # runtime-enforced schema (the SDK does no validation, per contract.py's
-    # vendoring pattern).
-    assert set(ui.ACTION_SHAPE) == {"label", "endpoint", "method", "confirm"}
+def test_action_shape_is_specified():
+    # §5 / issue #123: page actions[] moved from reserved to specified. The
+    # shape docs cover the same field vocabulary the platform's UIAction /
+    # UIActionField models enforce (pinned equal by the platform's
+    # test_ui_contract_drift.py). Still documentation, not an SDK-side schema —
+    # the platform is the enforcement surface.
+    assert set(ui.ACTION_SHAPE) == ui.ACTION_FIELDS == {"id", "label", "endpoint", "fields"}
+    assert set(ui.ACTION_FIELD_SHAPE) == ui.ACTION_FIELD_FIELDS == {
+        "name",
+        "label",
+        "kind",
+        "required",
+    }
+    assert ui.ACTION_FIELD_KINDS == {"text", "multiline"}
+    # The action endpoint's response contract (the generic success-navigation
+    # href the shell follows).
+    assert set(ui.ACTION_RESPONSE_SHAPE) == {"navigate"}
 
 
 def test_package_reexports_ui_constants():

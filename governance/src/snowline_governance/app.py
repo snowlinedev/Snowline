@@ -32,7 +32,7 @@ from snowline_governance import config, registration, replication_apply
 from snowline_governance.db import session_scope
 from snowline_governance.mcp_surface import build_main_surface, build_shadow_surface
 from snowline_governance.replication_stream import INGEST_PATH
-from snowline_governance.scope_client import ScopeClient
+from snowline_governance.scope_client import HttpScopeClient, ScopeClient
 from snowline_governance.ui_api import router as ui_api_router
 
 
@@ -127,6 +127,17 @@ def create_app(
     app = FastAPI(title="Snowline Governance", lifespan=_lifespan)
     app.state.migrate_on_startup = migrate_on_startup
     app.state.register_on_startup = register_on_startup
+    # The `/ui-api` WRITE route that creates a branch (the shadow-branches
+    # page's declared `actions[]` entry, ui-shell.md §5) resolves its `scope`
+    # slug → `(id, slug)` against the platform BEFORE the DB write — the same
+    # soft-reference pattern the shadow MCP surface uses (mcp_surface.py's
+    # `_resolve_scope`). The read routes need no scope client, but this write
+    # does, so the resolved client is stashed on `app.state` for the route to
+    # read via `request.app.state.scope_client`. Injected in tests; in
+    # production (`scope_client=None`) it builds its own `HttpScopeClient` from
+    # the same config the MCP surfaces use — one more client instance, same
+    # platform URL.
+    app.state.scope_client = scope_client or HttpScopeClient()
 
     @app.get("/health")
     async def health() -> dict:

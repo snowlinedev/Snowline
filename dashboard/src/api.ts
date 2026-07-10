@@ -25,6 +25,29 @@ export type UIComposer = {
   disabled_when?: string;
 };
 
+/** A declared form field of a page `action` (ui-shell.md §5): the shell
+ * renders one labelled control per field and submits `{ name: value }` in the
+ * action's POST body. `kind` is a rendering hint — `text` (default) or
+ * `multiline`; an unknown value falls back to a text control. */
+export type UIActionField = {
+  name: string;
+  label?: string;
+  kind?: string;
+  required?: boolean;
+};
+
+/** A page-level write affordance (ui-shell.md §5 actions[]): a labelled button
+ * that opens a minimal form of `fields` and POSTs their values through the
+ * `/ui-api` proxy to `endpoint` (allowlisted exactly like `composer`). On a
+ * 2xx the shell follows an optional plugin-relative `navigate` href in the
+ * response. Rendered GENERICALLY — the shell knows nothing plugin-specific. */
+export type UIAction = {
+  id: string;
+  label: string;
+  endpoint: string;
+  fields?: UIActionField[];
+};
+
 export type UIPage = {
   id: string;
   route: string;
@@ -33,6 +56,7 @@ export type UIPage = {
   kind: string;
   data: string;
   composer?: UIComposer | null;
+  actions?: UIAction[] | null;
 };
 
 export type UIBlock = {

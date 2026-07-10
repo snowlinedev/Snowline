@@ -58,6 +58,15 @@ UI_KINDS: frozenset[str] = WIDGET_KINDS | PAGE_KINDS
 # pinned equal to this copy by `test_ui_contract_drift.py`.
 COMPOSER_FIELDS: frozenset[str] = frozenset({"endpoint", "placeholder", "disabled_when"})
 
+# Page `actions[]` field vocabulary (ui-shell.md §5, issue #123) — mirrors
+# `COMPOSER_FIELDS`' drift-guard treatment: the platform
+# (`snowline_platform.manifest`: `ACTION_FIELDS`/`ACTION_FIELD_FIELDS`/
+# `ACTION_FIELD_KINDS`, pinned to the real `UIAction`/`UIActionField` models) is
+# the source of truth, and `test_ui_contract_drift.py` pins these equal.
+ACTION_FIELDS: frozenset[str] = frozenset({"id", "label", "endpoint", "fields"})
+ACTION_FIELD_FIELDS: frozenset[str] = frozenset({"name", "label", "kind", "required"})
+ACTION_FIELD_KINDS: frozenset[str] = frozenset({"text", "multiline"})
+
 # The /ui-api proxy's POST body cap (shadow-conversations.md §3): a
 # conversation message, not an upload. THE shared value — the platform's
 # proxy enforcement (`snowline_platform.ui_api.POST_BODY_LIMIT`) is pinned
@@ -162,21 +171,48 @@ UI_KIND_SHAPES: dict[str, dict[str, str]] = {
     PAGE_KIND_DOCUMENT: DOCUMENT_SHAPE,
 }
 
-# --- Actions (RESERVED, §4.3) ------------------------------------------------
+# --- Actions (§5, SPECIFIED — issue #123) ------------------------------------
 #
-# Rows, thread nodes, and pages may declare an `actions` list — the
-# declarative write path a future shell version renders (v1 shells render
-# read-only and IGNORE this field per §4.3, but it ships in the kind schemas
-# from day one so a plugin can land the field now and get write rendering
-# later as a shell upgrade, not a plugin redesign).
+# A page may declare an `actions` list: labelled buttons that open a minimal
+# form of declared `fields` and POST their values through the /ui-api proxy to
+# `endpoint`. The button/form-shaped sibling of the input-shaped `composer` —
+# both ride the same proxy-POST enablement + endpoint-allowlist posture (§5).
+# The shell renders them GENERICALLY (no plugin-specific UI code): a plugin
+# declares the button label, the write endpoint, and the form fields, and the
+# shell handles rendering, submission, and — on a 2xx — following an optional
+# plugin-relative `navigate` href in the response.
+#
+# Registration-time validation (platform `manifest.py`/`UIAction`): 422 if
+# `endpoint` doesn't start with '/ui-api/', if it references a '{param}' absent
+# from the page's `route`, on any unknown action or field key, or on a
+# duplicate action id / field name within the page. `kind` on a field stays a
+# FREE string — an unknown value falls back to a text control at render, it
+# does not reject the manifest.
+
+ACTION_FIELD_SHAPE: dict[str, str] = {
+    "name": "required — the JSON key the shell submits this field's value as",
+    "label": "optional — the visible field label (defaults to `name`)",
+    "kind": "optional — 'text' (single line, default) or 'multiline' (textarea)",
+    "required": "optional — the shell blocks submit until this is filled "
+    "(default false)",
+}
 
 ACTION_SHAPE: dict[str, str] = {
-    "label": "required — the button/menu-item text",
-    "endpoint": "required — a /ui-api-relative path, may template '{id}'-style "
-    "params the same way a page route does",
-    "method": "required — the HTTP verb the shell POSTs (v1 shells never send "
-    "it; reserved for a later shell version)",
-    "confirm": "optional — a confirmation prompt shown before the shell submits",
+    "id": "required — unique within the page's actions",
+    "label": "required — the button text",
+    "endpoint": "required — a /ui-api-relative POST target; may template "
+    "'{param}' segments matching the page's route params",
+    "fields": f"optional — the form the shell renders: list of "
+    f"{ACTION_FIELD_SHAPE!r} (empty = a bare button posting an empty body)",
+}
+
+# The action endpoint's RESPONSE contract (plugin side): a 2xx may carry an
+# optional `navigate` — a plugin-relative shell href the shell lands on after a
+# successful submit (re-prefixed with `/<plugin>`, same as a table row `href`).
+# Everything else in the body is ignored by the generic shell.
+ACTION_RESPONSE_SHAPE: dict[str, str] = {
+    "navigate": "optional — a plugin-relative shell route to navigate to on "
+    "success (e.g. a newly-created resource's page)",
 }
 
 __all__ = [
@@ -199,7 +235,12 @@ __all__ = [
     "THREAD_SHAPE",
     "DOCUMENT_SHAPE",
     "UI_KIND_SHAPES",
+    "ACTION_FIELDS",
+    "ACTION_FIELD_FIELDS",
+    "ACTION_FIELD_KINDS",
+    "ACTION_FIELD_SHAPE",
     "ACTION_SHAPE",
+    "ACTION_RESPONSE_SHAPE",
     "COMPOSER_FIELDS",
     "COMPOSER_SHAPE",
     "UI_WRITE_BODY_LIMIT",

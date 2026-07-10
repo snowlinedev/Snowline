@@ -8,7 +8,7 @@
 import { useParams } from "react-router-dom";
 
 import type { PluginEntry, UIPage } from "../api";
-import { Card, RegisteredKind, useUiData } from "../kinds/kinds";
+import { Card, PageActions, RegisteredKind, useUiData } from "../kinds/kinds";
 import { Layout } from "../shell/Layout";
 import { THREAD_COMPOSER_POLL_SECONDS, contractSupported, templateData } from "../registry";
 
@@ -30,10 +30,18 @@ export function PluginPage(props: { plugin: PluginEntry; page: UIPage }) {
     pollsForComposer,
   );
   const composerPath = composer ? templateData(composer.endpoint, params) : undefined;
+  // Page-level actions (ui-shell.md §5): rendered generically above the page's
+  // kind content. Endpoints are route-templated the same way `data`/`composer`
+  // are, so an action on a `{param}` route reaches the right concrete path.
+  const actions = (props.page.actions ?? []).map((a) => ({
+    ...a,
+    endpoint: templateData(a.endpoint, params),
+  }));
 
   return (
     <Layout title={props.page.title ?? props.page.id}>
       <Card>
+        <PageActions plugin={props.plugin.name} actions={actions} />
         <RegisteredKind
           plugin={props.plugin.name}
           path={dataPath}

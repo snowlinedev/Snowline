@@ -45,6 +45,17 @@ UI_KINDS: frozenset[str] = UI_WIDGET_KINDS | UI_PAGE_KINDS
 # silently fork.
 COMPOSER_FIELDS: frozenset[str] = frozenset({"endpoint", "placeholder", "disabled_when"})
 
+# Page `actions[]` (ui-shell.md §5 — moved from "reserved" to specified, issue
+# #123): the button-shaped write seam sibling of `composer`. Same drift-guard
+# treatment as COMPOSER_FIELDS — the SDK ships equal copies, pinned by
+# test_ui_contract_drift.py — so a plugin author has one documented field
+# vocabulary. `ACTION_FIELDS` are the keys of an `actions[]` entry;
+# `ACTION_FIELD_FIELDS` are the keys of one declared form field; the shell
+# renders a form-field control per `ACTION_FIELD_KINDS` value.
+ACTION_FIELDS: frozenset[str] = frozenset({"id", "label", "endpoint", "fields"})
+ACTION_FIELD_FIELDS: frozenset[str] = frozenset({"name", "label", "kind", "required"})
+ACTION_FIELD_KINDS: frozenset[str] = frozenset({"text", "multiline"})
+
 # Route path-param segments template verbatim into `data` (ui-shell.md §3):
 # `{name}` where `name` is a simple identifier. A literal segment is a
 # generic url-safe token (letters/digits/`_`/`-`/`.`) — permissive on purpose,
@@ -131,6 +142,14 @@ def _valid_ui_endpoint(endpoint: str, label: str = "composer endpoint") -> str:
     return endpoint
 
 
+def _valid_ui_action_endpoint(endpoint: str) -> str:
+    """A page action's POST endpoint — same `/ui-api/` confinement + per-segment
+    shape rule as a composer endpoint (both are proxy-POST write targets, and
+    the proxy's write-path matcher walks them identically), just labelled for
+    honest 422s."""
+    return _valid_ui_endpoint(endpoint, "action endpoint")
+
+
 def _no_duplicate_ids(items: list, what: str) -> None:
     ids = [item.id for item in items]
     dupes = sorted({i for i in ids if ids.count(i) > 1})
@@ -196,6 +215,73 @@ class UIComposer(BaseModel):
     _valid_endpoint = field_validator("endpoint")(_valid_ui_endpoint)
 
 
+class UIActionField(BaseModel):
+    """One declared form field of a page `action` (ui-shell.md §5). The shell
+    renders one labelled control per field and submits `{name: value}` in the
+    action's POST body.
+
+    `extra="forbid"` — an unknown field key (typo, or a future field an older
+    platform doesn't know) rejects the whole manifest, same fail-loud posture
+    as everything else in the `ui` block. `kind` stays a FREE string (like a
+    widget/page `kind`): an unrecognized value fails visible at render (the
+    shell falls back to a text control) rather than bricking registration —
+    `ACTION_FIELD_KINDS` documents what the shell renders, it does not gate.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(description="the JSON key the shell submits this field as")
+    label: str | None = Field(
+        default=None, description="visible field label (defaults to `name`)"
+    )
+    kind: str = Field(
+        default="text",
+        description="rendering hint — 'text' (single line) or 'multiline' "
+        "(textarea); unknown kinds fall back to a text control at render",
+    )
+    required: bool = Field(
+        default=False, description="the shell blocks submit until this is filled"
+    )
+
+
+class UIAction(BaseModel):
+    """One page-level write affordance (ui-shell.md §5 actions[], issue #123):
+    a labelled button that opens a minimal form of `fields` and POSTs their
+    values through the /ui-api proxy to `endpoint`. The button-shaped sibling of
+    the input-shaped `composer` — both ride the same proxy-POST enablement and
+    endpoint-allowlist posture (§5); the plugin owns all semantics. On a 2xx the
+    shell follows an optional plugin-relative `navigate` href in the response.
+
+    `extra="forbid"` — same fail-loud posture as `UIComposer`: a typo'd or
+    unknown key rejects the manifest rather than silently dropping a write seam.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(description="unique within the page's actions")
+    label: str = Field(description="the button text")
+    endpoint: str = Field(
+        description="plugin-relative POST target, proxied via /ui-api (§5); "
+        "may contain '{param}' segments matching the page's route params"
+    )
+    fields: list[UIActionField] = Field(
+        default_factory=list,
+        description="the form the shell renders; empty = a bare button that "
+        "POSTs an empty body",
+    )
+
+    _valid_endpoint = field_validator("endpoint")(_valid_ui_action_endpoint)
+
+    @field_validator("fields")
+    @classmethod
+    def _unique_field_names(cls, v: list[UIActionField]) -> list[UIActionField]:
+        names = [f.name for f in v]
+        dupes = sorted({n for n in names if names.count(n) > 1})
+        if dupes:
+            raise ValueError(f"duplicate action field name(s): {dupes!r}")
+        return v
+
+
 class UIPage(BaseModel):
     """One page contribution (ui-shell.md §3/§4.2).
 
@@ -226,9 +312,37 @@ class UIPage(BaseModel):
         description="optional write seam, valid only on 'thread' pages "
         "(shadow-conversations.md §4)",
     )
+    actions: list[UIAction] = Field(
+        default_factory=list,
+        description="optional page-level write affordances (ui-shell.md §5 "
+        "actions[]); valid on any page kind, unlike the thread-only composer",
+    )
 
     _valid_data = field_validator("data")(_valid_ui_data)
     _valid_route = field_validator("route")(_valid_ui_route)
+
+    @field_validator("actions")
+    @classmethod
+    def _unique_action_ids(cls, v: list[UIAction]) -> list[UIAction]:
+        _no_duplicate_ids(v, "action")
+        return v
+
+    @model_validator(mode="after")
+    def _valid_action_params_for_route(self) -> "UIPage":
+        # Every '{param}' an action endpoint templates must exist in the page's
+        # route (same rule as the composer below) — an action endpoint keyed on
+        # a param the route can't supply is a dead write seam, so it fails loud
+        # at registration rather than 403ing forever at request time.
+        route_params = _path_param_names(self.route)
+        for action in self.actions:
+            unknown = _path_param_names(action.endpoint) - route_params
+            if unknown:
+                raise ValueError(
+                    f"action {action.id!r} endpoint {action.endpoint!r} "
+                    f"references param(s) {sorted(unknown)!r} not present in "
+                    f"route {self.route!r}"
+                )
+        return self
 
     @model_validator(mode="after")
     def _valid_composer_for_kind(self) -> "UIPage":

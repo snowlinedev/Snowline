@@ -141,26 +141,40 @@ internally — the platform eats its own vocabulary.
 `search` (query box + result list, for shadow corpus search) is anticipated
 but **deferred** until the read views prove out.
 
-### 4.3 Actions (contract reserved v1, shell support later)
+### 4.3 Actions (page-level write affordances — specified, §5)
 
-Rows, thread nodes, and pages may declare **actions** — the declarative write
-path the PM roadmap will need (complete item, add to initiative):
+A page may declare **actions** — labelled buttons that open a minimal form and
+POST it through the §5 proxy; the plugin owns all semantics. The full contract
+(fields, response, validation) is in §5; the shape at a glance:
 
 ```jsonc
-"actions": [{ "label": "Complete", "endpoint": "/ui-api/items/{id}/complete",
-              "method": "POST", "confirm": "Complete this item?" }]
+"actions": [{
+  "id": "new-branch",
+  "label": "New branch",
+  "endpoint": "/ui-api/pages/branches",
+  "fields": [
+    { "name": "scope", "label": "Scope", "kind": "text", "required": true },
+    { "name": "name",  "label": "Branch name", "kind": "text", "required": true },
+    { "name": "opening_message", "label": "Opening note", "kind": "multiline" }
+  ]
+}]
 ```
 
-The shell renders buttons/menus and POSTs through the §5 proxy; the plugin owns
-all semantics. Reorderable tables/boards (drag-to-reorder as a `table`/`board`
-capability flag + reorder endpoint) are the same idea and land with the pm
-work. **v1 shells render read-only** and ignore `actions` — but the field is
-in the kind schemas from day one so pm lands as registration, not redesign.
+The seam has two activations, sharing the same proxy-POST enablement and
+endpoint-allowlist posture (§5) but different shapes:
 
-The first ACTIVATION of this seam is input-shaped rather than button-shaped:
-the `thread` kind's **`composer`** (`shadow-conversations.md` §4) — a declared
-POST endpoint rendered as a message box. Composer and `actions` share the same
-proxy-POST enablement and the same endpoint-allowlist posture (§5).
+- **input-shaped** — the `thread` kind's **`composer`** (`shadow-conversations.md`
+  §4): one declared POST endpoint rendered as a message box.
+- **button/form-shaped** — page **`actions[]`** (this section; first activated by
+  issue #123's "New branch"): a button opening a form of declared fields. The
+  shell renders these GENERICALLY — a plugin declares label + endpoint + fields
+  and gets rendering, submission, and success-navigation with no shell code of
+  its own (the posture §2 requires).
+
+Row/thread-node actions and reorderable tables/boards (drag-to-reorder as a
+`table`/`board` capability flag + reorder endpoint) are the same idea at finer
+grain and land with the pm work; page-level actions[] is the shape specified
+now.
 
 ### 4.4 Fail visible
 
@@ -189,7 +203,58 @@ GET /ui-api/<plugin>/<path>   →   <plugin base_url><path>
 - **Verbs:** GET, plus POST to endpoints a plugin DECLARED as write targets
   in its `ui` block (`composer.endpoint`, `actions[].endpoint`) — structural
   allowlist, JSON-only, size-capped (`shadow-conversations.md` §3). Undeclared
-  paths 403.
+  paths 403. Both declared-write flavors flatten into one allowlist the proxy
+  matches uniformly: it admits a POST because *some* manifest field declared
+  the concrete path, not because of which flavor did.
+
+#### 5.1 The `actions[]` contract (specified — issue #123)
+
+A page's `actions` list moves here from "reserved" (§4.3 previously sketched it
+speculatively). Each entry is a page-level write affordance the shell renders
+GENERICALLY — no plugin-specific UI code, per §2's posture. The producer↔
+consumer field vocabulary is drift-guarded the same way the kind vocabulary and
+`composer` are: `snowline_platform.manifest` (`ACTION_FIELDS`,
+`ACTION_FIELD_FIELDS`, `ACTION_FIELD_KINDS`, pinned to the real
+`UIAction`/`UIActionField` models) is the source of truth, mirrored in
+`snowline_plugin_sdk.ui` and pinned equal by `test_ui_contract_drift.py`.
+
+An `actions[]` entry:
+
+| field | req? | meaning |
+|---|---|---|
+| `id` | yes | unique within the page's actions |
+| `label` | yes | the button text |
+| `endpoint` | yes | plugin-relative POST target, `/ui-api/`-confined + allowlisted exactly like `composer.endpoint`; may template `{param}` segments that must appear in the page `route` |
+| `fields` | no | the form the shell renders (default `[]` = a bare button posting an empty body) |
+
+Each `fields[]` entry — the field-shape table:
+
+| field | req? | meaning |
+|---|---|---|
+| `name` | yes | the JSON key the shell submits this field's value as |
+| `label` | no | visible field label (defaults to `name`) |
+| `kind` | no | rendering hint: `text` (single line, default) or `multiline` (textarea). A FREE string — an unknown value falls back to a text control at render, it does not reject the manifest |
+| `required` | no | the shell blocks submit until this is non-blank (default `false`) |
+
+**Shell rendering.** A `label` button sits above the page's kind content;
+clicking it opens a form of the declared fields (text→input, multiline→
+textarea). Submit POSTs `{ <name>: <value>, … }` as JSON through the proxy to
+`endpoint`. `endpoint`'s `{param}` segments are route-templated the same way a
+page's `data`/`composer` are, so an action on a `{param}` route reaches the
+right concrete path.
+
+**Response contract.** A 2xx body MAY carry `navigate` — a plugin-relative
+shell href the shell lands on after a successful submit (re-prefixed with
+`/<plugin>`, same as a table row `href`). Everything else in the body is
+ignored by the generic shell. Absent `navigate` = the shell just closes the
+form. This is how "New branch" (issue #123) lands the user on the newly-created
+branch's thread page while the shell stays ignorant of branches.
+
+**Registration validation** (`manifest.py`/`UIAction`): 422 on an `endpoint`
+not under `/ui-api/`, an `endpoint` `{param}` absent from the page `route`, an
+unknown action/field key (`extra="forbid"`), or a duplicate action `id` / field
+`name` within a page. `actions` is valid on ANY page kind (unlike the
+thread-only `composer`).
 
 ## 6. Platform-native views & the shell
 
@@ -252,9 +317,10 @@ colorblind-safe series palette.
 ## 9. Out of scope (v1)
 
 - Writes from the browser (action *rendering*; the contract shape ships in v1
-  schemas). *Superseded for the composer path: `shadow-conversations.md`
-  activates proxy POST + the thread composer; button-shaped `actions`
-  rendering still lands with the pm work.*
+  schemas). *Superseded: `shadow-conversations.md` activates proxy POST + the
+  thread composer, and issue #123 activates PAGE-LEVEL `actions[]` rendering
+  (§5.1). Finer-grain row/thread-node actions and reorderable boards still land
+  with the pm work.*
 - Remote-module escape hatch (documented direction only).
 - `search` page kind; websockets/SSE liveness (poll first); mobile-dedicated
   layouts (responsive reflow only); theming beyond light/dark.
