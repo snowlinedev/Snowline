@@ -14,6 +14,7 @@ members = [
     "snowline-memory",
     "snowline-platform",
     "snowline-plugin-sdk",
+    "snowline-remote-front",
 ]
 
 [[package]]
@@ -946,6 +947,7 @@ dev = [
     { name = "pytest" },
     { name = "snowline-governance" },
     { name = "snowline-memory" },
+    { name = "snowline-remote-front" },
 ]
 
 [package.metadata]
@@ -965,6 +967,7 @@ dev = [
     { name = "pytest", specifier = ">=8.0" },
     { name = "snowline-governance", editable = "governance" },
     { name = "snowline-memory", editable = "memory" },
+    { name = "snowline-remote-front", editable = "ops/remote-front" },
 ]
 
 [[package]]
@@ -1012,6 +1015,35 @@ dev = [
     { name = "pytest", specifier = ">=8.0" },
     { name = "sqlalchemy", specifier = ">=2.0" },
 ]
+
+[[package]]
+name = "snowline-remote-front"
+version = "0.0.1"
+source = { editable = "ops/remote-front" }
+dependencies = [
+    { name = "anyio" },
+    { name = "httpx" },
+    { name = "mcp" },
+    { name = "starlette" },
+    { name = "uvicorn" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "anyio", specifier = ">=4" },
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "mcp", specifier = ">=1.2" },
+    { name = "starlette", specifier = ">=0.37" },
+    { name = "uvicorn", specifier = ">=0.29" },
+]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=8.0" }]
 
 [[package]]
 name = "sqlalchemy"

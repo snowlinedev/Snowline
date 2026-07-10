@@ -41,6 +41,13 @@ dev = [
     # the platform depends on no plugin). It rides the dev group so a plain
     # `uv sync` installs it for the combined test run.
     "snowline-memory",
+    # `snowline-remote-front` (ops/remote-front, issue #120) is a workspace
+    # MEMBER too — the OAuth-terminating public MCP front. Same dependency
+    # direction (the platform depends on no ops package): it rides the dev group
+    # so `uv sync` installs it for the combined test run. It shares NO runtime
+    # code with the platform (it's a standalone ASGI app in front of the
+    # gateway), so it stays out of the platform's runtime deps.
+    "snowline-remote-front",
 ]
 
 [build-system]
@@ -55,19 +62,22 @@ packages = ["src/snowline_platform"]
 # own directory. The first member is `governance` — the flagship plugin, its own
 # package + DB + alembic chain. `uv sync` resolves the whole workspace at once.
 [tool.uv.workspace]
-members = ["governance", "memory", "sdk"]
+members = ["governance", "memory", "sdk", "ops/remote-front"]
 
 [tool.uv.sources]
 snowline-governance = { workspace = true }
 snowline-memory = { workspace = true }
 snowline-plugin-sdk = { workspace = true }
+snowline-remote-front = { workspace = true }
 
 [tool.pytest.ini_options]
 # Run every workspace member's tests in one `uv run python -m pytest` from the
 # repo root.
-testpaths = ["tests", "governance/tests", "memory/tests", "sdk/tests"]
-# importlib mode: all four test trees have a `test_import_purity.py` and three
-# have a `conftest.py` (same basenames, different dirs). The default prepend
-# import mode collides on the basename / package name; importlib imports each by
-# file path, so the trees coexist without `__init__.py` gymnastics.
+testpaths = ["tests", "governance/tests", "memory/tests", "sdk/tests", "ops/remote-front/tests"]
+# importlib mode: the platform/governance/memory/sdk trees each have a
+# `test_import_purity.py`, most trees have a `conftest.py`, and remote-front's
+# import-purity check lives inside its `tests/test_store_and_config.py` (same
+# basenames, different dirs). The default prepend import mode collides on the
+# basename / package name; importlib imports each by file path, so the trees
+# coexist without `__init__.py` gymnastics.
 addopts = "--import-mode=importlib"
