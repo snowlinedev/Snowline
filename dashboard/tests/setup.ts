@@ -78,7 +78,7 @@ export const FIXTURES: Record<string, unknown> = {
                     label: "New branch",
                     endpoint: "/ui-api/pages/branches",
                     fields: [
-                      { name: "scope", label: "Scope", kind: "text", required: true },
+                      { name: "scope", label: "Scope", kind: "scope", required: true },
                       { name: "name", label: "Branch name", kind: "text", required: true },
                       {
                         name: "opening_message",

@@ -117,8 +117,13 @@ def build_manifest(base_url: str | None = None) -> dict:
                     # exactly like the composer — platform `_declared_write_
                     # templates`), and on success follows the response's
                     # `navigate` href to the new branch's thread page. `scope`
-                    # and `name` are required text; `opening_message` is an
-                    # optional multiline note that becomes the branch's first
+                    # is a required `scope`-kind field (ui-shell.md §5.1: a text
+                    # input backed by a native <datalist> typeahead over the
+                    # platform's scope slugs — so a phone user picks a slug
+                    # instead of typo-ing `snowlinedev/snowline-pm`; free text
+                    # still allowed for not-yet-registered scopes); `name` is
+                    # required text; `opening_message` is an optional multiline
+                    # note that becomes the branch's first
                     # conversation message (ui_api.create_branch_action). The
                     # route carries no params, so the endpoint carries none.
                     "actions": [
@@ -130,7 +135,7 @@ def build_manifest(base_url: str | None = None) -> dict:
                                 {
                                     "name": "scope",
                                     "label": "Scope",
-                                    "kind": "text",
+                                    "kind": "scope",
                                     "required": True,
                                 },
                                 {

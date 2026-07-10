@@ -47,7 +47,7 @@ def test_action_shape_is_specified():
         "kind",
         "required",
     }
-    assert ui.ACTION_FIELD_KINDS == {"text", "multiline"}
+    assert ui.ACTION_FIELD_KINDS == {"text", "multiline", "scope"}
     # The action endpoint's response contract (the generic success-navigation
     # href the shell follows).
     assert set(ui.ACTION_RESPONSE_SHAPE) == {"navigate"}

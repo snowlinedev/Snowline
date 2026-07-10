@@ -27,8 +27,9 @@ export type UIComposer = {
 
 /** A declared form field of a page `action` (ui-shell.md §5): the shell
  * renders one labelled control per field and submits `{ name: value }` in the
- * action's POST body. `kind` is a rendering hint — `text` (default) or
- * `multiline`; an unknown value falls back to a text control. */
+ * action's POST body. `kind` is a rendering hint — `text` (default),
+ * `multiline`, or `scope` (a text input with a `<datalist>` typeahead over the
+ * platform's scope slugs); an unknown value falls back to a text control. */
 export type UIActionField = {
   name: string;
   label?: string;
@@ -107,6 +108,25 @@ export const fetchSurfaces = () =>
   get<{ surfaces: Surface[] }>("/surfaces").then((b) => b.surfaces);
 export const fetchScopeTree = () =>
   get<{ tree: ScopeNode[] }>("/scopes/tree").then((b) => b.tree);
+
+/** Every scope slug in the tree, flattened depth-first and sorted — the source
+ * for the `scope` action-field kind's `<datalist>` typeahead (ui-shell.md
+ * §5.1). Reuses the Scopes page's `/scopes/tree` data path rather than a new
+ * endpoint. */
+export function flattenScopeSlugs(tree: ScopeNode[]): string[] {
+  const out: string[] = [];
+  const walk = (nodes: ScopeNode[]) => {
+    for (const n of nodes) {
+      out.push(n.slug);
+      walk(n.children);
+    }
+  };
+  walk(tree);
+  return out.sort();
+}
+
+export const fetchScopeSlugs = (): Promise<string[]> =>
+  fetchScopeTree().then(flattenScopeSlugs);
 
 /** ui-shell.md §5: `GET /ui-api/<plugin>/<path>` proxies to the plugin's own
  * `/ui-api/<path>`. Manifest `data`/widget values are PLUGIN-RELATIVE and

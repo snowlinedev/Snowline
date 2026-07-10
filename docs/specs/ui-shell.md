@@ -153,7 +153,7 @@ POST it through the §5 proxy; the plugin owns all semantics. The full contract
   "label": "New branch",
   "endpoint": "/ui-api/pages/branches",
   "fields": [
-    { "name": "scope", "label": "Scope", "kind": "text", "required": true },
+    { "name": "scope", "label": "Scope", "kind": "scope", "required": true },
     { "name": "name",  "label": "Branch name", "kind": "text", "required": true },
     { "name": "opening_message", "label": "Opening note", "kind": "multiline" }
   ]
@@ -233,12 +233,13 @@ Each `fields[]` entry — the field-shape table:
 |---|---|---|
 | `name` | yes | the JSON key the shell submits this field's value as |
 | `label` | no | visible field label (defaults to `name`) |
-| `kind` | no | rendering hint: `text` (single line, default) or `multiline` (textarea). A FREE string — an unknown value falls back to a text control at render, it does not reject the manifest |
+| `kind` | no | rendering hint: `text` (single line, default), `multiline` (textarea), or `scope` (a text input backed by a native `<datalist>` typeahead over the platform's scope slugs — assistance only, free text still allowed, and a failed/loading scope fetch degrades silently to a plain text input). A FREE string — an unknown value falls back to a text control at render, it does not reject the manifest. An older shell that predates a given kind rendering it as a plain text input is CORRECT degradation, not a bug |
 | `required` | no | the shell blocks submit until this is non-blank (default `false`) |
 
 **Shell rendering.** A `label` button sits above the page's kind content;
 clicking it opens a form of the declared fields (text→input, multiline→
-textarea). Submit POSTs `{ <name>: <value>, … }` as JSON through the proxy to
+textarea, scope→input + native `<datalist>` typeahead over the scope slugs).
+Submit POSTs `{ <name>: <value>, … }` as JSON through the proxy to
 `endpoint`. `endpoint`'s `{param}` segments are route-templated the same way a
 page's `data`/`composer` are, so an action on a `{param}` route reaches the
 right concrete path.
