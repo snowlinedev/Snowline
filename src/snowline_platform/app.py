@@ -243,7 +243,18 @@ def create_app(
             and candidate.is_file()
             and candidate.is_relative_to(dist_dir.resolve())
         ):
-            return FileResponse(candidate)
+            # Cache policy: vite writes content-hashed filenames under
+            # assets/, so those are immutable; everything else (index.html
+            # via the fallback below, favicons, manifest files) must
+            # revalidate every load — with no Cache-Control, browsers apply
+            # HEURISTIC freshness and mobile Safari serves a stale
+            # index.html referencing a bundle that no longer exists, which
+            # reads as "the deploy didn't take" on phones.
+            if candidate.is_relative_to((dist_dir / "assets").resolve()):
+                headers = {"Cache-Control": "public, max-age=31536000, immutable"}
+            else:
+                headers = {"Cache-Control": "no-cache"}
+            return FileResponse(candidate, headers=headers)
         index = dist_dir / "index.html"
         if not index.is_file():
             # A half-built dist (vite mid-rebuild, interrupted build) must
@@ -252,7 +263,7 @@ def create_app(
                 {"detail": "dashboard bundle incomplete — rebuild (npm run build)"},
                 status_code=status.HTTP_404_NOT_FOUND,
             )
-        return FileResponse(index)
+        return FileResponse(index, headers={"Cache-Control": "no-cache"})
 
     return app
 

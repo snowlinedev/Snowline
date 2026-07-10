@@ -119,3 +119,30 @@ def test_reserved_surface_names_fail_boot(monkeypatch):
     monkeypatch.setenv("SNOWLINE_SURFACES", "main,ui")
     with pytest.raises(ConfigError, match="reserved"):
         _app()
+
+
+def test_ui_cache_headers_split_immutable_assets_from_revalidating_shell(
+    monkeypatch, tmp_path
+):
+    # index.html (direct and via SPA fallback) must carry Cache-Control:
+    # no-cache — with NO Cache-Control, browsers apply heuristic freshness
+    # and a phone keeps rendering a stale shell pointing at a bundle that no
+    # longer exists after a redeploy. Hash-named files under assets/ are
+    # immutable by construction (vite content-hashes them), so those cache
+    # forever; non-hashed top-level files (favicons) revalidate like the
+    # shell.
+    dist = tmp_path / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "index.html").write_text("<html>shell</html>")
+    (dist / "assets" / "app-abc123.js").write_text("//js")
+    (dist / "favicon.svg").write_text("<svg/>")
+    monkeypatch.setenv("SNOWLINE_DASHBOARD_DIST", str(dist))
+
+    client = TestClient(_app())
+    assert client.get("/ui").headers["cache-control"] == "no-cache"
+    assert client.get("/ui/plugins").headers["cache-control"] == "no-cache"
+    assert client.get("/ui/favicon.svg").headers["cache-control"] == "no-cache"
+    assert (
+        client.get("/ui/assets/app-abc123.js").headers["cache-control"]
+        == "public, max-age=31536000, immutable"
+    )
