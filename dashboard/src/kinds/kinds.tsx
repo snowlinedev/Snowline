@@ -21,6 +21,7 @@ import {
 import { Link, useNavigate } from "react-router-dom";
 
 import {
+  fetchScopeSlugs,
   fetchUiData,
   postUiApi,
   UiApiError,
@@ -802,6 +803,40 @@ function safeNavigateHref(nav: string | undefined): string | undefined {
   return nav;
 }
 
+/** The scope slugs backing a `scope`-kind field's `<datalist>` (ui-shell.md
+ * §5.1). Fetched LAZILY and once per `enabled` transition — the caller only
+ * enables it while the form is open AND actually declares a scope field, so a
+ * form with no scope field (the common case) never hits `/scopes/tree`.
+ *
+ * Built ON `useData` rather than a hand-rolled fetch effect, so the ONE fetch
+ * lifecycle in this codebase (generation counter — a slow response can't
+ * resolve out of order and overwrite newer data — plus unmount liveness)
+ * covers this path too. No `refreshSeconds`: one fetch per `enabled` flip.
+ *
+ * The datalist is ASSISTANCE, not validation: loading and error both degrade
+ * to an empty list — the field stays a plain text input, free text is always
+ * accepted, and a failed scope fetch never surfaces a UI error or blocks the
+ * form (a phone on a flaky tailnet still gets a working input). The degrade
+ * is silent in the UI only: a `console.warn` keeps a fetch/shape failure
+ * diagnosable for a developer. */
+function useScopeSlugs(enabled: boolean): string[] {
+  const result = useData(
+    () => (enabled ? fetchScopeSlugs() : Promise.resolve<string[]>([])),
+    undefined,
+    [enabled],
+  );
+  const failure = result.state === "error" ? result.message : null;
+  useEffect(() => {
+    if (failure != null) {
+      console.warn(
+        "scope typeahead disabled: /scopes/tree fetch/shape error —",
+        failure,
+      );
+    }
+  }, [failure]);
+  return result.state === "ready" ? result.data : [];
+}
+
 function PageAction(props: { plugin: string; action: UIAction }) {
   const navigate = useNavigate();
   const fields = props.action.fields ?? [];
@@ -814,6 +849,17 @@ function PageAction(props: { plugin: string; action: UIAction }) {
   // the state flag alone could double-POST. The ref flips synchronously.
   const inflight = useRef(false);
   const id = useId();
+
+  // Scope-typeahead source: fetched only while the form is open AND a scope
+  // field exists (ui-shell.md §5.1) — once per form open, degrading silently.
+  // ONE form-level datalist serves every scope-kind field, and its id comes
+  // from its OWN useId() call, never derived from field names — a
+  // name-derived id (`${id}-${name}-scopes`) could collide with a sibling
+  // field's input id (`${id}-${name2}` where name2 = name + "-scopes"),
+  // breaking label IDREF wiring (first-in-DOM wins).
+  const hasScopeField = fields.some((f) => f.kind === "scope");
+  const scopeSlugs = useScopeSlugs(open && hasScopeField);
+  const scopeListId = useId();
 
   const setField = (name: string, v: string) =>
     setValues((prev) => ({ ...prev, [name]: v }));
@@ -912,10 +958,19 @@ function PageAction(props: { plugin: string; action: UIAction }) {
                 onChange={(e) => setField(f.name, e.target.value)}
               />
             ) : (
+              // Everything else is a text input; a `scope`-kind field (ui-
+              // shell.md §5.1) additionally points `list` at the form-level
+              // scope datalist below — iOS Safari renders it as native
+              // suggestions and it's the lightest fully-accessible typeahead.
+              // Free text stays allowed — the datalist is assistance, never a
+              // restriction (PM-style scopes may not be registered yet). When
+              // the fetch is loading or failed, the datalist is empty and this
+              // is indistinguishable from a plain text input.
               <input
                 id={fieldId}
                 type="text"
                 className="page-action-input"
+                list={f.kind === "scope" ? scopeListId : undefined}
                 value={values[f.name] ?? ""}
                 required={f.required}
                 disabled={submitting}
@@ -925,6 +980,15 @@ function PageAction(props: { plugin: string; action: UIAction }) {
           </div>
         );
       })}
+      {/* The ONE datalist every scope-kind input's `list` points at — see the
+       * id-collision rationale where `scopeListId` is minted above. */}
+      {hasScopeField && (
+        <datalist id={scopeListId}>
+          {scopeSlugs.map((slug) => (
+            <option key={slug} value={slug} />
+          ))}
+        </datalist>
+      )}
       <div className="page-action-actions">
         <button
           type="button"

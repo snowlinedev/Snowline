@@ -12,6 +12,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from snowline_platform import manifest
 from snowline_platform.manifest import PluginManifest
 
 
@@ -338,6 +339,19 @@ def test_valid_actions_on_any_page_kind_register():
 def test_actions_absent_defaults_empty():
     m = _manifest({"pages": [_page()]})
     assert m.ui.pages[0].actions == []
+
+
+def test_action_field_scope_kind_round_trips():
+    # The `scope` field kind (ui-shell.md §5.1: a text input with a <datalist>
+    # typeahead over the platform's scope slugs) round-trips like any other —
+    # `kind` is a free string, so this is just a documented value, not a new
+    # validation branch. It's in the DOCUMENTED vocabulary the drift test pins.
+    m = _manifest(
+        {"pages": [_page(actions=[_action(fields=[{"name": "scope", "kind": "scope"}])])]}
+    )
+    field = m.ui.pages[0].actions[0].fields[0]
+    assert field.name == "scope" and field.kind == "scope"
+    assert "scope" in manifest.ACTION_FIELD_KINDS
 
 
 def test_action_field_label_defaults_none():

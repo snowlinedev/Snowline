@@ -65,7 +65,7 @@ COMPOSER_FIELDS: frozenset[str] = frozenset({"endpoint", "placeholder", "disable
 # the source of truth, and `test_ui_contract_drift.py` pins these equal.
 ACTION_FIELDS: frozenset[str] = frozenset({"id", "label", "endpoint", "fields"})
 ACTION_FIELD_FIELDS: frozenset[str] = frozenset({"name", "label", "kind", "required"})
-ACTION_FIELD_KINDS: frozenset[str] = frozenset({"text", "multiline"})
+ACTION_FIELD_KINDS: frozenset[str] = frozenset({"text", "multiline", "scope"})
 
 # The /ui-api proxy's POST body cap (shadow-conversations.md §3): a
 # conversation message, not an upload. THE shared value — the platform's
@@ -192,7 +192,8 @@ UI_KIND_SHAPES: dict[str, dict[str, str]] = {
 ACTION_FIELD_SHAPE: dict[str, str] = {
     "name": "required — the JSON key the shell submits this field's value as",
     "label": "optional — the visible field label (defaults to `name`)",
-    "kind": "optional — 'text' (single line, default) or 'multiline' (textarea)",
+    "kind": "optional — 'text' (single line, default), 'multiline' (textarea), "
+    "or 'scope' (text input with a typeahead over the platform's scope slugs)",
     "required": "optional — the shell blocks submit until this is filled "
     "(default false)",
 }

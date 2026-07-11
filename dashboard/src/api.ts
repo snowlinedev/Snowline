@@ -27,8 +27,9 @@ export type UIComposer = {
 
 /** A declared form field of a page `action` (ui-shell.md §5): the shell
  * renders one labelled control per field and submits `{ name: value }` in the
- * action's POST body. `kind` is a rendering hint — `text` (default) or
- * `multiline`; an unknown value falls back to a text control. */
+ * action's POST body. `kind` is a rendering hint — `text` (default),
+ * `multiline`, or `scope` (a text input with a `<datalist>` typeahead over the
+ * platform's scope slugs); an unknown value falls back to a text control. */
 export type UIActionField = {
   name: string;
   label?: string;
@@ -107,6 +108,36 @@ export const fetchSurfaces = () =>
   get<{ surfaces: Surface[] }>("/surfaces").then((b) => b.surfaces);
 export const fetchScopeTree = () =>
   get<{ tree: ScopeNode[] }>("/scopes/tree").then((b) => b.tree);
+
+/** Every scope slug in the tree, flattened depth-first and sorted — the source
+ * for the `scope` action-field kind's `<datalist>` typeahead (ui-shell.md
+ * §5.1). Reuses the Scopes page's `/scopes/tree` data path rather than a new
+ * endpoint.
+ *
+ * No `status` filter: the platform's status vocabulary is open ("active" |
+ * "stub" | … per scope-namespace.md §2) and defines no dead value today, and
+ * `resolve` matches regardless of status — every registered slug is a
+ * legitimate suggestion. (`isolated` is an inheritance property, never a
+ * reason to hide a scope.)
+ *
+ * Shape-guarded (`Array.isArray`) so a malformed node degrades to skipping its
+ * subtree rather than a TypeError — the caller treats a rejection as
+ * "typeahead off", so a shape bug must not be indistinguishable from a
+ * network blip beyond the console diagnostic. */
+export function flattenScopeSlugs(tree: ScopeNode[]): string[] {
+  const out: string[] = [];
+  const walk = (nodes: ScopeNode[]) => {
+    for (const n of nodes) {
+      out.push(n.slug);
+      if (Array.isArray(n.children)) walk(n.children);
+    }
+  };
+  if (Array.isArray(tree)) walk(tree);
+  return out.sort();
+}
+
+export const fetchScopeSlugs = (): Promise<string[]> =>
+  fetchScopeTree().then(flattenScopeSlugs);
 
 /** ui-shell.md §5: `GET /ui-api/<plugin>/<path>` proxies to the plugin's own
  * `/ui-api/<path>`. Manifest `data`/widget values are PLUGIN-RELATIVE and

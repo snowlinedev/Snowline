@@ -10,12 +10,12 @@
  * plain queries and property/attribute checks. */
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
 
 import { App } from "../src/App";
 import type { UIAction } from "../src/api";
-import { PageActions } from "../src/kinds/kinds";
+import { jsonResponse, renderActionsInRouter as renderInRouter } from "./helpers";
 import { FIXTURES } from "./setup";
 
 const ACTION: UIAction = {
@@ -32,29 +32,6 @@ const ACTION: UIAction = {
 // The URL `postUiApi` actually calls `fetch` with, once the shell proxy prefix
 // is applied to the plugin-relative endpoint (uiApiUrl).
 const PROXIED_PATH = "/ui-api/governance/pages/branches";
-
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
-}
-
-/** PageActions in a router whose destination route renders a marker, so a
- * successful `navigate` is observable. */
-function renderInRouter(actions: UIAction[]) {
-  return render(
-    <MemoryRouter initialEntries={["/governance/shadow"]}>
-      <Routes>
-        <Route
-          path="/governance/shadow"
-          element={<PageActions plugin="governance" actions={actions} />}
-        />
-        <Route path="/governance/shadow/:branch" element={<div>LANDED HERE</div>} />
-      </Routes>
-    </MemoryRouter>,
-  );
-}
 
 describe("page actions[]", () => {
   it("renders nothing extra when a page declares no actions", () => {

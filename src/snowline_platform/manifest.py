@@ -54,7 +54,7 @@ COMPOSER_FIELDS: frozenset[str] = frozenset({"endpoint", "placeholder", "disable
 # renders a form-field control per `ACTION_FIELD_KINDS` value.
 ACTION_FIELDS: frozenset[str] = frozenset({"id", "label", "endpoint", "fields"})
 ACTION_FIELD_FIELDS: frozenset[str] = frozenset({"name", "label", "kind", "required"})
-ACTION_FIELD_KINDS: frozenset[str] = frozenset({"text", "multiline"})
+ACTION_FIELD_KINDS: frozenset[str] = frozenset({"text", "multiline", "scope"})
 
 # Route path-param segments template verbatim into `data` (ui-shell.md §3):
 # `{name}` where `name` is a simple identifier. A literal segment is a
@@ -236,8 +236,10 @@ class UIActionField(BaseModel):
     )
     kind: str = Field(
         default="text",
-        description="rendering hint — 'text' (single line) or 'multiline' "
-        "(textarea); unknown kinds fall back to a text control at render",
+        description="rendering hint — 'text' (single line), 'multiline' "
+        "(textarea), or 'scope' (text input with a typeahead over the "
+        "platform's scope slugs); unknown kinds fall back to a text control "
+        "at render",
     )
     required: bool = Field(
         default=False, description="the shell blocks submit until this is filled"
