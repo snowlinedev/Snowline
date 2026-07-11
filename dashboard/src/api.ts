@@ -112,16 +112,27 @@ export const fetchScopeTree = () =>
 /** Every scope slug in the tree, flattened depth-first and sorted — the source
  * for the `scope` action-field kind's `<datalist>` typeahead (ui-shell.md
  * §5.1). Reuses the Scopes page's `/scopes/tree` data path rather than a new
- * endpoint. */
+ * endpoint.
+ *
+ * No `status` filter: the platform's status vocabulary is open ("active" |
+ * "stub" | … per scope-namespace.md §2) and defines no dead value today, and
+ * `resolve` matches regardless of status — every registered slug is a
+ * legitimate suggestion. (`isolated` is an inheritance property, never a
+ * reason to hide a scope.)
+ *
+ * Shape-guarded (`Array.isArray`) so a malformed node degrades to skipping its
+ * subtree rather than a TypeError — the caller treats a rejection as
+ * "typeahead off", so a shape bug must not be indistinguishable from a
+ * network blip beyond the console diagnostic. */
 export function flattenScopeSlugs(tree: ScopeNode[]): string[] {
   const out: string[] = [];
   const walk = (nodes: ScopeNode[]) => {
     for (const n of nodes) {
       out.push(n.slug);
-      walk(n.children);
+      if (Array.isArray(n.children)) walk(n.children);
     }
   };
-  walk(tree);
+  if (Array.isArray(tree)) walk(tree);
   return out.sort();
 }
 

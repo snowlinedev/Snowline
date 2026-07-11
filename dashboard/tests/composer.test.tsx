@@ -20,6 +20,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { App } from "../src/App";
 import { Thread } from "../src/kinds/kinds";
+import { jsonResponse } from "./helpers";
 import { FIXTURES } from "./setup";
 
 // `composer.path` is PLUGIN-RELATIVE, mirroring the `data` path convention
@@ -36,13 +37,6 @@ const COMPOSER = {
 // The URL `postUiApi` actually calls `fetch` with, once the shell proxy
 // prefix is applied.
 const PROXIED_PATH = "/ui-api/governance/pages/branches/main-plan-x/messages";
-
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
-}
 
 describe("thread composer", () => {
   it("renders the composer only when the page declares one", () => {
