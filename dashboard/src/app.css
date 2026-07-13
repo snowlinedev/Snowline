@@ -533,6 +533,196 @@ textarea.page-action-input {
   font-size: 0.95em;
 }
 
+/* kind: board (ui-shell.md §4.2a) — a hierarchical, collapsible read tree.
+ * Sizes/colors off the same density/theme tokens as every other kind — no
+ * relaxation, comfortable or compact, light or dark. */
+.board {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+/* view toggles (group-by / facets) above the tree */
+.board-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+}
+
+.board-control-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.board-view-btn,
+.board-facet-btn {
+  min-height: var(--control-h);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  background: var(--surface-card);
+  color: var(--ink-secondary);
+  font-size: var(--font-small);
+  cursor: pointer;
+}
+
+/* Pressed state carries visible weight ALONGSIDE aria-pressed — the accent
+ * fill is not the only signal (the button label always reads, and screen
+ * readers get aria-pressed). */
+.board-view-btn[aria-pressed="true"],
+.board-facet-btn[aria-pressed="true"] {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+/* nested numbered/unnumbered lists — the shell draws numbers/markers itself */
+.board-top,
+.board-children {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.board-children {
+  padding-left: var(--space-5);
+  border-left: 1px solid var(--hairline);
+  margin-left: var(--space-2);
+}
+
+.board-groups {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.board-group-heading {
+  margin: 0 0 var(--space-2);
+  font-size: var(--font-body);
+  color: var(--ink-secondary);
+}
+
+.board-node {
+  padding: var(--space-1) 0;
+}
+
+.board-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-height: var(--row-h);
+}
+
+.board-index {
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+/* the expand/collapse control — a real button, 24px+ target in comfortable */
+.board-toggle {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--control-h);
+  min-height: var(--control-h);
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: none;
+  color: var(--ink-secondary);
+  cursor: pointer;
+}
+
+.board-toggle:hover {
+  border-color: var(--hairline);
+  background: var(--surface-card);
+}
+
+.board-main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-1) 0;
+}
+
+.board-label-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.board-label {
+  font-weight: 600;
+}
+
+.board-chip {
+  padding: 0 var(--space-2);
+  border: 1px solid var(--hairline);
+  border-radius: 4px;
+  background: var(--surface-page);
+  color: var(--ink-secondary);
+  font-size: var(--font-small);
+}
+
+/* status chips — intent colors the TEXT, never the only signal (the badge
+ * text always reads); the border/background stay neutral */
+.board-badge {
+  padding: 0 var(--space-2);
+  border: 1px solid var(--hairline);
+  border-radius: 4px;
+  font-size: var(--font-small);
+  font-weight: 600;
+}
+
+.board-meta {
+  margin-left: auto;
+}
+
+.board-annotation {
+  color: var(--ink-secondary);
+  font-size: var(--font-small);
+}
+
+/* progress: a dot row (decoration, aria-hidden) + the complete/total text
+ * (the real signal) */
+.board-progress {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.board-progress-dots {
+  display: inline-flex;
+  gap: var(--space-1);
+}
+
+.board-seg {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--status-unknown);
+}
+
+.board-seg-complete {
+  background: var(--status-up);
+}
+
+.board-seg-active {
+  background: var(--accent);
+}
+
+.board-seg-upcoming {
+  background: var(--hairline);
+}
+
+.board-progress-text {
+  font-variant-numeric: tabular-nums;
+}
+
 /* status chip: dot + text label, never color alone */
 .chip {
   display: inline-flex;

@@ -40,9 +40,10 @@ WIDGET_KINDS: frozenset[str] = frozenset({WIDGET_KIND_STAT, WIDGET_KIND_LIST})
 PAGE_KIND_TABLE: str = "table"
 PAGE_KIND_THREAD: str = "thread"
 PAGE_KIND_DOCUMENT: str = "document"
+PAGE_KIND_BOARD: str = "board"
 
 PAGE_KINDS: frozenset[str] = frozenset(
-    {PAGE_KIND_TABLE, PAGE_KIND_THREAD, PAGE_KIND_DOCUMENT}
+    {PAGE_KIND_TABLE, PAGE_KIND_THREAD, PAGE_KIND_DOCUMENT, PAGE_KIND_BOARD}
 )
 
 # The full v1 kind vocabulary — what the drift-guard test pins against the
@@ -143,6 +144,84 @@ DOCUMENT_SHAPE: dict[str, str] = {
     "meta": "optional",
 }
 
+# --- Board (§4.2a) — hierarchical, collapsible, read-only tree ---------------
+#
+# The FIRST kind where the shell keeps a little client-side view state (which
+# facets are hidden, flat vs grouped) over one already-fetched payload rather
+# than re-fetching per view change — a deliberate, narrow exception (§4.2a).
+# The plugin still ships JSON and stamps every meaning (`group_key`, `facets`);
+# the shell only groups by a key the plugin names and hides nodes a
+# plugin-stamped boolean flags, the same "plugin computes meaning, shell only
+# renders" split every other kind holds.
+
+BOARD_PROGRESS_SHAPE: dict[str, str] = {
+    "segments": "required — ordered list of {status} per-phase-like status "
+    "strings ('complete'|'active'|'upcoming', an OPEN set — an unknown value "
+    "renders in upcoming's neutral style rather than erroring), shown as a "
+    "small dot row",
+    "complete": "required — the count rendered alongside the dots, e.g. the 2 "
+    "in '2/5'",
+    "total": "required — the total rendered alongside the dots, e.g. the 5 in "
+    "'2/5'",
+}
+
+BOARD_NODE_SHAPE: dict[str, str] = {
+    "id": "required — stable id, unique within the WHOLE tree (the React key "
+    "and, with `href`, the drill-down target)",
+    "label": "required — the node's primary text",
+    "href": "optional — a shell route this node links to (plugin-relative, "
+    "re-prefixed with /<plugin> exactly like a table row / list item `href`)",
+    "kind": "optional — a FREE node-type hint (e.g. 'initiative'|'phase'|"
+    "'item') for styling/iconography only; the shell does not branch behavior "
+    "on it",
+    "meta": "optional — small trailing text (e.g. an age like '2d')",
+    "chip": "optional — one small leading text badge, distinct from `badges[]` "
+    "(e.g. a scope slug) — a single visually-secondary chip, not a list",
+    "badges": "optional — list of {text, intent?} status chips; `intent` "
+    "reuses the stat/list vocabulary (good|bad|neutral|str) and is NEVER the "
+    "only signal (a decoration alongside the badge's visible text)",
+    "annotation": "optional — one line of small plain-text explanation under "
+    "the label (NOT markdown — a plugin wanting rich text uses `document`)",
+    "progress": f"optional — {BOARD_PROGRESS_SHAPE!r}",
+    "group_key": "optional — which top-level group this node belongs to when "
+    "`group_by` is set; meaningless on non-top-level nodes, ignored there",
+    "facets": "optional — {facetKey: bool} marking which of the payload's "
+    "declared `facets[]` this node satisfies; a facet a node doesn't mention "
+    "defaults to false",
+    "collapsed_by_default": "optional — default false; a node with children "
+    "starts collapsed if true (local shell state, never persisted or "
+    "round-tripped)",
+    "children": "optional — list of BOARD_NODE_SHAPE, recursively "
+    "(omitted/empty on a leaf)",
+}
+
+GROUP_BY_SHAPE: dict[str, str] = {
+    "key": "required — the BoardNode field the shell buckets top-level nodes "
+    "by when grouped (e.g. 'group_key'); an undeclared key degrades every "
+    "node into the 'Ungrouped' bucket, never an error",
+    "label": "required — the grouped toggle's visible label (e.g. 'By org')",
+    "flat_label": "required — the ungrouped toggle's visible label (e.g. "
+    "'Flat'), selected by default",
+}
+
+FACET_SHAPE: dict[str, str] = {
+    "key": "required — the BoardNode.facets key this toggle filters on",
+    "label": "required — the toggle's visible label; names the thing being "
+    "HIDDEN (e.g. 'Hide stale scopes')",
+    "hidden_by_default": "optional — default false; true starts the facet "
+    "filtering nodes where node.facets[key] === true OUT of view",
+}
+
+BOARD_SHAPE: dict[str, str] = {
+    "nodes": f"required — list of {BOARD_NODE_SHAPE!r}, already in the "
+    "plugin's intended default order",
+    "group_by": f"optional — {GROUP_BY_SHAPE!r}; omit to offer no grouping "
+    "toggle",
+    "facets": f"optional — list of {FACET_SHAPE!r}; omit to offer no filter "
+    "toggles",
+    "empty": "optional — placeholder text/state when nodes is []",
+}
+
 # `thread` pages' optional `composer` object (shadow-conversations.md §4): an
 # input-shaped POST target rendered as a markdown textarea + send button at
 # the thread foot. NOT an §4.3 action (button-shaped, confirm semantics) —
@@ -169,6 +248,7 @@ UI_KIND_SHAPES: dict[str, dict[str, str]] = {
     PAGE_KIND_TABLE: TABLE_SHAPE,
     PAGE_KIND_THREAD: THREAD_SHAPE,
     PAGE_KIND_DOCUMENT: DOCUMENT_SHAPE,
+    PAGE_KIND_BOARD: BOARD_SHAPE,
 }
 
 # --- Actions (§5, SPECIFIED — issue #123) ------------------------------------
@@ -224,6 +304,7 @@ __all__ = [
     "PAGE_KIND_TABLE",
     "PAGE_KIND_THREAD",
     "PAGE_KIND_DOCUMENT",
+    "PAGE_KIND_BOARD",
     "PAGE_KINDS",
     "UI_KINDS",
     "STAT_SHAPE",
@@ -235,6 +316,11 @@ __all__ = [
     "THREAD_NODE_SHAPE",
     "THREAD_SHAPE",
     "DOCUMENT_SHAPE",
+    "BOARD_PROGRESS_SHAPE",
+    "BOARD_NODE_SHAPE",
+    "GROUP_BY_SHAPE",
+    "FACET_SHAPE",
+    "BOARD_SHAPE",
     "UI_KIND_SHAPES",
     "ACTION_FIELDS",
     "ACTION_FIELD_FIELDS",

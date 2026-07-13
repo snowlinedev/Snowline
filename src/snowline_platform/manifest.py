@@ -34,7 +34,7 @@ PLUGIN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 UI_CONTRACT_VERSION: int = 1
 
 UI_WIDGET_KINDS: frozenset[str] = frozenset({"stat", "list"})
-UI_PAGE_KINDS: frozenset[str] = frozenset({"table", "thread", "document"})
+UI_PAGE_KINDS: frozenset[str] = frozenset({"table", "thread", "document", "board"})
 UI_KINDS: frozenset[str] = UI_WIDGET_KINDS | UI_PAGE_KINDS
 
 # `thread` pages' optional `composer` block (shadow-conversations.md §4) — the

@@ -19,15 +19,18 @@ def test_widget_kinds():
 
 
 def test_page_kinds():
-    assert ui.PAGE_KINDS == frozenset({"table", "thread", "document"})
+    assert ui.PAGE_KINDS == frozenset({"table", "thread", "document", "board"})
     assert ui.PAGE_KIND_TABLE == "table"
     assert ui.PAGE_KIND_THREAD == "thread"
     assert ui.PAGE_KIND_DOCUMENT == "document"
+    assert ui.PAGE_KIND_BOARD == "board"
 
 
 def test_ui_kinds_is_the_union():
     assert ui.UI_KINDS == ui.WIDGET_KINDS | ui.PAGE_KINDS
-    assert ui.UI_KINDS == frozenset({"stat", "list", "table", "thread", "document"})
+    assert ui.UI_KINDS == frozenset(
+        {"stat", "list", "table", "thread", "document", "board"}
+    )
 
 
 def test_every_kind_has_a_shape_doc():
