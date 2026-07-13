@@ -137,9 +137,100 @@ internally — the platform eats its own vocabulary.
 | `table` | `{ columns: [{ key, label, kind? }], rows: [{ cells, href? }], empty? }` | column `kind` hints (text/chip/time/actor); row `href` targets shell routes |
 | `thread` | `{ title, meta, nodes: [{ author, kind, markdown, at, citations: [...] }] }` | the shadow discussion view: ordered authored markdown nodes with metadata |
 | `document` | `{ title, markdown, meta? }` | rendered markdown (e.g. branch narrative notes) |
+| `board` | `{ nodes: [BoardNode...], group_by?, facets?, empty? }` (§4.2a) | hierarchical, collapsible, read-only tree — specified for the pm roadmap (`roadmap-board.md`, snowline-pm repo) |
 
 `search` (query box + result list, for shadow corpus search) is anticipated
 but **deferred** until the read views prove out.
+
+#### 4.2a The `board` kind — hierarchical read view (specified — roadmap-board.md)
+
+`table` renders one flat grid; the pm roadmap needs REAL nesting (initiative →
+phase → item), per-node status badges, small progress indicators, and a couple
+of client-side view toggles (group-by, show/hide facets) that must not
+round-trip the network on every click. `board` is that kind — still fully
+declarative (the plugin ships JSON, the shell owns every pixel, §2's posture
+holds), but it is the FIRST kind where the shell keeps a small amount of
+client-side view state (which facets are hidden, flat vs grouped) over one
+already-fetched payload, rather than re-fetching per view change. That's a
+deliberate, narrow exception, not a precedent for shell-side business logic:
+the shell does not know what "org" or "stale" MEAN — it only groups nodes by
+a `group_by.key` the plugin names and hides nodes an already-plugin-stamped
+boolean flags, exactly the same "plugin computes meaning, shell only renders"
+split every other kind holds. This is viable because board data is small
+(a portfolio's roadmap, not a paginated log) — a kind for large/streaming
+hierarchies would need a different contract.
+
+**`BoardNode`** (recursive):
+
+| field | req? | meaning |
+|---|---|---|
+| `id` | yes | stable id, unique within the whole tree — the React key and (with `href`) the drill-down target |
+| `label` | yes | the node's primary text |
+| `href` | no | a shell route this node links to (same plugin-relative + re-prefix treatment as a `table` row/`list` item `href`) |
+| `kind` | no | a free string node-type hint (e.g. `initiative`/`phase`/`item`) — styling/iconography only, the shell does not branch behavior on it |
+| `meta` | no | small trailing text (e.g. an age like `"2d"`) |
+| `chip` | no | small leading text badge distinct from `badges[]` (e.g. a scope slug) — one visually-secondary chip, not a list |
+| `badges` | no | `[{ text, intent? }]` — status chips (e.g. `{"text": "STUCK", "intent": "bad"}`); `intent` reuses the `stat`/`list` vocabulary (`good`\|`bad`\|`neutral`\|string) and is NEVER the only signal (§7: intent is a decoration alongside visible text, same rule `KindList`'s `dot` already follows) |
+| `annotation` | no | one line of small explanatory text under the label (e.g. `"waiting on Downgrade flow PR"`) — plain text, not markdown (no parser needed for a one-liner; a plugin wanting rich text uses `document` instead) |
+| `progress` | no | `{ segments: [{ status }], complete, total }` — `segments` is an ordered list of per-phase-like status strings (`"complete"`\|`"active"`\|`"upcoming"`, open string set — an unknown value renders as `upcoming`'s neutral style rather than erroring) rendered as a small dot row; `complete`/`total` render alongside as `"2/5"` |
+| `group_key` | no | which top-level group this node belongs to when `group_by` is set (§ below) — meaningless on non-top-level nodes, ignored there |
+| `facets` | no | `{ [facetKey]: bool }` — which of the payload's declared `facets[]` this node satisfies (e.g. `{"stale": true}`); a facet a node doesn't mention defaults to `false` |
+| `collapsed_by_default` | no | default `false`; a node with children starts collapsed if `true` — expand/collapse is local shell state, never persisted server-side or round-tripped |
+| `children` | no | `BoardNode[]`, same shape, recursively — omitted/empty on a leaf |
+
+**Top-level response:**
+
+```jsonc
+{
+  "nodes": [ /* BoardNode[], already in the plugin's intended default order */ ],
+  "group_by": {                      // optional — omit to offer no grouping toggle
+    "key": "group_key",
+    "label": "org",                  // the toggle's visible label, e.g. "By org"
+    "flat_label": "Flat"             // the ungrouped toggle's visible label
+  },
+  "facets": [                        // optional — omit to offer no filter toggles
+    { "key": "stale", "label": "Hide stale scopes", "hidden_by_default": true },
+    { "key": "initiative_only", "label": "Initiative work only", "hidden_by_default": false }
+  ],
+  "empty": "Nothing here."
+}
+```
+
+**Shell rendering.** Top-level nodes render as a numbered, collapsible list
+(node index, 1-based — pure presentation, never a payload field, so a
+plugin's own ordering is always what's numbered). A node with `children`
+renders an expand/collapse control (default state per
+`collapsed_by_default`); collapsing hides the whole subtree, purely a CSS/DOM
+state change — no refetch. When `group_by` is present the shell offers a
+`flat_label`/`label` toggle (radio-style, `Flat` selected by default) that
+either renders `nodes` as-is or buckets top-level nodes by `group_key` under a
+group heading (nodes with no matching `group_key` fall into an "Ungrouped"
+bucket) — same node array, same objects, just a different top-level grouping,
+so this NEVER changes which nodes exist or their `href`s. When `facets` is
+present the shell renders one toggle per declared facet; a facet whose
+`hidden_by_default` is `true` starts filtering nodes where
+`node.facets[key] === true` OUT of view (both the "hide" wording and the
+default read the same way: the facet names the thing being HIDDEN, matching
+the pm mock's own "Hide stale scopes" copy) — toggling a facet OFF/ON never
+refetches, and a parent whose every child is filtered out still renders
+(collapsed to show 0 visible children, not hidden itself) so the tree's shape
+stays legible.
+
+**Validation** (fail-visible, §4.4, same posture as every other kind): a
+response missing `nodes` (or `nodes` not an array), or any node missing
+`id`/`label`, renders the malformed-data card. `group_by`/`facets`/per-node
+optional fields are never validated beyond their own type — a facet key with
+no `facets[]` declaration still renders (just with no toggle to hide it), and
+an undeclared `group_by.key` degrades every node into the "Ungrouped" bucket
+when grouped view is selected, never an error.
+
+**Deferred, this increment:** drag-to-reorder (§4.3 already names this as a
+later `board` capability — a reorder endpoint + capability flag, once a
+plugin needs write-from-board); `search`-style free-text filtering (facets are
+plugin-declared booleans, not an open query); persisting a user's toggle
+choices across sessions (local component state only, resets on reload,
+consistent with §9's "no persistence beyond the tailnet trust edge" posture
+for v1 UI state generally).
 
 ### 4.3 Actions (page-level write affordances — specified, §5)
 
@@ -312,8 +403,11 @@ colorblind-safe series palette.
 3. **First registered contribution** (governance): `/ui-api` JSON routes over
    the existing shadow service layer; `stat` widget + `table` branches page +
    `thread`/`document` branch view.
-4. **Later** (pm repo, tracked there): roadmap pages via `table`/`board` +
-   the action contract; shell grows action rendering then.
+4. **Roadmap** (pm repo, tracked there — `roadmap-board.md`): the pm roadmap
+   moves off the `table`-with-indentation stopgap (`ui_api.py`'s current
+   `_item_row(indent=True)`) onto `board` (§4.2a) — real nesting, gating
+   badges, org grouping/facets; the action contract lands whenever pm's
+   roadmap first needs a browser write.
 
 ## 9. Out of scope (v1)
 
