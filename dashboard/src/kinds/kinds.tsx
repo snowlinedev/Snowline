@@ -563,13 +563,328 @@ export function Document(props: { title: string; markdown: string; meta?: ReactN
   );
 }
 
+/* ---- kind: board ----------------------------------------------------------
+ * A hierarchical, collapsible, read-only tree (ui-shell.md §4.2a): the pm
+ * roadmap's initiative → phase → item nesting, per-node status badges + small
+ * progress indicators, and a couple of client-side view toggles (group-by,
+ * show/hide facets) that must NOT round-trip the network on every click.
+ *
+ * This is the ONE kind where the shell keeps a small amount of client-side
+ * view state (which facets are hidden, flat vs grouped) over one
+ * already-fetched payload — a deliberate, narrow exception (§4.2a), not a
+ * precedent for shell-side business logic. The shell does not know what "org"
+ * or "stale" MEAN: it groups nodes by a `group_by.key` the plugin names and
+ * hides nodes an already-plugin-stamped `facets` boolean flags, the same
+ * "plugin computes meaning, shell only renders" split every other kind holds. */
+
+export type BoardBadge = { text: string; intent?: "good" | "bad" | "neutral" | string };
+export type BoardProgress = {
+  segments?: { status: string }[];
+  complete?: number;
+  total?: number;
+};
+export type BoardNode = {
+  id: string;
+  label: string;
+  href?: string;
+  kind?: string;
+  meta?: ReactNode;
+  chip?: string;
+  badges?: BoardBadge[];
+  annotation?: string;
+  progress?: BoardProgress;
+  group_key?: string;
+  facets?: Record<string, boolean>;
+  collapsed_by_default?: boolean;
+  children?: BoardNode[];
+};
+export type BoardGroupBy = { key: string; label: string; flat_label: string };
+export type BoardFacet = { key: string; label: string; hidden_by_default?: boolean };
+
+// The known progress-segment states; anything else renders in `upcoming`'s
+// neutral style rather than erroring (§4.2a: an OPEN string set).
+const PROGRESS_STATES = new Set(["complete", "active", "upcoming"]);
+function progressClass(status: unknown): string {
+  return typeof status === "string" && PROGRESS_STATES.has(status)
+    ? status
+    : "upcoming";
+}
+
+/** A node's `progress` (§4.2a): a small dot row of per-phase-like segment
+ * statuses PLUS a `complete`/`total` count. The dots are decoration
+ * (aria-hidden — an unknown status is neutral, not an error); the count text
+ * is the real signal, the same "never color-only" rule badges follow. The
+ * count text always renders when progress is present so the dots are never the
+ * only thing shown. */
+function BoardProgressRow(props: { progress: BoardProgress }) {
+  const segments = Array.isArray(props.progress.segments)
+    ? props.progress.segments
+    : [];
+  const total =
+    typeof props.progress.total === "number" ? props.progress.total : segments.length;
+  const complete =
+    typeof props.progress.complete === "number"
+      ? props.progress.complete
+      : segments.filter((s) => progressClass(s?.status) === "complete").length;
+  return (
+    <div className="board-progress">
+      {segments.length > 0 && (
+        <span className="board-progress-dots" aria-hidden="true">
+          {segments.map((s, i) => (
+            <span key={i} className={`board-seg board-seg-${progressClass(s?.status)}`} />
+          ))}
+        </span>
+      )}
+      <span className="board-progress-text meta">
+        {complete}/{total}
+      </span>
+    </div>
+  );
+}
+
+/** One node in the tree, rendered recursively. Expand/collapse is LOCAL state
+ * (per node, keyed by `node.id` so it survives filter toggles) — a real
+ * `<button aria-expanded>` (keyboard-operable, matching PageAction's pattern),
+ * never a div onClick. The subtree is always in the DOM and toggled with the
+ * `hidden` attribute (§4.2a: "purely a CSS/DOM state change — no refetch"),
+ * which keeps the button's `aria-controls` idref valid and drops collapsed
+ * children from the a11y tree. Only TOP-LEVEL nodes are numbered (`index`);
+ * children render in an unnumbered nested list. */
+function BoardNodeRow(props: { plugin: string; node: BoardNode; index?: number }) {
+  const { node } = props;
+  const children = Array.isArray(node.children) ? node.children : [];
+  const hasChildren = children.length > 0;
+  const [expanded, setExpanded] = useState(!node.collapsed_by_default);
+  const childrenId = useId();
+  const href = prefixHref(props.plugin, node.href);
+  return (
+    <li className="board-node">
+      <div className="board-row">
+        {props.index != null && (
+          <span className="board-index meta" aria-hidden="true">
+            {props.index}.
+          </span>
+        )}
+        {hasChildren && (
+          <button
+            type="button"
+            className="board-toggle"
+            aria-expanded={expanded}
+            aria-controls={childrenId}
+            aria-label={`${expanded ? "Collapse" : "Expand"} ${node.label}`}
+            onClick={() => setExpanded((v) => !v)}
+          >
+            <span className="board-toggle-icon" aria-hidden="true">
+              {expanded ? "▾" : "▸"}
+            </span>
+          </button>
+        )}
+        <div className="board-main">
+          <div className="board-label-line">
+            {node.chip && <span className="board-chip">{node.chip}</span>}
+            {href ? (
+              <Link to={href} className="board-label">
+                {node.label}
+              </Link>
+            ) : (
+              <span className="board-label">{node.label}</span>
+            )}
+            {/* Badges: intent is a decoration on the badge's own visible text,
+             * never a color-only signal (ACCESSIBILITY.md 1.4.1). Guarded with
+             * Array.isArray (not just a null check) — a plugin's `badges` can
+             * be present but malformed, and validateBoardNodes only checks
+             * `id`/`label` per node, same loose posture as every other
+             * validator, so a non-array value must degrade here rather than
+             * throw. */}
+            {(Array.isArray(node.badges) ? node.badges : []).map((b, i) => (
+              <span key={i} className={`board-badge intent-${b.intent ?? "neutral"}`}>
+                {b.text}
+              </span>
+            ))}
+            {node.meta != null && <span className="meta board-meta">{node.meta}</span>}
+          </div>
+          {node.annotation && <div className="board-annotation">{node.annotation}</div>}
+          {node.progress && <BoardProgressRow progress={node.progress} />}
+        </div>
+      </div>
+      {hasChildren && (
+        <ul id={childrenId} className="board-children" hidden={!expanded}>
+          {children.map((child) => (
+            <BoardNodeRow key={child.id} plugin={props.plugin} node={child} />
+          ))}
+        </ul>
+      )}
+    </li>
+  );
+}
+
+/** Filter nodes RECURSIVELY (§4.2a): drop any node whose OWN facets satisfy a
+ * currently-hidden facet key, but keep surviving parents even when every child
+ * is filtered out (they render with 0 visible children, never vanish, so the
+ * tree's shape stays legible). Never changes which nodes exist server-side —
+ * just what's shown. */
+function facetFilter(nodes: BoardNode[], hidden: Set<string>): BoardNode[] {
+  if (hidden.size === 0) return nodes;
+  const kept: BoardNode[] = [];
+  for (const n of nodes) {
+    const nodeHidden =
+      n.facets != null && [...hidden].some((k) => n.facets![k] === true);
+    if (nodeHidden) continue;
+    kept.push(
+      Array.isArray(n.children)
+        ? { ...n, children: facetFilter(n.children, hidden) }
+        : n,
+    );
+  }
+  return kept;
+}
+
+/** Bucket TOP-LEVEL nodes by `node[key]` (§4.2a), preserving first-seen order;
+ * a node with no string value for the key falls into "Ungrouped" (so an
+ * undeclared `group_by.key` degrades every node into one bucket, never an
+ * error). Same node objects, same hrefs — grouping only changes the top-level
+ * arrangement. */
+function groupNodes(
+  nodes: BoardNode[],
+  key: string,
+): { label: string; nodes: BoardNode[] }[] {
+  const order: string[] = [];
+  const buckets = new Map<string, BoardNode[]>();
+  for (const n of nodes) {
+    const raw = (n as Record<string, unknown>)[key];
+    const label = typeof raw === "string" && raw !== "" ? raw : "Ungrouped";
+    let bucket = buckets.get(label);
+    if (!bucket) {
+      bucket = [];
+      buckets.set(label, bucket);
+      order.push(label);
+    }
+    bucket.push(n);
+  }
+  return order.map((label) => ({ label, nodes: buckets.get(label)! }));
+}
+
+/** The `board` kind (ui-shell.md §4.2a). Group-by (Flat / grouped) and
+ * per-facet toggles are LOCAL component state sitting above the tree, applied
+ * to the ALREADY-fetched `nodes` array — no refetch, no `useUiData` change,
+ * never persisted across sessions. Flat is selected by default; a facet whose
+ * `hidden_by_default` is true starts filtering. */
+export function Board(props: {
+  plugin: string;
+  nodes: BoardNode[];
+  groupBy?: BoardGroupBy;
+  facets?: BoardFacet[];
+  empty?: string;
+}) {
+  // A malformed `facets` (present but not an array — validateBoardData only
+  // checks `nodes`, same loose posture as every other kind's validator)
+  // degrades to "no facets" here rather than crashing every `.map`/iteration
+  // below — the same fail-visible-by-degradation rule `badges` follows.
+  const facets = Array.isArray(props.facets) ? props.facets : [];
+  const [grouped, setGrouped] = useState(false);
+  const [hidden, setHidden] = useState<Set<string>>(() => {
+    const s = new Set<string>();
+    for (const f of facets) if (f.hidden_by_default) s.add(f.key);
+    return s;
+  });
+  const toggleFacet = (key: string) =>
+    setHidden((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  const visible = facetFilter(props.nodes, hidden);
+
+  const tree =
+    props.groupBy && grouped ? (
+      <div className="board-groups">
+        {groupNodes(visible, props.groupBy.key).map((g) => (
+          <section key={g.label} className="board-group">
+            {/* h2: the first heading below Layout's page h1 (the page's Card is
+             * untitled), so no heading level is skipped (axe heading-order). */}
+            <h2 className="board-group-heading">{g.label}</h2>
+            <ol className="board-top">
+              {g.nodes.map((n, i) => (
+                <BoardNodeRow key={n.id} plugin={props.plugin} node={n} index={i + 1} />
+              ))}
+            </ol>
+          </section>
+        ))}
+      </div>
+    ) : (
+      <ol className="board-top">
+        {visible.map((n, i) => (
+          <BoardNodeRow key={n.id} plugin={props.plugin} node={n} index={i + 1} />
+        ))}
+      </ol>
+    );
+
+  return (
+    <div className="board">
+      {(props.groupBy || facets.length > 0) && (
+        <div className="board-controls">
+          {props.groupBy && (
+            <div className="board-control-group" role="group" aria-label="Grouping">
+              {/* Radio-style: aria-pressed carries the selection, the label
+               * carries the meaning — never color-only. Flat is default. */}
+              <button
+                type="button"
+                className="board-view-btn"
+                aria-pressed={!grouped}
+                onClick={() => setGrouped(false)}
+              >
+                {props.groupBy.flat_label}
+              </button>
+              <button
+                type="button"
+                className="board-view-btn"
+                aria-pressed={grouped}
+                onClick={() => setGrouped(true)}
+              >
+                {props.groupBy.label}
+              </button>
+            </div>
+          )}
+          {facets.length > 0 && (
+            <div className="board-control-group" role="group" aria-label="Filters">
+              {facets.map((f) => (
+                <button
+                  key={f.key}
+                  type="button"
+                  className="board-facet-btn"
+                  aria-pressed={hidden.has(f.key)}
+                  onClick={() => toggleFacet(f.key)}
+                >
+                  {f.label}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+      {props.nodes.length === 0 ? (
+        <p className="state-note">{props.empty ?? "Nothing here."}</p>
+      ) : visible.length === 0 ? (
+        // Distinct from the true-empty case above: nodes exist, but the
+        // active facet toggles filtered every one of them out — a blank
+        // render here (checking props.nodes.length alone) would be
+        // indistinguishable from a broken page.
+        <p className="state-note">Nothing matches the current filters.</p>
+      ) : (
+        tree
+      )}
+    </div>
+  );
+}
+
 /* ---- registered-contribution dispatch (ui-shell.md §4.4 fail-visible) ----- */
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-const KNOWN_KINDS = new Set(["stat", "list", "table", "thread", "document"]);
+const KNOWN_KINDS = new Set(["stat", "list", "table", "thread", "document", "board"]);
 
 function validateStat(d: unknown) {
   if (!isRecord(d)) return null;
@@ -636,6 +951,69 @@ function validateDocumentData(d: unknown) {
     return null;
   }
   return d as { title: string; markdown: string; meta?: ReactNode };
+}
+
+/** Minimal, recursive shape check (§4.2a fail-visible): `nodes` must be an
+ * array, and every node — including nested `children` — must carry a string
+ * `id` and `label`. Most other fields are untyped beyond "don't crash" (the
+ * shell renders what it gets), but `badges`/`facets`, when PRESENT, are
+ * type-checked and REJECTED (not silently coerced) on a bad shape — same
+ * "malformed content fails visible rather than being coerced" rule
+ * `validateThreadData` already applies to `flags`, because a `.map`/lookup
+ * over a wrong-shaped `badges`/`facets` value would otherwise crash the
+ * render tree instead of showing the malformed-data card. `children`, when
+ * present, must itself be a valid node array. */
+function validateBoardNodes(nodes: unknown): boolean {
+  if (!Array.isArray(nodes)) return false;
+  for (const n of nodes) {
+    if (!isRecord(n) || typeof n.id !== "string" || typeof n.label !== "string") {
+      return false;
+    }
+    if (
+      n.badges !== undefined &&
+      (!Array.isArray(n.badges) ||
+        n.badges.some((b) => !isRecord(b) || typeof b.text !== "string"))
+    ) {
+      return false;
+    }
+    if (
+      n.facets !== undefined &&
+      (!isRecord(n.facets) ||
+        Object.values(n.facets).some((v) => typeof v !== "boolean"))
+    ) {
+      return false;
+    }
+    if (n.children !== undefined && !validateBoardNodes(n.children)) return false;
+  }
+  return true;
+}
+
+function validateBoardData(d: unknown) {
+  if (!isRecord(d) || !validateBoardNodes(d.nodes)) return null;
+  if (
+    d.group_by !== undefined &&
+    (!isRecord(d.group_by) ||
+      typeof d.group_by.key !== "string" ||
+      typeof d.group_by.label !== "string" ||
+      typeof d.group_by.flat_label !== "string")
+  ) {
+    return null;
+  }
+  if (
+    d.facets !== undefined &&
+    (!Array.isArray(d.facets) ||
+      d.facets.some(
+        (f) => !isRecord(f) || typeof f.key !== "string" || typeof f.label !== "string",
+      ))
+  ) {
+    return null;
+  }
+  return d as {
+    nodes: BoardNode[];
+    group_by?: BoardGroupBy;
+    facets?: BoardFacet[];
+    empty?: string;
+  };
 }
 
 /** Row/item `href` values are SHELL routes, and a plugin only knows its OWN
@@ -759,6 +1137,19 @@ export function RegisteredKind(props: {
       const v = validateDocumentData(data);
       if (!v) return malformed;
       return <Document title={v.title} markdown={v.markdown} meta={v.meta} />;
+    }
+    case "board": {
+      const v = validateBoardData(data);
+      if (!v) return malformed;
+      return (
+        <Board
+          plugin={props.plugin}
+          nodes={v.nodes}
+          groupBy={v.group_by}
+          facets={v.facets}
+          empty={v.empty}
+        />
+      );
     }
     default:
       return <UnsupportedKindCard plugin={props.plugin} kind={props.kind} />;

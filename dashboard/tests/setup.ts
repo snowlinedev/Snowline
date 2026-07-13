@@ -109,6 +109,60 @@ export const FIXTURES: Record<string, unknown> = {
                   disabled_when: "archived",
                 },
               },
+              // ui-shell.md §4.2a: the `board` kind — a hierarchical read tree
+              // (the pm roadmap shape). >=2 levels of nesting so recursion +
+              // the collapse control get exercised; declares group_by + facets
+              // so the client-side view toggles render. nav:false but routable
+              // at /governance/roadmap, like shadow-branch.
+              {
+                id: "roadmap",
+                route: "/roadmap",
+                title: "Roadmap",
+                nav: false,
+                kind: "board",
+                data: "/ui-api/pages/roadmap",
+              },
+              // Deliberately malformed (a node missing `id`/`label`) — exercises
+              // the §4.4 malformed-data card, the board-kind analogue of the
+              // broken-stat widget above.
+              {
+                id: "roadmap-broken",
+                route: "/roadmap-broken",
+                title: "Broken roadmap",
+                nav: false,
+                kind: "board",
+                data: "/ui-api/pages/roadmap-broken",
+              },
+              // Malformed `badges`/`facets` (present but wrong-shaped) —
+              // validateBoardData must REJECT these, not silently coerce
+              // them and crash on a downstream `.map`.
+              {
+                id: "roadmap-bad-badges",
+                route: "/roadmap-bad-badges",
+                title: "Roadmap with bad badges",
+                nav: false,
+                kind: "board",
+                data: "/ui-api/pages/roadmap-bad-badges",
+              },
+              {
+                id: "roadmap-bad-facets",
+                route: "/roadmap-bad-facets",
+                title: "Roadmap with bad facets",
+                nav: false,
+                kind: "board",
+                data: "/ui-api/pages/roadmap-bad-facets",
+              },
+              // Every top-level node is filtered out by a hidden_by_default
+              // facet — the "nothing matches the filters" state, distinct
+              // from a truly empty board (props.empty).
+              {
+                id: "roadmap-all-filtered",
+                route: "/roadmap-all-filtered",
+                title: "Roadmap, all filtered",
+                nav: false,
+                kind: "board",
+                data: "/ui-api/pages/roadmap-all-filtered",
+              },
             ],
           },
         },
@@ -160,6 +214,92 @@ export const FIXTURES: Record<string, unknown> = {
         citations: ["decision-abc"],
       },
     ],
+  },
+  // ui-shell.md §4.2a board payload: two top-level initiatives (one grouped
+  // under snowlinedev, one under acme and flagged `stale`), initiative → phase
+  // → item nesting (3 levels), per-node badges/chip/annotation/progress/meta,
+  // a collapsed-by-default phase, and a linked leaf item.
+  "/ui-api/governance/pages/roadmap": {
+    nodes: [
+      {
+        id: "init-replication",
+        label: "Replication continuity",
+        kind: "initiative",
+        group_key: "snowlinedev",
+        chip: "snowlinedev/snowline",
+        meta: "3d",
+        badges: [{ text: "ACTIVE", intent: "good" }],
+        progress: {
+          segments: [{ status: "complete" }, { status: "active" }, { status: "upcoming" }],
+          complete: 1,
+          total: 3,
+        },
+        facets: { stale: false },
+        children: [
+          {
+            id: "phase-pairing",
+            label: "Pairing",
+            kind: "phase",
+            badges: [{ text: "STUCK", intent: "bad" }],
+            annotation: "waiting on the Downgrade flow PR",
+            children: [
+              {
+                id: "item-sign",
+                label: "Sign envelopes",
+                kind: "item",
+                href: "/roadmap/item-sign",
+                facets: { initiative_only: false },
+              },
+              { id: "item-verify", label: "Verify peer", kind: "item" },
+            ],
+          },
+          {
+            id: "phase-ingest",
+            label: "Ingest",
+            kind: "phase",
+            collapsed_by_default: true,
+            children: [{ id: "item-requeue", label: "Requeue by stream", kind: "item" }],
+          },
+        ],
+      },
+      {
+        id: "init-stale",
+        label: "Stale exploration",
+        kind: "initiative",
+        group_key: "acme",
+        badges: [{ text: "STALE", intent: "neutral" }],
+        facets: { stale: true },
+        children: [{ id: "phase-idea", label: "Idea", kind: "phase" }],
+      },
+    ],
+    group_by: { key: "group_key", label: "By org", flat_label: "Flat" },
+    facets: [
+      { key: "stale", label: "Hide stale scopes", hidden_by_default: true },
+      { key: "initiative_only", label: "Initiative work only", hidden_by_default: false },
+    ],
+    empty: "Nothing on the roadmap.",
+  },
+  // A node missing required `id`/`label` — malformed, fails visible (§4.4).
+  "/ui-api/governance/pages/roadmap-broken": {
+    nodes: [{ label: "orphan with no id" }],
+  },
+  // `badges` present but not an array of {text} objects — malformed, fails
+  // visible rather than crashing `.map`/being silently dropped.
+  "/ui-api/governance/pages/roadmap-bad-badges": {
+    nodes: [{ id: "n1", label: "Node", badges: "not-an-array" }],
+  },
+  // Top-level `facets` present but not an array of {key,label} objects —
+  // malformed, fails visible.
+  "/ui-api/governance/pages/roadmap-bad-facets": {
+    nodes: [{ id: "n1", label: "Node" }],
+    facets: "not-an-array",
+  },
+  // Every top-level node carries a facet a hidden_by_default toggle hides —
+  // renders the "nothing matches the filters" state, not a blank page.
+  "/ui-api/governance/pages/roadmap-all-filtered": {
+    nodes: [{ id: "n1", label: "Filtered node", facets: { stale: true } }],
+    facets: [{ key: "stale", label: "Hide stale scopes", hidden_by_default: true }],
+    empty: "Nothing on the roadmap.",
   },
   "/surfaces": {
     surfaces: [

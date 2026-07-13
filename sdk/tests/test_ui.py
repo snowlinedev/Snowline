@@ -19,15 +19,18 @@ def test_widget_kinds():
 
 
 def test_page_kinds():
-    assert ui.PAGE_KINDS == frozenset({"table", "thread", "document"})
+    assert ui.PAGE_KINDS == frozenset({"table", "thread", "document", "board"})
     assert ui.PAGE_KIND_TABLE == "table"
     assert ui.PAGE_KIND_THREAD == "thread"
     assert ui.PAGE_KIND_DOCUMENT == "document"
+    assert ui.PAGE_KIND_BOARD == "board"
 
 
 def test_ui_kinds_is_the_union():
     assert ui.UI_KINDS == ui.WIDGET_KINDS | ui.PAGE_KINDS
-    assert ui.UI_KINDS == frozenset({"stat", "list", "table", "thread", "document"})
+    assert ui.UI_KINDS == frozenset(
+        {"stat", "list", "table", "thread", "document", "board"}
+    )
 
 
 def test_every_kind_has_a_shape_doc():
@@ -59,3 +62,13 @@ def test_package_reexports_ui_constants():
     assert sdk.UI_CONTRACT_VERSION == ui.UI_CONTRACT_VERSION
     assert sdk.UI_KINDS == ui.UI_KINDS
     assert sdk.UI_KIND_SHAPES is ui.UI_KIND_SHAPES
+    # Every individual PAGE_KIND_* constant is re-exported at the top level
+    # too (a plugin author reasonably expects `from snowline_plugin_sdk import
+    # PAGE_KIND_X` to work the same way for every kind, not just some — a
+    # newly-added kind missing here is an inconsistent, undocumented import
+    # surface, not a fail-visible-at-render concern like the kind vocabulary
+    # itself).
+    assert sdk.PAGE_KIND_TABLE == ui.PAGE_KIND_TABLE
+    assert sdk.PAGE_KIND_THREAD == ui.PAGE_KIND_THREAD
+    assert sdk.PAGE_KIND_DOCUMENT == ui.PAGE_KIND_DOCUMENT
+    assert sdk.PAGE_KIND_BOARD == ui.PAGE_KIND_BOARD

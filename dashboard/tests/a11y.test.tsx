@@ -25,6 +25,11 @@ const PAGES = [
   "/scopes",
   "/governance/shadow",
   "/governance/shadow/main-plan-x",
+  // The registered `board` page (ui-shell.md §4.2a): audits the collapse
+  // controls (real aria-expanded buttons), the group-by / facet toggles
+  // (aria-pressed, labelled), and the badges (never color-only) — all through
+  // the same kind dispatch as the native pages.
+  "/governance/roadmap",
 ];
 
 describe("axe: native pages", () => {
