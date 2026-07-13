@@ -133,6 +133,36 @@ export const FIXTURES: Record<string, unknown> = {
                 kind: "board",
                 data: "/ui-api/pages/roadmap-broken",
               },
+              // Malformed `badges`/`facets` (present but wrong-shaped) —
+              // validateBoardData must REJECT these, not silently coerce
+              // them and crash on a downstream `.map`.
+              {
+                id: "roadmap-bad-badges",
+                route: "/roadmap-bad-badges",
+                title: "Roadmap with bad badges",
+                nav: false,
+                kind: "board",
+                data: "/ui-api/pages/roadmap-bad-badges",
+              },
+              {
+                id: "roadmap-bad-facets",
+                route: "/roadmap-bad-facets",
+                title: "Roadmap with bad facets",
+                nav: false,
+                kind: "board",
+                data: "/ui-api/pages/roadmap-bad-facets",
+              },
+              // Every top-level node is filtered out by a hidden_by_default
+              // facet — the "nothing matches the filters" state, distinct
+              // from a truly empty board (props.empty).
+              {
+                id: "roadmap-all-filtered",
+                route: "/roadmap-all-filtered",
+                title: "Roadmap, all filtered",
+                nav: false,
+                kind: "board",
+                data: "/ui-api/pages/roadmap-all-filtered",
+              },
             ],
           },
         },
@@ -252,6 +282,24 @@ export const FIXTURES: Record<string, unknown> = {
   // A node missing required `id`/`label` — malformed, fails visible (§4.4).
   "/ui-api/governance/pages/roadmap-broken": {
     nodes: [{ label: "orphan with no id" }],
+  },
+  // `badges` present but not an array of {text} objects — malformed, fails
+  // visible rather than crashing `.map`/being silently dropped.
+  "/ui-api/governance/pages/roadmap-bad-badges": {
+    nodes: [{ id: "n1", label: "Node", badges: "not-an-array" }],
+  },
+  // Top-level `facets` present but not an array of {key,label} objects —
+  // malformed, fails visible.
+  "/ui-api/governance/pages/roadmap-bad-facets": {
+    nodes: [{ id: "n1", label: "Node" }],
+    facets: "not-an-array",
+  },
+  // Every top-level node carries a facet a hidden_by_default toggle hides —
+  // renders the "nothing matches the filters" state, not a blank page.
+  "/ui-api/governance/pages/roadmap-all-filtered": {
+    nodes: [{ id: "n1", label: "Filtered node", facets: { stale: true } }],
+    facets: [{ key: "stale", label: "Hide stale scopes", hidden_by_default: true }],
+    empty: "Nothing on the roadmap.",
   },
   "/surfaces": {
     surfaces: [

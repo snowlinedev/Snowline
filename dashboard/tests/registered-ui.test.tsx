@@ -75,7 +75,11 @@ describe("home grid: registered widgets", () => {
       </MemoryRouter>,
     );
     await screen.findByText("Open shadow branches");
-    expect(screen.getByText("3")).toBeTruthy();
+    // The widget's title renders immediately from static manifest data, but
+    // its VALUE depends on the async /ui-api fetch resolving — a synchronous
+    // getByText here raced that fetch (usually won, but not guaranteed; grew
+    // flaky as the wider suite's async workload increased). findByText waits.
+    expect(await screen.findByText("3")).toBeTruthy();
     expect(screen.getByText("open branches")).toBeTruthy();
   });
 

@@ -33,6 +33,7 @@ from .contract import (
 )
 from .events import BadSignature, verify_event
 from .ui import (
+    PAGE_KIND_BOARD,
     PAGE_KIND_DOCUMENT,
     PAGE_KIND_TABLE,
     PAGE_KIND_THREAD,
@@ -62,6 +63,7 @@ __all__ = [
     "PAGE_KIND_TABLE",
     "PAGE_KIND_THREAD",
     "PAGE_KIND_DOCUMENT",
+    "PAGE_KIND_BOARD",
     "PAGE_KINDS",
     "UI_KINDS",
     "UI_KIND_SHAPES",

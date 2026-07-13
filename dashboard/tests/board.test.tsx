@@ -61,6 +61,40 @@ describe("board kind: rendering", () => {
     // does), not the proxied /ui-api/<plugin>/… URL.
     expect(error.textContent).toContain("/ui-api/pages/roadmap-broken");
   });
+
+  it("fails visible on wrong-shaped badges rather than crashing", async () => {
+    render(
+      <MemoryRouter initialEntries={["/governance/roadmap-bad-badges"]}>
+        <App />
+      </MemoryRouter>,
+    );
+    const error = await screen.findByRole("alert");
+    expect(error.textContent).toContain("/ui-api/pages/roadmap-bad-badges");
+  });
+
+  it("fails visible on wrong-shaped top-level facets rather than crashing", async () => {
+    render(
+      <MemoryRouter initialEntries={["/governance/roadmap-bad-facets"]}>
+        <App />
+      </MemoryRouter>,
+    );
+    const error = await screen.findByRole("alert");
+    expect(error.textContent).toContain("/ui-api/pages/roadmap-bad-facets");
+  });
+
+  it("shows a filtered-empty state, not a blank page, when every node is hidden", async () => {
+    render(
+      <MemoryRouter initialEntries={["/governance/roadmap-all-filtered"]}>
+        <App />
+      </MemoryRouter>,
+    );
+    await screen.findByRole("button", { name: "Hide stale scopes" });
+    expect(screen.queryByText("Filtered node")).toBeNull();
+    expect(screen.getByText("Nothing matches the current filters.")).toBeTruthy();
+    // Distinct from the plugin's true-empty `empty` copy, which never renders
+    // here — nodes DO exist, they're just all filtered.
+    expect(screen.queryByText("Nothing on the roadmap.")).toBeNull();
+  });
 });
 
 describe("board kind: collapse control", () => {

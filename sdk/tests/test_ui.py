@@ -62,3 +62,13 @@ def test_package_reexports_ui_constants():
     assert sdk.UI_CONTRACT_VERSION == ui.UI_CONTRACT_VERSION
     assert sdk.UI_KINDS == ui.UI_KINDS
     assert sdk.UI_KIND_SHAPES is ui.UI_KIND_SHAPES
+    # Every individual PAGE_KIND_* constant is re-exported at the top level
+    # too (a plugin author reasonably expects `from snowline_plugin_sdk import
+    # PAGE_KIND_X` to work the same way for every kind, not just some — a
+    # newly-added kind missing here is an inconsistent, undocumented import
+    # surface, not a fail-visible-at-render concern like the kind vocabulary
+    # itself).
+    assert sdk.PAGE_KIND_TABLE == ui.PAGE_KIND_TABLE
+    assert sdk.PAGE_KIND_THREAD == ui.PAGE_KIND_THREAD
+    assert sdk.PAGE_KIND_DOCUMENT == ui.PAGE_KIND_DOCUMENT
+    assert sdk.PAGE_KIND_BOARD == ui.PAGE_KIND_BOARD

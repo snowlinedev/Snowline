@@ -690,8 +690,13 @@ function BoardNodeRow(props: { plugin: string; node: BoardNode; index?: number }
               <span className="board-label">{node.label}</span>
             )}
             {/* Badges: intent is a decoration on the badge's own visible text,
-             * never a color-only signal (ACCESSIBILITY.md 1.4.1). */}
-            {node.badges?.map((b, i) => (
+             * never a color-only signal (ACCESSIBILITY.md 1.4.1). Guarded with
+             * Array.isArray (not just a null check) — a plugin's `badges` can
+             * be present but malformed, and validateBoardNodes only checks
+             * `id`/`label` per node, same loose posture as every other
+             * validator, so a non-array value must degrade here rather than
+             * throw. */}
+            {(Array.isArray(node.badges) ? node.badges : []).map((b, i) => (
               <span key={i} className={`board-badge intent-${b.intent ?? "neutral"}`}>
                 {b.text}
               </span>
@@ -771,10 +776,15 @@ export function Board(props: {
   facets?: BoardFacet[];
   empty?: string;
 }) {
+  // A malformed `facets` (present but not an array — validateBoardData only
+  // checks `nodes`, same loose posture as every other kind's validator)
+  // degrades to "no facets" here rather than crashing every `.map`/iteration
+  // below — the same fail-visible-by-degradation rule `badges` follows.
+  const facets = Array.isArray(props.facets) ? props.facets : [];
   const [grouped, setGrouped] = useState(false);
   const [hidden, setHidden] = useState<Set<string>>(() => {
     const s = new Set<string>();
-    for (const f of props.facets ?? []) if (f.hidden_by_default) s.add(f.key);
+    for (const f of facets) if (f.hidden_by_default) s.add(f.key);
     return s;
   });
   const toggleFacet = (key: string) =>
@@ -784,8 +794,6 @@ export function Board(props: {
       else next.add(key);
       return next;
     });
-
-  const facets = props.facets ?? [];
   const visible = facetFilter(props.nodes, hidden);
 
   const tree =
@@ -857,6 +865,12 @@ export function Board(props: {
       )}
       {props.nodes.length === 0 ? (
         <p className="state-note">{props.empty ?? "Nothing here."}</p>
+      ) : visible.length === 0 ? (
+        // Distinct from the true-empty case above: nodes exist, but the
+        // active facet toggles filtered every one of them out — a blank
+        // render here (checking props.nodes.length alone) would be
+        // indistinguishable from a broken page.
+        <p className="state-note">Nothing matches the current filters.</p>
       ) : (
         tree
       )}
@@ -939,15 +953,34 @@ function validateDocumentData(d: unknown) {
   return d as { title: string; markdown: string; meta?: ReactNode };
 }
 
-/** Minimal, recursive shape check (§4.2a fail-visible, same loose posture as
- * every other validator): `nodes` must be an array, and every node — including
- * nested `children` — must carry a string `id` and `label`. Everything else is
- * optional and NOT type-checked beyond "don't crash"; the shell renders what
- * it gets. `children`, when present, must itself be a valid node array. */
+/** Minimal, recursive shape check (§4.2a fail-visible): `nodes` must be an
+ * array, and every node — including nested `children` — must carry a string
+ * `id` and `label`. Most other fields are untyped beyond "don't crash" (the
+ * shell renders what it gets), but `badges`/`facets`, when PRESENT, are
+ * type-checked and REJECTED (not silently coerced) on a bad shape — same
+ * "malformed content fails visible rather than being coerced" rule
+ * `validateThreadData` already applies to `flags`, because a `.map`/lookup
+ * over a wrong-shaped `badges`/`facets` value would otherwise crash the
+ * render tree instead of showing the malformed-data card. `children`, when
+ * present, must itself be a valid node array. */
 function validateBoardNodes(nodes: unknown): boolean {
   if (!Array.isArray(nodes)) return false;
   for (const n of nodes) {
     if (!isRecord(n) || typeof n.id !== "string" || typeof n.label !== "string") {
+      return false;
+    }
+    if (
+      n.badges !== undefined &&
+      (!Array.isArray(n.badges) ||
+        n.badges.some((b) => !isRecord(b) || typeof b.text !== "string"))
+    ) {
+      return false;
+    }
+    if (
+      n.facets !== undefined &&
+      (!isRecord(n.facets) ||
+        Object.values(n.facets).some((v) => typeof v !== "boolean"))
+    ) {
       return false;
     }
     if (n.children !== undefined && !validateBoardNodes(n.children)) return false;
@@ -957,6 +990,24 @@ function validateBoardNodes(nodes: unknown): boolean {
 
 function validateBoardData(d: unknown) {
   if (!isRecord(d) || !validateBoardNodes(d.nodes)) return null;
+  if (
+    d.group_by !== undefined &&
+    (!isRecord(d.group_by) ||
+      typeof d.group_by.key !== "string" ||
+      typeof d.group_by.label !== "string" ||
+      typeof d.group_by.flat_label !== "string")
+  ) {
+    return null;
+  }
+  if (
+    d.facets !== undefined &&
+    (!Array.isArray(d.facets) ||
+      d.facets.some(
+        (f) => !isRecord(f) || typeof f.key !== "string" || typeof f.label !== "string",
+      ))
+  ) {
+    return null;
+  }
   return d as {
     nodes: BoardNode[];
     group_by?: BoardGroupBy;
