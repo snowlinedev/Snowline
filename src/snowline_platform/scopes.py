@@ -26,6 +26,7 @@ import re
 import uuid
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from snowline_platform.models import Scope
@@ -246,7 +247,14 @@ def create(
     Raises `ScopeConflictError` if the slug is already taken (spec §8: this is
     ALSO the cross-partition slug-collision error a replicated create surfaces
     — see `apply_scope_event`), `InvalidSlugError` / `InvalidScopeFieldError` on
-    a bad slug/kind/parent.
+    a bad slug/kind/parent. The `resolve()` pre-check below is check-then-act,
+    not atomic — two concurrent creates for the SAME slug (a local create
+    racing a replicated one, or two peers minting the same slug during a
+    partition) can both pass it before either commits. The DB's unique
+    constraint on `Scope.slug` is the real arbiter for that race: a flush
+    collision is caught below and converted into the SAME `ScopeConflictError`,
+    so `apply_scope_event`'s `ParkNow` fast path (#92) fires on the actual
+    collision attempt rather than only on a later, self-healing retry.
     """
     validate_slug(slug)
     _validate_kind_for_slug(slug, kind)
@@ -292,7 +300,14 @@ def create(
         kwargs["id"] = scope_id
     scope = Scope(**kwargs)
     session.add(scope)
-    session.flush()
+    try:
+        session.flush()
+    except IntegrityError as exc:
+        # The race the resolve() pre-check above can't close (see docstring):
+        # the unique constraint on `slug` is the atomic arbiter. Roll back the
+        # failed insert and surface the SAME error the pre-check raises.
+        session.rollback()
+        raise ScopeConflictError(f"scope {slug!r} already exists") from exc
     emit_event(session, EVENT_SCOPE_CREATED, to_replication_payload(scope))
     return scope
 

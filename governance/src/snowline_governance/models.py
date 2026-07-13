@@ -36,7 +36,7 @@ platform-side slug rename can't make a pre-rename governs edge invisible.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import (
     BigInteger,
@@ -81,6 +81,14 @@ DEFAULT_SHADOW_BRANCH_STATUS = "active"
 SHADOW_BRANCH_STATUS_ARCHIVED = "archived"
 
 
+def _utcnow() -> datetime:
+    """Naive UTC, stamped in Python — NOT `func.now()`, whose value is the
+    Postgres session's `TimeZone` setting (can be non-UTC), while replication
+    (§6, decision `2eb96356`) compares `recorded_at` byte-for-byte against
+    UTC-stamped values from peers for supersession/LWW ordering."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -107,7 +115,7 @@ class Decision(Base):
     scope_slug: Mapped[str] = mapped_column(String, nullable=False)
     decision: Mapped[str] = mapped_column(String, nullable=False)
     rationale: Mapped[str | None] = mapped_column(String, nullable=True)
-    recorded_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    recorded_at: Mapped[datetime] = mapped_column(default=_utcnow, server_default=func.now())
     supersedes_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("decisions.id"), nullable=True
     )

@@ -193,8 +193,10 @@ def retire_inbound_stream(session: Session, source_id: str, epoch: str) -> dict:
 def rotate_inbound_secret(session: Session, source_id: str, epoch: str) -> dict:
     """§5 rotation, receiver side: mint a replacement secret for a LIVE stream —
     no epoch change, no re-seed. Old and new both verify during the switch; the
-    old retires on the first new-signed delivery (`ingest_delivery`). Returns
-    the new secret ONCE (the pairing CLI carries it to the sender).
+    old retires on the first new-signed delivery that ALSO applies successfully
+    (`ingest_delivery`) — a new-signed delivery whose apply fails leaves
+    `previous_secret` untouched, and is simply retried by the next delivery.
+    Returns the new secret ONCE (the pairing CLI carries it to the sender).
 
     Re-rotating while a rotation is still pending (the sender hasn't swapped)
     KEEPS `previous_secret` — the one secret the sender provably still signs
@@ -300,15 +302,23 @@ def ingest_delivery(
         return 404, {"status": "rejected", "reason": REJECT_UNKNOWN_STREAM}
 
     # Verify against the current secret, then the pre-rotation one (§5: both
-    # accepted during the switch). The FIRST new-signed delivery retires the
-    # old secret — delivery-time signing guarantees the sender's whole backlog
-    # re-signs once it swaps, so retirement can't strand queued rows.
-    if verify_signature(stream.secret, body, signature):
-        if stream.previous_secret is not None:
-            stream.previous_secret = None
-            session.flush()
-    elif not verify_signature(stream.previous_secret or "", body, signature) or (
-        stream.previous_secret is None
+    # accepted during the switch). The FIRST new-signed delivery that APPLIES
+    # CLEANLY retires the old secret — staged as `retire_secret` below and
+    # only applied alongside the success bookkeeping past the apply() call.
+    # (Retirement used to be mutated+flushed here, immediately on signature
+    # verification, before apply() ran. `_apply_failed`/`_park_now` roll the
+    # session back to its last commit on ANY apply failure, which happened to
+    # undo that early flush too — so the observable behavior was already
+    # correct, just by accident, via a rollback three functions away rather
+    # than by an explicit condition here. Staging it as a local instead makes
+    # the "retire only on confirmed success" rule self-evident at the call
+    # site, instead of depending on `_apply_failed`/`_park_now` never changing
+    # to commit partial state.)
+    verified_with_current = verify_signature(stream.secret, body, signature)
+    retire_secret = verified_with_current and stream.previous_secret is not None
+    if not verified_with_current and (
+        not verify_signature(stream.previous_secret or "", body, signature)
+        or stream.previous_secret is None
     ):
         return 401, {"status": "rejected", "reason": REJECT_BAD_SIGNATURE}
 
@@ -359,6 +369,8 @@ def ingest_delivery(
     stream.gate_seq = seq
     stream.blocked_seq = None
     stream.blocked_attempts = 0
+    if retire_secret:
+        stream.previous_secret = None
     _recompute_applied_seq(session, stream)
     session.flush()
     return 200, {
