@@ -54,12 +54,44 @@ from snowline_plugin_sdk.replication import emit as sdk_emit
 from snowline_governance.contract import (
     EVENT_ARTIFACT_GOVERNS_SET,
     EVENT_ARTIFACT_MATURITY_SET,
+    EVENT_MEMORY_FORGOTTEN,
+    EVENT_MEMORY_SET,
+    EVENT_SCOPE_CREATED,
+    EVENT_SCOPE_UPDATED,
     EVENT_SHADOW_GRADUATED,
     EVENT_SHADOW_NOTES_SET,
+    EVENT_TYPES,
 )
 from snowline_governance.models import LwwRegister
 
 log = logging.getLogger("snowline.governance.replication_stream")
+
+# The EVENT_TYPES members governance does NOT emit: the platform's scope
+# namespace (#81) and memory (#80) adopt the same replication contract and
+# vendor their event types into the shared, drift-guarded registry (kept byte-
+# equal to the SDK's), but governance is not their producer. This set is the
+# ONLY thing hand-maintained; the owned set is DERIVED from it (below).
+FOREIGN_EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        EVENT_SCOPE_CREATED,
+        EVENT_SCOPE_UPDATED,
+        EVENT_MEMORY_SET,
+        EVENT_MEMORY_FORGOTTEN,
+    }
+)
+
+# The subset of the registry governance's OWN write surface emits — everything
+# that isn't foreign. DERIVING it by subtraction (rather than hand-listing the
+# owned types) is what keeps the §4 full-write-surface guard honest in BOTH
+# directions: a NEW governance event added to EVENT_TYPES is owned-by-default,
+# so forgetting its `emit(...)` call fails the guard loud (the old
+# `emitted == EVENT_TYPES` property, restored); and a new FOREIGN type must be
+# classified above (or it too lands in `owned` and fails the guard) — so foreign
+# vocabulary can't silently rot the guard either. A governance-LOCAL fact about
+# the emit surface, so it lives HERE (the emit authority, alongside
+# `LWW_REGISTERS`), NOT in the vendored `contract` copy — it is not wire
+# contract.
+GOVERNANCE_OWNED_EVENT_TYPES: frozenset[str] = EVENT_TYPES - FOREIGN_EVENT_TYPES
 
 # The manifest's declared ingest route (§4) — the SDK router serves it and
 # `registration.build_manifest` advertises it; one constant so they can't skew.

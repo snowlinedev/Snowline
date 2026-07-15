@@ -27,6 +27,10 @@ from snowline_governance.contract import (
     EVENT_TYPES,
 )
 from snowline_governance.models import LwwRegister
+from snowline_governance.replication_stream import (
+    FOREIGN_EVENT_TYPES,
+    GOVERNANCE_OWNED_EVENT_TYPES,
+)
 
 SOURCE = "primary.governance"
 PEER = "roam.governance"
@@ -93,11 +97,28 @@ def test_decision_writes_emit_v2_stream_envelopes(db_session):
     assert rows[1].payload["payload"]["supersedes_id"] == v1["id"]
 
 
+def test_owned_and_foreign_partition_the_registry():
+    """Pure drift invariant — NO DB, so it runs even in DB-less CI (the §4
+    write-surface test below is Postgres-gated). The foreign vocabulary is real
+    registry membership, and owned + foreign EXACTLY partition EVENT_TYPES: with
+    `owned` derived by subtraction, this is what forces a new EVENT_TYPES entry
+    to be classified — owned-by-default (must be emitted, §4 below) unless
+    explicitly listed foreign (#80/#81)."""
+    assert FOREIGN_EVENT_TYPES <= EVENT_TYPES
+    assert GOVERNANCE_OWNED_EVENT_TYPES.isdisjoint(FOREIGN_EVENT_TYPES)
+    assert GOVERNANCE_OWNED_EVENT_TYPES | FOREIGN_EVENT_TYPES == EVENT_TYPES
+
+
 def test_full_write_surface_emits_every_registry_event_type(db_session):
-    """§4 coverage, pinned against the drift-guarded registry: exercising the
-    whole write surface (shadow graph, artifacts, graduation, decisions)
-    produces EVERY member of EVENT_TYPES — a new lifecycle write can't ship
-    without landing in the registry, and vice versa."""
+    """§4 coverage, pinned against governance's OWNED subset of the drift-guarded
+    registry: exercising the whole write surface (shadow graph, artifacts,
+    graduation, decisions) produces EVERY governance-owned member — a new
+    lifecycle write can't ship without being emitted. The subset is what
+    governance emits; the scope.*/memory.* vocabulary in EVENT_TYPES is foreign
+    (vendored only for SDK drift-equality, #106), so comparing against the whole
+    registry would falsely fail here. Because `owned` is DERIVED (EVENT_TYPES −
+    foreign), a governance type added to the registry but not emitted still fails
+    this loud — it lands in `owned` automatically."""
     _subscribe(db_session)
     scope, sid = "acme/widget", _sid("acme/widget")
 
@@ -147,7 +168,7 @@ def test_full_write_surface_emits_every_registry_event_type(db_session):
     )
 
     emitted = {r.event_type for r in _outbox(db_session)}
-    assert emitted == set(EVENT_TYPES)
+    assert emitted == set(GOVERNANCE_OWNED_EVENT_TYPES)
     # …and the stream stayed contiguous through all of it.
     assert [r.seq for r in _outbox(db_session)] == list(
         range(1, len(_outbox(db_session)) + 1)

@@ -86,12 +86,12 @@ def test_prime_forward_creates_primary_outbound(tmp_path):
     assert list(sub.event_types) == ["decision.recorded"]
 
 
-def test_scrub_and_inject_sets_watermark_and_wipes_clones(tmp_path):
+def test_scrub_and_inject_sets_watermark_and_wipes_clones(tmp_path, monkeypatch):
     sp, primary, spoke, client = _seed_participant(tmp_path)
     epoch, secret = seed.prime_forward(client, sp, report=lambda _m: None)
 
     # Primary authors 3 writes AFTER priming, BEFORE the dump → counter = 3.
-    _emit(primary, "primary.governance", 3, "decision.recorded")
+    _emit(primary, "primary.governance", 3, "decision.recorded", monkeypatch)
     _clone_store(primary.engine, spoke.engine)
 
     # The clone carried the primary's OWN outbound subscription + outbox +
@@ -118,7 +118,7 @@ def test_scrub_and_inject_sets_watermark_and_wipes_clones(tmp_path):
     assert inbound.active is True
 
 
-def test_gapless_exactly_once_handoff(tmp_path):
+def test_gapless_exactly_once_handoff(tmp_path, monkeypatch):
     """§10's headline seeding criterion: a primary write between priming and the
     dump, and another after the dump, each reach the spoke EXACTLY once — the
     pre-dump ones as no-op duplicates (already in the snapshot), the post-dump
@@ -126,10 +126,10 @@ def test_gapless_exactly_once_handoff(tmp_path):
     sp, primary, spoke, client = _seed_participant(tmp_path)
     epoch, secret = seed.prime_forward(client, sp, report=lambda _m: None)
 
-    _emit(primary, "primary.governance", 3, "decision.recorded")  # pre-dump: seq 1-3
+    _emit(primary, "primary.governance", 3, "decision.recorded", monkeypatch)  # pre-dump: seq 1-3
     _clone_store(primary.engine, spoke.engine)
     seed.scrub_and_inject(sp, epoch, secret, report=lambda _m: None)
-    _emit(primary, "primary.governance", 1, "decision.recorded")  # post-dump: seq 4
+    _emit(primary, "primary.governance", 1, "decision.recorded", monkeypatch)  # post-dump: seq 4
 
     # The primary's delivery loop drains its whole outbox (seq 1-4) to the spoke.
     with primary.scope() as s:
@@ -355,10 +355,12 @@ def test_run_reverse_pair_refuses_version_mismatch(tmp_path):
 # --- helpers ------------------------------------------------------------------
 
 
-def _emit(inst, source_id, n, event_type, monkeypatch=None):
-    import os
-
-    os.environ["SNOWLINE_REPLICATION_SOURCE_ID"] = source_id
+def _emit(inst, source_id, n, event_type, monkeypatch):
+    # monkeypatch.setenv (NOT raw os.environ) so the source id is restored at
+    # test teardown — a raw write here leaked `primary.governance` forward into
+    # the governance suite (#106). The platform-suite conftest also snapshots
+    # this var as a belt-and-suspenders net.
+    monkeypatch.setenv("SNOWLINE_REPLICATION_SOURCE_ID", source_id)
     with inst.scope() as s:
         for i in range(n):
             emit_mod.emit_event(s, event_type, {"id": f"{source_id}-{i}"})
