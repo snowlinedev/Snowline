@@ -25,6 +25,7 @@ from snowline_governance.contract import (
     EVENT_DECISION_RECORDED,
     EVENT_DECISION_SUPERSEDED,
     EVENT_TYPES,
+    GOVERNANCE_EVENT_TYPES,
 )
 from snowline_governance.models import LwwRegister
 
@@ -96,8 +97,10 @@ def test_decision_writes_emit_v2_stream_envelopes(db_session):
 def test_full_write_surface_emits_every_registry_event_type(db_session):
     """§4 coverage, pinned against the drift-guarded registry: exercising the
     whole write surface (shadow graph, artifacts, graduation, decisions)
-    produces EVERY member of EVENT_TYPES — a new lifecycle write can't ship
-    without landing in the registry, and vice versa."""
+    produces EVERY member of GOVERNANCE_EVENT_TYPES — a new lifecycle write
+    can't ship without landing in the registry, and vice versa. Pinned to the
+    GOVERNANCE-OWNED subset (#117): EVENT_TYPES is the whole platform's
+    vocabulary and includes scope/memory events governance never emits."""
     _subscribe(db_session)
     scope, sid = "acme/widget", _sid("acme/widget")
 
@@ -147,7 +150,7 @@ def test_full_write_surface_emits_every_registry_event_type(db_session):
     )
 
     emitted = {r.event_type for r in _outbox(db_session)}
-    assert emitted == set(EVENT_TYPES)
+    assert emitted == set(GOVERNANCE_EVENT_TYPES)
     # …and the stream stayed contiguous through all of it.
     assert [r.seq for r in _outbox(db_session)] == list(
         range(1, len(_outbox(db_session)) + 1)

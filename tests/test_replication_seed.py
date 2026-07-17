@@ -355,13 +355,16 @@ def test_run_reverse_pair_refuses_version_mismatch(tmp_path):
 # --- helpers ------------------------------------------------------------------
 
 
-def _emit(inst, source_id, n, event_type, monkeypatch=None):
-    import os
-
-    os.environ["SNOWLINE_REPLICATION_SOURCE_ID"] = source_id
-    with inst.scope() as s:
-        for i in range(n):
-            emit_mod.emit_event(s, event_type, {"id": f"{source_id}-{i}"})
+def _emit(inst, source_id, n, event_type):
+    # Scoped env write (#125): a raw os.environ write here leaked
+    # SNOWLINE_REPLICATION_SOURCE_ID into every later-collected suite, breaking
+    # governance's replication tests (whose emitters fail-loud on an unset var
+    # and record the env source into LWW coordinates) under combined runs.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("SNOWLINE_REPLICATION_SOURCE_ID", source_id)
+        with inst.scope() as s:
+            for i in range(n):
+                emit_mod.emit_event(s, event_type, {"id": f"{source_id}-{i}"})
 
 
 def _cfg(participants):
