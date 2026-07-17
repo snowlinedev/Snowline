@@ -212,6 +212,7 @@ def _version_dict(
         "id": str(v.id),
         "status": v.status,
         "relation": v.relation,
+        "supersedes_id": str(v.supersedes_id) if v.supersedes_id else None,
         "has_snapshot": v.body_snapshot is not None,
         "summary": v.summary,
         "created_at": v.created_at.isoformat() if v.created_at else None,
@@ -246,9 +247,10 @@ def _artifact_dict(
     # `include_body` expands ONLY current_version (leaves stay lean headers —
     # a competing leaf's content is read via `get_artifact_version`, so a
     # branched artifact's payload doesn't carry every body).
-    current = (
-        _version_dict(leaves[0], include_body=include_body) if leaves else None
-    )
+    if include_body and leaves:
+        current = _version_dict(leaves[0], include_body=True)
+    else:
+        current = leaf_dicts[0] if leaf_dicts else None
     points = branching.branch_points(
         session,
         ArtifactVersion.supersedes_id,
@@ -283,6 +285,29 @@ def _require_artifact(session: Session, artifact_id) -> Artifact:
     if a is None:
         raise ArtifactNotFoundError(f"no artifact {artifact_id!r}")
     return a
+
+
+def _require_version(
+    session: Session, a: Artifact, version_id, param: str = "version_id"
+) -> ArtifactVersion:
+    """Parse + resolve a version id and require it to belong to artifact `a` —
+    the one validation chokepoint for every verb taking a (artifact, version)
+    pair. Distinguishes an id that matches NO version anywhere (a not-found)
+    from one that exists on a DIFFERENT artifact (a pairing error), so a caller
+    holding a stale id isn't sent hunting other artifacts. `param` names the
+    caller's parameter in the parse error (e.g. `supersedes`)."""
+    try:
+        vkey = uuid.UUID(str(version_id))
+    except (ValueError, TypeError):
+        raise ValueError(f"{param} is not a version id: {version_id!r}") from None
+    v = session.get(ArtifactVersion, vkey)
+    if v is None:
+        raise ValueError(f"no version {version_id!r}")
+    if v.artifact_id != a.id:
+        raise ValueError(
+            f"version {version_id!r} is not a version of this artifact"
+        )
+    return v
 
 
 # --- writes -----------------------------------------------------------------
@@ -386,18 +411,7 @@ def revise_artifact(
             raise ValueError("artifact has no version to supersede")
         sup_id = cur.id
     else:
-        try:
-            sup_key = uuid.UUID(str(supersedes))
-        except (ValueError, TypeError):
-            raise ValueError(
-                f"supersedes is not a version id: {supersedes!r}"
-            ) from None
-        sup = session.get(ArtifactVersion, sup_key)
-        if sup is None or sup.artifact_id != a.id:
-            raise ValueError(
-                f"version {supersedes!r} is not a version of this artifact"
-            )
-        sup_id = sup.id
+        sup_id = _require_version(session, a, supersedes, param="supersedes").id
     version = ArtifactVersion(
         artifact_id=a.id,
         supersedes_id=sup_id,
@@ -428,13 +442,8 @@ def resolve_artifact(session: Session, artifact_id: str, version_id: str) -> dic
         raise ValueError(
             "nothing to resolve — the artifact has a single current leaf"
         )
-    try:
-        vkey = uuid.UUID(str(version_id))
-    except (ValueError, TypeError):
-        raise ValueError(
-            f"version_id is not a version id: {version_id!r}"
-        ) from None
-    target = next((v for v in leaves if v.id == vkey), None)
+    v = _require_version(session, a, version_id)
+    target = next((leaf for leaf in leaves if leaf.id == v.id), None)
     if target is None:
         raise ValueError(
             f"{version_id!r} is not a current competing leaf of this artifact"
@@ -525,20 +534,9 @@ def get_artifact_version(
     `resolve_artifact`) or a superseded version (audit / pinned exports).
     Read-only; raises when the version doesn't belong to the artifact."""
     a = _require_artifact(session, artifact_id)
-    try:
-        vkey = uuid.UUID(str(version_id))
-    except (ValueError, TypeError):
-        raise ValueError(
-            f"version_id is not a version id: {version_id!r}"
-        ) from None
-    v = session.get(ArtifactVersion, vkey)
-    if v is None or v.artifact_id != a.id:
-        raise ValueError(
-            f"version {version_id!r} is not a version of this artifact"
-        )
+    v = _require_version(session, a, version_id)
     out = _version_dict(v, include_body=True)
     out["artifact_id"] = str(a.id)
-    out["supersedes_id"] = str(v.supersedes_id) if v.supersedes_id else None
     return out
 
 

@@ -130,6 +130,10 @@ def test_get_artifact_version_validates_pairing(db_session):
     a2 = artifacts.register_artifact(db_session, body="two")
     with pytest.raises(ValueError, match="not a version id"):
         artifacts.get_artifact_version(db_session, a1["id"], "not-a-uuid")
+    # A well-formed id matching NO version anywhere is a not-found, distinct
+    # from the wrong-artifact pairing error (review finding on #136).
+    with pytest.raises(ValueError, match="no version"):
+        artifacts.get_artifact_version(db_session, a1["id"], str(uuid.uuid4()))
     with pytest.raises(ValueError, match="not a version of this artifact"):
         artifacts.get_artifact_version(
             db_session, a1["id"], a2["current_version"]["id"]
