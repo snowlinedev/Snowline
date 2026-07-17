@@ -329,6 +329,21 @@ def test_recall_filters_by_kind(db_session):
     assert out["memories"][0]["name"] == "pref"
 
 
+def test_scope_input_is_case_insensitive(db_session):
+    """#134: mixed-case GitHub-style scope input canonicalizes to lowercase on
+    write AND read — the same query that failed cross-surface now matches."""
+    memory.remember(
+        db_session, content="scoped", name="cased", scope="TurtlesEdge/TurtleTracks"
+    )
+    out = memory.recall(db_session, scope="turtlesedge/turtletracks")
+    assert {m["name"] for m in out["memories"]} == {"cased"}
+    assert out["memories"][0]["scope"] == "turtlesedge/turtletracks"
+    # Mixed-case filter input finds the canonical rows too.
+    out = memory.recall(db_session, scope="TURTLESEDGE/turtletracks")
+    assert {m["name"] for m in out["memories"]} == {"cased"}
+    assert out["scope"] == "turtlesedge/turtletracks"
+
+
 def test_recall_scope_includes_portfolio_wide(db_session):
     memory.remember(db_session, content="scoped", name="scoped", scope="acme/widget")
     memory.remember(db_session, content="global", name="global")  # portfolio-wide

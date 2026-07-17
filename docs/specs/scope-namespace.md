@@ -15,7 +15,11 @@ from the platform; they never own it.
 ## 2. The Scope model (schema-compatible with the monolith)
 
 - `slug` — unique, the namespace key; **hierarchical** (`org`, `org/repo`,
-  `org/repo/initiative`).
+  `org/repo/initiative`). Canonical form is **lowercase**; slug INPUT is
+  case-insensitive at every surface (resolve, create/update, filters — #134):
+  GitHub-style casing like `TurtlesEdge/turtletracks` folds to the canonical
+  slug before validation, lookup, and storage. Two slugs differing only by
+  case are the SAME scope.
 - `name` — display name.
 - `kind` — `org` | `project` | `initiative` | `component` | … . **Invariant:** a
   bare slug (no `/`) ⇔ `kind == org`.

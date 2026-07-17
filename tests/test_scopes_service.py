@@ -24,6 +24,40 @@ def test_resolve_found_and_none(db_session):
     assert scopes.resolve(db_session, "nope") is None
 
 
+def test_slug_input_is_case_insensitive(db_session):
+    """#134: mixed-case GitHub-style input canonicalizes to lowercase at every
+    seam — resolve, create (slug + parent), list org filter. Storage stays
+    canonical lowercase."""
+    scopes.create(db_session, slug="TurtlesEdge", name="TE", kind="org")
+    created = scopes.create(
+        db_session,
+        slug="TurtlesEdge/TurtleTracks",
+        name="TT",
+        kind="project",
+        parent="TURTLESEDGE",
+    )
+    db_session.flush()
+    # Stored canonical; parent resolved despite casing.
+    assert created.slug == "turtlesedge/turtletracks"
+    assert created.parent_id is not None
+    # Mixed-case resolve finds the canonical row.
+    assert (
+        scopes.resolve(db_session, "TurtlesEdge/turtletracks").slug
+        == "turtlesedge/turtletracks"
+    )
+    # Mixed-case org filter narrows to the canonical org.
+    rows = scopes.list_scopes(db_session, org="TurtlesEdge")
+    assert {r["slug"] for r in rows} == {
+        "turtlesedge",
+        "turtlesedge/turtletracks",
+    }
+    # A duplicate differing only by case is the SAME scope → conflict.
+    with pytest.raises(scopes.ScopeConflictError):
+        scopes.create(
+            db_session, slug="TURTLESEDGE/turtletracks", name="dup", kind="project"
+        )
+
+
 def test_ancestors_halt_at_isolated_middle_node(db_session):
     _build_tree(db_session)
     reader = scopes.resolve(db_session, "org/repo/init/reader")

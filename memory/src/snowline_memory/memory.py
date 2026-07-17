@@ -97,12 +97,14 @@ def validate_name(name: str) -> str:
 
 
 def validate_scope(scope: str | None) -> str | None:
-    """Validate an OPTIONAL scope slug against the platform grammar; return it
-    verbatim (memory never resolves a slug — it's a soft reference). None passes
-    through (portfolio-wide)."""
+    """Validate an OPTIONAL scope slug against the platform grammar; return the
+    CANONICAL (lowercased) form — slug input is case-insensitive across every
+    Snowline surface (#134), storage/filtering canonical-only. Memory never
+    resolves a slug — it's a soft reference. None passes through
+    (portfolio-wide)."""
     if scope is None:
         return None
-    scope = scope.strip()
+    scope = scope.strip().lower()
     if not scope:
         return None
     if not SLUG_RE.match(scope):

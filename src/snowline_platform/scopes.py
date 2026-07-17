@@ -62,6 +62,15 @@ class ScopeConflictError(ValueError):
     """A scope with the given slug already exists."""
 
 
+def canonical_slug(slug):
+    """Fold slug INPUT to the canonical §2.1 form — lowercase, trimmed (#134).
+    Slug input is case-insensitive across every platform surface (GitHub owner
+    casing like `TurtlesEdge/turtletracks` is common in the wild); STORAGE and
+    equality stay canonical-lowercase-only. Non-strings pass through untouched
+    so `validate_slug` still raises its own error for them."""
+    return slug.strip().lower() if isinstance(slug, str) else slug
+
+
 def validate_slug(slug: str) -> str:
     if not isinstance(slug, str) or not SLUG_RE.match(slug):
         raise InvalidSlugError(f"invalid scope slug: {slug!r} (§2.1)")
@@ -79,8 +88,11 @@ def kind_matches_slug(slug: str, kind: str) -> bool:
 
 def resolve(session: Session, slug: str) -> Scope | None:
     """Non-mutating lookup — the scope for `slug`, or None if unknown (spec §3).
-    No implicit stub creation in the public read path."""
-    return session.scalar(select(Scope).where(Scope.slug == slug))
+    Input is canonicalized first (#134), so mixed-case GitHub-style slugs
+    resolve; storage is canonical lowercase. No implicit stub creation in the
+    public read path. This is THE shared seam: the /scopes routes and every
+    plugin resolving through the scope API inherit case-insensitive input."""
+    return session.scalar(select(Scope).where(Scope.slug == canonical_slug(slug)))
 
 
 # Back-compat alias for the monolith's name; `resolve` is the spec verb.
@@ -117,6 +129,7 @@ def list_scopes(session: Session, org: str | None = None) -> list[dict]:
     """All scopes as lightweight rows (slug, name, kind, derived org, status,
     isolated), slug-ordered. `org` narrows to one org (the first slug segment).
     Read-only (carried from `graph.list_scopes`, with `isolated` exposed)."""
+    org = canonical_slug(org) if org is not None else None
     out: list[dict] = []
     for sc in session.scalars(select(Scope).order_by(Scope.slug.asc())):
         scope_org = sc.slug.split("/", 1)[0]
@@ -256,6 +269,7 @@ def create(
     so `apply_scope_event`'s `ParkNow` fast path (#92) fires on the actual
     collision attempt rather than only on a later, self-healing retry.
     """
+    slug = canonical_slug(slug)
     validate_slug(slug)
     _validate_kind_for_slug(slug, kind)
     if not isinstance(isolated, bool):
@@ -281,6 +295,7 @@ def create(
                 parent_id = prow.id
     elif parent:
         # An explicit, non-empty parent slug: must already exist.
+        parent = canonical_slug(parent)
         validate_slug(parent)
         prow = resolve(session, parent)
         if prow is None:
@@ -350,6 +365,7 @@ def update(
                 raise InvalidScopeFieldError(
                     f"an org scope has no parent (got {parent!r} for {slug!r})"
                 )
+            parent = canonical_slug(parent)
             validate_slug(parent)
             prow = resolve(session, parent)
             if prow is None:
