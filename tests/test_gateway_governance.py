@@ -117,33 +117,34 @@ def governance_db():
             f"Postgres not reachable at {_maintenance_url(_GOV_DB_URL)!r} — "
             "governance end-to-end skipped"
         )
-    # Save/restore (#114): a raw write with no restore leaked this module's DB
-    # URL into later-collected suites (the governance suite's lazily-created
-    # engines would silently point at THIS module's gateway-test DB).
-    prior = os.environ.get("SNOWLINE_GOVERNANCE_DATABASE_URL")
-    os.environ["SNOWLINE_GOVERNANCE_DATABASE_URL"] = _GOV_DB_URL
-
+    # Scoped env write (#114): a raw write with no restore leaked this module's
+    # DB URL into later-collected suites (the governance suite's lazily-created
+    # engines would silently point at THIS module's gateway-test DB). The
+    # try/finally also covers a SETUP failure — pytest never runs post-yield
+    # teardown for a fixture that errored before yielding, so a bare post-yield
+    # restore would leak exactly when _recreate_db/upgrade raise (#140 review).
     from alembic import command
     from alembic.config import Config
 
     from snowline_governance.db import reset_engine
 
-    migrations = (
-        Path(__import__("snowline_governance").__file__).resolve().parent
-        / "migrations"
-    )
-    _recreate_db(_GOV_DB_URL)
-    reset_engine()
-    cfg = Config()
-    cfg.set_main_option("script_location", str(migrations))
-    cfg.set_main_option("sqlalchemy.url", _GOV_DB_URL)
-    command.upgrade(cfg, "head")
-    yield _GOV_DB_URL
-    reset_engine()
-    if prior is None:
-        os.environ.pop("SNOWLINE_GOVERNANCE_DATABASE_URL", None)
-    else:
-        os.environ["SNOWLINE_GOVERNANCE_DATABASE_URL"] = prior
+    mp = pytest.MonkeyPatch()
+    mp.setenv("SNOWLINE_GOVERNANCE_DATABASE_URL", _GOV_DB_URL)
+    try:
+        migrations = (
+            Path(__import__("snowline_governance").__file__).resolve().parent
+            / "migrations"
+        )
+        _recreate_db(_GOV_DB_URL)
+        reset_engine()
+        cfg = Config()
+        cfg.set_main_option("script_location", str(migrations))
+        cfg.set_main_option("sqlalchemy.url", _GOV_DB_URL)
+        command.upgrade(cfg, "head")
+        yield _GOV_DB_URL
+    finally:
+        reset_engine()
+        mp.undo()
 
 
 def _build_gov_surfaces():

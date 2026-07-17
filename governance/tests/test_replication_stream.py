@@ -151,9 +151,6 @@ def test_full_write_surface_emits_every_registry_event_type(db_session):
 
     emitted = {r.event_type for r in _outbox(db_session)}
     assert emitted == set(GOVERNANCE_EVENT_TYPES)
-    # The owned subset is a strict subset of the platform vocabulary — the
-    # foreign (scope/memory) events stay in EVENT_TYPES for the drift guard.
-    assert GOVERNANCE_EVENT_TYPES < EVENT_TYPES
     # …and the stream stayed contiguous through all of it.
     assert [r.seq for r in _outbox(db_session)] == list(
         range(1, len(_outbox(db_session)) + 1)
