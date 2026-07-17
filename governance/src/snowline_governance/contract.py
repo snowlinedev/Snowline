@@ -72,7 +72,13 @@ EVENT_SCOPE_UPDATED: str = "scope.updated"
 EVENT_MEMORY_SET: str = "memory.set"
 EVENT_MEMORY_FORGOTTEN: str = "memory.forgotten"
 
-EVENT_TYPES: frozenset[str] = frozenset(
+# The events GOVERNANCE'S OWN write surface emits — the coverage set the §4
+# full-write-surface test pins (#117). Distinct from EVENT_TYPES below, which
+# is the whole PLATFORM's drift-guarded vocabulary: when #80/#81 vendored the
+# scope/memory events in (so the producer/SDK copies stay byte-equal), the
+# coverage test kept asserting the FULL set and went permanently red —
+# governance can never emit another plugin's events.
+GOVERNANCE_EVENT_TYPES: frozenset[str] = frozenset(
     {
         EVENT_DECISION_RECORDED,
         EVENT_DECISION_SUPERSEDED,
@@ -89,6 +95,11 @@ EVENT_TYPES: frozenset[str] = frozenset(
         EVENT_ARTIFACT_RESOLVED,
         EVENT_ARTIFACT_MATURITY_SET,
         EVENT_ARTIFACT_GOVERNS_SET,
+    }
+)
+
+EVENT_TYPES: frozenset[str] = GOVERNANCE_EVENT_TYPES | frozenset(
+    {
         EVENT_SCOPE_CREATED,
         EVENT_SCOPE_UPDATED,
         EVENT_MEMORY_SET,

@@ -117,6 +117,10 @@ def governance_db():
             f"Postgres not reachable at {_maintenance_url(_GOV_DB_URL)!r} — "
             "governance end-to-end skipped"
         )
+    # Save/restore (#114): a raw write with no restore leaked this module's DB
+    # URL into later-collected suites (the governance suite's lazily-created
+    # engines would silently point at THIS module's gateway-test DB).
+    prior = os.environ.get("SNOWLINE_GOVERNANCE_DATABASE_URL")
     os.environ["SNOWLINE_GOVERNANCE_DATABASE_URL"] = _GOV_DB_URL
 
     from alembic import command
@@ -136,6 +140,10 @@ def governance_db():
     command.upgrade(cfg, "head")
     yield _GOV_DB_URL
     reset_engine()
+    if prior is None:
+        os.environ.pop("SNOWLINE_GOVERNANCE_DATABASE_URL", None)
+    else:
+        os.environ["SNOWLINE_GOVERNANCE_DATABASE_URL"] = prior
 
 
 def _build_gov_surfaces():
