@@ -76,6 +76,7 @@ _READ_REAL_GROUNDING = {
     "list_decisions",
     "applicable_decisions",
     "get_artifact",
+    "get_artifact_version",
     "list_artifacts",
     "applicable_artifacts",
     # §6.1 unreconciled view (replication-continuity, #79) — a pure read on the
@@ -90,7 +91,7 @@ def _tool_names(surface) -> set[str]:
 
 def test_shadow_surface_is_isolated_no_real_write():
     """THE KEY isolation test: the shadow surface's tool set is EXACTLY the 10
-    shadow writes + the 6 read-real grounding tools — and contains ZERO real-write
+    shadow writes + the 8 read-real grounding tools — and contains ZERO real-write
     verbs. The absence of record_decision / supersede / register / revise /
     resolve / set_governs / set_maturity IS the isolation (decision 8a7f0a11)."""
     surface = build_shadow_surface(scope_client=_NoopScopeClient())

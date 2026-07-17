@@ -7,7 +7,8 @@ Mirrors the frozen monolith's FastMCP registration pattern (`mcp_server.py`):
     The 5 decision tools (`record_decision`, `supersede_decision`, `get_decision`,
     `list_decisions`, `applicable_decisions`) + the artifact tools
     (`register_artifact`, `revise_artifact`, `resolve_artifact`, `get_artifact`,
-    `list_artifacts`, `set_governs`, `set_maturity`, `applicable_artifacts`).
+    `get_artifact_version`, `list_artifacts`, `set_governs`, `set_maturity`,
+    `applicable_artifacts`).
 
   - `build_shadow_surface` — the SPECULATION surface, mounted at `/shadow/mcp`.
     The 8 shadow-WRITE tools (`create_branch`, `list_branches`, `get_branch`,
@@ -54,7 +55,9 @@ read the ancestor-inherited governance that applies at a scope. Decisions: \
 `record_decision`, `supersede_decision`, `get_decision`, `list_decisions`, \
 `applicable_decisions`. Artifacts: `register_artifact` (inline-backed — content \
 lives in the substrate), `revise_artifact`, `resolve_artifact` (collapse \
-competing version leaves), `get_artifact`, `list_artifacts`, `set_governs`, \
+competing version leaves), `get_artifact` (carries the canonical body by \
+default), `get_artifact_version` (one version's body — competing leaves, \
+superseded history), `list_artifacts`, `set_governs`, \
 `set_maturity`, `applicable_artifacts` (artifacts governing a scope, \
 ancestor-inherited). `applicable_*` resolve "what governs here" by walking the \
 scope tree UPWARD and halting at the first isolated ancestor. Scopes are owned \
@@ -78,7 +81,8 @@ log the UI composer writes; `get_branch` returns its recent tail), \
 and `shadow_corpus_search` (full-text over the shadow content \
 + the real decisions backlinked to a shadow line). Read-real grounding: \
 `get_decision`, `list_decisions`, `applicable_decisions`, `get_artifact`, \
-`list_artifacts`, `applicable_artifacts` — read the real graph freely to ground \
+`get_artifact_version`, `list_artifacts`, `applicable_artifacts` — read the \
+real graph freely to ground \
 your speculation. It deliberately exposes NO real-write verb — `record_decision`, \
 `supersede_decision`, and the artifact write verbs are ABSENT by construction, on \
 the separate `main` surface only. This ensures a speculation session physically \
@@ -95,7 +99,8 @@ _SECURITY = TransportSecuritySettings(enable_dns_rebinding_protection=False)
 def _register_read_tools(mcp: FastMCP, client: ScopeClient) -> None:
     """Register the READ-REAL governance tools on `mcp` — the decision reads
     (`get_decision`, `list_decisions`, `applicable_decisions`) + the artifact
-    reads (`get_artifact`, `list_artifacts`, `applicable_artifacts`). Shared by
+    reads (`get_artifact`, `get_artifact_version`, `list_artifacts`,
+    `applicable_artifacts`). Shared by
     BOTH the `main` surface (its read half) and the `shadow` surface (its
     read-real grounding half), so the two surfaces register the SAME handlers —
     one source of truth per tool. Pure-read: no write verb is registered here, so
@@ -170,16 +175,39 @@ def _register_read_tools(mcp: FastMCP, client: ScopeClient) -> None:
             _applicable_decisions_sync, scope, include_superseded, limit
         )
 
-    def _get_artifact_sync(artifact_id):
+    def _get_artifact_sync(artifact_id, include_body):
         with session_scope() as session:
-            return artifacts.get_artifact(session, artifact_id)
+            return artifacts.get_artifact(
+                session, artifact_id, include_body=include_body
+            )
 
     @mcp.tool()
-    async def get_artifact(artifact_id: str) -> dict:
+    async def get_artifact(artifact_id: str, include_body: bool = True) -> dict:
         """Read one artifact's full record by id — identity, doc_kind, maturity,
-        governs, the current leaf + all competing leaves + branch points. The
-        on-demand expansion of a `list_artifacts` header. Read-only."""
-        return await anyio.to_thread.run_sync(_get_artifact_sync, artifact_id)
+        governs, the current leaf + all competing leaves + branch points. By
+        default `current_version` carries the canonical inline content as
+        `body_snapshot` (`include_body=False` for the lean header shape); the
+        `leaves` rows stay lean — expand a competing or historical version via
+        `get_artifact_version`. The on-demand expansion of a `list_artifacts`
+        header. Read-only."""
+        return await anyio.to_thread.run_sync(
+            _get_artifact_sync, artifact_id, include_body
+        )
+
+    def _get_artifact_version_sync(artifact_id, version_id):
+        with session_scope() as session:
+            return artifacts.get_artifact_version(session, artifact_id, version_id)
+
+    @mcp.tool()
+    async def get_artifact_version(artifact_id: str, version_id: str) -> dict:
+        """Read ONE version's full record — including its `body_snapshot` — by
+        (artifact, version) pair. The body read for versions `get_artifact`
+        keeps lean: a competing leaf (compare branches before
+        `resolve_artifact`) or a superseded version (audit / pinned exports).
+        Read-only; errors when the version doesn't belong to the artifact."""
+        return await anyio.to_thread.run_sync(
+            _get_artifact_version_sync, artifact_id, version_id
+        )
 
     def _list_artifacts_sync(governs, limit):
         governs_scope_id = None

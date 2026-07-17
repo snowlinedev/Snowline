@@ -203,10 +203,12 @@ def _current_version(session: Session, artifact_id) -> ArtifactVersion | None:
     return session.scalars(_leaf_stmt(artifact_id).limit(1)).first()
 
 
-def _version_dict(v: ArtifactVersion | None) -> dict | None:
+def _version_dict(
+    v: ArtifactVersion | None, include_body: bool = False
+) -> dict | None:
     if v is None:
         return None
-    return {
+    out = {
         "id": str(v.id),
         "status": v.status,
         "relation": v.relation,
@@ -214,6 +216,9 @@ def _version_dict(v: ArtifactVersion | None) -> dict | None:
         "summary": v.summary,
         "created_at": v.created_at.isoformat() if v.created_at else None,
     }
+    if include_body:
+        out["body_snapshot"] = v.body_snapshot
+    return out
 
 
 def _governs(session: Session, artifact_id) -> list[str]:
@@ -228,7 +233,9 @@ def _governs(session: Session, artifact_id) -> list[str]:
     return list(rows)
 
 
-def _artifact_dict(session: Session, a: Artifact) -> dict:
+def _artifact_dict(
+    session: Session, a: Artifact, include_body: bool = False
+) -> dict:
     count = session.scalar(
         select(func.count())
         .select_from(ArtifactVersion)
@@ -236,6 +243,12 @@ def _artifact_dict(session: Session, a: Artifact) -> dict:
     )
     leaves = _leaves(session, a.id)
     leaf_dicts = [_version_dict(v) for v in leaves]
+    # `include_body` expands ONLY current_version (leaves stay lean headers —
+    # a competing leaf's content is read via `get_artifact_version`, so a
+    # branched artifact's payload doesn't carry every body).
+    current = (
+        _version_dict(leaves[0], include_body=include_body) if leaves else None
+    )
     points = branching.branch_points(
         session,
         ArtifactVersion.supersedes_id,
@@ -252,7 +265,7 @@ def _artifact_dict(session: Session, a: Artifact) -> dict:
         "governs_all": a.governs_all,
         # current_version is the latest leaf; `leaves` surfaces all competing
         # leaves (len>1 ⇒ branched) with ZERO inference.
-        "current_version": leaf_dicts[0] if leaf_dicts else None,
+        "current_version": current,
         "leaves": leaf_dicts,
         "is_branched": len(leaves) > 1,
         "branch_points": [str(p) for p in points],
@@ -489,11 +502,44 @@ def set_governs(
 # --- reads ------------------------------------------------------------------
 
 
-def get_artifact(session: Session, artifact_id: str) -> dict:
+def get_artifact(
+    session: Session, artifact_id: str, include_body: bool = True
+) -> dict:
     """The full artifact — identity, lifecycle, governs, the current leaf + all
-    competing leaves + branch points — by id. Read-only; raises on an
+    competing leaves + branch points — by id. With `include_body` (the default:
+    this is the on-demand full record, #132) `current_version` carries the
+    canonical inline content as `body_snapshot`; leaves stay lean headers
+    (expand one via `get_artifact_version`). Read-only; raises on an
     unknown/invalid id (parsed first, so a non-UUID is a clean not-found)."""
-    return _artifact_dict(session, _require_artifact(session, artifact_id))
+    return _artifact_dict(
+        session, _require_artifact(session, artifact_id), include_body=include_body
+    )
+
+
+def get_artifact_version(
+    session: Session, artifact_id: str, version_id: str
+) -> dict:
+    """One version's full record — including its `body_snapshot` — by
+    (artifact, version) pair (#132). This is the body read for versions
+    `get_artifact` keeps lean: a competing leaf (branch comparison before
+    `resolve_artifact`) or a superseded version (audit / pinned exports).
+    Read-only; raises when the version doesn't belong to the artifact."""
+    a = _require_artifact(session, artifact_id)
+    try:
+        vkey = uuid.UUID(str(version_id))
+    except (ValueError, TypeError):
+        raise ValueError(
+            f"version_id is not a version id: {version_id!r}"
+        ) from None
+    v = session.get(ArtifactVersion, vkey)
+    if v is None or v.artifact_id != a.id:
+        raise ValueError(
+            f"version {version_id!r} is not a version of this artifact"
+        )
+    out = _version_dict(v, include_body=True)
+    out["artifact_id"] = str(a.id)
+    out["supersedes_id"] = str(v.supersedes_id) if v.supersedes_id else None
+    return out
 
 
 def _resolve_list_limit(limit: int | None, default: int = 50, cap: int = 500) -> int:
