@@ -440,19 +440,33 @@ def remember(
     return row
 
 
-def _any_term_tsquery(query: str):
-    """OR the query's terms into one tsquery — the relaxed fallback for when the
-    strict `websearch_to_tsquery` (which ANDs every term, #133) matches nothing.
-    Pure-operator tokens (`OR`/`AND`, `-negations`) are dropped rather than OR'd
-    (a lone negation would match nearly everything). Returns None when nothing
-    searchable survives."""
-    words = [
-        w
-        for w in re.split(r"\s+", query)
-        if w and w.upper() not in ("OR", "AND") and not w.startswith("-")
-    ]
-    if not words:
+def _relax_terms(query: str) -> list[str] | None:
+    """The tokens the any-term fallback may OR together, or None when the
+    fallback must NOT run. ONE tokenizer feeds both the retry gate and the
+    relaxed query so they can't disagree (#137 review). None when:
+
+      - the query uses websearch operator syntax — a quoted phrase, a
+        `-negation` (including flag-like tokens, which websearch parses as
+        negations), or `OR`. Those are PRECISION requests; relaxing them would
+        return rows the caller explicitly excluded or unglue an exact phrase,
+        so they stay strict and a miss is an honest 0.
+      - fewer than two tokens survive (nothing to relax).
+
+    Splits on commas/semicolons as well as whitespace — `websearch_to_tsquery`
+    ANDs `a,b,c` exactly like `a b c`, so punctuation-separated queries get the
+    same fallback (#133's failure otherwise persists for them)."""
+    if '"' in query:
         return None
+    words = [w for w in re.split(r"[\s,;]+", query) if w]
+    if any(w.startswith("-") or w.upper() == "OR" for w in words):
+        return None
+    return words if len(words) > 1 else None
+
+
+def _any_term_tsquery(words: list[str]):
+    """OR the surviving plain tokens into one tsquery — the relaxed retry for
+    when the strict `websearch_to_tsquery` (which ANDs every term, #133)
+    matches nothing. `ts_rank` then orders rows by how many terms hit."""
     tsq = func.websearch_to_tsquery(_TS_CONFIG, words[0])
     for w in words[1:]:
         tsq = tsq.op("||")(func.websearch_to_tsquery(_TS_CONFIG, w))
@@ -468,13 +482,16 @@ def recall(
 ) -> dict:
     """Search working memory. With `query`: FTS-ranked over name+description+content
     (Postgres `websearch_to_tsquery` + `ts_rank` on the generated `search_vector`
-    column). The strict query ANDs every term; when a MULTI-word query matches
-    nothing that way, recall retries with the terms OR'd (#133 — a natural query
-    like "walkthrough plugin usage registration" shouldn't return 0 because one
-    word misses) and `match_mode` reports "any_term" so the caller knows the
-    results are relaxed matches, best-first by how many terms hit. Without a
-    query: newest-first. `kind` filters exactly; `scope` returns that scope's
-    rows PLUS portfolio-wide rows. Returns full rows + `items_total`."""
+    column). The strict query ANDs every term; when a PLAIN multi-term query
+    matches nothing that way, recall retries with the terms OR'd (#133 — a
+    natural query like "walkthrough plugin usage registration" shouldn't return
+    0 because one word misses), best-first by how many terms hit. `match_mode`
+    reports the query that produced the result: "all_terms", or "any_term"
+    whenever the relaxed retry ran (even to 0). Queries using websearch operator
+    syntax (quoted phrases, `-negations`, `OR`) are precision requests and NEVER
+    relax — see `_relax_terms`. Without a query: newest-first. `kind` filters
+    exactly; `scope` returns that scope's rows PLUS portfolio-wide rows. Returns
+    full rows + `items_total`."""
     scope = validate_scope(scope)
     lim = _resolve_limit(limit, DEFAULT_RECALL_LIMIT)
 
@@ -500,19 +517,23 @@ def recall(
                 .limit(lim)
             )
             rows = list(session.execute(stmt))
-            total = session.scalar(
-                select(func.count()).select_from(Memory).where(match, *filters)
-            ) or 0
+            if len(rows) < lim:
+                total = len(rows)  # page not full — the SELECT proved the total
+            else:
+                total = session.scalar(
+                    select(func.count()).select_from(Memory).where(match, *filters)
+                ) or 0
             return [{**_row(m), "rank": float(r)} for m, r in rows], total
 
         match_mode = "all_terms"
         items, total = _fts(func.websearch_to_tsquery(_TS_CONFIG, query))
-        if total == 0 and len(query.split()) > 1:
-            relaxed = _any_term_tsquery(query)
-            if relaxed is not None:
-                items, total = _fts(relaxed)
-                if total:
-                    match_mode = "any_term"
+        if total == 0:
+            words = _relax_terms(query)
+            if words:
+                # Reported even when the retry also finds nothing — the caller
+                # must know relaxation already ran (no point re-querying looser).
+                match_mode = "any_term"
+                items, total = _fts(_any_term_tsquery(words))
     else:
         stmt = (
             select(Memory)
