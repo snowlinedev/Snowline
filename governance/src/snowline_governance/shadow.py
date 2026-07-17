@@ -219,7 +219,12 @@ def _get_branch_row(
     session: Session, scope_slug: str, name: str
 ) -> ShadowBranch:
     """The branch row addressed by `<scope>:<name>` (matched by the soft
-    `scope_slug` reference)."""
+    `scope_slug` reference). Scope input is case-insensitive (#134): stored
+    slugs are canonical lowercase (create_branch stores the platform-resolved
+    slug), so the same mixed-case input that could CREATE a branch must also
+    ADDRESS it here — ASCII-only fold, matching the platform's rule."""
+    if isinstance(scope_slug, str) and scope_slug.isascii():
+        scope_slug = scope_slug.strip().lower()
     branch = session.scalar(
         select(ShadowBranch).where(
             ShadowBranch.scope_slug == scope_slug, ShadowBranch.name == name

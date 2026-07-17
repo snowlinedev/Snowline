@@ -69,6 +69,23 @@ def test_get_scope_and_404(clean_db):
     assert client.get("/scopes/ghost").status_code == 404
 
 
+def test_get_scope_mixed_case_resolves_canonical(clean_db):
+    """#134 over the wire: GitHub-style casing resolves through the shared
+    seam — this is exactly what heals governance's mixed-case rejections
+    (it resolves via this API and stores the canonical slug returned)."""
+    _seed()
+    client = _trusted_client()
+    r = client.get("/scopes/ORG/Repo")
+    assert r.status_code == 200, r.text
+    assert r.json()["slug"] == "org/repo"
+    chain = client.get("/scopes/Org/REPO/init/ancestors")
+    assert chain.status_code == 200, chain.text
+    assert [a["slug"] for a in chain.json()["ancestors"]] == [
+        "org/repo/init",
+        "org/repo",
+    ]
+
+
 def test_list_scopes_and_org_filter(clean_db):
     _seed()
     client = _trusted_client()

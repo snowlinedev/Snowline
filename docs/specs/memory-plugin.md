@@ -84,8 +84,9 @@ One table, `memories`:
   `project`). Soft, so a new kind never needs a migration. Lowercased at the
   `remember` boundary (`Gotcha` ≡ `gotcha`) so case can't split the digest.
 - `scope_slug` — text NULL. A **soft** scope reference, validated against the
-  platform slug grammar when present, stored **verbatim** (never resolved to a
-  platform id, never a join). NULL ⇒ portfolio-wide (applies everywhere).
+  platform slug grammar when present, stored in the **canonical lowercase**
+  form (input is case-insensitive, #134; never resolved to a platform id,
+  never a join). NULL ⇒ portfolio-wide (applies everywhere).
 - `created_at` / `updated_at` — timestamps; `updated_at` bumps on **every**
   upsert, including an identical-content re-`remember` (the write is a
   deliberate touch — recency reflects the last time the note was asserted).
@@ -115,7 +116,8 @@ All verbs run their blocking DB work in a thread (the monolith's
   description, else the content head. When `description` is omitted it's
   derived from the content's first line. `kind` defaults to `project` and is
   lowercased at the boundary; `scope` is
-  an optional slug (validated, stored verbatim). Save durable working context —
+  an optional slug (validated, stored canonical-lowercase). Save durable
+  working context —
   conventions, gotchas, preferences, current focus — **not** things the repo/git
   already record.
 - **`recall(query?, kind?, scope?, limit=10)`** — the search. With `query`:

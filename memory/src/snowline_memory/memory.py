@@ -29,7 +29,8 @@ register with tombstoned deletes** (replication-continuity §4 coverage note,
 value — the register value is (content, description, kind, scope_slug, forgotten)
 resolved by (`last_event_at`, `last_source_id`). Scope is a SOFT reference: a
 slug is validated against the platform grammar (carried, not imported —
-import-purity) and stored verbatim; it is never resolved against the platform.
+import-purity) and stored in the CANONICAL lowercase form — input is
+case-insensitive (#134) — but never resolved against the platform.
 """
 
 from __future__ import annotations
@@ -96,12 +97,25 @@ def validate_name(name: str) -> str:
     return name
 
 
+def canonical_scope(scope):
+    """Fold a scope slug to the canonical lowercase form (#134). ASCII-ONLY:
+    non-ASCII input passes through untouched so the grammar check still rejects
+    it loudly — Unicode case-folds (U+212A → 'k') must not smuggle an invalid
+    input in as a silently different slug. Non-strings pass through."""
+    if isinstance(scope, str) and scope.isascii():
+        return scope.strip().lower()
+    return scope
+
+
 def validate_scope(scope: str | None) -> str | None:
-    """Validate an OPTIONAL scope slug against the platform grammar; return it
-    verbatim (memory never resolves a slug — it's a soft reference). None passes
-    through (portfolio-wide)."""
+    """Validate an OPTIONAL scope slug against the platform grammar; return the
+    CANONICAL (lowercased) form — slug input is case-insensitive across every
+    Snowline surface (#134), storage/filtering canonical-only. Memory never
+    resolves a slug — it's a soft reference. None passes through
+    (portfolio-wide)."""
     if scope is None:
         return None
+    scope = canonical_scope(scope)
     scope = scope.strip()
     if not scope:
         return None
@@ -376,8 +390,9 @@ def remember(
     from the description/content head when omitted; `description` is derived from
     the content's first line when omitted; `kind` defaults to `project` and is
     LOWERCASED at this boundary (soft enum — `Gotcha` and `gotcha` are the same
-    kind, so the digest never splits on case); `scope` is an optional, validated,
-    verbatim-stored slug. If a memory with the NORMALIZED `name` already exists it
+    kind, so the digest never splits on case); `scope` is an optional, validated
+    slug stored in canonical lowercase (case-insensitive input, #134). If a
+    memory with the NORMALIZED `name` already exists it
     is updated IN PLACE (content/description/kind/scope), bumping `updated_at` on
     EVERY upsert — including an identical-content re-remember (the write is a
     deliberate touch) — so `my_note` then `my-note` collide as the same memory.
@@ -713,7 +728,11 @@ def apply_event(session: Session, envelope: dict) -> None:
             content=payload.get("content", ""),
             description=payload.get("description", ""),
             kind=payload.get("kind", DEFAULT_KIND),
-            scope_slug=payload.get("scope_slug"),
+            # Canonicalize on APPLY too (#139 review): a payload from a peer
+            # not yet emitting canonical slugs must not persist a mixed-case
+            # row invisible to the (now canonical-only) read filters. Folding
+            # only — never raise here; every apply exception parks the event.
+            scope_slug=canonical_scope(payload.get("scope_slug")),
             event_at=event_at,
             source_id=src,
         )

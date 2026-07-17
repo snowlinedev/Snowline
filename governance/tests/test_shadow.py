@@ -136,6 +136,12 @@ def test_branch_roundtrip(db_session):
 
     got = shadow.get_branch(db_session, slug, "auth-as-jwt")
     assert got["id"] == created["id"]
+
+    # #134/#139: scope input is case-insensitive at the branch-address seam
+    # too — the same mixed-case input that can CREATE (via platform resolve)
+    # must also ADDRESS the branch.
+    cased = shadow.get_branch(db_session, "Acme/Widget", "auth-as-jwt")
+    assert cased["id"] == created["id"]
     assert got["narrative_notes"] == "exploring jwt"
 
     listed = shadow.list_branches(db_session, slug, _sid(slug))
