@@ -344,6 +344,37 @@ def test_scope_input_is_case_insensitive(db_session):
     assert out["scope"] == "turtlesedge/turtletracks"
 
 
+def test_scope_canonicalization_is_ascii_only(db_session):
+    """#139 review: a Unicode char whose lowercase folds into the slug set
+    (U+212A KELVIN SIGN → 'k') must still fail the grammar loudly, not be
+    silently stored under a different slug."""
+    with pytest.raises(memory.InvalidScopeError):
+        memory.remember(
+            db_session, content="x", name="bad-scope", scope="acmeK/widget"
+        )
+
+
+def test_apply_event_canonicalizes_scope(db_session):
+    """#139 review: the replication apply seam folds payload scope_slug to
+    canonical, so a peer emitting non-canonical casing can't persist a row
+    invisible to the (canonical-only) read filters."""
+    memory.apply_event(
+        db_session,
+        {
+            "event_type": "memory.set",
+            "payload": {
+                "name": "replicated-cased",
+                "content": "from a peer",
+                "scope_slug": "TurtlesEdge/TurtleTracks",
+                "event_at": "2026-07-17T00:00:00+00:00",
+                "source_id": "peer.memory",
+            },
+        },
+    )
+    out = memory.recall(db_session, scope="turtlesedge/turtletracks")
+    assert {m["name"] for m in out["memories"]} == {"replicated-cased"}
+
+
 def test_recall_scope_includes_portfolio_wide(db_session):
     memory.remember(db_session, content="scoped", name="scoped", scope="acme/widget")
     memory.remember(db_session, content="global", name="global")  # portfolio-wide

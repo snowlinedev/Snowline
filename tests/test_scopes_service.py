@@ -58,6 +58,21 @@ def test_slug_input_is_case_insensitive(db_session):
         )
 
 
+def test_canonicalization_is_ascii_only(db_session):
+    """#139 review: Unicode case-folds must NOT smuggle a previously-invalid
+    slug in as a silently different one — non-ASCII input still fails §2.1
+    loudly (U+212A KELVIN SIGN lowercases to 'k'; Unicode-whitespace padding
+    lowercases/strips into a valid slug)."""
+    with pytest.raises(scopes.InvalidSlugError):
+        scopes.create(db_session, slug="acmeK", name="x", kind="org")
+    with pytest.raises(scopes.InvalidSlugError):
+        scopes.create(db_session, slug=" acme ", name="x", kind="org")
+    # And resolve doesn't fold non-ASCII either — it just misses.
+    scopes.create(db_session, slug="acmek", name="x", kind="org")
+    db_session.flush()
+    assert scopes.resolve(db_session, "acmeK") is None
+
+
 def test_ancestors_halt_at_isolated_middle_node(db_session):
     _build_tree(db_session)
     reader = scopes.resolve(db_session, "org/repo/init/reader")
