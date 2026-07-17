@@ -105,7 +105,10 @@ def build_main_surface() -> FastMCP:
     ) -> dict:
         """Search working memory. Pass a `query` for full-text search (ranked by
         relevance over name + description + content); omit it to get the most
-        recently-updated notes. Filter by `kind` and/or `scope` — a `scope`
+        recently-updated notes. A multi-word query first requires ALL terms;
+        when that matches nothing it automatically relaxes to ANY term,
+        best-matches-first, and the response's `match_mode` says which applied
+        ("all_terms" / "any_term"). Filter by `kind` and/or `scope` — a `scope`
         returns that scope's notes PLUS portfolio-wide ones. Returns the matching
         memories (full content) and `items_total`.
         """

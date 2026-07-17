@@ -21,8 +21,9 @@ register with tombstoned deletes** (replication-continuity §4 coverage note,
   - `recall` / `memory_digest` / `list_memories` — reads, all excluding
     tombstones. `recall` is FTS-ranked with a query (Postgres
     `websearch_to_tsquery` + `ts_rank` over the generated `search_vector`
-    column), newest-first otherwise; filtered by kind + scope (scope ⊇
-    portfolio-wide).
+    column; a multi-word query that strictly matches nothing relaxes to
+    OR'd terms, #133), newest-first otherwise; filtered by kind + scope
+    (scope ⊇ portfolio-wide).
 
 `id`/`created_at`/`updated_at` are LOCAL bookkeeping and are NOT the converged
 value — the register value is (content, description, kind, scope_slug, forgotten)
@@ -439,6 +440,25 @@ def remember(
     return row
 
 
+def _any_term_tsquery(query: str):
+    """OR the query's terms into one tsquery — the relaxed fallback for when the
+    strict `websearch_to_tsquery` (which ANDs every term, #133) matches nothing.
+    Pure-operator tokens (`OR`/`AND`, `-negations`) are dropped rather than OR'd
+    (a lone negation would match nearly everything). Returns None when nothing
+    searchable survives."""
+    words = [
+        w
+        for w in re.split(r"\s+", query)
+        if w and w.upper() not in ("OR", "AND") and not w.startswith("-")
+    ]
+    if not words:
+        return None
+    tsq = func.websearch_to_tsquery(_TS_CONFIG, words[0])
+    for w in words[1:]:
+        tsq = tsq.op("||")(func.websearch_to_tsquery(_TS_CONFIG, w))
+    return tsq
+
+
 def recall(
     session: Session,
     query: str | None = None,
@@ -448,8 +468,13 @@ def recall(
 ) -> dict:
     """Search working memory. With `query`: FTS-ranked over name+description+content
     (Postgres `websearch_to_tsquery` + `ts_rank` on the generated `search_vector`
-    column). Without: newest-first. `kind` filters exactly; `scope` returns that
-    scope's rows PLUS portfolio-wide rows. Returns full rows + `items_total`."""
+    column). The strict query ANDs every term; when a MULTI-word query matches
+    nothing that way, recall retries with the terms OR'd (#133 — a natural query
+    like "walkthrough plugin usage registration" shouldn't return 0 because one
+    word misses) and `match_mode` reports "any_term" so the caller knows the
+    results are relaxed matches, best-first by how many terms hit. Without a
+    query: newest-first. `kind` filters exactly; `scope` returns that scope's
+    rows PLUS portfolio-wide rows. Returns full rows + `items_total`."""
     scope = validate_scope(scope)
     lim = _resolve_limit(limit, DEFAULT_RECALL_LIMIT)
 
@@ -462,21 +487,32 @@ def recall(
         filters.append(sf)
 
     query = (query or "").strip()
+    match_mode = None
     if query:
-        tsq = func.websearch_to_tsquery(_TS_CONFIG, query)
-        match = Memory.search_vector.op("@@")(tsq)
-        rank = func.ts_rank(Memory.search_vector, tsq)
-        stmt = (
-            select(Memory, rank.label("rank"))
-            .where(match, *filters)
-            .order_by(rank.desc(), Memory.updated_at.desc(), Memory.name.asc())
-            .limit(lim)
-        )
-        rows = list(session.execute(stmt))
-        items = [{**_row(m), "rank": float(r)} for m, r in rows]
-        total = session.scalar(
-            select(func.count()).select_from(Memory).where(match, *filters)
-        ) or 0
+
+        def _fts(tsq):
+            match = Memory.search_vector.op("@@")(tsq)
+            rank = func.ts_rank(Memory.search_vector, tsq)
+            stmt = (
+                select(Memory, rank.label("rank"))
+                .where(match, *filters)
+                .order_by(rank.desc(), Memory.updated_at.desc(), Memory.name.asc())
+                .limit(lim)
+            )
+            rows = list(session.execute(stmt))
+            total = session.scalar(
+                select(func.count()).select_from(Memory).where(match, *filters)
+            ) or 0
+            return [{**_row(m), "rank": float(r)} for m, r in rows], total
+
+        match_mode = "all_terms"
+        items, total = _fts(func.websearch_to_tsquery(_TS_CONFIG, query))
+        if total == 0 and len(query.split()) > 1:
+            relaxed = _any_term_tsquery(query)
+            if relaxed is not None:
+                items, total = _fts(relaxed)
+                if total:
+                    match_mode = "any_term"
     else:
         stmt = (
             select(Memory)
@@ -489,13 +525,16 @@ def recall(
             select(func.count()).select_from(Memory).where(*filters)
         ) or 0
 
-    return {
+    out = {
         "query": query or None,
         "kind": kind or None,
         "scope": scope,
         "memories": items,
         "items_total": total,
     }
+    if match_mode is not None:
+        out["match_mode"] = match_mode
+    return out
 
 
 def memory_digest(session: Session, scope: str | None = None) -> dict:

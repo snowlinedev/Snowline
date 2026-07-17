@@ -182,6 +182,74 @@ def test_recall_fts_ranks_relevant_first(db_session):
     assert out["items_total"] == 1
     assert out["memories"][0]["name"] == "postgres-store"
     assert "rank" in out["memories"][0]
+    assert out["match_mode"] == "all_terms"
+
+
+def test_recall_multiword_relaxes_to_any_term(db_session):
+    """#133 (production-faithful repro): a natural multi-word query whose terms
+    DON'T all appear in one memory must not return 0 — the strict all-terms
+    query falls back to any-term, ranked best-first, and says so."""
+    memory.remember(
+        db_session,
+        name="walkthrough-plugin-usage",
+        description="How the walkthrough plugin drives a simulator session",
+        content="Drive walkthroughs via the walkthrough plugin's tap/swipe tools.",
+    )
+    memory.remember(
+        db_session,
+        name="dashboard-stack",
+        content="The dashboard is a Vite React app.",
+    )
+    # "registration" appears in NO memory → the AND query is empty; the OR
+    # fallback still surfaces the walkthrough memory (the #133 felt failure).
+    out = memory.recall(db_session, query="walkthrough plugin usage registration")
+    assert out["match_mode"] == "any_term"
+    assert out["items_total"] == 1
+    assert out["memories"][0]["name"] == "walkthrough-plugin-usage"
+
+
+def test_recall_multiword_all_terms_stays_strict(db_session):
+    """When the strict query DOES match, no fallback happens — precision kept."""
+    memory.remember(
+        db_session,
+        name="postgres-store",
+        content="Postgres is the durable store for all Snowline data.",
+    )
+    memory.remember(
+        db_session,
+        name="postgres-tuning",
+        content="Postgres tuning notes.",
+    )
+    out = memory.recall(db_session, query="postgres durable store")
+    assert out["match_mode"] == "all_terms"
+    assert out["items_total"] == 1  # only the row with ALL terms
+    assert out["memories"][0]["name"] == "postgres-store"
+
+
+def test_recall_single_word_miss_does_not_relax(db_session):
+    memory.remember(db_session, content="a", name="only-note")
+    out = memory.recall(db_session, query="nonexistentterm")
+    assert out["items_total"] == 0
+    assert out["match_mode"] == "all_terms"
+
+
+def test_recall_relaxed_ranks_more_hits_first(db_session):
+    memory.remember(
+        db_session,
+        name="two-hits",
+        content="alpha beta together here",
+    )
+    memory.remember(
+        db_session,
+        name="one-hit",
+        content="alpha alone",
+    )
+    # "gamma" matches nothing → relaxed; two-hits matches 2 of 3 terms and
+    # must outrank one-hit.
+    out = memory.recall(db_session, query="alpha beta gamma")
+    assert out["match_mode"] == "any_term"
+    names = [m["name"] for m in out["memories"]]
+    assert names == ["two-hits", "one-hit"]
 
 
 def test_recall_no_query_is_newest_first(clean_db):
