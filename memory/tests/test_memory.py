@@ -182,6 +182,126 @@ def test_recall_fts_ranks_relevant_first(db_session):
     assert out["items_total"] == 1
     assert out["memories"][0]["name"] == "postgres-store"
     assert "rank" in out["memories"][0]
+    assert out["match_mode"] == "all_terms"
+
+
+def test_recall_multiword_relaxes_to_any_term(db_session):
+    """#133 (production-faithful repro): a natural multi-word query whose terms
+    DON'T all appear in one memory must not return 0 — the strict all-terms
+    query falls back to any-term, ranked best-first, and says so."""
+    memory.remember(
+        db_session,
+        name="walkthrough-plugin-usage",
+        description="How the walkthrough plugin drives a simulator session",
+        content="Drive walkthroughs via the walkthrough plugin's tap/swipe tools.",
+    )
+    memory.remember(
+        db_session,
+        name="dashboard-stack",
+        content="The dashboard is a Vite React app.",
+    )
+    # "registration" appears in NO memory → the AND query is empty; the OR
+    # fallback still surfaces the walkthrough memory (the #133 felt failure).
+    out = memory.recall(db_session, query="walkthrough plugin usage registration")
+    assert out["match_mode"] == "any_term"
+    assert out["items_total"] == 1
+    assert out["memories"][0]["name"] == "walkthrough-plugin-usage"
+
+
+def test_recall_multiword_all_terms_stays_strict(db_session):
+    """When the strict query DOES match, no fallback happens — precision kept."""
+    memory.remember(
+        db_session,
+        name="postgres-store",
+        content="Postgres is the durable store for all Snowline data.",
+    )
+    memory.remember(
+        db_session,
+        name="postgres-tuning",
+        content="Postgres tuning notes.",
+    )
+    out = memory.recall(db_session, query="postgres durable store")
+    assert out["match_mode"] == "all_terms"
+    assert out["items_total"] == 1  # only the row with ALL terms
+    assert out["memories"][0]["name"] == "postgres-store"
+
+
+def test_recall_single_word_miss_does_not_relax(db_session):
+    memory.remember(db_session, content="a", name="only-note")
+    out = memory.recall(db_session, query="nonexistentterm")
+    assert out["items_total"] == 0
+    assert out["match_mode"] == "all_terms"
+
+
+def test_recall_comma_separated_terms_relax_too(db_session):
+    """websearch ANDs `a,b,c` exactly like spaced terms, so punctuation-separated
+    queries must get the same fallback (#137 review)."""
+    memory.remember(
+        db_session,
+        name="walkthrough-plugin-usage",
+        content="Drive walkthroughs via the walkthrough plugin's tools.",
+    )
+    out = memory.recall(db_session, query="walkthrough,plugin,registration")
+    assert out["match_mode"] == "any_term"
+    assert out["memories"][0]["name"] == "walkthrough-plugin-usage"
+
+
+def test_recall_negation_never_relaxes(db_session):
+    """A `-negation` is a precision request: relaxing would return exactly the
+    rows the caller excluded (#137 review). Strict miss stays an honest 0.
+    Flag-like tokens (`--deep`) parse as negations too and behave the same."""
+    memory.remember(
+        db_session,
+        name="staging-deploy",
+        content="deploy runbook for the staging environment",
+    )
+    out = memory.recall(db_session, query="deploy -staging")
+    assert out["items_total"] == 0
+    assert out["match_mode"] == "all_terms"
+    out = memory.recall(db_session, query="codesign --deep gotcha")
+    assert out["items_total"] == 0
+    assert out["match_mode"] == "all_terms"
+
+
+def test_recall_quoted_phrase_never_relaxes(db_session):
+    """A quoted phrase asks for adjacency; word-splitting it would flood the
+    caller with unrelated single-word hits (#137 review)."""
+    memory.remember(
+        db_session,
+        name="scope-notes",
+        content="create a scope on the platform first",  # not adjacent
+    )
+    out = memory.recall(db_session, query='"scope create"')
+    assert out["items_total"] == 0
+    assert out["match_mode"] == "all_terms"
+
+
+def test_recall_relaxed_zero_still_reports_any_term(db_session):
+    """When the relaxed retry RAN and also found nothing, match_mode says
+    any_term — the response must not imply relaxation wasn't attempted."""
+    memory.remember(db_session, content="a", name="only-note")
+    out = memory.recall(db_session, query="qqqterm zzzterm")
+    assert out["items_total"] == 0
+    assert out["match_mode"] == "any_term"
+
+
+def test_recall_relaxed_ranks_more_hits_first(db_session):
+    memory.remember(
+        db_session,
+        name="two-hits",
+        content="alpha beta together here",
+    )
+    memory.remember(
+        db_session,
+        name="one-hit",
+        content="alpha alone",
+    )
+    # "gamma" matches nothing → relaxed; two-hits matches 2 of 3 terms and
+    # must outrank one-hit.
+    out = memory.recall(db_session, query="alpha beta gamma")
+    assert out["match_mode"] == "any_term"
+    names = [m["name"] for m in out["memories"]]
+    assert names == ["two-hits", "one-hit"]
 
 
 def test_recall_no_query_is_newest_first(clean_db):
