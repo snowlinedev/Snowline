@@ -71,6 +71,77 @@ def test_register_inline_then_get(db_session):
     got = artifacts.get_artifact(db_session, art["id"])
     assert got["id"] == art["id"]
     assert got["current_version"]["id"] == art["current_version"]["id"]
+    # The canonical content is readable back (#132) — the full-record read
+    # carries the current version's body by default.
+    assert got["current_version"]["body_snapshot"] == "# spec body"
+
+
+def test_get_artifact_body_shapes(db_session):
+    """#132: `include_body=True` (the default) expands ONLY current_version;
+    leaves stay lean; `include_body=False` restores the lean header shape; the
+    WRITE returns stay lean (no body echo)."""
+    art = artifacts.register_artifact(db_session, body="# v1")
+    # Write return: lean — has_snapshot only, no body key.
+    assert "body_snapshot" not in art["current_version"]
+
+    got = artifacts.get_artifact(db_session, art["id"])
+    assert got["current_version"]["body_snapshot"] == "# v1"
+    # Leaves are lean headers even on the default read.
+    assert all("body_snapshot" not in leaf for leaf in got["leaves"])
+
+    lean = artifacts.get_artifact(db_session, art["id"], include_body=False)
+    assert "body_snapshot" not in lean["current_version"]
+    assert lean["current_version"]["has_snapshot"] is True
+
+
+def test_get_artifact_version_reads_any_version_body(db_session):
+    """#132: `get_artifact_version` serves the bodies `get_artifact` keeps lean —
+    competing leaves (branch comparison) and superseded history (pinned reads)."""
+    art = artifacts.register_artifact(db_session, body="root")
+    root_v = art["current_version"]["id"]
+    artifacts.revise_artifact(
+        db_session, art["id"], relation="refines",
+        supersedes=root_v, body_snapshot="branch A",
+    )
+    branched = artifacts.revise_artifact(
+        db_session, art["id"], relation="pivot",
+        supersedes=root_v, body_snapshot="branch B",
+    )
+    assert branched["is_branched"] is True
+
+    # Every competing leaf's body is readable for comparison.
+    bodies = {
+        artifacts.get_artifact_version(db_session, art["id"], leaf["id"])[
+            "body_snapshot"
+        ]
+        for leaf in branched["leaves"]
+    }
+    assert bodies == {"branch A", "branch B"}
+
+    # The superseded root stays readable (audit / pinned exports), with lineage.
+    root = artifacts.get_artifact_version(db_session, art["id"], root_v)
+    assert root["body_snapshot"] == "root"
+    assert root["artifact_id"] == art["id"]
+    assert root["supersedes_id"] is None
+
+
+def test_get_artifact_version_validates_pairing(db_session):
+    a1 = artifacts.register_artifact(db_session, body="one")
+    a2 = artifacts.register_artifact(db_session, body="two")
+    with pytest.raises(ValueError, match="not a version id"):
+        artifacts.get_artifact_version(db_session, a1["id"], "not-a-uuid")
+    # A well-formed id matching NO version anywhere is a not-found, distinct
+    # from the wrong-artifact pairing error (review finding on #136).
+    with pytest.raises(ValueError, match="no version"):
+        artifacts.get_artifact_version(db_session, a1["id"], str(uuid.uuid4()))
+    with pytest.raises(ValueError, match="not a version of this artifact"):
+        artifacts.get_artifact_version(
+            db_session, a1["id"], a2["current_version"]["id"]
+        )
+    with pytest.raises(artifacts.ArtifactNotFoundError):
+        artifacts.get_artifact_version(
+            db_session, str(uuid.uuid4()), a1["current_version"]["id"]
+        )
 
 
 def test_register_inline_requires_body(db_session):

@@ -76,7 +76,11 @@ Carried over unchanged in shape (a lift, per the develop-in-public carve), minus
   (ancestor-inherited — §6.1).
 - **Artifacts (write):** `register_artifact`, `revise_artifact`,
   `resolve_artifact` (leaf resolution), `set_governs`, `set_maturity`.
-- **Artifacts (read):** `get_artifact`, `list_artifacts`.
+- **Artifacts (read):** `get_artifact` (the full record — `current_version`
+  carries the canonical inline body by default; `include_body=False` for the
+  lean header), `get_artifact_version` (one version's body by (artifact,
+  version) pair — competing leaves for branch comparison, superseded versions
+  for audit/pinned reads), `list_artifacts` (lean headers only).
 - **Scope reads:** delegated to / proxied from the platform scope surface (a
   reader needs the tree to make sense of inheritance).
 
