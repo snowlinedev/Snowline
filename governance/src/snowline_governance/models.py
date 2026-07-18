@@ -190,6 +190,14 @@ class ArtifactVersion(Base):
     `Decision.supersedes_id`); the artifact's *current* version is the leaf.
     `relation` labels a successor `refines`/`pivot`; `status` is `proposed` until
     `resolve_artifact` flips a losing competing leaf to `superseded`.
+
+    `milestone` is an optional SOFT reference (spec §4) — a slug stamped verbatim
+    at mint, the portfolio's cross-plugin correlation key for a release ("this
+    feature-list version is what `v1-launch` shipped as"; PM tags work items with
+    the same slug). It names NO real scope and is NEVER resolved, exactly like the
+    `ArtifactGoverns` scope end and PM's `spec_id` — grammar-validated + stored
+    canonical-lowercase at the write boundary (`artifacts._canonical_milestone`),
+    NOT keyed on anything platform-owned. NULL for an unstamped version.
     """
 
     __tablename__ = "artifact_versions"
@@ -207,6 +215,10 @@ class ArtifactVersion(Base):
     git_sha: Mapped[str | None] = mapped_column(String, nullable=True)
     body_snapshot: Mapped[str | None] = mapped_column(String, nullable=True)
     summary: Mapped[str | None] = mapped_column(String, nullable=True)
+    # SOFT milestone/release ref — a slug stored verbatim, never resolved (see the
+    # class docstring). NULL for an unstamped version; indexed so the milestone
+    # filter (`artifacts.list_versions_by_milestone`) is a cheap equality scan.
+    milestone: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     status: Mapped[str] = mapped_column(
         String, nullable=False, server_default=DEFAULT_ARTIFACT_VERSION_STATUS,
         default=DEFAULT_ARTIFACT_VERSION_STATUS,

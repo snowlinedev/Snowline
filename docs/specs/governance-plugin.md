@@ -64,7 +64,12 @@ Carried over unchanged in shape (a lift, per the develop-in-public carve), minus
   (durable, resumable per-branch conversation log).
 - **Artifacts** — `Artifact` (a governing doc: `doc_kind` spec/plan/reference,
   `backend` git|inline, `maturity` draft→exploratory→stable, `governs_all`),
-  `ArtifactVersion` (supersession DAG + content snapshot/locator),
+  `ArtifactVersion` (supersession DAG + content snapshot/locator, plus an
+  optional `milestone` — a SOFT release-correlation slug stamped verbatim at
+  mint, never resolved, the portfolio's cross-plugin key: PM tags work items
+  with the same slug, so a stamped version records which artifact version a
+  release shipped as; grammar-validated + canonical-lowercase like a scope slug,
+  case-insensitive input per #139),
   `ArtifactGoverns` (artifact↔scope, multi-scope).
 - **Webhook bus** — `WebhookSubscription`, `WebhookDelivery` (§7).
 
@@ -74,13 +79,17 @@ Carried over unchanged in shape (a lift, per the develop-in-public carve), minus
 - **Decisions (write):** `record_decision`, `supersede_decision`.
 - **Decisions (read):** `get_decision`, `list_decisions`, `applicable_decisions`
   (ancestor-inherited — §6.1).
-- **Artifacts (write):** `register_artifact`, `revise_artifact`,
+- **Artifacts (write):** `register_artifact`, `revise_artifact`
+  (both accept an optional `milestone` release slug stamped on the version),
   `resolve_artifact` (leaf resolution), `set_governs`, `set_maturity`.
 - **Artifacts (read):** `get_artifact` (the full record — `current_version`
   carries the canonical inline body by default; `include_body=False` for the
   lean header), `get_artifact_version` (one version's body by (artifact,
   version) pair — competing leaves for branch comparison, superseded versions
-  for audit/pinned reads), `list_artifacts` (lean headers only).
+  for audit/pinned reads), `list_artifacts` (lean headers only),
+  `list_artifact_versions` (versions across all artifacts stamped with a given
+  `milestone` slug — the release-correlation read). Every version read surfaces
+  its `milestone`.
 - **Scope reads:** delegated to / proxied from the platform scope surface (a
   reader needs the tree to make sense of inheritance).
 
