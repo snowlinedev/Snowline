@@ -632,10 +632,14 @@ no-op, not a merge algorithm.
   backfill stream can never contaminate live causal context by construction;
   (3) it is self-describing in every parked-event row, delivery log, and
   stream listing an operator will read during the union.
-- The stream is opened by the ordinary §5 handshake (both instances are up
-  during a reunion — none of §7's seed-plays-receiver exception applies),
-  delivered by the ordinary delivery loop, gated/parked/signed like any
-  stream, and **retired on completion** on both halves. Steady state after
+- The stream is opened by a §5-SHAPED handshake — receiver mints, secret
+  carried once — via the union tool's own open verb, not the pairing CLI's
+  `handshake_direction` (which always wires a live `peer_source_id`; a
+  backfill subscription carries None, per the walker bullet). Both
+  instances are up during a reunion, so none of §7's seed-plays-receiver
+  exception applies. The stream is delivered by the ordinary delivery loop,
+  gated/parked/signed like any stream, and **retired on completion** on
+  both halves. Steady state after
   the union is exactly the steady state before it: one live stream per
   direction.
 - The backfill subscription is created with an **EMPTY event vocabulary** —
@@ -735,7 +739,11 @@ both sides, for *every shared scope*. Two consequences, both settled here:
   gains the row's authored/updated stamps as ADDITIVE fields —
   `.get`-tolerant on the apply side, no contract bump. The UPDATED stamp
   arbitrates metadata (falling back to the created stamp when absent); the
-  created stamp is provenance only.
+  created stamp is provenance only. The apply persists the WINNING EVENT'S
+  updated stamp as the row's LWW coordinate — suppressing any
+  `onupdate=now()` column default, which would silently rebase the
+  coordinate to import time and let an older backlogged update beat a newer
+  one (the discipline governance's LWW registers already embody).
 - **Plugin apply resolves scope references by SLUG; the wire `scope_id` is
   advisory.** Plugin payloads carry both (`scope`, `scope_id`); the apply
   seam and §6.1's detection walk must key on the local resolution of the
@@ -778,7 +786,16 @@ before, during, and after the union):
 
 Post-union live traffic needs no special case: new events flag through the
 ordinary outbox mechanism, and pre-pairing history — now present on both
-sides and provenance-stamped — never re-enters the candidate set.
+sides and provenance-stamped — never re-enters the candidate set. Two
+honest edges: rows replicated in during a live-pairing era that PREDATES
+the provenance column read as locally authored (vacuous in the cold-start
+case — the empty side has no such rows — but a previously-paired reunion
+should provenance-backfill where determinable, or expect and bulk-resolve
+the extra flags; runbook note); and a row authored live mid-union may flag
+on one instance only (its concurrent partner arrived by backfill there and
+by live stream on the other side, where it has no outbox seq) — nothing is
+lost, `mark-compatible` converges both sides, but the union's triage reads
+the unreconciled view ON BOTH INSTANCES, not one.
 
 **The procedure (CLI-driven, one verb per step, §5 admin surface only):**
 
@@ -810,7 +827,9 @@ sides and provenance-stamped — never re-enters the candidate set.
 4. **Verify, then retire the backfill streams** on both halves. Completion =
    every enumerator exhausted, every backfill stream's `applied_seq` equal to
    its final seq, parked sets empty (or explicitly resolved), and the §6.1
-   unreconciled view triaged. The retired streams stay for audit, like every
+   unreconciled view triaged ON BOTH INSTANCES (a mid-union live write can
+   flag on one side only — see the sibling note). The retired streams stay
+   for audit, like every
    retired stream.
 
 **Acceptance (§10 additions).** No write authored on either side during the
