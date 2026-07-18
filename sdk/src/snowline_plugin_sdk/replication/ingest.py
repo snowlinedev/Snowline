@@ -152,9 +152,36 @@ def register_inbound_stream(
     never listed again and never logged. `secret` may be supplied only by the
     §7 seed script, which plays the receiver's part before the spoke's store
     exists. Re-registering a live stream raises (rotation is `rotate_inbound_secret`,
-    re-pairing mints a fresh epoch)."""
+    re-pairing mints a fresh epoch).
+
+    SINGLE-ACTIVE-STREAM INVARIANT (issue #119): at most ONE inbound stream per
+    `source_id` may be active — `emit.py`'s `_peer_seen` reports "the" active
+    stream's applied frontier into every outbound envelope's §6.1 causal
+    context, which is only well-defined when there is exactly one. So a
+    registration while ANOTHER epoch is still active for the same `source_id`
+    raises loudly (retire the old stream first — a fresh-epoch re-pair/re-seed
+    does, §7 step 5) rather than silently leaving two epochs live and
+    `peer_seen` reporting whichever was created last. Enforced HERE, on the
+    receiver, so it holds for every caller — the pairing CLI's own pre-check in
+    `handshake_direction` is client-side courtesy, not the guarantee. (The
+    check-then-insert race two concurrent registrations could thread is
+    accepted: this is a tailnet-gated operator surface driven by a
+    run-once-per-pair CLI, not a concurrent hot path.)"""
     if session.get(ReplicationInboundStream, (source_id, epoch)) is not None:
         raise ValueError(f"inbound stream ({source_id!r}, {epoch!r}) already exists")
+    other_active = session.scalars(
+        select(ReplicationInboundStream.epoch).where(
+            ReplicationInboundStream.source_id == source_id,
+            ReplicationInboundStream.active.is_(True),
+        )
+    ).first()
+    if other_active is not None:
+        raise ValueError(
+            f"an inbound stream from {source_id!r} is already active under epoch "
+            f"{other_active!r} — at most one stream per source may be active "
+            f"(#119: two live epochs would corrupt peer_seen). Retire it first "
+            f"(re-pairing is a fresh-epoch re-seed, spec §7 step 5)."
+        )
     row = ReplicationInboundStream(
         source_id=source_id,
         epoch=epoch,
