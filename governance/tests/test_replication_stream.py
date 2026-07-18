@@ -22,6 +22,8 @@ from snowline_governance import artifacts, concurrence, decisions, graduation, s
 from snowline_governance.contract import (
     CONTRACT_VERSION,
     EVENT_ARTIFACT_MATURITY_SET,
+    EVENT_ARTIFACT_REGISTERED,
+    EVENT_ARTIFACT_REVISED,
     EVENT_DECISION_RECORDED,
     EVENT_DECISION_SUPERSEDED,
     EVENT_TYPES,
@@ -225,3 +227,20 @@ def test_idempotent_rearchive_emits_nothing(db_session):
     n = len(_outbox(db_session))
     shadow.archive_branch(db_session, scope, "line-a")  # idempotent re-archive
     assert len(_outbox(db_session)) == n
+
+
+def test_milestone_rides_the_artifact_version_payloads(db_session):
+    """#141: the SOFT milestone ref MUST travel on the emitted version half of
+    both `artifact.registered` and `artifact.revised` — a replicated version
+    would silently lose its release stamp otherwise (§4 / §6)."""
+    _subscribe(db_session)
+    art = artifacts.register_artifact(
+        db_session, body="# feature list", milestone="v1-launch"
+    )
+    artifacts.revise_artifact(
+        db_session, art["id"], "refines",
+        body_snapshot="# v2", milestone="v2-launch",
+    )
+    by_type = {r.event_type: r.payload["payload"] for r in _outbox(db_session)}
+    assert by_type[EVENT_ARTIFACT_REGISTERED]["version"]["milestone"] == "v1-launch"
+    assert by_type[EVENT_ARTIFACT_REVISED]["version"]["milestone"] == "v2-launch"

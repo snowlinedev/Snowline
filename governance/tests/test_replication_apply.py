@@ -30,6 +30,8 @@ from sqlalchemy import func, select
 from snowline_governance import artifacts, concurrence, decisions, graduation, shadow
 from snowline_governance.contract import (
     EVENT_ARTIFACT_MATURITY_SET,
+    EVENT_ARTIFACT_REGISTERED,
+    EVENT_ARTIFACT_REVISED,
     EVENT_DECISION_MARKED_COMPATIBLE,
     EVENT_DECISION_RECORDED,
     EVENT_DECISION_SUPERSEDED,
@@ -39,7 +41,10 @@ from snowline_governance.contract import (
     EVENT_SHADOW_GRADUATED,
     EVENT_TYPES,
 )
+from snowline_governance import replication_stream
 from snowline_governance.models import (
+    Artifact,
+    ArtifactVersion,
     Decision,
     ShadowConversationEvent,
     ShadowNode,
@@ -904,3 +909,83 @@ def test_citation_apply_dedupes_on_the_edge(db_session, apply_fn):
     assert str(
         db_session.get(ShadowNodeCitation, uuid.UUID(other_edge["id"])).id
     ) == other_edge["id"]  # a NEW edge keeps its authoring id
+
+
+# --- #141: the milestone soft ref survives the replication seam ------------------
+
+
+def _artifact_registered_payload(milestone=None):
+    """A peer-authored `artifact.registered` body (fresh ids) — an inline
+    artifact + its initial version, optionally carrying a milestone stamp."""
+    return _payload(
+        id=str(uuid.uuid4()),
+        doc_kind="spec",
+        backend="inline",
+        maturity="draft",
+        governs_all=False,
+        governs=[],
+        created_at=utcnow().isoformat(),
+        version={
+            "id": str(uuid.uuid4()),
+            "body_snapshot": "# feature list",
+            "milestone": milestone,
+            "created_at": utcnow().isoformat(),
+        },
+    )
+
+
+def test_milestone_applies_on_artifact_registered(db_session, apply_fn):
+    p = _artifact_registered_payload(milestone="v1-launch")
+    apply_fn(db_session, _envelope(EVENT_ARTIFACT_REGISTERED, p))
+    apply_fn(db_session, _envelope(EVENT_ARTIFACT_REGISTERED, p))  # replay no-ops
+    v = db_session.get(ArtifactVersion, uuid.UUID(p["version"]["id"]))
+    assert v is not None and v.milestone == "v1-launch"
+
+
+def test_milestone_none_applies_as_null_on_registered(db_session, apply_fn):
+    p = _artifact_registered_payload(milestone=None)
+    apply_fn(db_session, _envelope(EVENT_ARTIFACT_REGISTERED, p))
+    v = db_session.get(ArtifactVersion, uuid.UUID(p["version"]["id"]))
+    assert v is not None and v.milestone is None
+
+
+def test_milestone_applies_on_artifact_revised(db_session, apply_fn):
+    # The revised event's version FKs the artifact — register locally first.
+    art = artifacts.register_artifact(db_session, body="v1")
+    p = _payload(
+        artifact_id=art["id"],
+        version={
+            "id": str(uuid.uuid4()),
+            "supersedes_id": art["current_version"]["id"],
+            "relation": "refines",
+            "body_snapshot": "# v2",
+            "summary": "cut for release",
+            "milestone": "v2-launch",
+            "created_at": utcnow().isoformat(),
+        },
+    )
+    apply_fn(db_session, _envelope(EVENT_ARTIFACT_REVISED, p))
+    v = db_session.get(ArtifactVersion, uuid.UUID(p["version"]["id"]))
+    assert v is not None and v.milestone == "v2-launch"
+
+
+def test_milestone_round_trips_emit_to_apply(db_session, apply_fn):
+    """End-to-end across the seam: the emit builder's payload, fed through apply,
+    reconstructs the version WITH its milestone (fresh id so apply actually
+    writes rather than no-opping on a PK collision)."""
+    local = artifacts.register_artifact(
+        db_session, body="# spec", milestone="v1-launch"
+    )
+    local_v = db_session.get(
+        ArtifactVersion, uuid.UUID(local["current_version"]["id"])
+    )
+    built = replication_stream.artifact_registered_payload(
+        db_session, db_session.get(Artifact, local_v.artifact_id), local_v
+    )
+    # Re-key to a fresh artifact + version so apply writes a NEW row.
+    built["id"] = str(uuid.uuid4())
+    built["version"]["id"] = str(uuid.uuid4())
+    assert built["version"]["milestone"] == "v1-launch"
+    apply_fn(db_session, _envelope(EVENT_ARTIFACT_REGISTERED, built))
+    v = db_session.get(ArtifactVersion, uuid.UUID(built["version"]["id"]))
+    assert v is not None and v.milestone == "v1-launch"

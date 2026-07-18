@@ -60,6 +60,7 @@ def test_main_surface_exposes_the_decision_and_artifact_tools():
         "get_artifact",
         "get_artifact_version",
         "list_artifacts",
+        "list_artifact_versions",
         "set_governs",
         "set_maturity",
         "applicable_artifacts",

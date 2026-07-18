@@ -7,8 +7,8 @@ Mirrors the frozen monolith's FastMCP registration pattern (`mcp_server.py`):
     The 5 decision tools (`record_decision`, `supersede_decision`, `get_decision`,
     `list_decisions`, `applicable_decisions`) + the artifact tools
     (`register_artifact`, `revise_artifact`, `resolve_artifact`, `get_artifact`,
-    `get_artifact_version`, `list_artifacts`, `set_governs`, `set_maturity`,
-    `applicable_artifacts`).
+    `get_artifact_version`, `list_artifacts`, `list_artifact_versions`,
+    `set_governs`, `set_maturity`, `applicable_artifacts`).
 
   - `build_shadow_surface` — the SPECULATION surface, mounted at `/shadow/mcp`.
     The 8 shadow-WRITE tools (`create_branch`, `list_branches`, `get_branch`,
@@ -57,7 +57,8 @@ read the ancestor-inherited governance that applies at a scope. Decisions: \
 lives in the substrate), `revise_artifact`, `resolve_artifact` (collapse \
 competing version leaves), `get_artifact` (carries the canonical body by \
 default), `get_artifact_version` (one version's body — competing leaves, \
-superseded history), `list_artifacts`, `set_governs`, \
+superseded history), `list_artifacts`, `list_artifact_versions` (versions \
+stamped with a release milestone slug), `set_governs`, \
 `set_maturity`, `applicable_artifacts` (artifacts governing a scope, \
 ancestor-inherited). `applicable_*` resolve "what governs here" by walking the \
 scope tree UPWARD and halting at the first isolated ancestor. Scopes are owned \
@@ -81,7 +82,8 @@ log the UI composer writes; `get_branch` returns its recent tail), \
 and `shadow_corpus_search` (full-text over the shadow content \
 + the real decisions backlinked to a shadow line). Read-real grounding: \
 `get_decision`, `list_decisions`, `applicable_decisions`, `get_artifact`, \
-`get_artifact_version`, `list_artifacts`, `applicable_artifacts` — read the \
+`get_artifact_version`, `list_artifacts`, `list_artifact_versions`, \
+`applicable_artifacts` — read the \
 real graph freely to ground \
 your speculation. It deliberately exposes NO real-write verb — `record_decision`, \
 `supersede_decision`, and the artifact write verbs are ABSENT by construction, on \
@@ -100,7 +102,7 @@ def _register_read_tools(mcp: FastMCP, client: ScopeClient) -> None:
     """Register the READ-REAL governance tools on `mcp` — the decision reads
     (`get_decision`, `list_decisions`, `applicable_decisions`) + the artifact
     reads (`get_artifact`, `get_artifact_version`, `list_artifacts`,
-    `applicable_artifacts`). Shared by
+    `list_artifact_versions`, `applicable_artifacts`). Shared by
     BOTH the `main` surface (its read half) and the `shadow` surface (its
     read-real grounding half), so the two surfaces register the SAME handlers —
     one source of truth per tool. Pure-read: no write verb is registered here, so
@@ -234,6 +236,27 @@ def _register_read_tools(mcp: FastMCP, client: ScopeClient) -> None:
         Expand any row via `get_artifact(id)`. Read-only."""
         return await anyio.to_thread.run_sync(
             _list_artifacts_sync, governs, limit
+        )
+
+    def _list_artifact_versions_sync(milestone, limit):
+        with session_scope() as session:
+            return artifacts.list_versions_by_milestone(
+                session, milestone, limit=limit
+            )
+
+    @mcp.tool()
+    async def list_artifact_versions(
+        milestone: str, limit: int | None = None
+    ) -> dict:
+        """List every artifact VERSION stamped with a `milestone` slug, across all
+        artifacts — the release-correlation read ("what versions did `v1-launch`
+        ship as?"). Each row is a lean version header + its `artifact_id`; expand
+        one via `get_artifact_version(artifact_id, version_id)`. `milestone` is the
+        SOFT release slug stamped at register/revise time (the same slug PM tags
+        work items with) — case-insensitive, grammar-validated. Newest-first,
+        capped; `items_total` carries the true depth. Read-only."""
+        return await anyio.to_thread.run_sync(
+            _list_artifact_versions_sync, milestone, limit
         )
 
     def _unreconciled_decisions_sync(limit):
@@ -569,7 +592,7 @@ def build_main_surface(scope_client: ScopeClient | None = None) -> FastMCP:
         return resolved
 
     def _register_artifact_sync(
-        body, doc_kind, maturity, governs, backend
+        body, doc_kind, maturity, governs, backend, milestone
     ):
         resolved = _resolve_governs(governs)
         with session_scope() as session:
@@ -580,6 +603,7 @@ def build_main_surface(scope_client: ScopeClient | None = None) -> FastMCP:
                 maturity=maturity,
                 governs=governs,
                 backend=backend,
+                milestone=milestone,
                 resolved_scopes=resolved,
             )
 
@@ -590,6 +614,7 @@ def build_main_surface(scope_client: ScopeClient | None = None) -> FastMCP:
         maturity: str = "draft",
         governs=None,
         backend: str = "inline",
+        milestone: str | None = None,
     ) -> dict:
         """Register an INLINE governing artifact (a spec/plan/reference doc) —
         its content (`body`) lives in the substrate, versioned by governance.
@@ -597,14 +622,17 @@ def build_main_surface(scope_client: ScopeClient | None = None) -> FastMCP:
         `governs` accepts a scope slug, a list of slugs, `'*'` (all scopes), or
         None (ungoverned) — each slug is resolved against the platform first.
         Only `backend='inline'` is supported; `'git'` is rejected (it needs a
-        repo registry that's a GitHub-plugin concern). Always mints a fresh
-        artifact + an initial version."""
+        repo registry that's a GitHub-plugin concern). `milestone` is an optional
+        SOFT release-correlation slug stamped on the initial version (the same
+        slug PM tags work items with) — grammar-validated, never resolved. Always
+        mints a fresh artifact + an initial version."""
         return await anyio.to_thread.run_sync(
-            _register_artifact_sync, body, doc_kind, maturity, governs, backend
+            _register_artifact_sync,
+            body, doc_kind, maturity, governs, backend, milestone,
         )
 
     def _revise_artifact_sync(
-        artifact_id, relation, supersedes, body_snapshot, summary
+        artifact_id, relation, supersedes, body_snapshot, summary, milestone
     ):
         with session_scope() as session:
             return artifacts.revise_artifact(
@@ -614,6 +642,7 @@ def build_main_surface(scope_client: ScopeClient | None = None) -> FastMCP:
                 supersedes=supersedes,
                 body_snapshot=body_snapshot,
                 summary=summary,
+                milestone=milestone,
             )
 
     @mcp.tool()
@@ -623,15 +652,19 @@ def build_main_surface(scope_client: ScopeClient | None = None) -> FastMCP:
         supersedes: str | None = None,
         body_snapshot: str | None = None,
         summary: str | None = None,
+        milestone: str | None = None,
     ) -> dict:
         """Create a new version of an artifact. `relation` is `refines` (normal
         improve) or `pivot` (a redirection kept as a branch). `supersedes` is the
         version id the new one follows (defaults to the current leaf); superseding
         a NON-leaf creates a competing branch. `body_snapshot` is the new inline
-        content; `summary` a one-line "why this version"."""
+        content; `summary` a one-line "why this version". `milestone` is an
+        optional SOFT release-correlation slug stamped on THIS version (per-version,
+        not inherited) — grammar-validated, never resolved; the release stamp for
+        the version cut for it."""
         return await anyio.to_thread.run_sync(
             _revise_artifact_sync,
-            artifact_id, relation, supersedes, body_snapshot, summary,
+            artifact_id, relation, supersedes, body_snapshot, summary, milestone,
         )
 
     def _resolve_artifact_sync(artifact_id, version_id):

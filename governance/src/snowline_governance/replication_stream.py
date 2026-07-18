@@ -357,6 +357,9 @@ def artifact_registered_payload(session, artifact, version) -> dict:
             "version": {
                 "id": str(version.id),
                 "body_snapshot": version.body_snapshot,
+                # SOFT milestone ref rides the version half — a replicated version
+                # would silently lose its release stamp without it (§4 / §6).
+                "milestone": version.milestone,
                 "created_at": (
                     version.created_at.isoformat()
                     if version.created_at
@@ -379,6 +382,9 @@ def artifact_revised_payload(version) -> dict:
                 "relation": version.relation,
                 "body_snapshot": version.body_snapshot,
                 "summary": version.summary,
+                # SOFT milestone ref rides the version half (§4 / §6) — apply
+                # stamps it back, so a replicated revision keeps its release tag.
+                "milestone": version.milestone,
                 "created_at": (
                     version.created_at.isoformat()
                     if version.created_at

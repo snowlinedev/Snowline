@@ -524,3 +524,124 @@ def test_applicable_artifacts_over_real_http_transport(db_session):
     inherited = by_id[str(org_ref.id)]
     assert inherited["from_scope"] == "org"
     assert inherited["path"] == "TONE.md"
+
+
+# --- milestone soft ref (#141) ------------------------------------------------
+
+
+def test_register_stamps_milestone_on_initial_version(db_session):
+    art = artifacts.register_artifact(
+        db_session, body="# feature list", milestone="v1-launch"
+    )
+    assert art["current_version"]["milestone"] == "v1-launch"
+    # Read-back surfaces it on the full record + the version read.
+    got = artifacts.get_artifact(db_session, art["id"])
+    assert got["current_version"]["milestone"] == "v1-launch"
+    ver = artifacts.get_artifact_version(
+        db_session, art["id"], art["current_version"]["id"]
+    )
+    assert ver["milestone"] == "v1-launch"
+
+
+def test_register_without_milestone_leaves_it_none(db_session):
+    art = artifacts.register_artifact(db_session, body="# spec")
+    assert art["current_version"]["milestone"] is None
+
+
+def test_revise_stamps_milestone_per_version_not_inherited(db_session):
+    art = artifacts.register_artifact(
+        db_session, body="v1", milestone="v1-launch"
+    )
+    revised = artifacts.revise_artifact(
+        db_session, art["id"], relation="refines",
+        body_snapshot="v2", milestone="v2-launch",
+    )
+    assert revised["current_version"]["milestone"] == "v2-launch"
+    # A revision that omits milestone does NOT inherit the predecessor's stamp —
+    # the release tag marks exactly the version cut for it.
+    revised2 = artifacts.revise_artifact(
+        db_session, art["id"], relation="refines", body_snapshot="v3",
+    )
+    assert revised2["current_version"]["milestone"] is None
+
+
+def test_milestone_input_is_case_insensitive_stored_lowercase(db_session):
+    art = artifacts.register_artifact(
+        db_session, body="# spec", milestone="V1-Launch"
+    )
+    assert art["current_version"]["milestone"] == "v1-launch"
+
+
+def test_milestone_orgstyle_slug_accepted(db_session):
+    art = artifacts.register_artifact(
+        db_session, body="# spec", milestone="TurtlesEdge/v1"
+    )
+    assert art["current_version"]["milestone"] == "turtlesedge/v1"
+
+
+def test_invalid_milestone_rejected_loudly(db_session):
+    with pytest.raises(ValueError, match="invalid milestone slug"):
+        artifacts.register_artifact(
+            db_session, body="# spec", milestone="not a slug!"
+        )
+    with pytest.raises(ValueError, match="invalid milestone slug"):
+        artifacts.revise_artifact(
+            db_session,
+            artifacts.register_artifact(db_session, body="v1")["id"],
+            relation="refines", milestone="bad/*/slug",
+        )
+
+
+def test_empty_milestone_is_none_not_error(db_session):
+    art = artifacts.register_artifact(db_session, body="# spec", milestone="  ")
+    assert art["current_version"]["milestone"] is None
+
+
+def test_list_versions_by_milestone_filters_across_artifacts(db_session):
+    a1 = artifacts.register_artifact(
+        db_session, body="feature list", milestone="v1-launch"
+    )
+    a2 = artifacts.register_artifact(
+        db_session, body="api plan", doc_kind="plan", milestone="v1-launch"
+    )
+    # A version stamped with a DIFFERENT milestone must not match.
+    artifacts.register_artifact(db_session, body="other", milestone="v2-launch")
+    # An unstamped version must not match either.
+    artifacts.register_artifact(db_session, body="unstamped")
+
+    out = artifacts.list_versions_by_milestone(db_session, "v1-launch")
+    assert out["milestone"] == "v1-launch"
+    assert out["items_total"] == 2
+    got_ids = {v["id"] for v in out["versions"]}
+    assert got_ids == {a1["current_version"]["id"], a2["current_version"]["id"]}
+    # Each row carries its artifact_id + the milestone header (lean, no body).
+    for v in out["versions"]:
+        assert v["milestone"] == "v1-launch"
+        assert "artifact_id" in v
+        assert "body_snapshot" not in v
+
+
+def test_list_versions_by_milestone_is_case_insensitive(db_session):
+    art = artifacts.register_artifact(
+        db_session, body="feature list", milestone="v1-launch"
+    )
+    out = artifacts.list_versions_by_milestone(db_session, "V1-LAUNCH")
+    assert out["items_total"] == 1
+    assert out["versions"][0]["id"] == art["current_version"]["id"]
+
+
+def test_list_versions_by_milestone_includes_revised_versions(db_session):
+    art = artifacts.register_artifact(db_session, body="v1")
+    revised = artifacts.revise_artifact(
+        db_session, art["id"], relation="refines",
+        body_snapshot="v2", milestone="v2-launch",
+    )
+    out = artifacts.list_versions_by_milestone(db_session, "v2-launch")
+    assert out["items_total"] == 1
+    assert out["versions"][0]["id"] == revised["current_version"]["id"]
+
+
+def test_list_versions_by_milestone_empty_input_yields_empty(db_session):
+    artifacts.register_artifact(db_session, body="v1", milestone="v1-launch")
+    out = artifacts.list_versions_by_milestone(db_session, "   ")
+    assert out["versions"] == [] and out["items_total"] == 0

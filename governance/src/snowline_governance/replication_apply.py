@@ -554,6 +554,11 @@ def _apply_artifact_registered(session, client, envelope: dict) -> None:
                 id=version_id,
                 artifact_id=artifact_id,
                 body_snapshot=version.get("body_snapshot"),
+                # SOFT milestone ref stamped verbatim from the payload — the
+                # author already grammar-validated/canonicalized it, and it names
+                # no scope, so apply reconstructs it directly (no re-validation,
+                # no resolution) exactly like `scope_slug` on the governs edges.
+                milestone=version.get("milestone"),
                 created_at=_dt(version.get("created_at")),
             )
         )
@@ -584,6 +589,8 @@ def _apply_artifact_revised(session, client, envelope: dict) -> None:
             relation=version.get("relation"),
             body_snapshot=version.get("body_snapshot"),
             summary=version.get("summary"),
+            # SOFT milestone ref, stamped verbatim (see _apply_artifact_registered).
+            milestone=version.get("milestone"),
             created_at=_dt(version.get("created_at")),
         )
     )

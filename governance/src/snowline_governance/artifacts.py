@@ -32,6 +32,7 @@ isolation-halting walk) and returns the artifacts governing any chain scope
 
 from __future__ import annotations
 
+import re
 import uuid
 
 from sqlalchemy import func, or_, select
@@ -58,6 +59,53 @@ from snowline_governance.models import (
     ArtifactVersion,
 )
 from snowline_governance.scope_client import ScopeClient
+
+
+# --- milestone soft ref (spec §4) --------------------------------------------
+#
+# The optional `ArtifactVersion.milestone` slug is a SOFT reference — the
+# portfolio's cross-plugin release-correlation key (PM tags work items with the
+# same slug). It names NO real scope and is NEVER resolved, so governance
+# validates it against the slug GRAMMAR itself rather than resolving it through
+# the platform (exactly as `snowline_memory` validates its soft scope refs). The
+# grammar is CARRIED (not imported — import-purity across the service boundary)
+# from `snowline_platform.scopes` §2.1, and input is folded to the canonical
+# lowercase form per #139 (scope-slug input is case-insensitive across every
+# Snowline surface; storage/filtering stays canonical-lowercase only).
+_MILESTONE_SEG = r"[._-]*[a-z0-9][a-z0-9._-]*"
+_MILESTONE_RE = re.compile(rf"^{_MILESTONE_SEG}(/{_MILESTONE_SEG})*$")
+
+
+def _canonical_milestone(milestone):
+    """Fold a milestone slug to the canonical lowercase form (#139). ASCII-ONLY:
+    non-ASCII input passes through untouched so the grammar check rejects it
+    LOUDLY — a Unicode case-fold (U+212A → 'k') must not smuggle an invalid input
+    in as a silently different slug. Non-strings pass through."""
+    if isinstance(milestone, str) and milestone.isascii():
+        return milestone.strip().lower()
+    return milestone
+
+
+def _validate_milestone(milestone: str | None) -> str | None:
+    """Validate an OPTIONAL milestone slug against the platform slug grammar and
+    return the CANONICAL (lowercased) form (#139). A soft ref, never resolved —
+    so this is grammar-only, like a scope-slug validation minus the platform
+    round-trip. `None`/empty pass through as None (an unstamped version); garbage
+    is rejected LOUDLY (spec §4 — the milestone names no scope, so a typo can't
+    self-heal via resolution)."""
+    if milestone is None:
+        return None
+    milestone = _canonical_milestone(milestone)
+    if isinstance(milestone, str):
+        milestone = milestone.strip()
+    if not milestone:
+        return None
+    if not isinstance(milestone, str) or not _MILESTONE_RE.match(milestone):
+        raise ValueError(
+            f"invalid milestone slug {milestone!r} — expected a platform-style "
+            "slug (lowercase `name` or `org/rest`, the §2.1 grammar)"
+        )
+    return milestone
 
 
 class ArtifactNotFoundError(Exception):
@@ -215,6 +263,8 @@ def _version_dict(
         "supersedes_id": str(v.supersedes_id) if v.supersedes_id else None,
         "has_snapshot": v.body_snapshot is not None,
         "summary": v.summary,
+        # SOFT release-correlation ref (spec §4); None on an unstamped version.
+        "milestone": v.milestone,
         "created_at": v.created_at.isoformat() if v.created_at else None,
     }
     if include_body:
@@ -320,6 +370,7 @@ def register_artifact(
     maturity: str = DEFAULT_ARTIFACT_MATURITY,
     governs=None,
     backend: str = ARTIFACT_BACKEND_INLINE,
+    milestone: str | None = None,
     resolved_scopes: dict[str, dict] | None = None,
 ) -> dict:
     """Register an INLINE governing artifact — content lives in the substrate on
@@ -334,6 +385,10 @@ def register_artifact(
     `GitBackendUnsupportedError` (the git backend needs a repo registry that's a
     GitHub-plugin concern, out of scope here). Each inline register mints a fresh
     artifact (there is no `(repo, path)` identity to be idempotent on).
+
+    `milestone` is an optional SOFT release-correlation slug stamped VERBATIM on
+    the initial version (spec §4) — grammar-validated + canonicalized lowercase
+    (#139), never resolved. `None`/empty leaves the version unstamped.
 
     `governs` (single slug / list / `'*'` / None) and `resolved_scopes` (slug →
     the platform's scope row) come from the MCP surface, which resolves each slug
@@ -365,12 +420,15 @@ def register_artifact(
             "nothing."
         )
     _normalize_governs(governs)  # validate up front (raises cleanly)
+    milestone = _validate_milestone(milestone)  # grammar-validate; canonical form
     artifact = Artifact(
         doc_kind=doc_kind, backend=ARTIFACT_BACKEND_INLINE, maturity=maturity,
     )
     session.add(artifact)
     session.flush()
-    initial = ArtifactVersion(artifact_id=artifact.id, body_snapshot=body)
+    initial = ArtifactVersion(
+        artifact_id=artifact.id, body_snapshot=body, milestone=milestone
+    )
     session.add(initial)
     if governs is not None:
         _apply_governs(session, artifact, governs, resolved_scopes)
@@ -392,6 +450,7 @@ def revise_artifact(
     supersedes: str | None = None,
     body_snapshot: str | None = None,
     summary: str | None = None,
+    milestone: str | None = None,
 ) -> dict:
     """Create a new version of an artifact (spec §4.2). `relation` is `refines`
     (the normal improve) or `pivot` (a redirection — kept as a branch off its
@@ -399,12 +458,19 @@ def revise_artifact(
     follows; defaults to the artifact's current leaf. Superseding a NON-leaf older
     version creates a competing branch (both leaves then surface in `leaves`, no
     inference). For an inline artifact `body_snapshot` is the new content; `summary`
-    is an optional one-line "why this version"."""
+    is an optional one-line "why this version".
+
+    `milestone` is an optional SOFT release-correlation slug stamped VERBATIM on
+    THIS new version (spec §4) — grammar-validated + canonicalized lowercase
+    (#139), never resolved. It is per-VERSION (not inherited from the predecessor):
+    an omitted `milestone` leaves the new version unstamped, so a release stamp
+    marks exactly the version cut for it."""
     a = _require_artifact(session, artifact_id)
     if relation not in ARTIFACT_RELATIONS:
         raise ValueError(
             f"relation must be one of {list(ARTIFACT_RELATIONS)}, got {relation!r}"
         )
+    milestone = _validate_milestone(milestone)  # grammar-validate; canonical form
     if supersedes is None:
         cur = _current_version(session, a.id)
         if cur is None:  # register always creates v1, so this is defensive
@@ -418,6 +484,7 @@ def revise_artifact(
         relation=relation,
         body_snapshot=body_snapshot,
         summary=summary,
+        milestone=milestone,
     )
     session.add(version)
     session.flush()
@@ -544,6 +611,43 @@ def _resolve_list_limit(limit: int | None, default: int = 50, cap: int = 500) ->
     if limit is None:
         return default
     return max(1, min(int(limit), cap))
+
+
+def list_versions_by_milestone(
+    session: Session, milestone: str, limit: int | None = None
+) -> dict:
+    """List every artifact VERSION stamped with a milestone slug (spec §4), across
+    all artifacts — the release-correlation read ("what versions did `v1-launch`
+    ship as?"). Newest first, capped at `limit` (default 50, max 500) with
+    `items_total` carrying the true depth. Each row is the lean version header
+    (`_version_dict`, no body) PLUS its `artifact_id`; expand one via
+    `get_artifact_version(artifact_id, version_id)`.
+
+    `milestone` is grammar-validated + canonicalized (#139) BEFORE the query, so a
+    mixed-case or garbage input is caught the same way the write side is (a
+    case-variant lookup can't silently miss the canonical-lowercase rows it should
+    match). Read-only; an empty/None milestone yields an empty list (not an
+    error — there is no 'unstamped' milestone to list)."""
+    lim = _resolve_list_limit(limit)
+    canonical = _validate_milestone(milestone)
+    if canonical is None:
+        return {"milestone": milestone, "versions": [], "items_total": 0}
+    stmt = (
+        select(ArtifactVersion)
+        .where(ArtifactVersion.milestone == canonical)
+        .order_by(ArtifactVersion.created_at.desc(), ArtifactVersion.id.desc())
+    )
+    rows = list(session.scalars(stmt))
+    versions: list[dict] = []
+    for v in rows[:lim]:
+        row = _version_dict(v)
+        row["artifact_id"] = str(v.artifact_id)
+        versions.append(row)
+    return {
+        "milestone": canonical,
+        "versions": versions,
+        "items_total": len(rows),
+    }
 
 
 def _governs_for_artifacts(

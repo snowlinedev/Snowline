@@ -78,6 +78,7 @@ _READ_REAL_GROUNDING = {
     "get_artifact",
     "get_artifact_version",
     "list_artifacts",
+    "list_artifact_versions",
     "applicable_artifacts",
     # §6.1 unreconciled view (replication-continuity, #79) — a pure read on the
     # shared read set, so speculation sessions see flagged pairs too.
