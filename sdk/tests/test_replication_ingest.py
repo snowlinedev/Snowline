@@ -147,6 +147,24 @@ def test_fresh_epoch_has_its_own_watermark(session):
     assert (status, resp["reason"]) == (404, "unknown_stream")
 
 
+def test_second_active_epoch_for_one_source_is_refused(session):
+    """#119: at most ONE inbound stream per source_id may be active — a second
+    epoch registered while the old one is still live would make `_peer_seen`'s
+    "the active stream" pick ambiguous, corrupting every outbound envelope's
+    §6.1 causal context toward that peer. Registration refuses LOUDLY; after
+    the old epoch retires (the §7 step-5 procedure), the fresh epoch registers
+    fine."""
+    _register(session)
+    with pytest.raises(ValueError, match="already active under epoch 'epoch-1'"):
+        ingest.register_inbound_stream(session, STREAM[0], "epoch-2")
+    # A DIFFERENT source is unaffected — the invariant is per source_id.
+    ingest.register_inbound_stream(session, "other.plugin", "epoch-1")
+
+    ingest.retire_inbound_stream(session, *STREAM)
+    new = ingest.register_inbound_stream(session, STREAM[0], "epoch-2")
+    assert new["active"] is True
+
+
 # --- rejections vs holds (§3.1/§3.2) ------------------------------------------
 
 

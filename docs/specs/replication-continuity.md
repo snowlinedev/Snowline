@@ -371,7 +371,14 @@ each opted-in plugin covers its write surface with events:
   2. create the SENDING plugin's outbound subscription (peer `ingest_path` +
      stream + that secret).
   The receiver minting means the verifying side holds the secret by
-  construction — a secret that only the sender knows can never verify. The
+  construction — a secret that only the sender knows can never verify.
+  **At most one inbound stream per `source_id` may be active** — `peer_seen`
+  reports "the" active stream's applied frontier (§3.2/§6.1), which is only
+  well-defined when there is exactly one — and the receiver's registration
+  ENFORCES this: registering a fresh epoch while another is still active
+  refuses loudly (409) until the old stream is retired, which the fresh-epoch
+  re-seed procedure does (§7 step 5). The pairing CLI's own already-paired
+  pre-check is a courtesy on top, not the guarantee. The
   CLI warns on any plugin opted in on one side only or with mismatched
   `contract_version`/vocabulary. It addresses each peer participant's
   replication surfaces by the §4.1 advertised-address rule: the participant's

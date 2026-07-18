@@ -114,6 +114,16 @@ def test_handshake_ingest_and_parked_view_over_http(app_and_applied):
     )
     assert dup.status_code == 409
 
+    # …and so does a SECOND epoch while e1 is still active (#119: the
+    # single-active-stream invariant, enforced server-side — two live epochs
+    # for one source would corrupt peer_seen).
+    second = _request(
+        app, "POST", "/replication-admin/inbound",
+        json={"source_id": "roam.plugin", "epoch": "e2"},
+    )
+    assert second.status_code == 409
+    assert "already active under epoch" in second.json()["detail"]
+
     envelope = build_envelope(
         "thing.recorded", {"id": "x"},
         source_id="roam.plugin", epoch="e1", seq=1, peer_seen=0,
