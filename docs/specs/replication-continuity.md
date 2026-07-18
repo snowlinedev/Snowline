@@ -596,6 +596,183 @@ delivery — lost. The procedure:
    were applied on the primary, and re-seeding over an unresolved park
    would overwrite the spoke's only applied copy of that write.
 
+### 7.1 Cold-start union merge — reuniting two stores that both have unpaired history (#98)
+
+§7 covers the superset case: a spoke born FROM the primary's snapshot. It
+cannot cover the reunion case — **two instances that each accumulated history
+while no subscription existed between them**, because replication moves
+events and events exist only for writes made while a subscription exists.
+Concrete scenario (2026-07-04, the real first-standup plan): the mini goes
+down; the owner stands `roam` up **empty** (no recent backup); works on it
+for days; the mini returns with months of pre-outage history. Neither store
+is a superset — `pair` alone only opens streams forward-in-time, and a §7
+seed's restore would overwrite one side's writes. The union rule is absolute:
+**no write authored on either side is absent after the reunion.**
+
+The shape: **backfill — manufacture the missing events.** A backfill walks
+one instance's domain rows and replays each as a synthetic event through the
+peer's EXISTING ingest path — the same idempotent apply seam, origin
+suppression, per-name LWW, §6.1 sibling flagging, §8.1 parking. Convergence
+rules already exist; the union only supplies the events that were never
+emitted. Run once per direction, it is NOT #84 multi-writer machinery: still
+one human, and "the other side already has this row" is the idempotent-apply
+no-op, not a merge algorithm.
+
+**The backfill stream — identity and envelope semantics (the §3.2 decisions):**
+
+- A backfill is an ORDINARY stream with a reserved identity:
+  `source_id = <live source_id>#backfill` (e.g. `mini.governance#backfill`),
+  epoch minted fresh at backfill start. The `#backfill` suffix is
+  load-bearing three ways: (1) it keeps the §5 single-active-stream-per-
+  source invariant (#119) intact — the live stream and the backfill stream
+  coexist because they are different sources, while the SAME invariant,
+  applied to the backfill source id, gives "at most one backfill per
+  direction at a time" for free; (2) `peer_seen`'s "the active inbound
+  stream from `peer_source_id`" lookup keys on the LIVE source id, so a
+  backfill stream can never contaminate live causal context by construction;
+  (3) it is self-describing in every parked-event row, delivery log, and
+  stream listing an operator will read during the union.
+- The stream is opened by the ordinary §5 handshake (both instances are up
+  during a reunion — none of §7's seed-plays-receiver exception applies),
+  delivered by the ordinary delivery loop, gated/parked/signed like any
+  stream, and **retired on completion** on both halves. Steady state after
+  the union is exactly the steady state before it: one live stream per
+  direction.
+- The backfill subscription is created with an **EMPTY event vocabulary** —
+  load-bearing, not cosmetic: `emit_event` fans a live write onto every
+  active subscription whose vocabulary matches, and a backfill subscription
+  declaring the live vocabulary would receive live writes interleaved onto
+  the walker's counter — non-deterministic seqs, broken resume, live events
+  wearing backfill causal context. An empty vocabulary makes the stream
+  invisible to the emit hook; the delivery loop drains its directly-written
+  rows regardless.
+- `seq` is allocated at ENQUEUE time from the backfill stream's own counter,
+  in **deterministic walk order** — `(authored_at, id)` per domain table,
+  **bounded at the instant live pairing opened**: anything authored after
+  that is live traffic by definition (the subscription existed), so the
+  enumeration set is frozen and an aborted backfill resumes from its
+  outbox/gate cursor over the identical sequence. A from-scratch re-run
+  under a fresh epoch replays harmlessly regardless (apply idempotence).
+  The walker writes outbox rows under the backfill subscription DIRECTLY —
+  never through the emit hook. The walk is read-only on the sender; only
+  the receiver's apply writes.
+- **`peer_seen` is 0 on every backfill envelope — and 0 is the truth**, not
+  a placeholder: pre-pairing writes were authored before any stream from the
+  receiver existed, so their authors had provably seen none of it. §6.1
+  reads this exactly right — every backfilled event is concurrent with every
+  local row in an overlapping applicability chain (see the sibling note
+  below).
+- **Payload timestamps are the rows' ORIGINAL authored-at times, never
+  import time.** They are the §6 LWW clock: memory's per-name register must
+  resolve a cross-partition `remember` race identically whether the events
+  arrived live or by backfill, and a backfilled tombstone must beat an older
+  `set` on authored time, not on import order.
+- Backfill envelopes are current-`CONTRACT_VERSION` envelopes with **no
+  additional marker field — the stream identity IS the marker**: an apply
+  that must behave differently under a union (exactly one exists: the scope
+  convergence rule below) keys off the envelope's `#backfill` source suffix,
+  and every other apply is deliberately identical for live and backfilled
+  events — idempotence and LWW neither know nor care how an event arrived.
+
+**Enumerators — the per-plugin half.** Each replicating participant defines a
+backfill enumerator next to its `apply`: a deterministic iterator over its
+replicated row surface that yields `(event_type, payload)` pairs from its
+EXISTING §4 vocabulary such that applying them to an empty peer reproduces
+each row's current state, and applying them to a peer that already has the
+row is the no-op/LWW path. Two rules with teeth: the enumeration includes
+**lifecycle and tombstone state** (a superseded decision enumerates as
+`recorded` + `superseded`; a forgotten memory enumerates its tombstone — a
+walk of only "live" rows would resurrect deletions on the peer); and where
+one event cannot carry a row's final state, the enumerator emits the minimal
+lifecycle sequence rather than inventing a new event shape. An enumerator MAY
+skip rows its store marks as replicated-in from the peer; correctness never
+depends on it (UUID no-op), it only saves traffic.
+
+**Scope identity — the union's one real identity decision.** Live replication
+lets every instance hold the same scope UUID because scope rows replicate
+from a single mint. A cold-start union breaks that: `roam`, stood up empty,
+re-created the same slugs the mini already had — same slug, different id, on
+both sides, for *every shared scope*. Two consequences, both settled here:
+
+- **Slug is the cross-instance identity of a scope; scope UUIDs are
+  instance-local.** On a backfill stream, `scope.created` for a slug that
+  exists locally under a different id applies as **convergence** — a no-op
+  that keeps the local row and id, metadata LWW'd by authored-at, logged at
+  WARNING — NOT the §8 `ParkNow`. (The scope payload carries no timestamp
+  today, so convergence has no clock: it gains the row's authored/updated
+  stamps as ADDITIVE fields — `.get`-tolerant on the apply side, no contract
+  bump, the same additive posture as any optional payload field.) Parking is the right posture on a LIVE
+  stream, where a same-new-slug race is a genuine surprise; on a union it is
+  the EXPECTED case for every shared slug, and parking would flood the §8.1
+  view with non-events while pinning the scope stream's frontier at zero.
+- **Apply resolves scope references by SLUG; the wire `scope_id` is
+  advisory.** Plugin payloads carry both (`scope`, `scope_id`); the apply
+  seam and §6.1's detection walk must key on the local resolution of the
+  slug, never trust the wire id into a stored row or an ancestor-chain
+  comparison. Under live replication the two are identical, so this costs
+  nothing observable today — it is the invariant that makes id divergence
+  permanently harmless rather than a latent corruption class.
+
+**Sibling detection under a union.** With `peer_seen` 0, §6.1 flags every
+backfilled event against every overlapping-chain local row — deliberately
+over-inclusive, and under a union the honest volume: a week of partition
+writes against months of pre-outage history CAN semantically collide
+anywhere their chains overlap. Three bounds keep it a reconcile session
+rather than a flood: detection compares only rows the apply actually created
+(a UUID/LWW no-op flags nothing); the candidate set on the receiving side
+must include **never-emitted local rows** (pre-pairing local history has no
+live-stream seq — a seq-keyed candidate query would silently exempt exactly
+the rows the union exists to reconcile); and `mark-compatible` remains the
+bulk affordance for cohorts the owner reviews together. The reconcile pass
+is owner-signed-off procedure (2026-07-04): the tool's job is the union, the
+judgment stays human.
+
+**The procedure (CLI-driven, one verb per step, §5 admin surface only):**
+
+1. **Pair live streams first** (fresh §5 pair; for a previously-paired pair,
+   retire the old streams per §7 step 5 — the re-seed preconditions do NOT
+   apply, a union replaces the restore). Old-epoch leftovers are superseded
+   by the backfill, which re-enumerates every row those deliveries carried:
+   undelivered pending rows on a retired stream stay put (nothing drains a
+   retired stream), and an old unresolved park can be dropped once the union
+   verifies — its payload re-arrives on the backfill stream and applies (or
+   re-parks loudly under the union's own identity). Forward-in-time
+   replication starts now; everything from here runs under live traffic.
+2. **Backfill the scope namespace, both directions, to completion** —
+   `applied_seq` at the walker's final seq, parked set empty — before any
+   plugin backfill starts. §8's ordering note self-heals plugin-before-scope
+   lag retryably, but starting plugins after scopes converge turns a
+   park-and-retry storm into a quiet pass.
+3. **Backfill each opted-in plugin, both directions.** Order among plugins is
+   free (no hard cross-plugin FKs, §4 checklist 5). An empty side simply
+   enumerates nothing — the cold-start case degenerates to one real
+   direction per store.
+4. **Verify, then retire the backfill streams** on both halves. Completion =
+   every enumerator exhausted, every backfill stream's `applied_seq` equal to
+   its final seq, parked sets empty (or explicitly resolved), and the §6.1
+   unreconciled view triaged. The retired streams stay for audit, like every
+   retired stream.
+
+**Acceptance (§10 additions).** No write authored on either side during the
+partition is absent after the union; every cross-partition collision is
+either LWW-resolved (same object) or flagged unreconciled (§6.1 siblings);
+a backfilled `remember`/`forget` race resolves identically to its live
+equivalent (original authored-at as the clock); a shared-slug scope pair
+converges to one local row per side with no park; re-running a completed
+backfill under a fresh epoch changes nothing (idempotence end-to-end); and
+after retirement, steady state is indistinguishable from a §7-seeded pair.
+
+**Build note.** SDK: the direct-enqueue walker driver, backfill stream
+lifecycle (open/status/retire), and the `#backfill` identity rule. Plugins:
+one enumerator each (governance, memory, platform scopes; PM privately, per
+§9 item 7). Platform: the union-mode scope apply (convergence instead of
+`ParkNow` on the backfill stream) and the additive authored/updated stamps
+in the scope payload. Governance: slug-keyed reference resolution in apply
+and §6.1 detection where the wire `scope_id` is trusted today, and the
+detection candidate set widened to never-emitted local rows. CLI: `snowline
+replicate union` orchestrating the procedure above. Runbook: the "stood up
+empty" recovery path lands beside §5/§6 when the tool ships.
+
 ## 8. The scope namespace — the platform dogfoods the contract
 
 Scopes are the shared spine every plugin references by slug; a spoke-authored
@@ -608,7 +785,9 @@ Scopes are slow-changing and append-mostly (slugs are never reused;
 building it platform-side proves the SDK seam before the PM plugin adopts it
 privately. Slug collisions across a partition (same new slug authored on both
 sides) fail loud at ingest and require manual resolution — acceptably rare
-for a single owner.
+for a single owner. (On a §7.1 backfill stream the same collision is the
+EXPECTED case, not a race, and converges by slug instead of parking — slug is
+the cross-instance identity of a scope; the park posture is live-stream-only.)
 
 Because the platform dogfoods the contract, it also **self-describes** it. A
 plugin's `contract_version`/vocabulary is discoverable at pairing time from its
@@ -757,6 +936,15 @@ events. The two never overlap.
   author: no cloned subscription, outbox row, watermark, or parked event
   survives the restore.
 - Seeding per §7 yields a spoke that converges from events alone thereafter.
+- A §7.1 union of two stores with unpaired history loses nothing: no write
+  authored on either side during the partition is absent afterward; every
+  cross-partition collision is LWW-resolved (same object) or flagged
+  unreconciled (§6.1); a backfilled memory race resolves identically to its
+  live equivalent (original authored-at as the LWW clock); shared-slug
+  scopes converge with no park; a completed backfill re-run under a fresh
+  epoch changes nothing; and after the backfill streams retire, steady state
+  is indistinguishable from a §7-seeded pair (one live stream per direction,
+  live causal context never contaminated by a backfill stream's frontier).
 
 ## 11. Out of scope
 
