@@ -17,8 +17,9 @@ runtime**, the place where capabilities actually meet.
 ## 2. Platform vs plugins
 
 - **The platform** (this repo): the **gateway** + **plugin registry** +
-  **health/supervision** + the **scope namespace** + the **trust gate**. Small,
-  but real — it owns the universal primitive (scopes) and composes everything.
+  **health/supervision** + the **scope namespace** + the **milestone registry**
+  + the **trust gate**. Small, but real — it owns the universal primitives
+  (scopes, milestones) and composes everything.
 - **Plugins**: independent modules, each exposing **MCP surface(s) + a UX** over
   its **own store**. Governance is the flagship; later: a private PM, a GitHub
   plugin, drift/triage carriers.
@@ -66,6 +67,7 @@ runtime**, the place where capabilities actually meet.
 | Gateway | aggregate plugin surfaces onto named platform surfaces; proxy MCP + UI | spec'd (`gateway.md`) |
 | Health + supervision | poll plugin health; restart local; route around down/unreachable | planned |
 | Scope namespace | the shared spine plugins reference | spec pending |
+| Milestone registry | first-class milestones: identity, lifecycle, resolution | spec'd (`milestones.md`) |
 | Governance plugin | the flagship capability (decisions + shadow + specs) | spec'd (`governance-plugin.md`) |
 | Plugin SDK / contract | published versioned dep plugins consume (typed client + signed-event verify) | carried from prior work |
 
