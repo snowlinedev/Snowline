@@ -69,7 +69,12 @@ Carried over unchanged in shape (a lift, per the develop-in-public carve), minus
   mint, never resolved, the portfolio's cross-plugin key: PM tags work items
   with the same slug, so a stamped version records which artifact version a
   release shipped as; grammar-validated + canonical-lowercase like a scope slug,
-  case-insensitive input per #139),
+  case-insensitive input per #139.
+  **Amended for first-class milestones** (`milestones.md` §6.1): the stamp
+  graduates from soft annotation to resolution key — validated against the
+  platform milestone registry at mint, and a leaf stamped with a *planned*
+  milestone is *pending*, not canonical/competing, until its milestone goes
+  active),
   `ArtifactGoverns` (artifact↔scope, multi-scope).
 - **Webhook bus** — `WebhookSubscription`, `WebhookDelivery` (§7).
 
