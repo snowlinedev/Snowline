@@ -28,7 +28,10 @@ composes; it never imports plugin code (plugins are addressed by URL).
 - **Isolation is plugin-side and structural**: the gateway composes *whole*
   surfaces and never reasons about individual tools, so a tool appears on a
   surface only because a plugin mapped it there (`record_decision` never lands on
-  `shadow`).
+  `shadow`). The one addition to plugin-mapped tools: the **platform's own
+  native tools** (scope and milestone registry verbs — `scope-namespace.md` §4,
+  `milestones.md` §5) contribute to `main` the same way, composed as a
+  platform-internal surface rather than routed to any plugin.
 
 ## 2a. Per-surface plugin allowlists (config)
 

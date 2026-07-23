@@ -87,6 +87,14 @@ Carried over unchanged in shape (a lift, per the develop-in-public carve), minus
 - **Artifacts (write):** `register_artifact`, `revise_artifact`
   (both accept an optional `milestone` release slug stamped on the version),
   `resolve_artifact` (leaf resolution), `set_governs`, `set_maturity`.
+  **Amended for first-class milestones** (`milestones.md` §6.1): the write
+  verbs validate + resolve the milestone ref against the platform registry
+  (hard-fail on unknown; canonical address stored); `revise_artifact`'s
+  `supersedes` default becomes the current **canonical** version (not the DAG
+  leaf, which may be a pending draft), and an unstamped revision superseding a
+  pending/dead version is rejected. `get_artifact` gains a `milestone=REF`
+  read parameter, and `list_artifact_versions`' filter resolves its ref and
+  matches stamps against the target's alias set.
 - **Artifacts (read):** `get_artifact` (the full record — `current_version`
   carries the canonical inline body by default; `include_body=False` for the
   lean header), `get_artifact_version` (one version's body by (artifact,
