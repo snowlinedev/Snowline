@@ -524,6 +524,7 @@ def _log_transition(
     *,
     authored_at: datetime,
     source_id: str | None,
+    warnings: list[str] | None = None,
 ) -> None:
     session.add(
         MilestoneTransition(
@@ -533,6 +534,7 @@ def _log_transition(
             reason=reason,
             authored_at=authored_at,
             source_id=source_id,
+            warnings=warnings or None,
         )
     )
 
@@ -552,12 +554,19 @@ def _transition(
     setattr(m, stamp, now)
     m.lww_authored_at = now
     m.lww_source_id = src
-    _log_transition(session, m, frm, to_status, reason, authored_at=now, source_id=src)
+    # The §4 warnings are computed AT the transition and PERSISTED on its log
+    # row (QA 6396993e) — the response reads the same list, and later audits
+    # see exactly what the caller was told at the moment of the act.
+    warnings = transition_warnings(session, m)
+    _log_transition(
+        session, m, frm, to_status, reason,
+        authored_at=now, source_id=src, warnings=warnings,
+    )
     session.flush()
     emit_event(
         session,
         EVENT_MILESTONE_TRANSITIONED,
-        _transition_payload(m, frm, to_status, reason, now),
+        _transition_payload(m, frm, to_status, reason, now, warnings),
     )
     return m
 
@@ -659,6 +668,7 @@ def transitions(session: Session, address: str) -> list[dict]:
             "from_status": t.from_status,
             "to_status": t.to_status,
             "reason": t.reason,
+            "warnings": t.warnings,
             "authored_at": _iso(t.authored_at),
         }
         for t in rows
@@ -1085,6 +1095,7 @@ def _transition_payload(
     to_status: str,
     reason: str | None,
     authored_at: datetime,
+    warnings: list[str] | None = None,
 ) -> dict:
     """The `milestone.transitioned` body: FULL ROW STATE (so apply converges the
     row by LWW) PLUS the transition triple (from/to status, reason) and the
@@ -1096,6 +1107,7 @@ def _transition_payload(
         "from_status": from_status,
         "to_status": to_status,
         "reason": reason,
+        "warnings": warnings or None,
         "authored_at": _iso(authored_at),
     }
 
@@ -1226,6 +1238,7 @@ def _append_transition_idempotent(
     reason: str | None,
     authored_at: datetime | None,
     source_id: str | None,
+    warnings: list | None = None,
 ) -> None:
     """Append the peer's transition to the log — the LWW LOSER's transition lands
     here too, never dropped (§9). Idempotent on redelivery: the
@@ -1248,6 +1261,7 @@ def _append_transition_idempotent(
                 reason=reason,
                 authored_at=authored_at,
                 source_id=source_id,
+                warnings=warnings or None,
             )
         )
         session.flush()
@@ -1338,6 +1352,7 @@ def _apply_transitioned(session: Session, envelope: dict) -> None:
         payload.get("reason"),
         _parse_dt(payload["authored_at"]),
         envelope.get("source"),
+        warnings=payload.get("warnings"),
     )
     _check_illegal_history(session, m)
 

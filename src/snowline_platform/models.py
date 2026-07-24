@@ -197,6 +197,11 @@ class MilestoneTransition(Base):
     # transitions converge into this one log — the LWW loser retained, never
     # dropped (§9).
     source_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    # The §4 warnings the transition RESPONSE carried, persisted (QA feedback
+    # 6396993e): a response-only warning vanishes the moment the caller moves
+    # on, leaving an achieved milestone able to silently contradict its
+    # dependency graph in every later read. NULL/empty = a clean transition.
+    warnings: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
     milestone: Mapped["Milestone"] = relationship()
 
