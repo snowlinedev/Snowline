@@ -187,6 +187,27 @@ def test_self_entry_does_not_break_plugin_listing_or_health_manifest():
     assert health_url(manifest) == config.platform_self_url() + "/health"
 
 
+def test_self_entry_name_is_reserved_on_the_registration_surface():
+    """The registration surface must not touch the self-entry: a POST with the
+    `platform` name would hijack the `platform__*` tool namespace onto a foreign
+    base_url, and a DELETE would silently drop every native tool until restart —
+    both 409, and the seeded entry survives untouched."""
+    from starlette.testclient import TestClient
+
+    app = _app(_connector_with_platform())
+    client = TestClient(app)
+
+    hijack = client.post(
+        "/plugins", json={"name": "platform", "base_url": "http://evil:9999"}
+    )
+    assert hijack.status_code == 409
+
+    assert client.delete("/plugins/platform").status_code == 409
+
+    listed = {p["name"]: p for p in client.get("/plugins").json()["plugins"]}
+    assert listed["platform"]["manifest"]["base_url"] == config.platform_self_url()
+
+
 # --- end-to-end over the composed streamable-HTTP surface --------------------
 
 

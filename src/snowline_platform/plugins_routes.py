@@ -37,6 +37,24 @@ def _registry(request: Request) -> PluginRegistry:
     return request.app.state.registry
 
 
+def _reject_reserved_name(name: str) -> None:
+    """The `platform` entry is the platform's OWN self-registration (decision
+    0503fff0), seeded at startup — the one name the external registration surface
+    must not touch: a POST would hijack the `platform__*` tool namespace onto a
+    foreign base_url, and a DELETE would silently drop every native tool until
+    the next restart. Same reservation posture as the surface-name check in
+    `create_app`."""
+    from snowline_platform.platform_tools import PLATFORM_PLUGIN_NAME
+
+    if name == PLATFORM_PLUGIN_NAME:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"{name!r} is the platform's own self-entry (decision 0503fff0) — "
+            "it is seeded at startup and cannot be registered or removed over "
+            "this surface",
+        )
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def register_plugin(
     manifest: PluginManifest, request: Request, response: Response
@@ -46,6 +64,7 @@ async def register_plugin(
     registration, 200 when already known (identical manifest keeps the entry and
     its health status; a changed manifest replaces it — a redeploy that moved or
     re-shaped a plugin takes effect without an unregister)."""
+    _reject_reserved_name(manifest.name)
     entry, outcome = _registry(request).upsert(manifest)
     if outcome == "created":
         log.info("plugin %r registered (base_url %s)", manifest.name, manifest.base_url)
@@ -75,6 +94,7 @@ async def unregister_plugin(name: str, request: Request) -> None:
     """Unregister a plugin. NOTE: a LIVE plugin's registration heartbeat will
     re-upsert it within one interval (issue #39) — to durably remove a plugin,
     stop its process first; DELETE alone only sticks for stopped plugins."""
+    _reject_reserved_name(name)
     try:
         _registry(request).unregister(name)
     except PluginNotFound:
