@@ -94,7 +94,10 @@ Carried over unchanged in shape (a lift, per the develop-in-public carve), minus
   leaf, which may be a pending draft), and an unstamped revision superseding a
   pending/dead version is rejected. `get_artifact` gains a `milestone=REF`
   read parameter, and `list_artifact_versions`' filter resolves its ref and
-  matches stamps against the target's alias set.
+  matches stamps against the target's alias set. (The validated posture rides
+  an injectable `MilestoneClient` both surfaces always wire; clientless direct
+  service calls keep the pre-registry #141 verbatim posture —
+  `milestones.md` §6.1.1 note.)
 - **Artifacts (read):** `get_artifact` (the full record — `current_version`
   carries the canonical inline body by default; `include_body=False` for the
   lean header), `get_artifact_version` (one version's body by (artifact,
