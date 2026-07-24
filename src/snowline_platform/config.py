@@ -37,6 +37,17 @@ DEFAULT_TRUSTED_CIDRS = "100.64.0.0/10,127.0.0.0/8,::1"
 # monolith's substrate config. Scopes are the platform's first persisted data.
 DEFAULT_DATABASE_URL = "postgresql+psycopg:///snowline_platform"
 
+# The platform's OWN loopback base URL — the address the gateway dials to reach
+# the platform's self-registered `platform` upstream (its native scope/milestone
+# tool app at `/platform/mcp`, governance decision 0503fff0). Same value the
+# out-of-process plugins already use to reach the platform's HTTP surface
+# (`SNOWLINE_PLATFORM_URL`, ops/roam/env.*.example — loopback, port 8848), so the
+# self-proxy dials the platform on the exact loopback front `tailscale serve`
+# maps 1:1 (replication-continuity §5.1/§6.1 co-location posture). Loopback, not
+# 0.0.0.0 — the self entry is health-checked against this like any plugin
+# (health.py), and the platform's own `/health` answers it.
+DEFAULT_PLATFORM_SELF_URL = "http://127.0.0.1:8848"
+
 # Health poller cadence (health.md): poll every plugin every INTERVAL seconds,
 # each check bounded by TIMEOUT so one slow plugin can't stall the round.
 DEFAULT_HEALTH_POLL_INTERVAL = 15.0
@@ -106,6 +117,18 @@ def trusted_cidrs() -> list[str]:
 
 def database_url() -> str:
     return os.environ.get("SNOWLINE_PLATFORM_DATABASE_URL", DEFAULT_DATABASE_URL)
+
+
+def platform_self_url() -> str:
+    """The platform's own loopback base URL, for the self-registered `platform`
+    upstream (decision 0503fff0). Reads `SNOWLINE_PLATFORM_URL` — the SAME env the
+    out-of-process plugins already resolve the platform on — so the self-proxy and
+    the plugins agree on one address; defaults to the ops loopback front
+    (`http://127.0.0.1:8848`). Trailing slash trimmed to match `PluginManifest`'s
+    base_url normalization (the self entry composes as an ordinary manifest)."""
+    return os.environ.get(
+        "SNOWLINE_PLATFORM_URL", DEFAULT_PLATFORM_SELF_URL
+    ).rstrip("/")
 
 
 def health_poll_interval() -> float:

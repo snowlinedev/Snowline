@@ -22,6 +22,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from snowline_platform import (
     config,
     milestones_routes,
+    platform_tools,
     plugins_routes,
     replication,
     scopes_routes,
@@ -31,6 +32,7 @@ from snowline_platform import (
 from snowline_platform.db import session_scope
 from snowline_platform.gateway import UpstreamConnector
 from snowline_platform.gateway_app import (
+    build_platform_tools_mount,
     build_surface_mounts,
     gateway_lifespan,
     mount_gateway,
@@ -75,16 +77,26 @@ async def _lifespan(app: FastAPI):
         # at create_app time; their managers' run() is the required-for-lifespan
         # context.
         async with gateway_lifespan(app.state.gateway_mounts):
-            # The registry is in-memory, so a restart boots it EMPTY and every
-            # mounted surface serves zero tools until the plugins' registration
-            # heartbeats re-upsert them (issue #39). That window is expected —
-            # but it must be LOUD, not silent: a crash-restart under launchd at
-            # 3am otherwise looks healthy while the whole gateway is hollow.
-            if app.state.gateway_mounts and not app.state.registry.list():
+            # The registry is in-memory, so a restart boots it with ONLY the
+            # platform self-entry (seeded in create_app, decision 0503fff0) and
+            # every mounted surface serves only the platform's native tools until
+            # the plugins' registration heartbeats re-upsert them (issue #39).
+            # That window is expected — but it must be LOUD, not silent: a
+            # crash-restart under launchd at 3am otherwise looks healthy while the
+            # gateway is hollow of PLUGIN tools. The platform self-entry is not a
+            # plugin heartbeat, so it is excluded from the count — otherwise the
+            # always-present self-entry would permanently silence this signal.
+            external = [
+                e
+                for e in app.state.registry.list()
+                if e.manifest.name != platform_tools.PLATFORM_PLUGIN_NAME
+            ]
+            if app.state.gateway_mounts and not external:
                 log.warning(
                     "boot: %d gateway surface(s) mounted but ZERO plugins "
-                    "registered — composed surfaces serve no tools until plugin "
-                    "registration heartbeats arrive (issue #39)",
+                    "registered — composed surfaces serve only the platform's own "
+                    "native tools until plugin registration heartbeats arrive "
+                    "(issue #39)",
                     len(app.state.gateway_mounts),
                 )
             # The health poller (health.md) and the replication delivery loop
@@ -156,6 +168,20 @@ def create_app(
     to start the loop at all."""
     app = FastAPI(title="Snowline Platform", lifespan=_lifespan)
     app.state.registry = registry or PluginRegistry()
+    # Seed the platform's OWN upstream (decision 0503fff0): a `platform` registry
+    # entry at the platform's loopback base_url mapping `/platform/mcp → main`, so
+    # the gateway composes the native scope/milestone tools onto `main` through
+    # the ORDINARY aggregation path — no special-casing in the aggregator, the
+    # tools surface `platform__<tool>` like any plugin's. Seeded HERE at startup
+    # (the same way the replication self-manifest is platform-owned, §8) rather
+    # than via an external registration call, so it needs no bootstrap client and
+    # survives a restart: the in-memory registry boots empty and — unlike a plugin
+    # that re-upserts on its heartbeat — the platform re-seeds itself every boot.
+    # `upsert` is idempotent, so an injected registry that already holds it is a
+    # no-op. It is a plain registry entry, so it also appears in GET /plugins and
+    # is health-checked against its own loopback /health like any plugin (no
+    # exemption — the platform's /health answers 200 while it is serving).
+    app.state.registry.upsert(platform_tools.platform_self_manifest())
     app.state.migrate_on_startup = migrate_on_startup
     app.state.poll_health = poll_health
     app.state.replicate = replicate
@@ -179,14 +205,18 @@ def create_app(
     app.include_router(ui_api.router)
 
     # The dashboard owns the /ui and /ui-api route namespaces (ui-shell.md
-    # §5–§6); a gateway surface named after either would mount /<name>/mcp
-    # inside them and silently interleave MCP transport with SPA assets —
-    # fail loud at boot like every other surface-config error.
-    reserved = {"ui", "ui-api"} & set(config.surfaces())
+    # §5–§6), and `platform` is the platform's OWN tool-app route (/platform/mcp,
+    # decision 0503fff0); a gateway surface named after any of them would mount
+    # /<name>/mcp on top of those and silently interleave MCP transports or SPA
+    # assets — fail loud at boot like every other surface-config error.
+    reserved = {"ui", "ui-api", platform_tools.PLATFORM_PLUGIN_NAME} & set(
+        config.surfaces()
+    )
     if reserved:
         raise config.ConfigError(
             f"SNOWLINE_SURFACES uses reserved name(s) {sorted(reserved)!r} — "
-            f"'ui' and 'ui-api' are the dashboard's route namespaces"
+            f"'ui'/'ui-api' are the dashboard's route namespaces and 'platform' "
+            f"is the platform's own tool-app route (/platform/mcp)"
         )
 
     # The gateway: aggregate registered plugins' MCP surfaces onto the platform's
@@ -194,6 +224,13 @@ def create_app(
     # /shadow/mcp), behind the trust gate. Mounts share the app's registry, so a
     # plugin registered at runtime is composed without a restart.
     mounts = build_surface_mounts(app.state.registry, connector=connector)
+    # The SERVE half of the platform-as-its-own-upstream: mount the native tool
+    # app at /platform/mcp alongside the composed surfaces, entered in the same
+    # gateway lifespan. The COMPOSE half is the self-entry seeded above; the
+    # gateway dials this route back over loopback like any upstream. Kept OUT of
+    # `build_surface_mounts` (which is per-named-surface, and asserted route-exact
+    # by tests) — it is not a surface, it is a plugin-shaped tool endpoint.
+    mounts.append(build_platform_tools_mount())
     app.state.gateway_mounts = mounts
     mount_gateway(app, mounts)
 

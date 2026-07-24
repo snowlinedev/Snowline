@@ -36,6 +36,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 
+from mcp.server.lowlevel import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.types import Receive, Scope, Send
@@ -59,6 +60,7 @@ __all__ = [
     "ROOT_SURFACE",
     "surface_route",
     "build_surface_mounts",
+    "build_platform_tools_mount",
     "mount_gateway",
     "gateway_lifespan",
 ]
@@ -79,23 +81,25 @@ def surface_route(surface: str) -> str:
     return "/mcp" if surface == ROOT_SURFACE else f"/{surface}/mcp"
 
 
-class _SurfaceMount:
-    """Holds a named surface's session manager + ASGI handler so the lifespan can
-    enter its `run()` and the app can mount its `handle_request`."""
+class _ServerMount:
+    """One low-level MCP `Server` served over streamable-HTTP at `route`: holds
+    the session manager + ASGI handler so the lifespan can enter its `run()` and
+    the app can mount its `handle_request`.
 
-    def __init__(
-        self,
-        surface: str,
-        registry: PluginRegistry,
-        connector: UpstreamConnector,
-        allowlist: frozenset[str] | None = None,
-    ) -> None:
-        self.surface = surface
-        self.route = surface_route(surface)
-        server = build_surface_server(registry, surface, connector, allowlist)
-        # stateless=True: the gateway holds no per-session server state of its own
-        # (each list/call re-discovers upstreams + opens a fresh upstream
-        # session), so a stateless transport is the honest model and avoids
+    The shared base for an aggregated gateway surface (`_SurfaceMount`) AND the
+    platform's OWN tool app (`build_platform_tools_mount`, decision 0503fff0) —
+    both serve a low-level `Server` over the same streamable-HTTP machinery, so
+    the mount/lifespan wiring is written once here rather than duplicated. The
+    platform tool app is served EXACTLY like a composed surface; the only thing
+    that makes it "the platform's own upstream" is the registry self-entry that
+    the gateway then dials back over loopback."""
+
+    def __init__(self, route: str, server: Server) -> None:
+        self.route = route
+        # stateless=True: neither the gateway (each list/call re-discovers
+        # upstreams + opens a fresh upstream session) nor the platform tool app
+        # (each tool opens a fresh `session_scope()`) holds per-session server
+        # state, so a stateless transport is the honest model and avoids
         # session-affinity bookkeeping across the proxy.
         self._manager = StreamableHTTPSessionManager(
             app=server,
@@ -108,6 +112,24 @@ class _SurfaceMount:
 
     def run(self):
         return self._manager.run()
+
+
+class _SurfaceMount(_ServerMount):
+    """A `_ServerMount` for one NAMED platform surface: the low-level server is
+    the gateway aggregator (`build_surface_server`) for that surface."""
+
+    def __init__(
+        self,
+        surface: str,
+        registry: PluginRegistry,
+        connector: UpstreamConnector,
+        allowlist: frozenset[str] | None = None,
+    ) -> None:
+        self.surface = surface
+        super().__init__(
+            surface_route(surface),
+            build_surface_server(registry, surface, connector, allowlist),
+        )
 
 
 def build_surface_mounts(
@@ -136,7 +158,30 @@ def build_surface_mounts(
     ]
 
 
-def mount_gateway(app, mounts: list[_SurfaceMount]) -> None:
+def build_platform_tools_mount() -> _ServerMount:
+    """The SERVE half of the platform-as-its-own-upstream (decision 0503fff0): the
+    platform's native scope/milestone tool app (`platform_tools.
+    build_platform_tools_surface`) as a `_ServerMount` at `/platform/mcp`, using
+    the SAME streamable-HTTP machinery as an aggregated surface.
+
+    The COMPOSE half is the registry self-entry (`platform_tools.
+    platform_self_manifest`), seeded at app startup: the gateway dials THIS app
+    back over the platform's own loopback base_url and aggregates it onto `main`
+    like any plugin. Imported lazily to keep `gateway_app` free of a
+    `platform_tools` → services import at module load (and to avoid any import
+    cycle)."""
+    from snowline_platform.platform_tools import (
+        PLATFORM_MCP_PATH,
+        build_platform_tools_surface,
+    )
+
+    # FastMCP wraps a low-level `Server` (`._mcp_server`) — the same server type
+    # `build_surface_server` returns — so it drops straight into `_ServerMount`.
+    surface = build_platform_tools_surface()
+    return _ServerMount(PLATFORM_MCP_PATH, surface._mcp_server)
+
+
+def mount_gateway(app, mounts: list[_ServerMount]) -> None:
     """Mount each surface's ASGI handler on the FastAPI/Starlette `app`.
 
     Routes are added MOST-SPECIFIC first so Starlette's first-match routing
@@ -158,7 +203,7 @@ def mount_gateway(app, mounts: list[_SurfaceMount]) -> None:
 
 @asynccontextmanager
 async def gateway_lifespan(
-    mounts: list[_SurfaceMount],
+    mounts: list[_ServerMount],
 ) -> AsyncIterator[None]:
     """Enter every surface session manager's `run()` for the app lifespan."""
     async with AsyncExitStack() as stack:

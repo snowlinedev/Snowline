@@ -20,9 +20,13 @@ Route ORDER matters (mirrors scopes_routes): `/milestones/resolve` and
 `{address}` uses the `:path` converter (an address contains `/`, e.g.
 `org/repo/name`) so a multi-segment address resolves to one path param.
 
+The MCP tool wrappers over this service now exist too — served on the platform
+`main` surface via self-registration (decision 0503fff0; `platform_tools.py`),
+not from this HTTP router.
+
 DEFERRED (spec §5 first-cut note; see the PR): the merge verb + the
-`/aliases` endpoint, the dependency verbs + the `/dependencies` endpoint +
-readiness surfacing, and the MCP tool wrappers.
+`/aliases` endpoint, and the dependency verbs + the `/dependencies` endpoint +
+readiness surfacing.
 """
 
 from __future__ import annotations

@@ -30,11 +30,18 @@ def test_register_list_delete_roundtrip():
     assert body["status"] == "unknown"
     assert body["manifest"]["mcp_path"] == "/mcp"
 
+    # The platform self-entry (decision 0503fff0) is always present in the
+    # registry, so filter it out to assert on the PLUGIN that was registered.
+    def _plugins(names):
+        return [n for n in names if n != "platform"]
+
     listed = client.get("/plugins").json()["plugins"]
-    assert [p["name"] for p in listed] == ["governance"]
+    assert _plugins(p["name"] for p in listed) == ["governance"]
 
     assert client.delete("/plugins/governance").status_code == 204
-    assert client.get("/plugins").json()["plugins"] == []
+    assert _plugins(
+        p["name"] for p in client.get("/plugins").json()["plugins"]
+    ) == []
 
 
 def test_reregister_is_idempotent_upsert():
@@ -52,7 +59,11 @@ def test_reregister_is_idempotent_upsert():
     r = client.post("/plugins", json=moved)
     assert r.status_code == 200, r.text
     assert r.json()["outcome"] == "updated"
-    listed = client.get("/plugins").json()["plugins"]
+    # Filter the always-present platform self-entry (decision 0503fff0) to assert
+    # on the governance plugin's replaced base_url.
+    listed = [
+        p for p in client.get("/plugins").json()["plugins"] if p["name"] != "platform"
+    ]
     assert [p["manifest"]["base_url"] for p in listed] == ["http://127.0.0.1:9999"]
 
 

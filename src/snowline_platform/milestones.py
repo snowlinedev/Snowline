@@ -18,12 +18,14 @@ name folds the same ASCII-only way (`validate_name`); everything stores canonica
 lowercase.
 
 Increment 1 (spec §5 first-cut note): model + service (create / resolve / get /
-list / lifecycle / update) + the HTTP read/resolve API. DEFERRED to later
+list / lifecycle / update) + the HTTP read/resolve API. The MCP tool wrappers
+(create/resolve/list/lifecycle/get/transitions) now ALSO exist — served on the
+platform `main` surface via the platform registering itself as an upstream
+(decision 0503fff0; `platform_tools.py`), NOT by this module. DEFERRED to later
 increments: the merge verb + alias traversal source (`merged_into_id` is the
 column, always NULL here), the dependency edge verbs + readiness surfacing (the
 `milestone_dependencies` table's schema lands now but nothing writes it),
-replication emission (§9), the governance consumer (§6.1), and MCP tooling (the
-platform has no native MCP-tool surface today — see the PR notes).
+replication emission (§9), and the governance consumer (§6.1).
 """
 
 from __future__ import annotations
