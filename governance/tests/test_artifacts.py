@@ -18,6 +18,10 @@ from sqlalchemy import event
 
 from snowline_governance import artifacts
 from snowline_governance.db import get_engine
+from snowline_governance.milestone_client import (
+    MilestoneResolutionError,
+    MilestoneServiceError,
+)
 
 
 @contextlib.contextmanager
@@ -526,122 +530,495 @@ def test_applicable_artifacts_over_real_http_transport(db_session):
     assert inherited["path"] == "TONE.md"
 
 
-# --- milestone soft ref (#141) ------------------------------------------------
+# --- first-class milestone consumer (milestones.md §6.1) ----------------------
+#
+# The stamp graduated from a soft verbatim slug (#141) to a RESOLUTION KEY (#145):
+# the write path resolves it against the platform milestone registry and stores
+# the CANONICAL address, and version canonicality is a function of milestone
+# STATE read from the platform. These tests drive the service against a
+# `StubMilestoneClient` (an in-memory registry), the way the wired MCP surface
+# drives the real `HttpMilestoneClient`.
 
 
-def test_register_stamps_milestone_on_initial_version(db_session):
+# --- 6.1.1 validated at mint --------------------------------------------------
+
+
+def test_mint_resolves_and_stores_canonical_address(db_session, stub_milestone_client):
+    """A bare ref resolves against the artifact's single governing scope and the
+    CANONICAL address is stored — not the bare input (§6.1.1)."""
+    mc = stub_milestone_client({"org/repo/v1": "active"})
     art = artifacts.register_artifact(
-        db_session, body="# feature list", milestone="v1-launch"
+        db_session, body="v1", governs="org/repo",
+        resolved_scopes=_resolved("org/repo"), milestone="v1",
+        milestone_client=mc,
     )
+    assert art["current_version"]["milestone"] == "org/repo/v1"
+    assert art["current_version"]["milestone_bucket"] == "eligible"
+
+
+def test_mint_unknown_ref_hardfails_with_suggestions(
+    db_session, stub_milestone_client
+):
+    """An unresolvable ref hard-fails carrying the platform's same-named
+    suggestions — never an automatic resolution (§3 / §6.1.1)."""
+    mc = stub_milestone_client({"other/repo/v1": "active"})
+    with pytest.raises(MilestoneResolutionError) as ei:
+        artifacts.register_artifact(
+            db_session, body="v1", governs="org/repo",
+            resolved_scopes=_resolved("org/repo"), milestone="v1",
+            milestone_client=mc,
+        )
+    assert any(s["address"] == "other/repo/v1" for s in ei.value.suggestions)
+    # nothing was written (the stamp resolves BEFORE the artifact is created).
+    assert artifacts.list_artifacts(db_session)["items_total"] == 0
+
+
+def test_mint_bare_ref_rejected_when_no_single_governing_scope(
+    db_session, stub_milestone_client
+):
+    """An artifact governing a LIST has no bare-name context — a bare ref is
+    rejected at mint; the full address works (§6.1.1)."""
+    mc = stub_milestone_client({"org/repo/v1": "active"})
+    with pytest.raises(ValueError, match="bare name"):
+        artifacts.register_artifact(
+            db_session, body="v1", governs=["org/repo", "org/other"],
+            resolved_scopes=_resolved("org/repo", "org/other"),
+            milestone="v1", milestone_client=mc,
+        )
+    art = artifacts.register_artifact(
+        db_session, body="v1", governs=["org/repo", "org/other"],
+        resolved_scopes=_resolved("org/repo", "org/other"),
+        milestone="org/repo/v1", milestone_client=mc,
+    )
+    assert art["current_version"]["milestone"] == "org/repo/v1"
+
+
+def test_mint_bare_ref_rejected_when_governs_all(db_session, stub_milestone_client):
+    """`governs_all` also has no bare-name context (§6.1.1)."""
+    mc = stub_milestone_client({"org/repo/v1": "active"})
+    with pytest.raises(ValueError, match="bare name"):
+        artifacts.register_artifact(
+            db_session, body="v1", governs="*", milestone="v1",
+            milestone_client=mc,
+        )
+
+
+def test_mint_terminal_milestone_rejected_unless_override(
+    db_session, stub_milestone_client
+):
+    """Stamping with an achieved/cancelled milestone is rejected absent the
+    explicit override (§6.1.1)."""
+    mc = stub_milestone_client(
+        {"org/repo/shipped": "achieved", "org/repo/dropped": "cancelled"}
+    )
+    with pytest.raises(ValueError, match="terminal"):
+        artifacts.register_artifact(
+            db_session, body="v1", governs="org/repo",
+            resolved_scopes=_resolved("org/repo"), milestone="org/repo/shipped",
+            milestone_client=mc,
+        )
+    with pytest.raises(ValueError, match="terminal"):
+        artifacts.register_artifact(
+            db_session, body="v1", governs="org/repo",
+            resolved_scopes=_resolved("org/repo"), milestone="org/repo/dropped",
+            milestone_client=mc,
+        )
+    art = artifacts.register_artifact(
+        db_session, body="v1", governs="org/repo",
+        resolved_scopes=_resolved("org/repo"), milestone="org/repo/shipped",
+        milestone_client=mc, allow_terminal_milestone=True,
+    )
+    assert art["current_version"]["milestone"] == "org/repo/shipped"
+
+
+# --- 6.1.2 state buckets ------------------------------------------------------
+
+
+def test_read_buckets_via_one_resolve_batch(db_session, stub_milestone_client):
+    """A milestone-aware read resolves all stamps in ONE resolve_batch call
+    (§6.1.2)."""
+    mc = stub_milestone_client({"org/repo/v1": "active", "org/repo/v2": "planned"})
+    art = artifacts.register_artifact(
+        db_session, body="v1", governs="org/repo",
+        resolved_scopes=_resolved("org/repo"), milestone="v1",
+        milestone_client=mc,
+    )
+    aid = art["id"]
+    artifacts.revise_artifact(
+        db_session, aid, relation="refines", body_snapshot="v2",
+        milestone="v2", milestone_client=mc,
+    )
+    mc.batch_calls.clear()
+    artifacts.get_artifact(db_session, aid, milestone_client=mc)
+    assert len(mc.batch_calls) == 1
+
+
+def test_legacy_stamp_treated_absent_and_flagged(db_session, stub_milestone_client):
+    """A stamp that doesn't resolve is LEGACY — treated as absent for
+    canonicality (still current) but flagged for backfill (§6.1.2)."""
+    mc = stub_milestone_client({})  # empty registry — nothing resolves
+    # clientless mint stores the verbatim slug (a pre-registry stamp).
+    art = artifacts.register_artifact(
+        db_session, body="v1", governs="org/repo",
+        resolved_scopes=_resolved("org/repo"), milestone="ghost/repo/v9",
+    )
+    aid = art["id"]
+    vid = art["current_version"]["id"]
+    got = artifacts.get_artifact(db_session, aid, milestone_client=mc)
+    assert got["current_version"]["id"] == vid  # legacy ⇒ absent ⇒ canonical
+    assert got["current_version"]["milestone_bucket"] == "legacy"
+    assert got["current_version"]["milestone_unresolved"] is True
+
+
+def test_transport_failure_is_a_hard_read_error(db_session, stub_milestone_client):
+    """A milestone-status read failure is a HARD error on the read — never
+    treated as an absent stamp (§6.1.2)."""
+    mc = stub_milestone_client({"org/repo/v1": "active"})
+    art = artifacts.register_artifact(
+        db_session, body="v1", governs="org/repo",
+        resolved_scopes=_resolved("org/repo"), milestone="v1",
+        milestone_client=mc,
+    )
+    aid = art["id"]
+    mc.raise_transport = True
+    with pytest.raises(MilestoneServiceError):
+        artifacts.get_artifact(db_session, aid, milestone_client=mc)
+
+
+# --- 6.1.3 canonical = leaf of the eligible subgraph --------------------------
+
+
+def test_pending_version_does_not_dethrone_canonical(
+    db_session, stub_milestone_client
+):
+    """A planned-stamped v2 is PENDING — it does not supersede v1 for
+    canonicality; v1 stays canonical, v2 surfaces as the structural leaf tagged
+    pending (§6.1.3)."""
+    mc = stub_milestone_client({"org/repo/v1": "active", "org/repo/v2": "planned"})
+    art = artifacts.register_artifact(
+        db_session, body="v1", governs="org/repo",
+        resolved_scopes=_resolved("org/repo"), milestone="v1",
+        milestone_client=mc,
+    )
+    aid = art["id"]
+    v1_id = art["current_version"]["id"]
+    r = artifacts.revise_artifact(
+        db_session, aid, relation="refines", body_snapshot="v2",
+        milestone="v2", milestone_client=mc,
+    )
+    assert r["current_version"]["id"] == v1_id  # v1 stays canonical
+    assert r["current_version"]["milestone"] == "org/repo/v1"
+    # v2 is the structural leaf, bucketed pending — not competing.
+    assert len(r["leaves"]) == 1
+    assert r["leaves"][0]["milestone_bucket"] == "pending"
+    assert r["competing_leaves"] == []
+
+
+def test_competing_eligible_leaves_surfaced_and_resolved(
+    db_session, stub_milestone_client
+):
+    """Two active-stamped forks of one parent are GENUINE competition — surfaced
+    via `competing_leaves`, never silently picked; `resolve_artifact` collapses
+    them (§6.1.3)."""
+    mc = stub_milestone_client({"org/repo/fix": "active", "org/repo/v2": "active"})
+    art = artifacts.register_artifact(
+        db_session, body="v1", governs="org/repo",
+        resolved_scopes=_resolved("org/repo"), milestone_client=mc,
+    )  # v1 unstamped ⇒ eligible
+    aid = art["id"]
+    v1_id = art["current_version"]["id"]
+    a = artifacts.revise_artifact(
+        db_session, aid, relation="refines", body_snapshot="fix",
+        supersedes=v1_id, milestone="fix", milestone_client=mc,
+    )
+    fix_id = a["current_version"]["id"]  # single eligible leaf so far
+    b = artifacts.revise_artifact(
+        db_session, aid, relation="pivot", body_snapshot="v2",
+        supersedes=v1_id, milestone="v2", milestone_client=mc,
+    )
+    v2_id = next(leaf["id"] for leaf in b["leaves"] if leaf["id"] != fix_id)
+    # Both forks are eligible leaves: one is the default pick, the other rides
+    # competing_leaves (an explicit warning, never a silent drop).
+    assert len(b["competing_leaves"]) == 1
+    surfaced = {b["current_version"]["id"]} | {c["id"] for c in b["competing_leaves"]}
+    assert surfaced == {fix_id, v2_id}
+    # resolve_artifact collapses it — drop the fix line as the loser.
+    res = artifacts.resolve_artifact(db_session, aid, fix_id, milestone_client=mc)
+    assert res["current_version"]["id"] == v2_id
+    assert res["competing_leaves"] == []
+
+
+def test_resolve_artifact_precondition_is_eligible_leaves(
+    db_session, stub_milestone_client
+):
+    """A pending competitor is not a resolvable leaf — the >1 precondition means
+    >1 ELIGIBLE leaves (§6.1.3)."""
+    mc = stub_milestone_client({"org/repo/v1": "active", "org/repo/v2": "planned"})
+    art = artifacts.register_artifact(
+        db_session, body="v1", governs="org/repo",
+        resolved_scopes=_resolved("org/repo"), milestone="v1",
+        milestone_client=mc,
+    )
+    aid = art["id"]
+    v1_id = art["current_version"]["id"]
+    b = artifacts.revise_artifact(
+        db_session, aid, relation="pivot", body_snapshot="v2",
+        supersedes=v1_id, milestone="v2", milestone_client=mc,
+    )
+    v2_id = b["leaves"][0]["id"] if b["leaves"][0]["id"] != v1_id else b["leaves"][1]["id"]
+    with pytest.raises(ValueError, match="single current eligible leaf"):
+        artifacts.resolve_artifact(db_session, aid, v2_id, milestone_client=mc)
+
+
+# --- 6.1.4 write defaults follow canonicality, not leaf-ness -------------------
+
+
+def test_revise_default_targets_canonical_not_pending_leaf(
+    db_session, stub_milestone_client
+):
+    """`revise`'s default supersedes is the current CANONICAL version, not the
+    DAG (pending) leaf — a typo-fix lands on the active line (§6.1.4)."""
+    mc = stub_milestone_client({"org/repo/v1": "active", "org/repo/v2": "planned"})
+    art = artifacts.register_artifact(
+        db_session, body="v1", governs="org/repo",
+        resolved_scopes=_resolved("org/repo"), milestone="v1",
+        milestone_client=mc,
+    )
+    aid = art["id"]
+    v1_id = art["current_version"]["id"]
+    # v2 pending becomes the structural leaf.
+    artifacts.revise_artifact(
+        db_session, aid, relation="refines", body_snapshot="v2",
+        milestone="v2", milestone_client=mc,
+    )
+    # a fix with NO supersedes: default must target canonical v1, NOT pending v2.
+    r = artifacts.revise_artifact(
+        db_session, aid, relation="refines", body_snapshot="v1-fix",
+        milestone="v1", milestone_client=mc,
+    )
+    fix_id = r["current_version"]["id"]
+    fix_ver = artifacts.get_artifact_version(db_session, aid, fix_id)
+    assert fix_ver["supersedes_id"] == v1_id
+
+
+def test_unstamped_child_of_pending_parent_rejected(
+    db_session, stub_milestone_client
+):
+    """A revision superseding a pending parent MUST carry an explicit stamp — an
+    unstamped child of a non-eligible parent is rejected (§6.1.4)."""
+    mc = stub_milestone_client({"org/repo/v2": "planned"})
+    art = artifacts.register_artifact(
+        db_session, body="v1", governs="org/repo",
+        resolved_scopes=_resolved("org/repo"), milestone_client=mc,
+    )  # v1 unstamped/eligible
+    aid = art["id"]
+    v1_id = art["current_version"]["id"]
+    b = artifacts.revise_artifact(
+        db_session, aid, relation="refines", body_snapshot="v2",
+        supersedes=v1_id, milestone="v2", milestone_client=mc,
+    )
+    v2_id = b["leaves"][0]["id"]
+    with pytest.raises(ValueError, match="explicit milestone stamp"):
+        artifacts.revise_artifact(
+            db_session, aid, relation="refines", body_snapshot="v3",
+            supersedes=v2_id, milestone_client=mc,
+        )
+    # stated explicitly, the same revision is legal (a recovery revision).
+    mc.set_status("org/repo/v3", "planned")
+    ok = artifacts.revise_artifact(
+        db_session, aid, relation="refines", body_snapshot="v3",
+        supersedes=v2_id, milestone="org/repo/v3", milestone_client=mc,
+    )
+    assert ok is not None
+
+
+# --- 6.1.5 per-milestone reads ------------------------------------------------
+
+
+def test_per_milestone_read_returns_stamped_subgraph_leaf(
+    db_session, stub_milestone_client
+):
+    """`get_artifact(milestone=REF)` returns the leaf of the subgraph stamped
+    with that milestone; an unstamped-for milestone falls back to canonical
+    (§6.1.5)."""
+    mc = stub_milestone_client(
+        {"org/repo/v1": "active", "org/repo/v2": "active", "org/repo/v3": "active"}
+    )
+    art = artifacts.register_artifact(
+        db_session, body="v1", governs="org/repo",
+        resolved_scopes=_resolved("org/repo"), milestone="v1",
+        milestone_client=mc,
+    )
+    aid = art["id"]
+    v1_id = art["current_version"]["id"]
+    r = artifacts.revise_artifact(
+        db_session, aid, relation="refines", body_snapshot="v2",
+        milestone="v2", milestone_client=mc,
+    )
+    v2_id = r["current_version"]["id"]
+    got1 = artifacts.get_artifact(
+        db_session, aid, milestone="org/repo/v1", milestone_client=mc
+    )
+    assert got1["current_version"]["id"] == v1_id
+    got2 = artifacts.get_artifact(
+        db_session, aid, milestone="org/repo/v2", milestone_client=mc
+    )
+    assert got2["current_version"]["id"] == v2_id
+    # a milestone that resolves but stamps no version → canonical fallback.
+    got3 = artifacts.get_artifact(
+        db_session, aid, milestone="org/repo/v3", milestone_client=mc
+    )
+    assert got3["current_version"]["id"] == v2_id
+
+
+def test_per_milestone_read_matches_full_alias_set(
+    db_session, stub_milestone_client
+):
+    """A stamp stored under a since-merged slug still matches when reading via the
+    target — alias-set matching (§5 / §6.1.5)."""
+    mc = stub_milestone_client(
+        {"org/repo/v1": "active"},
+        aliases={"org/repo/v1": ["org/repo/v1-old"]},
+    )
+    # a pre-registry version stored under the OLD slug (clientless verbatim mint).
+    art = artifacts.register_artifact(
+        db_session, body="legacy", governs="org/repo",
+        resolved_scopes=_resolved("org/repo"), milestone="org/repo/v1-old",
+    )
+    aid = art["id"]
+    vid = art["current_version"]["id"]
+    got = artifacts.get_artifact(
+        db_session, aid, milestone="org/repo/v1", milestone_client=mc
+    )
+    assert got["current_version"]["id"] == vid
+
+
+def test_list_versions_by_milestone_matches_alias_set(
+    db_session, stub_milestone_client
+):
+    """`list_versions_by_milestone` resolves the ref and matches stamps against
+    the target's full alias set, flagging alias-matched rows (§5 / §6.1.5)."""
+    mc = stub_milestone_client(
+        {"org/repo/v1": "active"},
+        aliases={"org/repo/v1": ["org/repo/v1-old"]},
+    )
+    art = artifacts.register_artifact(
+        db_session, body="legacy", governs="org/repo",
+        resolved_scopes=_resolved("org/repo"), milestone="org/repo/v1-old",
+    )
+    vid = art["current_version"]["id"]
+    out = artifacts.list_versions_by_milestone(
+        db_session, "org/repo/v1", milestone_client=mc
+    )
+    assert out["milestone"] == "org/repo/v1"
+    assert out["items_total"] == 1
+    assert out["versions"][0]["id"] == vid
+    assert out["versions"][0].get("matched_via_alias") is True
+
+
+def test_per_milestone_read_requires_client(db_session):
+    """A per-milestone read is an explicit request — clientless it fails loudly
+    rather than silently degrading to the default read (§6.1.5)."""
+    art = artifacts.register_artifact(db_session, body="v1")
+    with pytest.raises(ValueError, match="requires a milestone client"):
+        artifacts.get_artifact(db_session, art["id"], milestone="org/repo/v1")
+
+
+def test_list_versions_by_milestone_resolves_once(
+    db_session, stub_milestone_client
+):
+    """The clientful release-correlation read resolves its ref exactly ONCE (the
+    helper returns the canonical primary alongside the alias match set)."""
+    mc = stub_milestone_client({"org/repo/v1": "active"})
+    artifacts.register_artifact(
+        db_session, body="v1", governs="org/repo",
+        resolved_scopes=_resolved("org/repo"), milestone="org/repo/v1",
+        milestone_client=mc,
+    )
+    mc.resolve_calls.clear()
+    artifacts.list_versions_by_milestone(
+        db_session, "org/repo/v1", milestone_client=mc
+    )
+    assert len(mc.resolve_calls) == 1
+
+
+# --- 6.1.6 promotion and demotion are implicit (the marquee) ------------------
+
+
+def test_promotion_and_demotion_flip_canonicality_with_no_write(
+    db_session, stub_milestone_client
+):
+    """The marquee (§6.1.6): a planned→active platform transition promotes v2 to
+    canonical with NO governance write; active→cancelled demotes it back."""
+    mc = stub_milestone_client({"org/repo/v1": "active", "org/repo/v2": "planned"})
+    art = artifacts.register_artifact(
+        db_session, body="v1", governs="org/repo",
+        resolved_scopes=_resolved("org/repo"), milestone="v1",
+        milestone_client=mc,
+    )
+    aid = art["id"]
+    v1_id = art["current_version"]["id"]
+    r = artifacts.revise_artifact(
+        db_session, aid, relation="refines", body_snapshot="v2",
+        milestone="v2", milestone_client=mc,
+    )
+    v2_id = r["leaves"][0]["id"]
+    # v1 canonical while v2 is planned.
+    got = artifacts.get_artifact(db_session, aid, milestone_client=mc)
+    assert got["current_version"]["id"] == v1_id
+
+    # planned → active: v2 becomes canonical, WITHOUT any governance write.
+    mc.set_status("org/repo/v2", "active")
+    got = artifacts.get_artifact(db_session, aid, milestone_client=mc)
+    assert got["current_version"]["id"] == v2_id
+    assert got["current_version"]["milestone"] == "org/repo/v2"
+
+    # active → cancelled: v2 demotes, canonicality reverts to v1 (§6.1.6).
+    mc.set_status("org/repo/v2", "cancelled")
+    got = artifacts.get_artifact(db_session, aid, milestone_client=mc)
+    assert got["current_version"]["id"] == v1_id
+
+
+# --- clientless fallback (#141 posture preserved) -----------------------------
+
+
+def test_clientless_register_stamps_verbatim(db_session):
+    """With no MilestoneClient the write degrades to the #141 grammar-only
+    verbatim posture (the wired surface never takes this path)."""
+    art = artifacts.register_artifact(db_session, body="# feature", milestone="V1-Launch")
     assert art["current_version"]["milestone"] == "v1-launch"
-    # Read-back surfaces it on the full record + the version read.
     got = artifacts.get_artifact(db_session, art["id"])
     assert got["current_version"]["milestone"] == "v1-launch"
-    ver = artifacts.get_artifact_version(
-        db_session, art["id"], art["current_version"]["id"]
-    )
-    assert ver["milestone"] == "v1-launch"
+    # clientless reads carry no milestone bucket annotation.
+    assert "milestone_bucket" not in got["current_version"]
 
 
-def test_register_without_milestone_leaves_it_none(db_session):
+def test_clientless_register_without_milestone_is_none(db_session):
     art = artifacts.register_artifact(db_session, body="# spec")
     assert art["current_version"]["milestone"] is None
 
 
-def test_revise_stamps_milestone_per_version_not_inherited(db_session):
-    art = artifacts.register_artifact(
-        db_session, body="v1", milestone="v1-launch"
-    )
-    revised = artifacts.revise_artifact(
-        db_session, art["id"], relation="refines",
-        body_snapshot="v2", milestone="v2-launch",
-    )
-    assert revised["current_version"]["milestone"] == "v2-launch"
-    # A revision that omits milestone does NOT inherit the predecessor's stamp —
-    # the release tag marks exactly the version cut for it.
-    revised2 = artifacts.revise_artifact(
-        db_session, art["id"], relation="refines", body_snapshot="v3",
-    )
-    assert revised2["current_version"]["milestone"] is None
-
-
-def test_milestone_input_is_case_insensitive_stored_lowercase(db_session):
-    art = artifacts.register_artifact(
-        db_session, body="# spec", milestone="V1-Launch"
-    )
-    assert art["current_version"]["milestone"] == "v1-launch"
-
-
-def test_milestone_orgstyle_slug_accepted(db_session):
-    art = artifacts.register_artifact(
-        db_session, body="# spec", milestone="TurtlesEdge/v1"
-    )
-    assert art["current_version"]["milestone"] == "turtlesedge/v1"
-
-
-def test_invalid_milestone_rejected_loudly(db_session):
+def test_clientless_invalid_milestone_rejected(db_session):
     with pytest.raises(ValueError, match="invalid milestone slug"):
-        artifacts.register_artifact(
-            db_session, body="# spec", milestone="not a slug!"
-        )
-    with pytest.raises(ValueError, match="invalid milestone slug"):
-        artifacts.revise_artifact(
-            db_session,
-            artifacts.register_artifact(db_session, body="v1")["id"],
-            relation="refines", milestone="bad/*/slug",
-        )
+        artifacts.register_artifact(db_session, body="# spec", milestone="not a slug!")
 
 
-def test_empty_milestone_is_none_not_error(db_session):
-    art = artifacts.register_artifact(db_session, body="# spec", milestone="  ")
-    assert art["current_version"]["milestone"] is None
-
-
-def test_list_versions_by_milestone_filters_across_artifacts(db_session):
+def test_clientless_list_versions_by_milestone_exact_match(db_session):
     a1 = artifacts.register_artifact(
         db_session, body="feature list", milestone="v1-launch"
     )
     a2 = artifacts.register_artifact(
         db_session, body="api plan", doc_kind="plan", milestone="v1-launch"
     )
-    # A version stamped with a DIFFERENT milestone must not match.
     artifacts.register_artifact(db_session, body="other", milestone="v2-launch")
-    # An unstamped version must not match either.
     artifacts.register_artifact(db_session, body="unstamped")
-
-    out = artifacts.list_versions_by_milestone(db_session, "v1-launch")
-    assert out["milestone"] == "v1-launch"
+    out = artifacts.list_versions_by_milestone(db_session, "V1-LAUNCH")
     assert out["items_total"] == 2
     got_ids = {v["id"] for v in out["versions"]}
     assert got_ids == {a1["current_version"]["id"], a2["current_version"]["id"]}
-    # Each row carries its artifact_id + the milestone header (lean, no body).
-    for v in out["versions"]:
-        assert v["milestone"] == "v1-launch"
-        assert "artifact_id" in v
-        assert "body_snapshot" not in v
 
 
-def test_list_versions_by_milestone_is_case_insensitive(db_session):
-    art = artifacts.register_artifact(
-        db_session, body="feature list", milestone="v1-launch"
-    )
-    out = artifacts.list_versions_by_milestone(db_session, "V1-LAUNCH")
-    assert out["items_total"] == 1
-    assert out["versions"][0]["id"] == art["current_version"]["id"]
-
-
-def test_list_versions_by_milestone_includes_revised_versions(db_session):
-    art = artifacts.register_artifact(db_session, body="v1")
-    revised = artifacts.revise_artifact(
-        db_session, art["id"], relation="refines",
-        body_snapshot="v2", milestone="v2-launch",
-    )
-    out = artifacts.list_versions_by_milestone(db_session, "v2-launch")
-    assert out["items_total"] == 1
-    assert out["versions"][0]["id"] == revised["current_version"]["id"]
-
-
-def test_list_versions_by_milestone_empty_input_yields_empty(db_session):
+def test_clientless_list_versions_by_milestone_empty_input(db_session):
     artifacts.register_artifact(db_session, body="v1", milestone="v1-launch")
     out = artifacts.list_versions_by_milestone(db_session, "   ")
     assert out["versions"] == [] and out["items_total"] == 0

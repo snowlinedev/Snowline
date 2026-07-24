@@ -31,6 +31,7 @@ from snowline_plugin_sdk.replication.admin import build_replication_router
 from snowline_governance import config, registration, replication_apply
 from snowline_governance.db import session_scope
 from snowline_governance.mcp_surface import build_main_surface, build_shadow_surface
+from snowline_governance.milestone_client import MilestoneClient
 from snowline_governance.replication_stream import INGEST_PATH
 from snowline_governance.scope_client import HttpScopeClient, ScopeClient
 from snowline_governance.ui_api import router as ui_api_router
@@ -52,21 +53,27 @@ def _migrate_to_head() -> None:
 
 def create_app(
     scope_client: ScopeClient | None = None,
+    milestone_client: MilestoneClient | None = None,
     *,
     migrate_on_startup: bool = True,
     register_on_startup: bool = True,
 ) -> FastAPI:
-    """Build the governance app. `scope_client` is injectable (tests pass a stub);
-    `migrate_on_startup=False` skips the boot-migrate (tests provision their own
-    schema); `register_on_startup=False` skips the platform registration
-    heartbeat (tests assert registration separately, against a stubbed
-    platform)."""
+    """Build the governance app. `scope_client` / `milestone_client` are injectable
+    (tests pass stubs); they default to the real `HttpScopeClient` /
+    `HttpMilestoneClient` (§6.1). `migrate_on_startup=False` skips the
+    boot-migrate (tests provision their own schema); `register_on_startup=False`
+    skips the platform registration heartbeat (tests assert registration
+    separately, against a stubbed platform)."""
     # Drop ONLY the heartbeat's per-beat `POST …/plugins` INFO line from the
     # httpx logger — governance's scope reads and webhook deliveries still
     # trace through (idempotent; rationale lives with the filter in the SDK).
     install_heartbeat_httpx_filter()
-    main_surface = build_main_surface(scope_client=scope_client)
-    shadow_surface = build_shadow_surface(scope_client=scope_client)
+    main_surface = build_main_surface(
+        scope_client=scope_client, milestone_client=milestone_client
+    )
+    shadow_surface = build_shadow_surface(
+        scope_client=scope_client, milestone_client=milestone_client
+    )
 
     @asynccontextmanager
     async def _lifespan(app: FastAPI):

@@ -28,6 +28,10 @@ import sqlalchemy as sa  # noqa: E402
 from alembic import command  # noqa: E402
 from alembic.config import Config  # noqa: E402
 
+from snowline_governance.milestone_client import (  # noqa: E402
+    MilestoneResolutionError,
+    MilestoneServiceError,
+)
 from snowline_governance.scope_client import ScopeNotFoundError  # noqa: E402
 
 MIGRATIONS = (
@@ -239,3 +243,127 @@ class StubScopeClient:
 def stub_scope_client():
     """Factory: `stub_scope_client(tree, isolated=...)` -> `StubScopeClient`."""
     return StubScopeClient
+
+
+# --- a stub MilestoneClient so unit tests need no running platform ----------
+
+
+class StubMilestoneClient:
+    """An in-memory `MilestoneClient` double (milestones.md §6.1: canonicality
+    must be testable without a live platform).
+
+    `statuses` maps a canonical milestone ADDRESS (`anchor/name`) to its status
+    (`planned`/`active`/`achieved`/`cancelled`); mutate one with `set_status` to
+    model a platform transition (the marquee promotion/demotion test). `aliases`
+    maps a TARGET address to the tombstone slugs that resolve to it — a stored
+    stamp is matched against `{target} ∪ aliases` (§5).
+
+    It mirrors the platform's resolution semantics closely enough for the
+    consumer: a full address resolves directly; a BARE name resolves against a
+    `context` scope by trying the repo anchor (`context/name`) then the org
+    anchor (`org/name`); a miss raises `MilestoneResolutionError` carrying
+    same-named `suggestions` (never an automatic resolution). It records every
+    call so a test can assert the read did ONE `resolve_batch` (§6.1.2). Set
+    `raise_transport=True` to model a platform outage — `resolve_batch` then
+    raises `MilestoneServiceError` (the HARD read error).
+    """
+
+    def __init__(
+        self,
+        statuses: dict[str, str] | None = None,
+        aliases: dict[str, list[str]] | None = None,
+    ) -> None:
+        self._statuses = {self._fold(k): v for k, v in (statuses or {}).items()}
+        self._aliases = {
+            self._fold(t): [self._fold(a) for a in al]
+            for t, al in (aliases or {}).items()
+        }
+        self._alias_to_target: dict[str, str] = {}
+        for tgt, al in self._aliases.items():
+            for a in al:
+                self._alias_to_target[a] = tgt
+        self.resolve_calls: list[tuple[str, str | None]] = []
+        self.batch_calls: list[list[str]] = []
+        self.aliases_calls: list[str] = []
+        self.raise_transport = False
+
+    @staticmethod
+    def _fold(s):
+        return s.strip().lower() if isinstance(s, str) else s
+
+    def set_status(self, address: str, status: str) -> None:
+        self._statuses[self._fold(address)] = status
+
+    def _candidates(self, ref: str, context: str | None) -> list[str]:
+        ref = self._fold(ref)
+        if "/" in ref:
+            return [ref]
+        if context is None:
+            return []
+        ctx = self._fold(context)
+        cands = [f"{ctx}/{ref}"]
+        org = ctx.split("/", 1)[0]
+        if org != ctx:
+            cands.append(f"{org}/{ref}")
+        return cands
+
+    def _suggestions(self, ref: str) -> list[dict]:
+        name = self._fold(ref).rsplit("/", 1)[-1]
+        return [
+            {"address": a, "status": s}
+            for a, s in sorted(self._statuses.items())
+            if a.rsplit("/", 1)[-1] == name
+        ]
+
+    def _resolve_address(self, ref, context):
+        for cand in self._candidates(ref, context):
+            if cand in self._alias_to_target:
+                tgt = self._alias_to_target[cand]
+                return (tgt, self._statuses.get(tgt), True)
+            if cand in self._statuses:
+                return (cand, self._statuses[cand], False)
+        return None
+
+    def resolve(self, ref: str, context: str | None = None) -> dict:
+        self.resolve_calls.append((ref, context))
+        hit = self._resolve_address(ref, context)
+        if hit is None:
+            raise MilestoneResolutionError(
+                f"unknown milestone {ref!r}", self._suggestions(ref)
+            )
+        addr, status, via = hit
+        return {"address": addr, "status": status, "resolved_via_alias": via}
+
+    def resolve_batch(self, refs, context: str | None = None) -> dict[str, dict]:
+        self.batch_calls.append(list(refs))
+        if self.raise_transport:
+            raise MilestoneServiceError("stub milestone transport failure")
+        out: dict[str, dict] = {}
+        for ref in refs:
+            hit = self._resolve_address(ref, context)
+            if hit is None:
+                out[ref] = {
+                    "error": f"unknown milestone {ref!r}",
+                    "suggestions": self._suggestions(ref),
+                }
+            else:
+                addr, status, via = hit
+                out[ref] = {
+                    "address": addr,
+                    "status": status,
+                    "resolved_via_alias": via,
+                }
+        return out
+
+    def aliases(self, address: str) -> dict:
+        self.aliases_calls.append(address)
+        hit = self._resolve_address(address, None)
+        target = hit[0] if hit else self._fold(address)
+        return {"target": target, "aliases": list(self._aliases.get(target, []))}
+
+
+@pytest.fixture()
+def stub_milestone_client():
+    """Factory: `stub_milestone_client(statuses, aliases=...)` ->
+    `StubMilestoneClient`."""
+    return StubMilestoneClient
