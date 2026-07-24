@@ -194,6 +194,44 @@ def test_no_subscription_emits_nothing(db_session):
     assert db_session.scalars(select(ReplicationOutboxRow)).all() == []
 
 
+def test_noop_update_does_not_stamp_or_emit(db_session):
+    """A content-free `update` (nothing provided, or values equal to stored)
+    advances NO LWW clock and emits NOTHING — it must not be able to shadow a
+    genuine concurrent peer update (review finding on §9)."""
+    emit.create_outbound_subscription(
+        db_session,
+        "http://peer/replication/events/ingest",
+        "topsecret",
+        list(replication.MILESTONE_EVENTS),
+        epoch="e1",
+        source_id="hub.platform",
+    )
+    scopes.create(db_session, slug="acme", name="Acme", kind="org")
+    db_session.commit()
+    milestones.create(db_session, "acme", "alpha", outcome="ship")
+    db_session.commit()
+    before_clock = milestones.get(db_session, "acme/alpha").lww_authored_at
+    before_outbox = len(db_session.scalars(select(ReplicationOutboxRow)).all())
+
+    milestones.update(db_session, "acme/alpha")  # nothing provided
+    milestones.update(db_session, "acme/alpha", outcome="ship")  # equal value
+    db_session.commit()
+
+    m = milestones.get(db_session, "acme/alpha")
+    assert m.lww_authored_at == before_clock
+    assert len(db_session.scalars(select(ReplicationOutboxRow)).all()) == before_outbox
+
+    # A REAL change still stamps + emits.
+    milestones.update(db_session, "acme/alpha", outcome="ship v1")
+    db_session.commit()
+    m = milestones.get(db_session, "acme/alpha")
+    assert m.lww_authored_at != before_clock
+    assert (
+        len(db_session.scalars(select(ReplicationOutboxRow)).all())
+        == before_outbox + 1
+    )
+
+
 # --- round-trip apply: address-keyed, anchor re-resolved by slug --------------
 
 

@@ -622,17 +622,24 @@ def update(
 ) -> Milestone:
     """Modify display fields — `outcome` / `target_date` — NEVER identity (§4).
     A provided value of `None` CLEARS the field; omitting the argument leaves it
-    unchanged. Stamps the §6 LWW clock + emits `milestone.updated` (§9). Raises
+    unchanged. A REAL change stamps the §6 LWW clock + emits `milestone.updated`
+    (§9); a no-op call (nothing provided, or values equal to what is stored)
+    stamps and emits NOTHING — a content-free write must not advance the LWW
+    clock, or it could shadow a genuine concurrent peer update. Raises
     `MilestoneNotFoundError` if unknown."""
     m = get(session, address)
-    if outcome is not _UNSET:
+    changed = False
+    if outcome is not _UNSET and m.outcome != outcome:
         m.outcome = outcome
-    if target_date is not _UNSET:
+        changed = True
+    if target_date is not _UNSET and m.target_date != target_date:
         m.target_date = target_date
-    m.lww_authored_at = _now()
-    m.lww_source_id = _local_source_id()
-    session.flush()
-    emit_event(session, EVENT_MILESTONE_UPDATED, to_replication_payload(m))
+        changed = True
+    if changed:
+        m.lww_authored_at = _now()
+        m.lww_source_id = _local_source_id()
+        session.flush()
+        emit_event(session, EVENT_MILESTONE_UPDATED, to_replication_payload(m))
     return m
 
 
