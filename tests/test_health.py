@@ -226,13 +226,18 @@ def test_app_lifespan_starts_poller_and_marks_unreachable_down():
     assert anyio.run(go) is PluginStatus.DOWN
 
 
-def test_health_loop_warns_when_registry_stays_empty(caplog):
-    """The hollow-gateway detector (issue #39): a registry still empty on the
-    second poll round — one boot round of grace for the plugins' registration
-    heartbeats — warns loudly, exactly once per emptiness episode."""
+def test_health_loop_warns_when_no_external_plugins(caplog):
+    """The hollow-gateway detector (issue #39): no EXTERNAL plugin on the second
+    poll round — one boot round of grace for the plugins' registration
+    heartbeats — warns loudly, exactly once per episode. The always-present
+    platform self-entry (decision 0503fff0) is seeded here to prove it does NOT
+    silence the signal (the #148 review follow-up)."""
     import logging
 
+    from snowline_platform.platform_tools import platform_self_manifest
+
     reg = PluginRegistry()
+    reg.upsert(platform_self_manifest())  # healthy self-entry, still hollow
 
     async def go():
         async with _mock_client(lambda req: httpx.Response(200)) as c:
@@ -244,14 +249,14 @@ def test_health_loop_warns_when_registry_stays_empty(caplog):
                 )
                 with anyio.move_on_after(2.0):
                     while not any(
-                        "registry still empty" in r.message for r in caplog.records
+                        "no external plugins" in r.message for r in caplog.records
                     ):
                         await anyio.sleep(0.005)
                 tg.cancel_scope.cancel()
 
     with caplog.at_level(logging.WARNING, logger="snowline_platform.health"):
         anyio.run(go)
-    warnings = [r for r in caplog.records if "registry still empty" in r.message]
+    warnings = [r for r in caplog.records if "no external plugins" in r.message]
     assert len(warnings) == 1  # loud once, then quiet — not a line per round
 
 

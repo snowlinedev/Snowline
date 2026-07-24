@@ -112,6 +112,14 @@ async def health_poll_loop(
     client = client or httpx.AsyncClient(
         timeout=httpx.Timeout(timeout), follow_redirects=True
     )
+
+    def _platform_plugin_name() -> str:
+        # Imported lazily (mirrors gateway_app's build_platform_tools_mount) so
+        # health stays import-light at module load.
+        from snowline_platform.platform_tools import PLATFORM_PLUGIN_NAME
+
+        return PLATFORM_PLUGIN_NAME
+
     empty_rounds = 0
     try:
         while True:
@@ -124,15 +132,23 @@ async def health_poll_loop(
                 # plugins down) and every composed surface serves zero tools.
                 # Warn once when emptiness persists past the first round; go
                 # quiet until plugins appear so the log isn't flooded.
-                if results:
+                # The platform's own self-entry (decision 0503fff0) is seeded
+                # at boot and always present, so it is EXCLUDED from the count
+                # — otherwise it permanently silences this signal (the same
+                # filter the create_app boot warning applies).
+                external = {
+                    n for n in results if n != _platform_plugin_name()
+                }
+                if external:
                     empty_rounds = 0
                 else:
                     empty_rounds += 1
                     if empty_rounds == 2:
                         log.warning(
-                            "health: registry still empty after %d poll rounds "
+                            "health: no external plugins after %d poll rounds "
                             "— no plugin registration heartbeats are arriving; "
-                            "composed surfaces serve no tools (issue #39)",
+                            "composed surfaces serve only the platform's own "
+                            "native tools (issue #39)",
                             empty_rounds,
                         )
             except Exception:  # never let one bad round kill the poller
