@@ -19,6 +19,7 @@ import uuid
 from datetime import date, datetime
 
 from sqlalchemy import (
+    JSON,
     Date,
     DateTime,
     ForeignKey,
@@ -97,6 +98,16 @@ class Milestone(Base):
     - `merged_into_id` — self-FK alias tombstone (§7). The COLUMN lands now so the
       merge verb (a later increment) needs no second migration; it is always NULL
       until then.
+    - `lww_authored_at` / `lww_source_id` — the ROW-LEVEL last-writer-wins clock
+      (milestones.md §9, replication-continuity §6): the authored-at + authoring
+      `source_id` of the write that last set this row's MUTABLE state (status /
+      outcome / target_date / the `*_at` stamps / the merge tombstone). Replication
+      apply converges the row by comparing an incoming event's
+      `(authored_at, source_id)` against these — a pure two-event LWW resolution,
+      `source_id` breaking an authored-at tie (§6). NULL on rows written before
+      replication was configured; local writes stamp them going forward. Distinct
+      from the append-only transition log, which retains BOTH instances' status
+      transitions (the loser's included) for the §4 illegal-history check.
     """
 
     __tablename__ = "milestones"
@@ -123,6 +134,10 @@ class Milestone(Base):
     merged_into_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("milestones.id"), nullable=True
     )
+    # The row-level LWW clock (§9 / replication-continuity §6) — see the class
+    # docstring. Nullable: only replication-configured local writes stamp it.
+    lww_authored_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    lww_source_id: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         server_default=func.now(), onupdate=func.now()
@@ -150,6 +165,44 @@ class MilestoneTransition(Base):
     to_status: Mapped[str] = mapped_column(String, nullable=False)
     authored_at: Mapped[datetime] = mapped_column(server_default=func.now())
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The AUTHORING instance's replication identity (milestones.md §9, #145):
+    # NULL for a locally-authored transition when replication is unconfigured,
+    # the peer's `source` for a replicated one. LWW tiebreak on equal
+    # `authored_at` (§6), the dedupe key that makes a redelivered transition
+    # idempotent, and the deterministic secondary sort under which the §4
+    # illegal-history check reconstructs the converged path. Both instances'
+    # transitions converge into this one log — the LWW loser retained, never
+    # dropped (§9).
+    source_id: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    milestone: Mapped["Milestone"] = relationship()
+
+
+class MilestoneUnreconciled(Base):
+    """First-class UNRECONCILED replication state for agent triage (milestones.md
+    §9, issue #145) — the milestone analogue of governance's decision-concurrence
+    flag, and deliberately NOT a parked event.
+
+    When two instances author concurrent lifecycle transitions during a partition,
+    replication apply CONVERGES the row by LWW (§6) — it never parks on a mere LWW
+    loss, and never silently invents a legal history. But when the converged
+    transition log implies a move ILLEGAL under §4's legality table (e.g. an
+    earlier-authored `cancel` that a later-authored `activate` wins over, so the
+    effective history reads cancelled->active), that contradiction is surfaced
+    HERE as durable, queryable state an agent resolves — not a log line, and not a
+    park (parking would block the very convergence §6 requires). One row per
+    detected contradiction on a milestone; `detail` carries the conflicting pair.
+    """
+
+    __tablename__ = "milestone_unreconciled"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    milestone_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("milestones.id"), nullable=False
+    )
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    detail: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     milestone: Mapped["Milestone"] = relationship()
 

@@ -50,17 +50,28 @@ def _request(app, method: str, path: str, *, peer=TAILNET_PEER):
 
 def test_self_manifest_shape_matches_the_replication_block():
     """The endpoint returns the same block shape a plugin declares (§4): a real
-    contract_version + ingest_path + scope vocabulary, with advertised_base_url
-    absent (a peer discovers the platform AT its base URL, §8)."""
+    contract_version + ingest_path + the FULL platform vocabulary (scopes AND
+    milestones, milestones.md §9), with advertised_base_url absent (a peer
+    discovers the platform AT its base URL, §8)."""
     body = _request(_app(), "GET", replication.MANIFEST_PATH).json()
     assert body == {
         "contract_version": CONTRACT_VERSION,
         "ingest_path": replication.INGEST_PATH,
-        "events": list(replication.SCOPE_EVENTS),
+        "events": list(replication.PLATFORM_EVENTS),
         "advertised_base_url": None,
     }
-    # The scope stream's declared vocabulary is exactly what it applies/emits.
-    assert body["events"] == ["scope.created", "scope.updated"]
+    # The declared vocabulary is exactly what the platform applies/emits — scope
+    # events plus the milestone-registry events (§9), so pairing subscribes a peer
+    # to both namespaces on the one platform stream.
+    assert body["events"] == [
+        "scope.created",
+        "scope.updated",
+        "milestone.created",
+        "milestone.updated",
+        "milestone.transitioned",
+        "milestone.dependency_changed",
+        "milestone.merged",
+    ]
 
 
 def test_self_manifest_is_tailnet_gated_like_its_sibling_admin_routes():

@@ -50,6 +50,24 @@ EVENT_SCOPE_UPDATED: str = "scope.updated"
 # so this registry stays the whole platform's vocabulary — not just governance's.
 EVENT_MEMORY_SET: str = "memory.set"
 EVENT_MEMORY_FORGOTTEN: str = "memory.forgotten"
+# The platform's milestone-registry REPLICATION vocabulary (milestones.md §9,
+# issue #145): the platform's second identity primitive dogfoods the same
+# replication-class contract scopes do, on the platform's own stream. Each event
+# carries FULL ROW STATE plus an authored-at LWW stamp; identity on the wire is
+# the canonical address (anchor slug + name), never the instance-local UUID.
+# `dependency_changed` carries an add/remove edge DELTA (idempotent, no
+# concurrent-edge clobber); `merged` carries the tombstone + terminal-target
+# addresses. Additive vocabulary — vendored EQUAL to the producer's copy, both
+# packages one commit, NO CONTRACT_VERSION bump (the envelope keying fields are
+# unchanged, exactly like the scope/memory additions). NOT to be confused with
+# the DEFERRED webhook-class notification bus (milestones.md §5): these are the
+# replication-class peer-stream events, unusable as notifications under origin
+# suppression.
+EVENT_MILESTONE_CREATED: str = "milestone.created"
+EVENT_MILESTONE_UPDATED: str = "milestone.updated"
+EVENT_MILESTONE_TRANSITIONED: str = "milestone.transitioned"
+EVENT_MILESTONE_DEPENDENCY_CHANGED: str = "milestone.dependency_changed"
+EVENT_MILESTONE_MERGED: str = "milestone.merged"
 
 EVENT_TYPES: frozenset[str] = frozenset(
     {
@@ -72,6 +90,11 @@ EVENT_TYPES: frozenset[str] = frozenset(
         EVENT_SCOPE_UPDATED,
         EVENT_MEMORY_SET,
         EVENT_MEMORY_FORGOTTEN,
+        EVENT_MILESTONE_CREATED,
+        EVENT_MILESTONE_UPDATED,
+        EVENT_MILESTONE_TRANSITIONED,
+        EVENT_MILESTONE_DEPENDENCY_CHANGED,
+        EVENT_MILESTONE_MERGED,
     }
 )
 

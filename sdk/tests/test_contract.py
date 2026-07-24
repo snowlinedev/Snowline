@@ -25,8 +25,9 @@ def test_event_type_literals():
 def test_event_types_frozenset():
     # The full write-surface vocabulary (replication-continuity §4, #79):
     # decisions + shadow graph + artifacts (the spec/plan/reference docs) +
-    # the graduation provenance stamp — pinned as LITERALS so a registry edit
-    # in only one package can't slip past its own suite.
+    # the graduation provenance stamp + scopes + memory + the milestone registry
+    # (milestones.md §9, #145) — pinned as LITERALS so a registry edit in only one
+    # package can't slip past its own suite.
     assert contract.EVENT_TYPES == frozenset(
         {
             "decision.recorded",
@@ -48,6 +49,11 @@ def test_event_types_frozenset():
             "scope.updated",
             "memory.set",
             "memory.forgotten",
+            "milestone.created",
+            "milestone.updated",
+            "milestone.transitioned",
+            "milestone.dependency_changed",
+            "milestone.merged",
         }
     )
     assert isinstance(contract.EVENT_TYPES, frozenset)

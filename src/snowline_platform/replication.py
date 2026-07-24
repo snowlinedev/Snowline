@@ -26,10 +26,15 @@ from contextlib import AbstractContextManager
 from fastapi import APIRouter, Request
 from sqlalchemy.orm import Session
 
-from snowline_platform import scopes
+from snowline_platform import milestones, scopes
 from snowline_platform.db import session_scope
 from snowline_plugin_sdk.contract import (
     CONTRACT_VERSION,
+    EVENT_MILESTONE_CREATED,
+    EVENT_MILESTONE_DEPENDENCY_CHANGED,
+    EVENT_MILESTONE_MERGED,
+    EVENT_MILESTONE_TRANSITIONED,
+    EVENT_MILESTONE_UPDATED,
     EVENT_SCOPE_CREATED,
     EVENT_SCOPE_UPDATED,
 )
@@ -52,23 +57,57 @@ ADMIN_PREFIX = "/replication-admin"
 # platform stream at pairing time exactly like a plugin's.
 MANIFEST_PATH = "/replication/manifest"
 
-# The platform's scope-stream event vocabulary (§8) — the events its
-# `apply_scope_event` handles and its emit side produces.
+# The platform's scope-stream event vocabulary (§8) — the events
+# `apply_scope_event` handles and the scope service's emit side produces.
 SCOPE_EVENTS: tuple[str, ...] = (EVENT_SCOPE_CREATED, EVENT_SCOPE_UPDATED)
+
+# The platform's milestone-registry event vocabulary (milestones.md §9, #145) —
+# the milestone service emits these and `apply_milestone_event` handles them, on
+# the SAME platform stream as scopes (one platform, one replication stream).
+MILESTONE_EVENTS: tuple[str, ...] = (
+    EVENT_MILESTONE_CREATED,
+    EVENT_MILESTONE_UPDATED,
+    EVENT_MILESTONE_TRANSITIONED,
+    EVENT_MILESTONE_DEPENDENCY_CHANGED,
+    EVENT_MILESTONE_MERGED,
+)
+
+# The platform's FULL replication vocabulary — scopes + milestones. This is what
+# the self-manifest advertises, so a pairing/seed handshake subscribes a peer's
+# forward stream to milestone events too (without it, a newly-paired instance
+# would receive scope rows but silently never the milestone registry, §9).
+PLATFORM_EVENTS: tuple[str, ...] = SCOPE_EVENTS + MILESTONE_EVENTS
+
+
+def apply_platform_event(session: Session, envelope: dict) -> None:
+    """The platform's single replication APPLY seam — dispatches by event type to
+    the owning service's apply function (scopes vs milestones), since the platform
+    runs ONE inbound stream carrying both namespaces' events. Both are address/
+    slug-keyed idempotent applies run under origin suppression (§9)."""
+    event_type = envelope.get("event_type")
+    if event_type in SCOPE_EVENTS:
+        scopes.apply_scope_event(session, envelope)
+    elif event_type in MILESTONE_EVENTS:
+        milestones.apply_milestone_event(session, envelope)
+    else:
+        raise ValueError(
+            f"platform replication apply: unknown event_type {event_type!r}"
+        )
 
 
 def manifest_payload() -> dict:
-    """The platform scope stream's self-manifest, same shape as a plugin's
-    `replication` block. `contract_version` is the SDK envelope contract the
-    platform's own emit/ingest speak (both instances run identical platform
-    code, so a skew here is a real deploy skew worth refusing at pairing).
-    `advertised_base_url` is absent: a peer discovers the platform AT its
-    reachable base URL, so the scope stream carries no distinct advertised
-    address — the field is present for shape-parity with the plugin block."""
+    """The platform stream's self-manifest, same shape as a plugin's `replication`
+    block. `events` is the FULL platform vocabulary — scopes AND milestones (§9) —
+    so pairing subscribes a peer to both. `contract_version` is the SDK envelope
+    contract the platform's own emit/ingest speak (both instances run identical
+    platform code, so a skew here is a real deploy skew worth refusing at
+    pairing). `advertised_base_url` is absent: a peer discovers the platform AT
+    its reachable base URL, so the stream carries no distinct advertised address —
+    the field is present for shape-parity with the plugin block."""
     return {
         "contract_version": CONTRACT_VERSION,
         "ingest_path": INGEST_PATH,
-        "events": list(SCOPE_EVENTS),
+        "events": list(PLATFORM_EVENTS),
         "advertised_base_url": None,
     }
 
@@ -88,7 +127,7 @@ def build_router(
     CLI to version-check the scope stream like a plugin's."""
     router = build_replication_router(
         session_scope_fn,
-        scopes.apply_scope_event,
+        apply_platform_event,
         ingest_path=INGEST_PATH,
         admin_prefix=ADMIN_PREFIX,
     )

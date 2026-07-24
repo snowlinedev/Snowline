@@ -125,7 +125,8 @@ def clean_db(migrated_db):
         s.execute(
             sa.text(
                 "TRUNCATE scopes, milestones, milestone_transitions, "
-                "milestone_dependencies, replication_subscriptions, "
+                "milestone_dependencies, milestone_unreconciled, "
+                "replication_subscriptions, "
                 "replication_outbox, replication_stream_counters, "
                 "replication_inbound_streams, replication_parked_events "
                 "RESTART IDENTITY CASCADE"
