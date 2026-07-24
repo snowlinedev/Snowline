@@ -353,6 +353,17 @@ def test_lifecycle_warnings_for_unmet_dependencies_and_active_cancel(clean_db):
     r = client.post("/milestones/other/clean/cancel").json()
     assert any("demote" in w for w in r.get("warnings", [])), r
 
+    # DURABLE (QA 6396993e): the warnings persist on the transition log rows —
+    # the contradiction is readable after the response is gone.
+    log = client.get(f"/milestones/{a}/transitions").json()["transitions"]
+    warned = [t for t in log if t.get("warnings")]
+    assert warned and any(
+        "unmet dependencies" in w for t in warned for w in t["warnings"]
+    ), log
+    clean_log = client.get("/milestones/other/clean/transitions").json()["transitions"]
+    activate_row = next(t for t in clean_log if t["to_status"] == "active")
+    assert activate_row["warnings"] is None  # clean transition stays clean
+
 
 def test_milestones_behind_trust_gate(clean_db):
     client = TestClient(create_app(migrate_on_startup=False))
