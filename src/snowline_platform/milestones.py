@@ -35,6 +35,7 @@ increments: replication emission (§9), the governance consumer (§6.1), and the
 from __future__ import annotations
 
 import difflib
+import os
 import re
 import uuid
 from collections import defaultdict
@@ -49,8 +50,17 @@ from snowline_platform.models import (
     Milestone,
     MilestoneDependency,
     MilestoneTransition,
+    MilestoneUnreconciled,
 )
 from snowline_platform.scopes import canonical_slug, validate_slug
+from snowline_plugin_sdk.contract import (
+    EVENT_MILESTONE_CREATED,
+    EVENT_MILESTONE_DEPENDENCY_CHANGED,
+    EVENT_MILESTONE_MERGED,
+    EVENT_MILESTONE_TRANSITIONED,
+    EVENT_MILESTONE_UPDATED,
+)
+from snowline_plugin_sdk.replication import ParkNow, emit_event
 
 # --- name / status contract (§2) --------------------------------------------
 
@@ -139,6 +149,32 @@ def _now() -> datetime:
     """A naive-UTC timestamp for the lifecycle `*_at` columns (TIMESTAMP WITHOUT
     TIME ZONE, matching the scope table's convention)."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+# The LEGAL lifecycle moves (§4), as the (from, to) pairs the transition verbs
+# permit: planned→active→achieved; planned|active→cancelled. This is the table
+# the replication illegal-history check (§9) reconstructs the CONVERGED transition
+# path against — a converged history whose effective path steps outside this set
+# (e.g. cancelled→active, a terminal state reversed by an LWW-winning transition
+# authored during a partition) is first-class unreconciled state, not a park.
+LEGAL_TRANSITIONS = frozenset(
+    {
+        ("planned", "active"),
+        ("active", "achieved"),
+        ("planned", "cancelled"),
+        ("active", "cancelled"),
+    }
+)
+
+
+def _local_source_id() -> str | None:
+    """This instance's replication `source_id` (`SNOWLINE_REPLICATION_SOURCE_ID`),
+    or None when replication is unconfigured. Stamped onto locally-authored rows /
+    transitions as the §6 LWW identity — it equals the `source` an outbound
+    subscription stamps into this instance's envelopes (both default from the same
+    env var), so a peer's apply compares like-for-like. None when unset: no
+    outbound stream exists to emit into anyway, so the clock is inert."""
+    return os.environ.get("SNOWLINE_REPLICATION_SOURCE_ID") or None
 
 
 # --- name / address helpers -------------------------------------------------
@@ -459,6 +495,8 @@ def create(
         outcome=outcome,
         target_date=target_date,
         status="planned",
+        lww_authored_at=_now(),
+        lww_source_id=_local_source_id(),
     )
     session.add(m)
     try:
@@ -470,6 +508,7 @@ def create(
         raise MilestoneConflictError(
             f"milestone {anchor_slug + '/' + name!r} already exists"
         ) from exc
+    emit_event(session, EVENT_MILESTONE_CREATED, to_replication_payload(m))
     return m
 
 
@@ -482,6 +521,9 @@ def _log_transition(
     from_status: str,
     to_status: str,
     reason: str | None,
+    *,
+    authored_at: datetime,
+    source_id: str | None,
 ) -> None:
     session.add(
         MilestoneTransition(
@@ -489,27 +531,50 @@ def _log_transition(
             from_status=from_status,
             to_status=to_status,
             reason=reason,
+            authored_at=authored_at,
+            source_id=source_id,
         )
     )
+
+
+def _transition(
+    session: Session, m: Milestone, to_status: str, stamp: str, reason: str | None
+) -> Milestone:
+    """Apply one lifecycle transition + stamp the §6 LWW clock + emit
+    `milestone.transitioned` (§9). `stamp` is the `*_at` column to set. The
+    transition's `authored_at` == the row's `lww_authored_at` == the emitted
+    event's `authored_at`, all one instant, so a peer's LWW comparison and its
+    illegal-history reconstruction see the identical clock this instance did."""
+    frm = m.status
+    now = _now()
+    src = _local_source_id()
+    m.status = to_status
+    setattr(m, stamp, now)
+    m.lww_authored_at = now
+    m.lww_source_id = src
+    _log_transition(session, m, frm, to_status, reason, authored_at=now, source_id=src)
+    session.flush()
+    emit_event(
+        session,
+        EVENT_MILESTONE_TRANSITIONED,
+        _transition_payload(m, frm, to_status, reason, now),
+    )
+    return m
 
 
 def activate(
     session: Session, address: str, reason: str | None = None
 ) -> Milestone:
     """planned→active (§4). Rejects any other source status; records the
-    transition (with optional `reason`). Nothing is ever automatic."""
+    transition (with optional `reason`) and emits `milestone.transitioned` (§9).
+    Nothing is ever automatic."""
     m = get(session, address)
     if m.status != "planned":
         raise IllegalTransitionError(
             f"cannot activate {address!r} from status {m.status!r} — "
             "only a planned milestone activates (§4)"
         )
-    frm = m.status
-    m.status = "active"
-    m.activated_at = _now()
-    _log_transition(session, m, frm, m.status, reason)
-    session.flush()
-    return m
+    return _transition(session, m, "active", "activated_at", reason)
 
 
 def achieve(
@@ -517,7 +582,7 @@ def achieve(
 ) -> Milestone:
     """active→achieved (§4). `achieve` on a PLANNED milestone is REJECTED —
     "activate first"; it never auto-activates, and no member-item state ever
-    implies achievement. Records the transition."""
+    implies achievement. Records the transition + emits `milestone.transitioned`."""
     m = get(session, address)
     if m.status == "planned":
         raise IllegalTransitionError(
@@ -529,33 +594,23 @@ def achieve(
             f"cannot achieve {address!r} from status {m.status!r} — "
             "only an active milestone is achieved (§4)"
         )
-    frm = m.status
-    m.status = "achieved"
-    m.achieved_at = _now()
-    _log_transition(session, m, frm, m.status, reason)
-    session.flush()
-    return m
+    return _transition(session, m, "achieved", "achieved_at", reason)
 
 
 def cancel(
     session: Session, address: str, reason: str | None = None
 ) -> Milestone:
     """planned|active→cancelled (§4) — a deliberate retraction. Records the
-    transition. (Cancelling an ACTIVE milestone demotes governance versions
-    stamped with it, §6.1.6 — that warning surfaces once the governance consumer
-    lands; deferred here.)"""
+    transition + emits `milestone.transitioned`. (Cancelling an ACTIVE milestone
+    demotes governance versions stamped with it, §6.1.6 — that warning surfaces
+    once the governance consumer lands; deferred here.)"""
     m = get(session, address)
     if m.status not in ("planned", "active"):
         raise IllegalTransitionError(
             f"cannot cancel {address!r} from status {m.status!r} — "
             "only a planned or active milestone is cancelled (§4)"
         )
-    frm = m.status
-    m.status = "cancelled"
-    m.cancelled_at = _now()
-    _log_transition(session, m, frm, m.status, reason)
-    session.flush()
-    return m
+    return _transition(session, m, "cancelled", "cancelled_at", reason)
 
 
 def update(
@@ -567,13 +622,17 @@ def update(
 ) -> Milestone:
     """Modify display fields — `outcome` / `target_date` — NEVER identity (§4).
     A provided value of `None` CLEARS the field; omitting the argument leaves it
-    unchanged. Raises `MilestoneNotFoundError` if unknown."""
+    unchanged. Stamps the §6 LWW clock + emits `milestone.updated` (§9). Raises
+    `MilestoneNotFoundError` if unknown."""
     m = get(session, address)
     if outcome is not _UNSET:
         m.outcome = outcome
     if target_date is not _UNSET:
         m.target_date = target_date
+    m.lww_authored_at = _now()
+    m.lww_source_id = _local_source_id()
     session.flush()
+    emit_event(session, EVENT_MILESTONE_UPDATED, to_replication_payload(m))
     return m
 
 
@@ -676,6 +735,11 @@ def add_dependency(
             )
         )
         session.flush()
+        emit_event(
+            session,
+            EVENT_MILESTONE_DEPENDENCY_CHANGED,
+            _dependency_payload("add", dependent, dependency),
+        )
     return _dependencies_of(session, dependent)
 
 
@@ -691,6 +755,11 @@ def remove_dependency(
     if edge is not None:
         session.delete(edge)
         session.flush()
+        emit_event(
+            session,
+            EVENT_MILESTONE_DEPENDENCY_CHANGED,
+            _dependency_payload("remove", dependent, dependency),
+        )
     return _dependencies_of(session, dependent)
 
 
@@ -784,9 +853,43 @@ def merge(session: Session, from_address: str, into_address: str) -> dict:
             "is truly intended (§7)."
         )
 
-    # Re-point `from`'s edges (both directions) onto `into`, drop self-edges,
-    # dedupe, and re-run the GLOBAL cycle guard on the prospective union — fail
-    # whole if it would cycle (§7). Nothing is written until the guard passes.
+    # Re-point edges + tombstone `from` (the mechanics shared with replication
+    # apply — see `_perform_merge`); raises `MilestoneMergeError` if the edge
+    # union would cycle, before anything is written.
+    _perform_merge(session, frm, into)
+    session.flush()
+    emit_event(
+        session, EVENT_MILESTONE_MERGED, _merged_payload(frm, into)
+    )
+    return {
+        "tombstone": to_row(frm),
+        "target": address_of(into),
+        "reminder": (
+            f"{address_of(frm)} is now an alias of {address_of(into)}. The "
+            "platform never bulk-retags plugin data — consumers' stored addresses "
+            "stay put and reads agree via alias-set matching. Review affected "
+            f"rows agent-side: list_artifact_versions(milestone={address_of(frm)}) "
+            f"and milestone_status({address_of(frm)}); the platform cannot count "
+            "plugin rows (§7)."
+        ),
+    }
+
+
+def _perform_merge(session: Session, frm: Milestone, into: Milestone) -> None:
+    """The merge MECHANICS shared by the `merge` verb and replication apply (§7,
+    §9): re-point `from`'s edges (both directions) onto `into`, drop self-edges,
+    dedupe against existing edges, re-run the GLOBAL cycle guard on the prospective
+    union (raise `MilestoneMergeError` if it would cycle — nothing written),
+    re-point any inbound alias so depth-1 holds in both orderings, then set
+    `from`'s tombstone pointer + stamp the §6 LWW clock (the clock a later
+    re-merge LWW-compares against). Status is left as-is (the row is now an alias;
+    resolution never surfaces its status).
+
+    The caller owns the DIFFERING guards: the `merge` verb pre-checks state
+    compatibility + already-tombstone and lets a cycle surface as
+    `MilestoneMergeError`; replication apply skips the state-compat re-check (it
+    was decided at the authoring instance — apply converges, §9), LWW-resolves an
+    already-tombstoned `from`, and translates a cycle into a park (§8.1)."""
     existing = list(session.scalars(select(MilestoneDependency)))
     touching = [
         e for e in existing if frm.id in (e.dependent_id, e.dependency_id)
@@ -823,19 +926,8 @@ def merge(session: Session, from_address: str, into_address: str) -> dict:
         inbound.merged_into_id = into.id
 
     frm.merged_into_id = into.id  # the tombstone; status stays as-is
-    session.flush()
-    return {
-        "tombstone": to_row(frm),
-        "target": address_of(into),
-        "reminder": (
-            f"{address_of(frm)} is now an alias of {address_of(into)}. The "
-            "platform never bulk-retags plugin data — consumers' stored addresses "
-            "stay put and reads agree via alias-set matching. Review affected "
-            f"rows agent-side: list_artifact_versions(milestone={address_of(frm)}) "
-            f"and milestone_status({address_of(frm)}); the platform cannot count "
-            "plugin rows (§7)."
-        ),
-    }
+    frm.lww_authored_at = _now()
+    frm.lww_source_id = _local_source_id()
 
 
 # --- aliases (§5) -----------------------------------------------------------
@@ -896,3 +988,431 @@ def to_row(milestone: Milestone) -> dict:
         "created_at": _iso(milestone.created_at),
         "updated_at": _iso(milestone.updated_at),
     }
+
+
+# --- replication: emit payloads (milestones.md §9) --------------------------
+#
+# Cross-instance identity is the CANONICAL ADDRESS (anchor slug + name), never
+# the instance-local UUID (§9): every payload carries `anchor` (the slug apply
+# re-resolves `anchor_scope_id` from) + `name`, and the `id` is deliberately
+# OMITTED so nothing on the apply side can key on it. `authored_at` is the §6 LWW
+# clock; the authoring `source_id` rides the ENVELOPE (`source`), so it is not
+# duplicated here.
+
+
+def to_replication_payload(milestone: Milestone) -> dict:
+    """The `milestone.created` / `milestone.updated` event body — FULL ROW STATE
+    keyed by the canonical address (§9). Carries everything apply needs to
+    reconstruct the row: the anchor slug (re-resolved to a local `anchor_scope_id`
+    at apply), the name, the mutable fields, and the `authored_at` LWW stamp."""
+    return {
+        "address": address_of(milestone),
+        "anchor": milestone.anchor.slug,
+        "name": milestone.name,
+        "outcome": milestone.outcome,
+        "status": milestone.status,
+        "target_date": _iso(milestone.target_date),
+        "activated_at": _iso(milestone.activated_at),
+        "achieved_at": _iso(milestone.achieved_at),
+        "cancelled_at": _iso(milestone.cancelled_at),
+        "merged_into": (
+            address_of(milestone.merged_into)
+            if milestone.merged_into_id is not None
+            else None
+        ),
+        "authored_at": _iso(milestone.lww_authored_at),
+    }
+
+
+def _transition_payload(
+    milestone: Milestone,
+    from_status: str,
+    to_status: str,
+    reason: str | None,
+    authored_at: datetime,
+) -> dict:
+    """The `milestone.transitioned` body: FULL ROW STATE (so apply converges the
+    row by LWW) PLUS the transition triple (from/to status, reason) and the
+    transition's `authored_at` — the same instant stamped on the row clock and the
+    log row, so a peer's LWW comparison + illegal-history reconstruction see the
+    identical clock (§9)."""
+    return {
+        **to_replication_payload(milestone),
+        "from_status": from_status,
+        "to_status": to_status,
+        "reason": reason,
+        "authored_at": _iso(authored_at),
+    }
+
+
+def _dependency_payload(
+    op: str, dependent: Milestone, dependency: Milestone
+) -> dict:
+    """The `milestone.dependency_changed` body — an add/remove edge DELTA (§9,
+    documented choice): `op` ∈ {add, remove} + the two canonical addresses. A
+    delta, NOT the dependent's full edge set, because a full-set replace would let
+    a concurrent edge on the SAME dependent (added at the peer during a partition)
+    be silently CLOBBERED on apply; a single-edge delta is idempotent (re-adding an
+    existing edge / removing an absent one is a no-op) and never drops a
+    concurrent edge, so both instances' independent edges survive convergence. The
+    only conflict a delta cannot self-heal — an add that CYCLES the union — is
+    exactly the §8.1 DAG race, which apply parks."""
+    return {
+        "op": op,
+        "dependent": address_of(dependent),
+        "dependency": address_of(dependency),
+        "authored_at": _iso(_now()),
+    }
+
+
+def _merged_payload(frm: Milestone, into: Milestone) -> dict:
+    """The `milestone.merged` body: the tombstone's canonical address + the
+    TERMINAL target address (§9). Apply re-derives the alias + edge re-point from
+    these two addresses (it never trusts a foreign UUID); `authored_at` is the LWW
+    clock a later re-merge of the same `from` resolves against."""
+    return {
+        "from": address_of(frm),
+        "into": address_of(into),
+        "authored_at": _iso(frm.lww_authored_at),
+    }
+
+
+# --- replication: apply (address-keyed, §9) ---------------------------------
+#
+# The domain APPLY seam driven through the SDK's `ingest_delivery`
+# (`replication.apply_platform_event` dispatches scope events here). Runs under
+# origin suppression, so the direct row writes below never re-emit. Apply writes
+# the row STATE DIRECTLY rather than replaying the lifecycle verbs (as scope apply
+# reuses create/update): the verbs are legality-guarded and cannot express "set
+# status=achieved with these timestamps" — a full-row LWW converge must (§6).
+#
+# Ordering posture, matched to scope apply's: a not-yet-replicated ANCHOR SCOPE
+# (or a not-yet-replicated referenced milestone) surfaces as an ORDINARY retryable
+# error — NOT `ParkNow` — so it self-heals the moment the referent's own event
+# applies, exactly as scope apply leaves an unknown parent slug retryable. Only a
+# permanent conflict that can never self-heal (a DAG/alias cycle in the union)
+# raises `ParkNow` (§8.1). Apply NEVER parks on a mere LWW loss (§9).
+
+
+class MilestoneAnchorPendingError(LookupError):
+    """The anchor scope named in a replicated milestone event has not replicated
+    to this instance yet (§9 ordering). A RETRYABLE error — never `ParkNow`: it
+    self-heals when the anchor's own `scope.created` applies, matching scope
+    apply's unknown-parent posture (the bounded retry exists for exactly this)."""
+
+
+def _parse_dt(value: str | None) -> datetime | None:
+    return datetime.fromisoformat(value) if value else None
+
+
+def _parse_date(value: str | None) -> date | None:
+    return date.fromisoformat(value) if value else None
+
+
+def _lww_incoming(payload: dict, envelope: dict) -> tuple[datetime, str]:
+    """The incoming event's LWW key `(authored_at, source_id)` — `source_id` from
+    the ENVELOPE (`source`), breaking an authored-at tie (§6)."""
+    return (
+        _parse_dt(payload["authored_at"]) or datetime.min,
+        envelope.get("source") or "",
+    )
+
+
+def _lww_local(m: Milestone) -> tuple[datetime, str]:
+    """The local row's LWW key. A NULL clock (a pre-replication row) sorts lowest,
+    so any authored incoming event wins over it."""
+    return (m.lww_authored_at or datetime.min, m.lww_source_id or "")
+
+
+def _write_row_state(m: Milestone, payload: dict, envelope: dict) -> None:
+    """Overwrite the row's MUTABLE state from a full-row payload + advance the LWW
+    clock (§6). Never touches identity (`anchor_scope_id`/`name`) or the tombstone
+    pointer (`merged_into_id` is owned by `milestone.merged` apply)."""
+    m.outcome = payload["outcome"]
+    m.status = payload["status"]
+    m.target_date = _parse_date(payload["target_date"])
+    m.activated_at = _parse_dt(payload["activated_at"])
+    m.achieved_at = _parse_dt(payload["achieved_at"])
+    m.cancelled_at = _parse_dt(payload["cancelled_at"])
+    m.lww_authored_at = _parse_dt(payload["authored_at"])
+    m.lww_source_id = envelope.get("source")
+
+
+def _upsert_row(session: Session, envelope: dict) -> Milestone:
+    """Address-keyed upsert of a full-row event (§9): re-resolve the anchor scope
+    by SLUG, then insert (new) or LWW-converge (existing). A missing anchor scope
+    raises the retryable `MilestoneAnchorPendingError`. On an LWW loss the local
+    row is kept untouched — and NEVER parked (§9)."""
+    payload = envelope["payload"]
+    anchor = scopes.resolve(session, payload["anchor"])
+    if anchor is None:
+        raise MilestoneAnchorPendingError(
+            f"anchor scope {payload['anchor']!r} for milestone "
+            f"{payload['address']!r} has not replicated yet — retryable (§9)"
+        )
+    m = _by_anchor_name(session, anchor.id, payload["name"])
+    if m is None:
+        m = Milestone(anchor_scope_id=anchor.id, name=payload["name"])
+        _write_row_state(m, payload, envelope)
+        session.add(m)
+        session.flush()
+        return m
+    if _lww_incoming(payload, envelope) > _lww_local(m):
+        _write_row_state(m, payload, envelope)
+        session.flush()
+    return m
+
+
+def _append_transition_idempotent(
+    session: Session,
+    m: Milestone,
+    from_status: str,
+    to_status: str,
+    reason: str | None,
+    authored_at: datetime | None,
+    source_id: str | None,
+) -> None:
+    """Append the peer's transition to the log — the LWW LOSER's transition lands
+    here too, never dropped (§9). Idempotent on redelivery: the
+    `(milestone, from, to, authored_at, source_id)` tuple keys the dedupe."""
+    exists = session.scalar(
+        select(MilestoneTransition).where(
+            MilestoneTransition.milestone_id == m.id,
+            MilestoneTransition.from_status == from_status,
+            MilestoneTransition.to_status == to_status,
+            MilestoneTransition.authored_at == authored_at,
+            MilestoneTransition.source_id == source_id,
+        )
+    )
+    if exists is None:
+        session.add(
+            MilestoneTransition(
+                milestone_id=m.id,
+                from_status=from_status,
+                to_status=to_status,
+                reason=reason,
+                authored_at=authored_at,
+                source_id=source_id,
+            )
+        )
+        session.flush()
+
+
+def _check_illegal_history(session: Session, m: Milestone) -> None:
+    """Reconstruct the CONVERGED transition path — every instance's transitions,
+    ordered by `(authored_at, source_id)` — and flag any adjacent effective move
+    ILLEGAL under §4 as first-class unreconciled state (§9). In single-instance
+    operation each transition's `from` equals the prior `to`, so every adjacent
+    `(prev.to, cur.to)` is a legal verb move and nothing flags; only concurrent
+    partition-authored transitions can produce an adjacent illegal move (e.g. an
+    earlier `cancel` an LWW-winning later `activate` reverses → cancelled→active).
+    Apply CONVERGES the row regardless — this flags, it never parks (§9)."""
+    rows = list(
+        session.scalars(
+            select(MilestoneTransition)
+            .where(MilestoneTransition.milestone_id == m.id)
+            .order_by(
+                MilestoneTransition.authored_at,
+                MilestoneTransition.source_id,
+            )
+        )
+    )
+    for prev, cur in zip(rows, rows[1:]):
+        move = (prev.to_status, cur.to_status)
+        if move[0] == move[1] or move in LEGAL_TRANSITIONS:
+            continue
+        _flag_unreconciled(session, m, prev, cur)
+
+
+def _flag_unreconciled(
+    session: Session,
+    m: Milestone,
+    prev: MilestoneTransition,
+    cur: MilestoneTransition,
+) -> None:
+    """Record (once per distinct illegal move on a milestone) a first-class
+    unreconciled row for agent triage (§9) — deduped on the illegal (from,to) pair
+    so redelivery never piles duplicates."""
+    move = [prev.to_status, cur.to_status]
+    for u in session.scalars(
+        select(MilestoneUnreconciled).where(
+            MilestoneUnreconciled.milestone_id == m.id
+        )
+    ):
+        if u.detail and u.detail.get("illegal_move") == move:
+            return
+    session.add(
+        MilestoneUnreconciled(
+            milestone_id=m.id,
+            reason=(
+                f"converged transition history implies {move[0]}->{move[1]}, "
+                "illegal under the §4 legality table — concurrent partition "
+                "transitions need agent triage (§9)"
+            ),
+            detail={
+                "illegal_move": move,
+                "earlier": {
+                    "from_status": prev.from_status,
+                    "to_status": prev.to_status,
+                    "authored_at": _iso(prev.authored_at),
+                    "source_id": prev.source_id,
+                },
+                "later": {
+                    "from_status": cur.from_status,
+                    "to_status": cur.to_status,
+                    "authored_at": _iso(cur.authored_at),
+                    "source_id": cur.source_id,
+                },
+            },
+        )
+    )
+    session.flush()
+
+
+def _apply_transitioned(session: Session, envelope: dict) -> None:
+    """Apply `milestone.transitioned` (§9): LWW-converge the row from full state,
+    ALWAYS append the transition to the log (loser included), then run the §4
+    illegal-history check. Converges — never parks on LWW loss."""
+    payload = envelope["payload"]
+    m = _upsert_row(session, envelope)
+    _append_transition_idempotent(
+        session,
+        m,
+        payload["from_status"],
+        payload["to_status"],
+        payload.get("reason"),
+        _parse_dt(payload["authored_at"]),
+        envelope.get("source"),
+    )
+    _check_illegal_history(session, m)
+
+
+def _apply_dependency_changed(session: Session, envelope: dict) -> None:
+    """Apply `milestone.dependency_changed` (§9) — the add/remove edge delta.
+    Both endpoints resolve through any alias (a not-yet-replicated milestone
+    surfaces as a retryable resolution error, self-healing). An `add` whose union
+    with the local edge set CYCLES is the §8.1 DAG race: `ParkNow` (reject +
+    park), keeping the dependency walk loop-free by construction."""
+    payload = envelope["payload"]
+    dependent = resolve(session, payload["dependent"])
+    dependency = resolve(session, payload["dependency"])
+    op = payload["op"]
+    if op == "add":
+        if dependent.id == dependency.id:
+            return  # a self-edge after alias resolution — nothing to add
+        if _edge(session, dependent.id, dependency.id) is None:
+            edges = _all_edges(session)
+            edges.add((dependent.id, dependency.id))
+            if _has_cycle(edges):
+                raise ParkNow(
+                    f"incoming dependency {payload['dependent']!r} -> "
+                    f"{payload['dependency']!r} cycles the local dependency DAG "
+                    "(each side passed its own guard; the union cycles) — "
+                    "rejected and parked for triage (§8.1/§9)"
+                )
+            session.add(
+                MilestoneDependency(
+                    dependent_id=dependent.id, dependency_id=dependency.id
+                )
+            )
+            session.flush()
+    elif op == "remove":
+        edge = _edge(session, dependent.id, dependency.id)
+        if edge is not None:
+            session.delete(edge)
+            session.flush()
+    else:
+        raise ValueError(
+            f"milestone.dependency_changed: unknown op {op!r} (add|remove)"
+        )
+
+
+def _apply_merged(session: Session, envelope: dict) -> None:
+    """Apply `milestone.merged` (§9). `from` is resolved by DIRECT address (the
+    tombstone itself), `into` to its TERMINAL target — a not-yet-replicated either
+    side is retryable. Handles the spec's named apply cases:
+
+      * `from` already a tombstone pointing ELSEWHERE — LWW on `merged_into` by
+        `authored_at` (`source_id` tiebreak); the loser is a clean no-op.
+      * an application that would CYCLE the alias graph (`into`'s terminal is
+        `from`) or the dependency DAG (the edge union) — `ParkNow` (reject + park,
+        §8.1), keeping alias traversal + the dependency walk loop-free.
+      * STATE COMPATIBILITY is NOT re-checked: it was decided at the authoring
+        instance (the `merge` verb's guard), and apply CONVERGES rather than
+        re-litigating an authored decision (§9)."""
+    payload = envelope["payload"]
+    frm = get(session, payload["from"])  # direct — the tombstone row itself
+    into = resolve(session, payload["into"])  # follow to the terminal target
+    incoming = (
+        _parse_dt(payload["authored_at"]) or datetime.min,
+        envelope.get("source") or "",
+    )
+    if frm.merged_into_id is not None:
+        if frm.merged_into_id == into.id:
+            return  # idempotent replay — already aliased to this target
+        if incoming <= _lww_local(frm):
+            return  # a competing local merge wins by LWW — keep it (§9)
+    if into.id == frm.id:
+        raise ParkNow(
+            f"merging {payload['from']!r} into {payload['into']!r} cycles the "
+            "alias graph (the terminal target resolves back to `from`) — "
+            "rejected and parked (§8.1/§9)"
+        )
+    try:
+        _perform_merge(session, frm, into)
+    except MilestoneMergeError as exc:
+        raise ParkNow(
+            f"merge {payload['from']!r} -> {payload['into']!r} would cycle the "
+            f"dependency DAG once edges re-point ({exc}) — rejected and parked "
+            "(§8.1/§9)"
+        ) from exc
+    # Stamp the AUTHORED clock (not `_perform_merge`'s apply-time `_now()`), so a
+    # later re-merge of this `from` LWW-compares against the true authored instant.
+    frm.lww_authored_at = incoming[0]
+    frm.lww_source_id = envelope.get("source")
+    session.flush()
+
+
+def apply_milestone_event(session: Session, envelope: dict) -> None:
+    """The milestone replication APPLY function (§9) — the domain seam
+    `replication.apply_platform_event` dispatches milestone events to, driven
+    through the SDK's `ingest_delivery` under origin suppression. Address-keyed,
+    LWW-converging (§6), parking only a permanent cycle conflict (§8.1) — never a
+    mere LWW loss, and never inventing a legal history (§9)."""
+    event_type = envelope["event_type"]
+    if event_type in (EVENT_MILESTONE_CREATED, EVENT_MILESTONE_UPDATED):
+        _upsert_row(session, envelope)
+    elif event_type == EVENT_MILESTONE_TRANSITIONED:
+        _apply_transitioned(session, envelope)
+    elif event_type == EVENT_MILESTONE_DEPENDENCY_CHANGED:
+        _apply_dependency_changed(session, envelope)
+    elif event_type == EVENT_MILESTONE_MERGED:
+        _apply_merged(session, envelope)
+    else:
+        raise ValueError(
+            f"milestone replication apply: unknown event_type {event_type!r}"
+        )
+
+
+# --- unreconciled state read (§9) -------------------------------------------
+
+
+def list_unreconciled(session: Session) -> list[dict]:
+    """Every first-class unreconciled milestone row, oldest first (§9) — the
+    agent-triage read (the milestone analogue of governance's unreconciled
+    decisions, and of the replication parked-events read). An empty list is the
+    standing invariant to watch."""
+    rows = session.scalars(
+        select(MilestoneUnreconciled).order_by(
+            MilestoneUnreconciled.created_at, MilestoneUnreconciled.id
+        )
+    )
+    return [
+        {
+            "milestone": address_of(u.milestone),
+            "reason": u.reason,
+            "detail": u.detail,
+            "created_at": _iso(u.created_at),
+        }
+        for u in rows
+    ]
