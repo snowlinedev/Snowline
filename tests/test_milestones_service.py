@@ -311,6 +311,16 @@ def test_transition_log_records_each_move(db_session):
 # --- update -----------------------------------------------------------------
 
 
+def test_get_malformed_address_is_not_found(db_session):
+    """A grammar-invalid address raises MilestoneNotFoundError (not a validation
+    error) so callers — the lifecycle verbs and the HTTP routes — fail clean."""
+    _anchors(db_session)
+    with pytest.raises(milestones.MilestoneNotFoundError):
+        milestones.get(db_session, "turtlesedge/turtletracks/bad$name")
+    with pytest.raises(milestones.MilestoneNotFoundError):
+        milestones.get(db_session, "not a slug/x")
+
+
 def test_update_outcome_and_target_date_only(db_session):
     _anchors(db_session)
     addr = "turtlesedge/turtletracks/spanish-beta"

@@ -217,14 +217,35 @@ async def get_milestone(
 async def update_milestone(
     address: str,
     request: Request,
-    outcome: str | None = Body(None),
-    target_date: date | None = Body(None),
+    payload: dict = Body(...),
     session: Session = Depends(get_session),
 ) -> dict:
-    try:
-        milestone = milestones.update(
-            session, address, outcome=outcome, target_date=target_date
+    # PATCH semantics: only keys PRESENT in the body change; a present key with
+    # a null value CLEARS that field (the service's _UNSET-vs-None distinction —
+    # typed Body(None) params can't express "omitted", they'd clear on every
+    # partial update).
+    unknown = set(payload) - {"outcome", "target_date"}
+    if unknown:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"unknown milestone fields: {sorted(unknown)}",
         )
+    kwargs: dict = {}
+    if "outcome" in payload:
+        kwargs["outcome"] = payload["outcome"]
+    if "target_date" in payload:
+        raw = payload["target_date"]
+        try:
+            kwargs["target_date"] = (
+                date.fromisoformat(raw) if raw is not None else None
+            )
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"invalid target_date: {raw!r}",
+            ) from exc
+    try:
+        milestone = milestones.update(session, address, **kwargs)
     except milestones.MilestoneNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from None
     return milestones.to_row(milestone)

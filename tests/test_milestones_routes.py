@@ -168,6 +168,50 @@ def test_list_and_filters_over_http(clean_db):
     assert empty == []
 
 
+def test_patch_is_partial_and_null_clears(clean_db):
+    """PATCH only touches keys PRESENT in the body: updating the outcome must
+    not clear an existing target_date; an explicit null clears; unknown keys
+    are rejected."""
+    _seed()
+    client = _trusted_client()
+    addr = "turtlesedge/turtletracks/spanish-beta"
+    assert (
+        client.patch(
+            f"/milestones/{addr}", json={"target_date": "2026-09-01"}
+        ).status_code
+        == 200
+    )
+    r = client.patch(f"/milestones/{addr}", json={"outcome": "beta ships"})
+    assert r.status_code == 200, r.text
+    assert r.json()["outcome"] == "beta ships"
+    assert r.json()["target_date"] == "2026-09-01"  # preserved, not cleared
+    r = client.patch(f"/milestones/{addr}", json={"target_date": None})
+    assert r.json()["target_date"] is None  # explicit null clears
+    assert r.json()["outcome"] == "beta ships"
+    assert (
+        client.patch(f"/milestones/{addr}", json={"status": "achieved"}).status_code
+        == 422
+    )  # unknown key (and no lifecycle bypass through PATCH)
+    assert (
+        client.patch(
+            f"/milestones/{addr}", json={"target_date": "not-a-date"}
+        ).status_code
+        == 422
+    )
+
+
+def test_malformed_address_is_404_not_500(clean_db):
+    """A grammar-invalid address addresses nothing — every `{address}` route
+    fails 404-clean, never a 500 out of the validators."""
+    _seed()
+    client = _trusted_client()
+    bad = "turtlesedge/turtletracks/bad$name"
+    assert client.get(f"/milestones/{bad}").status_code == 404
+    assert client.post(f"/milestones/{bad}/activate").status_code == 404
+    assert client.get(f"/milestones/{bad}/transitions").status_code == 404
+    assert client.patch(f"/milestones/{bad}", json={"outcome": "x"}).status_code == 404
+
+
 def test_milestones_behind_trust_gate(clean_db):
     client = TestClient(create_app(migrate_on_startup=False))
     assert client.get("/milestones").status_code == 403

@@ -323,8 +323,16 @@ def get(session: Session, address: str) -> Milestone:
             f"invalid milestone address {address!r} — expected "
             "<org>/<name> or <org>/<repo>/<name>"
         )
-    anchor_slug = validate_slug("/".join(segs[:-1]))
-    name = validate_name(segs[-1])
+    # A grammar-invalid address addresses NOTHING — surface it as not-found, so
+    # every caller of `get` (the lifecycle verbs, update, transitions, and their
+    # HTTP routes) fails 404-clean instead of leaking a validation error.
+    try:
+        anchor_slug = validate_slug("/".join(segs[:-1]))
+        name = validate_name(segs[-1])
+    except (scopes.InvalidSlugError, InvalidMilestoneNameError) as exc:
+        raise MilestoneNotFoundError(
+            f"invalid milestone address {address!r}: {exc}"
+        ) from exc
     anchor = scopes.resolve(session, anchor_slug)
     m = _by_anchor_name(session, anchor.id, name) if anchor is not None else None
     if m is None:
