@@ -71,6 +71,15 @@ EVENT_SCOPE_UPDATED: str = "scope.updated"
 # so the drift guard (`tests/test_contract_drift.py`) keeps them byte-equal.
 EVENT_MEMORY_SET: str = "memory.set"
 EVENT_MEMORY_FORGOTTEN: str = "memory.forgotten"
+# The platform's milestone-registry REPLICATION vocabulary (milestones.md §9,
+# issue #145). Governance does not EMIT these — vendored here ONLY so this copy
+# stays byte-equal to the SDK's (the drift guard). Additive vocabulary, NO
+# CONTRACT_VERSION bump (envelope keying fields unchanged), same as scope/memory.
+EVENT_MILESTONE_CREATED: str = "milestone.created"
+EVENT_MILESTONE_UPDATED: str = "milestone.updated"
+EVENT_MILESTONE_TRANSITIONED: str = "milestone.transitioned"
+EVENT_MILESTONE_DEPENDENCY_CHANGED: str = "milestone.dependency_changed"
+EVENT_MILESTONE_MERGED: str = "milestone.merged"
 
 # The events GOVERNANCE'S OWN write surface emits — the coverage set the §4
 # full-write-surface test pins (#117). Distinct from EVENT_TYPES below, which
@@ -104,6 +113,11 @@ EVENT_TYPES: frozenset[str] = GOVERNANCE_EVENT_TYPES | frozenset(
         EVENT_SCOPE_UPDATED,
         EVENT_MEMORY_SET,
         EVENT_MEMORY_FORGOTTEN,
+        EVENT_MILESTONE_CREATED,
+        EVENT_MILESTONE_UPDATED,
+        EVENT_MILESTONE_TRANSITIONED,
+        EVENT_MILESTONE_DEPENDENCY_CHANGED,
+        EVENT_MILESTONE_MERGED,
     }
 )
 
