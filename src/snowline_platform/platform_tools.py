@@ -72,8 +72,14 @@ cross-plugin release-correlation keys, addressed `<anchor>/<name>`: \
 suggestions and NEVER mints), `list_milestones`, the lifecycle verbs \
 `activate_milestone`/`achieve_milestone`/`cancel_milestone` (explicit, never \
 automatic), `get_milestone` (audit read — returns a merge tombstone as itself), \
-and `milestone_transitions` (the append-only lifecycle log). Slugs and names are \
-case-insensitive on input and stored canonical-lowercase.\
+`update_milestone` (outcome/target_date only, `""` clears), and \
+`milestone_transitions` (the append-only lifecycle log). Drift reconciliation: \
+`merge_milestone` aliases one milestone into another (state-compatible only; the \
+tombstone reserves its name forever), `milestone_aliases` reads a target's \
+tombstone closure, and `add_milestone_dependency`/`remove_milestone_dependency`/\
+`milestone_dependencies` manage the cycle-guarded, readiness-only dependency DAG \
+(cross-anchor edges allowed). Slugs and names are case-insensitive on input and \
+stored canonical-lowercase.\
 """
 
 # DNS-rebinding protection off on the streamable-HTTP transport, matching the
@@ -379,6 +385,115 @@ def build_platform_tools_surface() -> FastMCP:
         return await anyio.to_thread.run_sync(
             _lifecycle_sync, milestones.cancel, address, reason
         )
+
+    def _update_milestone_sync(
+        address: str, outcome: str | None, target_date: str | None
+    ) -> dict:
+        # Body-present-key semantics MCP can't express natively (no way to send a
+        # Python sentinel), so mirror `update_scope`: None = leave unchanged; the
+        # empty string "" = the documented CLEAR signal (→ service None, which
+        # clears). A non-empty `target_date` parses as ISO.
+        kwargs: dict = {}
+        if outcome is not None:
+            kwargs["outcome"] = None if outcome == "" else outcome
+        if target_date is not None:
+            kwargs["target_date"] = None if target_date == "" else _parse_date(
+                target_date
+            )
+        with session_scope() as session:
+            return milestones.to_row(milestones.update(session, address, **kwargs))
+
+    @mcp.tool()
+    async def update_milestone(
+        address: str,
+        outcome: str | None = None,
+        target_date: str | None = None,
+    ) -> dict:
+        """Modify a milestone's display fields — `outcome` / `target_date` — NEVER
+        its identity (§4). Only arguments you pass change: an omitted (null)
+        argument is left as-is, and the empty string `""` CLEARS that field (for
+        `target_date`, `""` clears; a non-empty value is ISO YYYY-MM-DD). Raises if
+        the address is unknown. Returns the refreshed row."""
+        return await anyio.to_thread.run_sync(
+            _update_milestone_sync, address, outcome, target_date
+        )
+
+    def _merge_milestone_sync(from_address: str, into_address: str) -> dict:
+        with session_scope() as session:
+            return milestones.merge(session, from_address, into_address)
+
+    @mcp.tool()
+    async def merge_milestone(from_address: str, into_address: str) -> dict:
+        """Merge one milestone into another (§7): mark `from_address` an ALIAS
+        TOMBSTONE resolving to `into_address` forever. `into` is resolved to its
+        terminal target first (chains stay depth-1); the tombstone stays at
+        `from`'s anchor, reserving that name. Legal only when the two statuses
+        MATCH or `from` is still `planned` (else the merge would rewrite governance
+        history — rejected). `from`'s dependency edges re-point to `into` and the
+        cycle guard re-runs (merge fails whole if the union would cycle). Returns
+        `{tombstone, target, reminder}` — the reminder flags that the platform
+        never bulk-retags plugin data, so review affected consumer rows agent-side.
+        """
+        return await anyio.to_thread.run_sync(
+            _merge_milestone_sync, from_address, into_address
+        )
+
+    def _add_dependency_sync(dependent: str, dependency: str) -> dict:
+        with session_scope() as session:
+            return milestones.add_dependency(session, dependent, dependency)
+
+    @mcp.tool()
+    async def add_milestone_dependency(dependent: str, dependency: str) -> dict:
+        """Add a dependency edge — `dependent` depends on `dependency` (§2/§4).
+        Both refs resolve through any merge alias. Cross-anchor edges are allowed
+        (the anchor is not a fence); the edge is cycle-guarded over the GLOBAL
+        dependency DAG and rejected if it would cycle. A self-edge is rejected; a
+        duplicate is idempotent (no-op success). Dependencies gate READINESS reads
+        only — they never block lifecycle verbs. Returns `dependent`'s current
+        `{depends_on, dependents}`."""
+        return await anyio.to_thread.run_sync(
+            _add_dependency_sync, dependent, dependency
+        )
+
+    def _remove_dependency_sync(dependent: str, dependency: str) -> dict:
+        with session_scope() as session:
+            return milestones.remove_dependency(session, dependent, dependency)
+
+    @mcp.tool()
+    async def remove_milestone_dependency(dependent: str, dependency: str) -> dict:
+        """Remove the `dependent → dependency` edge (§4). Both refs resolve through
+        any merge alias. Idempotent — removing an absent edge is a no-op success.
+        Returns `dependent`'s current `{depends_on, dependents}`."""
+        return await anyio.to_thread.run_sync(
+            _remove_dependency_sync, dependent, dependency
+        )
+
+    def _milestone_dependencies_sync(address: str) -> dict:
+        with session_scope() as session:
+            return milestones.dependencies(session, address)
+
+    @mcp.tool()
+    async def milestone_dependencies(address: str) -> dict:
+        """Both directions of a milestone's dependency edges (§4): `depends_on`
+        (what it depends on) and `dependents` (what depends on it), each
+        `{address, status}`. The raw status is always surfaced — a dependency on a
+        CANCELLED milestone stays visible (PM flags it `blocked_by_cancelled`). The
+        address resolves through any merge alias. Read-only."""
+        return await anyio.to_thread.run_sync(
+            _milestone_dependencies_sync, address
+        )
+
+    def _milestone_aliases_sync(address: str) -> dict:
+        with session_scope() as session:
+            return milestones.aliases(session, address)
+
+    @mcp.tool()
+    async def milestone_aliases(address: str) -> dict:
+        """The tombstone closure resolving to `address`'s terminal target (§5):
+        `{target, aliases}`, where `aliases` is every merged-away address pointing
+        at that milestone. Consumer reads match stored stamps/tags against this
+        full alias set so reads via either address agree. Read-only."""
+        return await anyio.to_thread.run_sync(_milestone_aliases_sync, address)
 
     return mcp
 
