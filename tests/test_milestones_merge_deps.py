@@ -221,6 +221,19 @@ def test_merge_fails_whole_if_edge_union_would_cycle(db_session):
     assert {r["address"] for r in deps["depends_on"]} == {c}
 
 
+def test_suffix_colliding_names_are_reserved(db_session):
+    """A milestone named after an address-suffix route (`aliases`, `transitions`,
+    `dependencies`, the lifecycle verbs) would make its own address misroute to
+    the suffix handler with a SHORTER address — so those names are reserved and
+    can never exist."""
+    _anchors(db_session)
+    for reserved in sorted(milestones.RESERVED_NAMES):
+        with pytest.raises(milestones.InvalidMilestoneNameError):
+            milestones.create(
+                db_session, anchor="turtlesedge/turtletracks", name=reserved
+            )
+
+
 # --- dependencies (§2/§4) ---------------------------------------------------
 
 

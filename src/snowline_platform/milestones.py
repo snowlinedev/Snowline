@@ -61,6 +61,17 @@ from snowline_platform.scopes import canonical_slug, validate_slug
 _NAME_SEG = r"[._-]*[a-z0-9][a-z0-9._-]*"
 NAME_RE = re.compile(rf"^{_NAME_SEG}$")
 
+# Names that collide with the HTTP surface's ADDRESS-SUFFIX routes
+# (`/{address}/transitions|aliases|dependencies|activate|achieve|cancel`): a
+# milestone so named would make requests to its own address misroute to the
+# suffix handler with a SHORTER address — the exact class of grammar ambiguity
+# the slash-free name rule exists to kill — so they are reserved at the name
+# level and can never exist. (The fixed single-segment paths — `resolve`,
+# `resolve-batch`, `merge` — cannot collide: an address is always ≥2 segments.)
+RESERVED_NAMES = frozenset(
+    {"transitions", "aliases", "dependencies", "activate", "achieve", "cancel"}
+)
+
 # The lifecycle status set and the LEGAL transition table (§4). Legal moves:
 # planned→active→achieved; planned|active→cancelled. `achieve` on a *planned*
 # milestone is rejected ("activate first") — never auto-activates. Terminal
@@ -149,6 +160,12 @@ def validate_name(name: str) -> str:
         raise InvalidMilestoneNameError(
             f"invalid milestone name: {name!r} — must be a slash-free lowercase "
             "slug (§2)"
+        )
+    if folded in RESERVED_NAMES:
+        raise InvalidMilestoneNameError(
+            f"milestone name {folded!r} is reserved — it collides with the "
+            "address-suffix route grammar "
+            f"(/{{address}}/{folded} is an operation, not a milestone)"
         )
     return folded
 
