@@ -58,20 +58,20 @@ from snowline_governance.models import (
     ArtifactGoverns,
     ArtifactVersion,
 )
+from snowline_governance.milestone_client import MilestoneClient
 from snowline_governance.scope_client import ScopeClient
 
 
-# --- milestone soft ref (spec §4) --------------------------------------------
+# --- milestone slug grammar (spec §4; the #141 clientless fallback) -----------
 #
-# The optional `ArtifactVersion.milestone` slug is a SOFT reference — the
-# portfolio's cross-plugin release-correlation key (PM tags work items with the
-# same slug). It names NO real scope and is NEVER resolved, so governance
-# validates it against the slug GRAMMAR itself rather than resolving it through
-# the platform (exactly as `snowline_memory` validates its soft scope refs). The
-# grammar is CARRIED (not imported — import-purity across the service boundary)
-# from `snowline_platform.scopes` §2.1, and input is folded to the canonical
-# lowercase form per #139 (scope-slug input is case-insensitive across every
-# Snowline surface; storage/filtering stays canonical-lowercase only).
+# Since #145 the `ArtifactVersion.milestone` stamp is a RESOLUTION KEY validated
+# against the platform registry at mint (see `_stamp_milestone` and
+# milestones.md §6.1). This grammar validator is retained for the CLIENTLESS
+# fallback only — a direct service call with no `MilestoneClient` injected keeps
+# the prior #141 posture (grammar-checked, stored verbatim). The grammar is
+# CARRIED (not imported — import-purity across the service boundary) from
+# `snowline_platform.scopes` §2.1, and input is folded to the canonical
+# lowercase form per #139.
 _MILESTONE_SEG = r"[._-]*[a-z0-9][a-z0-9._-]*"
 _MILESTONE_RE = re.compile(rf"^{_MILESTONE_SEG}(/{_MILESTONE_SEG})*$")
 
@@ -106,6 +106,212 @@ def _validate_milestone(milestone: str | None) -> str | None:
             "slug (lowercase `name` or `org/rest`, the §2.1 grammar)"
         )
     return milestone
+
+
+# --- first-class milestone consumer (milestones.md §6.1) ---------------------
+#
+# Since #145 the stamp is a RESOLUTION KEY, not a soft slug: the write path
+# resolves it against the platform milestone registry and stores the CANONICAL
+# address, and version canonicality becomes a function of milestone STATE read
+# from the platform (§6.1). The `MilestoneClient` is injected (the MCP surface
+# always wires the real/stub client); a clientless direct call degrades to the
+# prior #141 grammar-only verbatim posture so the service stays callable without
+# a platform (the wired surfaces never take that path).
+
+# Statuses that make a stamped version ELIGIBLE for canonicality (§6.1.2). An
+# ABSENT stamp is eligible too; `planned` is pending; `cancelled` is dead.
+_ELIGIBLE_STATUSES = frozenset({"active", "achieved"})
+# Terminal statuses a mint may not stamp with (§6.1.1) absent an override.
+_TERMINAL_STATUSES = frozenset({"achieved", "cancelled"})
+
+_BUCKET_ELIGIBLE = "eligible"
+_BUCKET_PENDING = "pending"
+_BUCKET_DEAD = "dead"
+_BUCKET_LEGACY = "legacy"
+# Buckets that COUNT toward canonicality: eligible, plus legacy (an unresolvable
+# stamp is treated as ABSENT for canonicality — annotation-only — §6.1.2).
+_CANONICALITY_BUCKETS = frozenset({_BUCKET_ELIGIBLE, _BUCKET_LEGACY})
+
+
+def _stamp_milestone(
+    ref: str | None,
+    milestone_client: MilestoneClient | None,
+    *,
+    context: str | None,
+    allow_terminal: bool,
+) -> str | None:
+    """Resolve a milestone REF to store at mint (§6.1.1). Returns the CANONICAL
+    address (or None for an empty/absent stamp).
+
+    With no `milestone_client` this degrades to the #141 grammar-only verbatim
+    posture (the wired surfaces always inject one). With a client:
+      - a BARE ref (no `/`) requires `context` — the artifact's single governing
+        scope; the caller passes `context=None` when the artifact governs a
+        list, all scopes, or nothing, and a bare ref is then REJECTED (full
+        address required);
+      - resolution is delegated to the platform (unknown → the client raises
+        `MilestoneResolutionError` carrying the platform's suggestions);
+      - an `achieved`/`cancelled` milestone is rejected unless `allow_terminal`
+        — a post-hoc terminal stamp rewrites what a released version reports as
+        shipped.
+    """
+    if milestone_client is None:
+        return _validate_milestone(ref)
+    if ref is None:
+        return None
+    if isinstance(ref, str):
+        ref = ref.strip()
+    if isinstance(ref, str) and not ref:
+        return None
+    if not isinstance(ref, str):
+        raise ValueError(
+            f"invalid milestone ref {ref!r} — expected a milestone name or "
+            "address string"
+        )
+    if "/" not in ref and context is None:
+        raise ValueError(
+            f"milestone {ref!r} is a bare name but this artifact has no single "
+            "governing scope to resolve it against (it governs a list of "
+            "scopes, all scopes, or nothing) — pass the full milestone address "
+            "(anchor/name)."
+        )
+    row = milestone_client.resolve(ref, context=context)
+    address = row.get("address")
+    status = row.get("status")
+    if status in _TERMINAL_STATUSES and not allow_terminal:
+        raise ValueError(
+            f"milestone {address!r} is {status} — stamping a version with a "
+            "terminal (achieved/cancelled) milestone would rewrite what "
+            "list_artifact_versions reports a release shipped as. Pass "
+            "allow_terminal_milestone=True to stamp it deliberately (§6.1.1)."
+        )
+    return address
+
+
+def _bucket_stamps(
+    stamps, milestone_client: MilestoneClient
+) -> dict[str, tuple[str, bool]]:
+    """Resolve a SET of distinct milestone stamps in ONE resolve_batch call and
+    map each to `(bucket, unresolved)` (§6.1.2). A stamp that doesn't resolve
+    (per-ref `{error}` in the batch) buckets as `legacy` — treated as ABSENT for
+    canonicality, flagged for backfill. A transport failure propagates as
+    `MilestoneServiceError` (a HARD read error — an unreadable stamp is NEVER
+    treated as absent)."""
+    stamps = sorted({s for s in stamps if s})
+    if not stamps:
+        return {}
+    results = milestone_client.resolve_batch(stamps)
+    out: dict[str, tuple[str, bool]] = {}
+    for s in stamps:
+        r = results.get(s)
+        if not r or "error" in r:
+            out[s] = (_BUCKET_LEGACY, True)
+            continue
+        status = r.get("status")
+        if status in _ELIGIBLE_STATUSES:
+            out[s] = (_BUCKET_ELIGIBLE, False)
+        elif status == "planned":
+            out[s] = (_BUCKET_PENDING, False)
+        elif status == "cancelled":
+            out[s] = (_BUCKET_DEAD, False)
+        else:  # unknown status → treat as absent/annotation-only, flagged
+            out[s] = (_BUCKET_LEGACY, True)
+    return out
+
+
+def _version_bucket(
+    v: "ArtifactVersion", stamp_buckets: dict[str, tuple[str, bool]]
+) -> tuple[str, bool]:
+    """This version's `(bucket, unresolved)`. An unstamped version is eligible
+    (absent stamp); a stamped one takes its milestone's bucket (legacy if it was
+    not in the resolved set)."""
+    if not v.milestone:
+        return (_BUCKET_ELIGIBLE, False)
+    return stamp_buckets.get(v.milestone, (_BUCKET_LEGACY, True))
+
+
+def _live_versions(session: Session, artifact_id) -> list["ArtifactVersion"]:
+    """All non-`superseded` versions of an artifact — the graph canonicality is
+    computed over (a resolve_artifact loser stays out, as today)."""
+    return list(
+        session.scalars(
+            select(ArtifactVersion).where(
+                ArtifactVersion.artifact_id == artifact_id,
+                ArtifactVersion.status != "superseded",
+            )
+        )
+    )
+
+
+def _child_map(versions: list["ArtifactVersion"]) -> dict:
+    """`parent version id -> [child version ids]` over the given version set —
+    the supersession DAG edges (child.supersedes_id points at its parent)."""
+    ids = {v.id for v in versions}
+    children: dict = {}
+    for v in versions:
+        if v.supersedes_id in ids:
+            children.setdefault(v.supersedes_id, []).append(v.id)
+    return children
+
+
+def _induced_leaves(
+    versions: list["ArtifactVersion"], member_ids: set
+) -> list["ArtifactVersion"]:
+    """Leaves of the DAG induced on `member_ids`: a member with NO other member
+    reachable as a descendant (following supersession edges through ANY
+    intermediate — a pending/dead version between two eligible ones does not
+    fork the line, it transmits it, §6.1.3). Newest-first, id-tiebroken, so the
+    default pick is deterministic; `len > 1` is genuine competition."""
+    children = _child_map(versions)
+    leaves: list["ArtifactVersion"] = []
+    for v in versions:
+        if v.id not in member_ids:
+            continue
+        stack = list(children.get(v.id, []))
+        seen: set = set()
+        has_member_desc = False
+        while stack:
+            c = stack.pop()
+            if c in seen:
+                continue
+            seen.add(c)
+            if c in member_ids:
+                has_member_desc = True
+                break
+            stack.extend(children.get(c, []))
+        if not has_member_desc:
+            leaves.append(v)
+    leaves.sort(key=lambda x: (x.created_at, x.id), reverse=True)
+    return leaves
+
+
+def _structural_leaves(
+    versions: list["ArtifactVersion"],
+) -> list["ArtifactVersion"]:
+    """Structural leaves over a live version set (nothing live supersedes them) —
+    the milestone-agnostic `is_branched` signal, newest-first."""
+    children = _child_map(versions)
+    leaves = [v for v in versions if not children.get(v.id)]
+    leaves.sort(key=lambda x: (x.created_at, x.id), reverse=True)
+    return leaves
+
+
+def _eligible_leaves(
+    session: Session,
+    artifact_id,
+    milestone_client: MilestoneClient,
+) -> tuple[list["ArtifactVersion"], dict[str, tuple[str, bool]], list["ArtifactVersion"]]:
+    """The CANONICAL competition: `(eligible_leaves, stamp_buckets, live_versions)`
+    — the leaves of the eligible subgraph (§6.1.3). ONE resolve_batch call;
+    transport failure propagates."""
+    versions = _live_versions(session, artifact_id)
+    stamp_buckets = _bucket_stamps((v.milestone for v in versions), milestone_client)
+    eligible_ids = {
+        v.id
+        for v in versions
+        if _version_bucket(v, stamp_buckets)[0] in _CANONICALITY_BUCKETS
+    }
+    return _induced_leaves(versions, eligible_ids), stamp_buckets, versions
 
 
 class ArtifactNotFoundError(Exception):
@@ -252,7 +458,9 @@ def _current_version(session: Session, artifact_id) -> ArtifactVersion | None:
 
 
 def _version_dict(
-    v: ArtifactVersion | None, include_body: bool = False
+    v: ArtifactVersion | None,
+    include_body: bool = False,
+    bucket: tuple[str, bool] | None = None,
 ) -> dict | None:
     if v is None:
         return None
@@ -263,10 +471,18 @@ def _version_dict(
         "supersedes_id": str(v.supersedes_id) if v.supersedes_id else None,
         "has_snapshot": v.body_snapshot is not None,
         "summary": v.summary,
-        # SOFT release-correlation ref (spec §4); None on an unstamped version.
+        # The milestone stamp (spec §4 / §6.1). Since #145 this is the CANONICAL
+        # address the write path resolved + stored; None on an unstamped version.
         "milestone": v.milestone,
         "created_at": v.created_at.isoformat() if v.created_at else None,
     }
+    # Milestone STATE bucket (§6.1.2), present only on a milestone-aware read
+    # (when a `MilestoneClient` was injected). `milestone_unresolved` flags a
+    # legacy stamp — one that doesn't resolve — treated as absent for
+    # canonicality but surfaced for agent-driven backfill.
+    if bucket is not None:
+        out["milestone_bucket"] = bucket[0]
+        out["milestone_unresolved"] = bucket[1]
     if include_body:
         out["body_snapshot"] = v.body_snapshot
     return out
@@ -285,28 +501,36 @@ def _governs(session: Session, artifact_id) -> list[str]:
 
 
 def _artifact_dict(
-    session: Session, a: Artifact, include_body: bool = False
+    session: Session,
+    a: Artifact,
+    include_body: bool = False,
+    milestone_client: MilestoneClient | None = None,
+    milestone_filter: set[str] | None = None,
 ) -> dict:
+    """Assemble the artifact read shape.
+
+    Milestone-agnostic (no `milestone_client`): the historical structural view —
+    `current_version` is the newest structural leaf. This is the clientless
+    fallback the direct-call ergonomics keep.
+
+    Milestone-aware (a `MilestoneClient` injected, always in the wired surfaces):
+    canonicality follows milestone STATE (§6.1). `current_version` is the leaf of
+    the ELIGIBLE subgraph (or, when `milestone_filter` is given — the
+    per-milestone read — the leaf of the subgraph stamped with that milestone,
+    §6.1.5). `leaves` are the structural leaves, each annotated with its milestone
+    bucket; `competing_leaves` explicitly surfaces >1 competing canonical leaves
+    (never a silent tie-break, §6.1.3)."""
     count = session.scalar(
         select(func.count())
         .select_from(ArtifactVersion)
         .where(ArtifactVersion.artifact_id == a.id)
     )
-    leaves = _leaves(session, a.id)
-    leaf_dicts = [_version_dict(v) for v in leaves]
-    # `include_body` expands ONLY current_version (leaves stay lean headers —
-    # a competing leaf's content is read via `get_artifact_version`, so a
-    # branched artifact's payload doesn't carry every body).
-    if include_body and leaves:
-        current = _version_dict(leaves[0], include_body=True)
-    else:
-        current = leaf_dicts[0] if leaf_dicts else None
     points = branching.branch_points(
         session,
         ArtifactVersion.supersedes_id,
         ArtifactVersion.artifact_id == a.id,
     )
-    return {
+    base = {
         "id": str(a.id),
         "doc_kind": a.doc_kind,
         "backend": a.backend,
@@ -315,15 +539,71 @@ def _artifact_dict(
         "maturity": a.maturity,
         "governs": _governs(session, a.id),
         "governs_all": a.governs_all,
-        # current_version is the latest leaf; `leaves` surfaces all competing
-        # leaves (len>1 ⇒ branched) with ZERO inference.
-        "current_version": current,
-        "leaves": leaf_dicts,
-        "is_branched": len(leaves) > 1,
         "branch_points": [str(p) for p in points],
         "version_count": count or 0,
         "created_at": a.created_at.isoformat() if a.created_at else None,
     }
+
+    if milestone_client is None:
+        # --- historical structural view (clientless fallback) ----------------
+        leaves = _leaves(session, a.id)
+        leaf_dicts = [_version_dict(v) for v in leaves]
+        if include_body and leaves:
+            current = _version_dict(leaves[0], include_body=True)
+        else:
+            current = leaf_dicts[0] if leaf_dicts else None
+        base.update(
+            current_version=current,
+            leaves=leaf_dicts,
+            is_branched=len(leaves) > 1,
+        )
+        return base
+
+    # --- milestone-aware view (§6.1) -----------------------------------------
+    versions = _live_versions(session, a.id)
+    stamp_buckets = _bucket_stamps((v.milestone for v in versions), milestone_client)
+
+    def _bkt(v):
+        return _version_bucket(v, stamp_buckets)
+
+    # `leaves` are the STRUCTURAL current leaves (milestone-agnostic), each
+    # annotated with its bucket — a reader sees every current line and its state.
+    structural = _structural_leaves(versions)
+    leaf_dicts = [_version_dict(v, bucket=_bkt(v)) for v in structural]
+
+    if milestone_filter is not None:
+        # Per-milestone read (§6.1.5): the leaf of the subgraph stamped with the
+        # target (alias-set matched). No stamped version → the canonical version.
+        member_ids = {v.id for v in versions if v.milestone in milestone_filter}
+        canonical_leaves = _induced_leaves(versions, member_ids)
+        if not canonical_leaves:
+            eligible_ids = {
+                v.id for v in versions if _bkt(v)[0] in _CANONICALITY_BUCKETS
+            }
+            canonical_leaves = _induced_leaves(versions, eligible_ids)
+    else:
+        # Default read: the leaf of the ELIGIBLE subgraph (§6.1.3).
+        eligible_ids = {
+            v.id for v in versions if _bkt(v)[0] in _CANONICALITY_BUCKETS
+        }
+        canonical_leaves = _induced_leaves(versions, eligible_ids)
+
+    current = None
+    if canonical_leaves:
+        top = canonical_leaves[0]
+        current = _version_dict(top, include_body=include_body, bucket=_bkt(top))
+    competing = [
+        _version_dict(v, bucket=_bkt(v)) for v in canonical_leaves[1:]
+    ] if len(canonical_leaves) > 1 else []
+
+    base["current_version"] = current
+    base["leaves"] = leaf_dicts
+    base["is_branched"] = len(structural) > 1
+    # >1 canonical leaves is a GENUINE competition — surfaced, never picked
+    # silently (§6.1.3). The default `current_version` is the newest; the rest
+    # ride here. Empty when there's a single canonical leaf.
+    base["competing_leaves"] = competing
+    return base
 
 
 def _require_artifact(session: Session, artifact_id) -> Artifact:
@@ -372,6 +652,8 @@ def register_artifact(
     backend: str = ARTIFACT_BACKEND_INLINE,
     milestone: str | None = None,
     resolved_scopes: dict[str, dict] | None = None,
+    milestone_client: MilestoneClient | None = None,
+    allow_terminal_milestone: bool = False,
 ) -> dict:
     """Register an INLINE governing artifact — content lives in the substrate on
     the initial version's `body_snapshot` (spec §6.3). Creates the `Artifact`
@@ -386,9 +668,14 @@ def register_artifact(
     GitHub-plugin concern, out of scope here). Each inline register mints a fresh
     artifact (there is no `(repo, path)` identity to be idempotent on).
 
-    `milestone` is an optional SOFT release-correlation slug stamped VERBATIM on
-    the initial version (spec §4) — grammar-validated + canonicalized lowercase
-    (#139), never resolved. `None`/empty leaves the version unstamped.
+    `milestone` is an optional release milestone REF stamped on the initial
+    version (milestones.md §6.1.1). With a `milestone_client` injected (the wired
+    surface always does) it is RESOLVED against the platform registry and the
+    CANONICAL address is stored; unknown refs hard-fail with the platform's
+    suggestions, a bare ref needs the artifact's single governing scope as
+    context, and an `achieved`/`cancelled` milestone is rejected unless
+    `allow_terminal_milestone=True`. Clientless, it degrades to the #141
+    grammar-only verbatim posture. `None`/empty leaves the version unstamped.
 
     `governs` (single slug / list / `'*'` / None) and `resolved_scopes` (slug →
     the platform's scope row) come from the MCP surface, which resolves each slug
@@ -419,8 +706,20 @@ def register_artifact(
             "doc; None would mint a content-less artifact that resolves to "
             "nothing."
         )
-    _normalize_governs(governs)  # validate up front (raises cleanly)
-    milestone = _validate_milestone(milestone)  # grammar-validate; canonical form
+    governs_all, gov_slugs = _normalize_governs(governs)  # validate up front
+    # Bare-name milestone context (§6.1.1): the artifact's SINGLE governing scope,
+    # normalized per §3. An artifact governing a list, all scopes (`governs_all`),
+    # or nothing has NO bare-name context — a bare stamp is then rejected at mint
+    # (full address required), enforced inside `_stamp_milestone`.
+    context = (
+        gov_slugs[0]
+        if (not governs_all and gov_slugs is not None and len(gov_slugs) == 1)
+        else None
+    )
+    milestone = _stamp_milestone(
+        milestone, milestone_client,
+        context=context, allow_terminal=allow_terminal_milestone,
+    )
     artifact = Artifact(
         doc_kind=doc_kind, backend=ARTIFACT_BACKEND_INLINE, maturity=maturity,
     )
@@ -440,7 +739,7 @@ def register_artifact(
         EVENT_ARTIFACT_REGISTERED,
         replication_stream.artifact_registered_payload(session, artifact, initial),
     )
-    return _artifact_dict(session, artifact)
+    return _artifact_dict(session, artifact, milestone_client=milestone_client)
 
 
 def revise_artifact(
@@ -451,33 +750,97 @@ def revise_artifact(
     body_snapshot: str | None = None,
     summary: str | None = None,
     milestone: str | None = None,
+    milestone_client: MilestoneClient | None = None,
+    allow_terminal_milestone: bool = False,
 ) -> dict:
     """Create a new version of an artifact (spec §4.2). `relation` is `refines`
     (the normal improve) or `pivot` (a redirection — kept as a branch off its
-    predecessor for the record). `supersedes` is the version id the new one
-    follows; defaults to the artifact's current leaf. Superseding a NON-leaf older
-    version creates a competing branch (both leaves then surface in `leaves`, no
-    inference). For an inline artifact `body_snapshot` is the new content; `summary`
-    is an optional one-line "why this version".
+    predecessor for the record). For an inline artifact `body_snapshot` is the new
+    content; `summary` is an optional one-line "why this version".
 
-    `milestone` is an optional SOFT release-correlation slug stamped VERBATIM on
-    THIS new version (spec §4) — grammar-validated + canonicalized lowercase
-    (#139), never resolved. It is per-VERSION (not inherited from the predecessor):
-    an omitted `milestone` leaves the new version unstamped, so a release stamp
-    marks exactly the version cut for it."""
+    `supersedes` is the version id the new one follows. Since #145 its default is
+    the current CANONICAL version — the leaf of the ELIGIBLE subgraph (§6.1.4),
+    NOT the DAG leaf (which may be a pending draft). Superseding a pending/dead
+    version explicitly is legal, but such a revision MUST carry an explicit
+    milestone stamp (inherit-or-state) — an unstamped child of a non-eligible
+    parent is rejected, because it would be eligible-absent and instantly
+    canonical. (Clientless, the default falls back to the structural current
+    leaf and no bucket check runs — the #141 posture.)
+
+    `milestone` is an optional release milestone REF stamped on THIS version
+    (per-version, not inherited). With a `milestone_client` it is resolved to its
+    CANONICAL address; a bare ref resolves against the artifact's single governing
+    scope; a terminal milestone needs `allow_terminal_milestone=True`."""
     a = _require_artifact(session, artifact_id)
     if relation not in ARTIFACT_RELATIONS:
         raise ValueError(
             f"relation must be one of {list(ARTIFACT_RELATIONS)}, got {relation!r}"
         )
-    milestone = _validate_milestone(milestone)  # grammar-validate; canonical form
-    if supersedes is None:
-        cur = _current_version(session, a.id)
-        if cur is None:  # register always creates v1, so this is defensive
-            raise ValueError("artifact has no version to supersede")
-        sup_id = cur.id
+    # Bare-name milestone context = the artifact's SINGLE governing scope (§6.1.1).
+    gov_slugs = _governs(session, a.id)
+    context = (
+        gov_slugs[0]
+        if (not a.governs_all and len(gov_slugs) == 1)
+        else None
+    )
+    milestone = _stamp_milestone(
+        milestone, milestone_client,
+        context=context, allow_terminal=allow_terminal_milestone,
+    )
+
+    if milestone_client is None:
+        # #141 structural posture (clientless direct call).
+        if supersedes is None:
+            cur = _current_version(session, a.id)
+            if cur is None:  # register always creates v1, so this is defensive
+                raise ValueError("artifact has no version to supersede")
+            sup_id = cur.id
+        else:
+            sup_id = _require_version(
+                session, a, supersedes, param="supersedes"
+            ).id
     else:
-        sup_id = _require_version(session, a, supersedes, param="supersedes").id
+        # --- milestone-aware write defaults (§6.1.4) -------------------------
+        versions = _live_versions(session, a.id)
+        stamp_buckets = _bucket_stamps(
+            (v.milestone for v in versions), milestone_client
+        )
+        by_id = {v.id: v for v in versions}
+        if supersedes is None:
+            # Default to the current CANONICAL version (eligible leaf), NOT the
+            # structural leaf. If nothing is eligible yet (e.g. the only version
+            # is a pending draft), fall back to the structural current leaf — the
+            # non-eligible-parent stamp rule below then forces an explicit stamp.
+            eligible_ids = {
+                vid
+                for vid, v in by_id.items()
+                if _version_bucket(v, stamp_buckets)[0] in _CANONICALITY_BUCKETS
+            }
+            canon = _induced_leaves(versions, eligible_ids)
+            if canon:
+                target = canon[0]
+            else:
+                structural = _structural_leaves(versions)
+                if not structural:  # defensive — register always creates v1
+                    raise ValueError("artifact has no version to supersede")
+                target = structural[0]
+        else:
+            target = _require_version(session, a, supersedes, param="supersedes")
+        # A revision whose supersedes-target is pending/dead MUST carry an
+        # explicit stamp — otherwise the unstamped child is eligible-absent and
+        # instantly canonical, leaking unreleased/retracted content (§6.1.4).
+        target_bucket = _version_bucket(target, stamp_buckets)[0]
+        if target_bucket in (_BUCKET_PENDING, _BUCKET_DEAD) and milestone is None:
+            raise ValueError(
+                f"cannot revise off a {target_bucket} version "
+                f"({target.milestone!r}) without an explicit milestone stamp — "
+                "an unstamped child of a non-eligible parent would be "
+                "eligible-absent and instantly canonical, leaking unreleased or "
+                "retracted content (§6.1.4). Pass a milestone to state the "
+                "revision's release line."
+            )
+        sup_id = target.id
+
     version = ArtifactVersion(
         artifact_id=a.id,
         supersedes_id=sup_id,
@@ -493,27 +856,46 @@ def revise_artifact(
         EVENT_ARTIFACT_REVISED,
         replication_stream.artifact_revised_payload(version),
     )
-    return _artifact_dict(session, a)
+    return _artifact_dict(session, a, milestone_client=milestone_client)
 
 
-def resolve_artifact(session: Session, artifact_id: str, version_id: str) -> dict:
+def resolve_artifact(
+    session: Session,
+    artifact_id: str,
+    version_id: str,
+    milestone_client: MilestoneClient | None = None,
+) -> dict:
     """Resolve competing leaves to one canonical version (spec §4.3). `version_id`
     is the LOSING leaf — it flips to `status=superseded` (the status-flip model: a
     node supersedes only one parent, so we can't merge two leaves into one node;
     instead we drop the loser from the *current* leaves while keeping it in the
     audit trail). Requires the artifact to have >1 current leaf and `version_id`
-    to be one of them; the OTHER leaf becomes canonical."""
+    to be one of them; the OTHER leaf becomes canonical.
+
+    Since #145 the ">1 leaves" precondition means >1 ELIGIBLE leaves (§6.1.3):
+    `resolve_artifact` collapses genuine competition WITHIN the eligible bucket,
+    so a pending/dead draft is not a resolvable competitor. The status flip stays
+    monotone/idempotent for replication convergence. Clientless, it falls back to
+    structural leaves (the #141 posture)."""
     a = _require_artifact(session, artifact_id)
-    leaves = _leaves(session, a.id)
+    if milestone_client is None:
+        leaves = _leaves(session, a.id)
+    else:
+        leaves, _buckets, _versions = _eligible_leaves(
+            session, a.id, milestone_client
+        )
     if len(leaves) < 2:
         raise ValueError(
-            "nothing to resolve — the artifact has a single current leaf"
+            "nothing to resolve — the artifact has a single current "
+            f"{'eligible ' if milestone_client is not None else ''}leaf"
         )
     v = _require_version(session, a, version_id)
     target = next((leaf for leaf in leaves if leaf.id == v.id), None)
     if target is None:
         raise ValueError(
-            f"{version_id!r} is not a current competing leaf of this artifact"
+            f"{version_id!r} is not a current competing "
+            f"{'eligible ' if milestone_client is not None else ''}leaf of this "
+            "artifact"
         )
     target.status = "superseded"
     session.flush()
@@ -524,7 +906,7 @@ def resolve_artifact(session: Session, artifact_id: str, version_id: str) -> dic
         EVENT_ARTIFACT_RESOLVED,
         replication_stream.artifact_resolved_payload(a.id, target.id),
     )
-    return _artifact_dict(session, a)
+    return _artifact_dict(session, a, milestone_client=milestone_client)
 
 
 def set_maturity(session: Session, artifact_id: str, maturity: str) -> dict:
@@ -578,17 +960,69 @@ def set_governs(
 # --- reads ------------------------------------------------------------------
 
 
+def _milestone_alias_set(
+    ref: str,
+    milestone_client: MilestoneClient,
+    *,
+    context: str | None,
+) -> set[str]:
+    """Resolve a milestone REF and return the folded match set `{canonical} ∪
+    aliases` (§5) — the milestone-keyed reads match stored stamps against the
+    target's FULL alias set, so a stamp stored under a since-merged slug still
+    matches. A bare ref needs `context`; unknown → the client's
+    `MilestoneResolutionError` (with suggestions) propagates."""
+    if "/" not in ref and context is None:
+        raise ValueError(
+            f"milestone {ref!r} is a bare name but this artifact has no single "
+            "governing scope to resolve it against — pass the full milestone "
+            "address (anchor/name)."
+        )
+    row = milestone_client.resolve(ref, context=context)
+    address = row.get("address")
+    members = {address}
+    members.update(milestone_client.aliases(address).get("aliases", []))
+    return {m for m in members if m}
+
+
 def get_artifact(
-    session: Session, artifact_id: str, include_body: bool = True
+    session: Session,
+    artifact_id: str,
+    include_body: bool = True,
+    milestone: str | None = None,
+    milestone_client: MilestoneClient | None = None,
 ) -> dict:
     """The full artifact — identity, lifecycle, governs, the current leaf + all
     competing leaves + branch points — by id. With `include_body` (the default:
     this is the on-demand full record, #132) `current_version` carries the
     canonical inline content as `body_snapshot`; leaves stay lean headers
     (expand one via `get_artifact_version`). Read-only; raises on an
-    unknown/invalid id (parsed first, so a non-UUID is a clean not-found)."""
+    unknown/invalid id (parsed first, so a non-UUID is a clean not-found).
+
+    With a `milestone_client` injected (the wired surface), `current_version` is
+    the milestone-aware CANONICAL version (leaf of the eligible subgraph, §6.1.3),
+    and each version row carries its milestone `bucket`. Passing `milestone=REF`
+    returns the version valid FOR that milestone (the leaf of the subgraph stamped
+    with it, alias-set matched, §6.1.5); no stamped version → the canonical
+    version."""
+    a = _require_artifact(session, artifact_id)
+    milestone_filter: set[str] | None = None
+    if milestone and milestone_client is not None:
+        # Bare-name context = the artifact's single governing scope (§6.1.1).
+        gov_slugs = _governs(session, a.id)
+        context = (
+            gov_slugs[0]
+            if (not a.governs_all and len(gov_slugs) == 1)
+            else None
+        )
+        milestone_filter = _milestone_alias_set(
+            milestone, milestone_client, context=context
+        )
     return _artifact_dict(
-        session, _require_artifact(session, artifact_id), include_body=include_body
+        session,
+        a,
+        include_body=include_body,
+        milestone_client=milestone_client,
+        milestone_filter=milestone_filter,
     )
 
 
@@ -614,27 +1048,49 @@ def _resolve_list_limit(limit: int | None, default: int = 50, cap: int = 500) ->
 
 
 def list_versions_by_milestone(
-    session: Session, milestone: str, limit: int | None = None
+    session: Session,
+    milestone: str,
+    limit: int | None = None,
+    milestone_client: MilestoneClient | None = None,
 ) -> dict:
-    """List every artifact VERSION stamped with a milestone slug (spec §4), across
-    all artifacts — the release-correlation read ("what versions did `v1-launch`
-    ship as?"). Newest first, capped at `limit` (default 50, max 500) with
-    `items_total` carrying the true depth. Each row is the lean version header
-    (`_version_dict`, no body) PLUS its `artifact_id`; expand one via
+    """List every artifact VERSION stamped with a milestone (spec §4 / §6.1.5),
+    across all artifacts — the release-correlation read ("what versions did
+    `v1-launch` ship as?"). Newest first, capped at `limit` (default 50, max 500)
+    with `items_total` carrying the true depth. Each row is the lean version
+    header (`_version_dict`, no body) PLUS its `artifact_id`; expand one via
     `get_artifact_version(artifact_id, version_id)`.
 
-    `milestone` is grammar-validated + canonicalized (#139) BEFORE the query, so a
-    mixed-case or garbage input is caught the same way the write side is (a
-    case-variant lookup can't silently miss the canonical-lowercase rows it should
-    match). Read-only; an empty/None milestone yields an empty list (not an
-    error — there is no 'unstamped' milestone to list)."""
+    With a `milestone_client` injected (the wired surface), the ref is RESOLVED
+    and stamps are matched against the target's FULL ALIAS SET (§5) — closing the
+    stored-verbatim-slug gap: a version stamped under a since-merged slug still
+    surfaces, flagged `matched_via_alias`. Bare refs resolve against no context
+    here (this is a portfolio-wide read, not per-artifact), so a bare ref needs
+    the read to carry a full address. Clientless, it falls back to an exact
+    canonical-slug equality match (#141). An empty/None milestone yields an empty
+    list (there is no 'unstamped' milestone to list)."""
     lim = _resolve_list_limit(limit)
-    canonical = _validate_milestone(milestone)
-    if canonical is None:
+    if milestone is None or (isinstance(milestone, str) and not milestone.strip()):
         return {"milestone": milestone, "versions": [], "items_total": 0}
+
+    if milestone_client is None:
+        canonical = _validate_milestone(milestone)
+        if canonical is None:
+            return {"milestone": milestone, "versions": [], "items_total": 0}
+        match_set = {canonical}
+        primary = canonical
+    else:
+        # Portfolio-wide read: no single artifact to derive a bare-name context
+        # from, so the ref must be a full address (`_milestone_alias_set` rejects
+        # a bare ref with context=None). Unknown → the client's resolution error
+        # (with suggestions) propagates.
+        match_set = _milestone_alias_set(
+            milestone.strip(), milestone_client, context=None
+        )
+        primary = milestone_client.resolve(milestone.strip()).get("address")
+
     stmt = (
         select(ArtifactVersion)
-        .where(ArtifactVersion.milestone == canonical)
+        .where(ArtifactVersion.milestone.in_(sorted(match_set)))
         .order_by(ArtifactVersion.created_at.desc(), ArtifactVersion.id.desc())
     )
     rows = list(session.scalars(stmt))
@@ -642,9 +1098,13 @@ def list_versions_by_milestone(
     for v in rows[:lim]:
         row = _version_dict(v)
         row["artifact_id"] = str(v.artifact_id)
+        # A stamp matched via a NON-primary alias (a since-merged slug) is a
+        # backfill candidate — flag it so an agent can re-stamp to canonical.
+        if milestone_client is not None and v.milestone != primary:
+            row["matched_via_alias"] = True
         versions.append(row)
     return {
-        "milestone": canonical,
+        "milestone": primary,
         "versions": versions,
         "items_total": len(rows),
     }
