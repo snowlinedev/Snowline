@@ -278,6 +278,66 @@ restated here.
   PM's lifecycle event (pm#64; polling until the platform bus exists, §5).
   #68's "slug owned by nobody" posture is **superseded** by this registry —
   the drift evidence is what changed the call.
+- **Phase milestone targets** (amendment, 2026-07-24 design session — feedback
+  `481e7f5c`/`e4cc0a6d`, hardened by adversarial review): an initiative PHASE
+  (or the initiative itself) may declare a `targets_milestone` address. The tie
+  is **annotation + default, never authority** — the fence against milestones
+  becoming a second priority system:
+  - **Declaration**: the target ref is validated + resolved through the
+    registry; bare-name context = the **owning initiative's scope**, normalized
+    per §3 (no resolvable context → full address required, the §6.1.1
+    list-governs posture). The stored value is the canonical address, but it is
+    **re-resolved (alias-following `resolve`, never the tombstone-frozen `get`)
+    at every use** — placement, backfill, roll-up — so a target whose milestone
+    is later merged keeps working and a merged-away name never accrues new
+    references (§3). Changing a target never re-stamps placed items; clearing
+    a target is legal, side-effect-free (stamps persist — one-time defaults),
+    and needs no override even on a terminal milestone.
+  - **Default-stamping fills absence only, visibly, and respects explicit
+    clears.** Placing an item under an *effective target* — the phase's, else
+    the initiative's (most specific wins); the initiative-level target applies
+    to any placement into the initiative, phased or not — stamps the target's
+    **terminal canonical address** as the item's milestone tag **iff the item
+    has none AND its history does not end in an explicit clear**
+    (`set_milestone(None)` is a recorded decision; a bulk default must never
+    reverse it). An existing tag is NEVER overwritten. The stamp arrives with
+    the default membership attribute (`required`) and **writes a roll-forward
+    history entry with distinct provenance** (`phase-default via <phase>`,
+    actor = the placing caller) so audits can tell default-origin tags from
+    chosen ones. The placement/backfill **response reports what was stamped**
+    (count + milestone) — a readiness-needle move must be visible the moment
+    it happens — and equally reports a default NOT applied and why (terminal
+    target, explicit clear). A registry read failure **hard-fails the
+    placement** (§6.1.2's rationale: the default is one-shot, so a silently
+    dropped stamp is a durable wrong state, not a transient glitch).
+  - **The item's tag stays the single membership fact.** Phase membership is
+    never *derived* milestone membership; removing an item from the phase does
+    not clear its tag. The backfill verb operates **per-initiative** with the
+    same shadowing (covering phaseless items), skipping explicit-clears, and
+    never stamps from a terminal target.
+  - **Divergence is legal and visible.** Target-vs-tag comparison is over the
+    **alias set** (§5), so a merge never false-positives a mismatch.
+    `milestone_status` and the initiative view surface three per-phase counts:
+    on-target, **off-target** (tagged differently — deliberate roll-forward vs
+    drift, owner/agent triage), and **untagged-in-targeting-phase** (backfill
+    candidates — items placed before the target existed are otherwise
+    invisible non-members).
+  - **Roll-up both directions**: `milestone_status` groups remaining/required
+    work by initiative + phase; the initiative view shows which milestones its
+    phases feed.
+  - **Terminal targets**: declaring a target on an `achieved`/`cancelled`
+    milestone is rejected absent an explicit override, and an override-declared
+    terminal target is **annotation-only** (documents which milestone a
+    historical phase fed; never stamps — unlike §6.1.1's override, which
+    genuinely stamps). A target whose milestone LATER goes terminal stops
+    default-stamping (a terminal milestone accrues no new default members),
+    with the inert default reported in the placement/backfill response and
+    surfaced on the initiative view.
+  - **Edge rules**: an item reachable by several targeting phases
+    (cross-initiative membership) takes whichever placement fills its absent
+    tag first — order-dependent but harmless: only absence fills, every stamp
+    is recorded with provenance, and the losing phase's off-target flag
+    surfaces the disagreement either way.
 
 ## 7. Merge + migration (pre-registry drift)
 
