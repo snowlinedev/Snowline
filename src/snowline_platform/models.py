@@ -37,6 +37,23 @@ from sqlalchemy.orm import (
 )
 
 
+def _utcnow() -> datetime:
+    """Naive-UTC stamp for the MILESTONE family's Python-side defaults.
+
+    The milestone service stamps its lifecycle columns (`activated_at`,
+    transition `authored_at`, the LWW clock) in naive UTC; the `created_at`/
+    `updated_at` server defaults were plain `now()` — the DB session's LOCAL
+    clock — so one row mixed two clocks hours apart (QA feedback 4c566e49).
+    The milestone tables now default these Python-side to the SAME naive-UTC
+    clock (with a UTC server_default fallback for raw SQL, migration
+    f6a8b0c2d4e6). Scope rows are untouched: they use the server clock for
+    every stamp, so they are internally consistent (their normalization rides
+    the #98 scope-payload work, not this fix)."""
+    from datetime import timezone as _tz
+
+    return datetime.now(_tz.utc).replace(tzinfo=None)
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -138,9 +155,13 @@ class Milestone(Base):
     # docstring. Nullable: only replication-configured local writes stamp it.
     lww_authored_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     lww_source_id: Mapped[str | None] = mapped_column(String, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    # ONE clock per row (QA 4c566e49): naive UTC, same as the lifecycle stamps.
+    created_at: Mapped[datetime] = mapped_column(
+        default=_utcnow, server_default=func.timezone("utc", func.now())
+    )
     updated_at: Mapped[datetime] = mapped_column(
-        server_default=func.now(), onupdate=func.now()
+        default=_utcnow, onupdate=_utcnow,
+        server_default=func.timezone("utc", func.now()),
     )
 
     anchor: Mapped["Scope"] = relationship()
@@ -163,7 +184,9 @@ class MilestoneTransition(Base):
     )
     from_status: Mapped[str] = mapped_column(String, nullable=False)
     to_status: Mapped[str] = mapped_column(String, nullable=False)
-    authored_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    authored_at: Mapped[datetime] = mapped_column(
+        default=_utcnow, server_default=func.timezone("utc", func.now())
+    )
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     # The AUTHORING instance's replication identity (milestones.md §9, #145):
     # NULL for a locally-authored transition when replication is unconfigured,
@@ -202,7 +225,9 @@ class MilestoneUnreconciled(Base):
     )
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     detail: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(
+        default=_utcnow, server_default=func.timezone("utc", func.now())
+    )
 
     milestone: Mapped["Milestone"] = relationship()
 
@@ -232,4 +257,6 @@ class MilestoneDependency(Base):
     dependency_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("milestones.id"), nullable=False
     )
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(
+        default=_utcnow, server_default=func.timezone("utc", func.now())
+    )

@@ -204,7 +204,14 @@ def _lifecycle(verb):
             raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from None
         except milestones.IllegalTransitionError as exc:
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from None
-        return milestones.to_row(milestone)
+        row = milestones.to_row(milestone)
+        # §4 warnings (unmet dependencies on activate/achieve; the
+        # cancel-from-active governance-demotion note) — attached only when
+        # there is something to say.
+        warnings = milestones.transition_warnings(session, milestone)
+        if warnings:
+            row["warnings"] = warnings
+        return row
 
     return handler
 

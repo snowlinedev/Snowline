@@ -964,6 +964,54 @@ def aliases(session: Session, address: str) -> dict:
     }
 
 
+# --- lifecycle response warnings (§4) ----------------------------------------
+
+
+def transition_warnings(session: Session, milestone: Milestone) -> list[str]:
+    """The §4 lifecycle-response warnings, computed post-transition (QA feedback
+    cc17d118 — this was spec'd in §4 but never wired when the dependency verbs
+    landed in a later increment than the lifecycle verbs):
+
+      * activating or achieving with UNMET (unachieved or cancelled)
+        dependencies succeeds — dependencies gate READINESS reads, never
+        transitions — but the response must SAY so, listing them, so an
+        achieved milestone cannot silently contradict its dependency graph.
+      * cancelling a milestone that had been ACTIVE is a deliberate retraction:
+        governance versions stamped with it demote and canonicality reverts to
+        the prior eligible line (§6.1.6) — the verb-level warning §4 promises.
+        (`activated_at` is the was-active witness: cancel is only legal from
+        planned|active, so a cancelled row with `activated_at` set came
+        through active.)
+
+    Returns [] when there is nothing to warn about — callers attach the list
+    to the response only when non-empty."""
+    warnings: list[str] = []
+    if milestone.status in ("active", "achieved"):
+        unmet = [
+            d
+            for d in _dependencies_of(session, milestone)["depends_on"]
+            if d["status"] != "achieved"
+        ]
+        if unmet:
+            verb = "activated" if milestone.status == "active" else "achieved"
+            listing = ", ".join(
+                f"{d['address']} ({d['status']})" for d in unmet
+            )
+            warnings.append(
+                f"{verb} with unmet dependencies: {listing} — dependencies "
+                "never gate transitions (§4), but this contradiction is now "
+                "recorded in your hands: resolve the dependency or remove the "
+                "edge"
+            )
+    elif milestone.status == "cancelled" and milestone.activated_at is not None:
+        warnings.append(
+            "cancelled from ACTIVE — governance versions stamped with this "
+            "milestone demote, and spec canonicality reverts to the prior "
+            "eligible line (§6.1.6)"
+        )
+    return warnings
+
+
 # --- serialization (the HTTP/MCP JSON shape) --------------------------------
 
 

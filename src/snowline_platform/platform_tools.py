@@ -356,7 +356,14 @@ def build_platform_tools_surface() -> FastMCP:
 
     def _lifecycle_sync(verb, address: str, reason: str | None) -> dict:
         with session_scope() as session:
-            return milestones.to_row(verb(session, address, reason=reason))
+            m = verb(session, address, reason=reason)
+            row = milestones.to_row(m)
+            # §4 warnings (unmet deps on activate/achieve; cancel-from-active
+            # governance demotion) — attached only when non-empty.
+            warnings = milestones.transition_warnings(session, m)
+            if warnings:
+                row["warnings"] = warnings
+            return row
 
     @mcp.tool()
     async def activate_milestone(address: str, reason: str | None = None) -> dict:

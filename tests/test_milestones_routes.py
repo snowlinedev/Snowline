@@ -311,6 +311,49 @@ def test_dependency_suffix_routes_not_shadowed_by_catchall(clean_db):
     assert set(client.get(f"/milestones/{b}/aliases").json()) == {"target", "aliases"}
 
 
+
+
+def test_lifecycle_warnings_for_unmet_dependencies_and_active_cancel(clean_db):
+    """§4 (QA cc17d118): activate/achieve with unachieved or cancelled
+    dependencies succeeds but WARNS, listing them; cancelling a once-active
+    milestone carries the governance-demotion warning; a clean transition
+    carries no warnings key. And one clock per row (QA 4c566e49): created_at
+    and activated_at agree to within minutes."""
+    _seed_two()
+    client = _trusted_client()
+    a = "turtlesedge/turtletracks/a"
+    b = "turtlesedge/turtletracks/b"
+    client.post(f"/milestones/{a}/dependencies", json={"dependency": b})  # a → b
+    client.post(f"/milestones/{b}/cancel")  # the dependency is now cancelled
+
+    r = client.post(f"/milestones/{a}/activate").json()
+    assert any(
+        "unmet dependencies" in w and "cancelled" in w
+        for w in r.get("warnings", [])
+    ), r
+    r = client.post(f"/milestones/{a}/achieve").json()
+    assert any("unmet dependencies" in w for w in r.get("warnings", [])), r
+
+    # One clock per row: created_at (server/ORM default) and activated_at
+    # (service stamp) are the SAME naive-UTC clock now.
+    from datetime import datetime
+
+    created = datetime.fromisoformat(r["created_at"])
+    activated = datetime.fromisoformat(r["activated_at"])
+    assert abs((activated - created).total_seconds()) < 300, r
+
+    # A clean transition has no warnings key at all.
+    with session_scope() as s:
+        scopes.create(s, slug="other", name="O", kind="org")
+        milestones.create(s, anchor="other", name="clean")
+    r = client.post("/milestones/other/clean/activate").json()
+    assert "warnings" not in r, r
+
+    # Cancel-from-active carries the governance-demotion warning.
+    r = client.post("/milestones/other/clean/cancel").json()
+    assert any("demote" in w for w in r.get("warnings", [])), r
+
+
 def test_milestones_behind_trust_gate(clean_db):
     client = TestClient(create_app(migrate_on_startup=False))
     assert client.get("/milestones").status_code == 403
