@@ -212,6 +212,105 @@ def test_malformed_address_is_404_not_500(clean_db):
     assert client.patch(f"/milestones/{bad}", json={"outcome": "x"}).status_code == 404
 
 
+def _seed_two():
+    """Two repo-anchored milestones, `a` and `b`, plus the org anchors."""
+    with session_scope() as s:
+        scopes.create(s, slug="turtlesedge", name="TE", kind="org")
+        scopes.create(
+            s, slug="turtlesedge/turtletracks", name="TT", kind="project"
+        )
+        milestones.create(s, anchor="turtlesedge/turtletracks", name="a")
+        milestones.create(s, anchor="turtlesedge/turtletracks", name="b")
+
+
+def test_merge_over_http(clean_db):
+    """POST /milestones/merge tombstones `from`; either address then reads as one,
+    a create on the tombstoned name is 409, and a state-compat violation is 409."""
+    _seed_two()
+    client = _trusted_client()
+    a = "turtlesedge/turtletracks/a"
+    b = "turtlesedge/turtletracks/b"
+    r = client.post("/milestones/merge", json={"from": a, "into": b})
+    assert r.status_code == 200, r.text
+    assert r.json()["target"] == b
+    # resolve(a) now follows the alias to b.
+    resolved = client.get("/milestones/resolve", params={"ref": a}).json()
+    assert resolved["address"] == b
+    assert resolved["resolved_via_alias"] is True
+    # get(a) still returns the tombstone as itself.
+    assert client.get(f"/milestones/{a}").json()["merged_into"] == b
+    # create on the tombstoned name → 409.
+    dup = client.post(
+        "/milestones", json={"anchor": "turtlesedge/turtletracks", "name": "a"}
+    )
+    assert dup.status_code == 409
+    # A missing field → 422; an unknown `into` → 404.
+    assert client.post("/milestones/merge", json={"from": a}).status_code == 422
+
+
+def test_merge_state_incompatible_over_http(clean_db):
+    _seed_two()
+    client = _trusted_client()
+    a = "turtlesedge/turtletracks/a"
+    b = "turtlesedge/turtletracks/b"
+    # a achieved, b planned → achieved→planned is rejected (409).
+    client.post(f"/milestones/{a}/activate")
+    client.post(f"/milestones/{a}/achieve")
+    r = client.post("/milestones/merge", json={"from": a, "into": b})
+    assert r.status_code == 409, r.text
+
+
+def test_aliases_over_http(clean_db):
+    _seed_two()
+    client = _trusted_client()
+    a = "turtlesedge/turtletracks/a"
+    b = "turtlesedge/turtletracks/b"
+    client.post("/milestones/merge", json={"from": a, "into": b})
+    body = client.get(f"/milestones/{b}/aliases").json()
+    assert body == {"target": b, "aliases": [a]}
+
+
+def test_dependencies_over_http(clean_db):
+    """GET/POST/DELETE /milestones/{address}/dependencies — both directions, add,
+    remove; a cycle is 409."""
+    _seed_two()
+    client = _trusted_client()
+    a = "turtlesedge/turtletracks/a"
+    b = "turtlesedge/turtletracks/b"
+    # a depends on b.
+    add = client.post(f"/milestones/{a}/dependencies", json={"dependency": b})
+    assert add.status_code == 200, add.text
+    assert [r["address"] for r in add.json()["depends_on"]] == [b]
+    # b now sees a as a dependent.
+    assert [
+        r["address"]
+        for r in client.get(f"/milestones/{b}/dependencies").json()["dependents"]
+    ] == [a]
+    # The reverse edge would cycle → 409.
+    cyc = client.post(f"/milestones/{b}/dependencies", json={"dependency": a})
+    assert cyc.status_code == 409
+    # Remove via DELETE + query param.
+    rm = client.delete(f"/milestones/{a}/dependencies", params={"dependency": b})
+    assert rm.status_code == 200
+    assert client.get(f"/milestones/{a}/dependencies").json()["depends_on"] == []
+
+
+def test_dependency_suffix_routes_not_shadowed_by_catchall(clean_db):
+    """The `/aliases` and `/dependencies` GET suffixes resolve to their own
+    handlers, not the greedy `/{address}` catch-all (the route-ordering hazard)."""
+    _seed_two()
+    client = _trusted_client()
+    b = "turtlesedge/turtletracks/b"
+    # A bare GET of the address is the row; the suffixes are distinct shapes.
+    assert "status" in client.get(f"/milestones/{b}").json()
+    assert set(client.get(f"/milestones/{b}/dependencies").json()) == {
+        "address",
+        "depends_on",
+        "dependents",
+    }
+    assert set(client.get(f"/milestones/{b}/aliases").json()) == {"target", "aliases"}
+
+
 def test_milestones_behind_trust_gate(clean_db):
     client = TestClient(create_app(migrate_on_startup=False))
     assert client.get("/milestones").status_code == 403
