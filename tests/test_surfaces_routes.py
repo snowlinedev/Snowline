@@ -41,9 +41,13 @@ def test_surfaces_reports_mounts_allowlists_and_composed_plugins(monkeypatch):
     by_name = {s["name"]: s for s in body["surfaces"]}
     assert by_name["main"]["route"] == "/mcp"
     assert by_name["main"]["allowlist"] == "*"
-    assert by_name["main"]["plugins"] == ["governance", "pm"]
+    # The platform self-entry (decision 0503fff0) composes onto `main` through the
+    # ordinary aggregation path, so it appears in the composed plugin list
+    # alongside the real plugins (name-sorted).
+    assert by_name["main"]["plugins"] == ["governance", "platform", "pm"]
     # core allowlists governance only; the ROOT_SURFACE projection (#38) maps
-    # governance's main mapping onto it, pm is filtered out.
+    # governance's main mapping onto it, pm AND the platform self-entry are
+    # filtered out (neither is in the `core` allowlist — no projection leak).
     assert by_name["core"]["route"] == "/core/mcp"
     assert by_name["core"]["allowlist"] == ["governance"]
     assert by_name["core"]["plugins"] == ["governance"]
@@ -61,7 +65,10 @@ def test_surfaces_skips_down_plugins(monkeypatch):
     reg.set_status("governance", PluginStatus.DOWN)
     body = TestClient(_app(reg)).get("/surfaces").json()
     main = next(s for s in body["surfaces"] if s["name"] == "main")
-    assert main["plugins"] == []  # composed view mirrors gateway route-around
+    # governance is routed around (DOWN); the platform self-entry (decision
+    # 0503fff0) stays composed (it is not down), so the composed view is exactly
+    # the platform — the down plugin is skipped, the self-entry is not.
+    assert main["plugins"] == ["platform"]
 
 
 def test_ui_serves_spa_with_fallback_and_traversal_guard(monkeypatch, tmp_path):

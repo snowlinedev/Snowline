@@ -247,14 +247,19 @@ def test_create_app_fails_loud_at_boot_on_bad_allowlist(monkeypatch, raw, why):
 
 
 def test_non_mcp_routes_still_work():
-    """Mounting the gateway doesn't break /health, /plugins, /scopes."""
+    """Mounting the gateway doesn't break /health, /plugins, /scopes. The plugin
+    listing now carries the platform self-entry (decision 0503fff0) — it is a
+    plain registry entry — but nothing ELSE registered here, so the listing is
+    exactly the platform and no plugin."""
     from starlette.testclient import TestClient
 
     reg = PluginRegistry()
     app = _app_with(reg, InMemoryConnector({}))
     client = TestClient(app)
     assert client.get("/health").status_code == 200
-    assert client.get("/plugins").json() == {"plugins": []}
+    assert [p["name"] for p in client.get("/plugins").json()["plugins"]] == [
+        "platform"
+    ]
 
 
 # --- Configurable surface set + prefix-specific mount ordering (#25) ----------
