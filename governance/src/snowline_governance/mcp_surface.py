@@ -41,6 +41,10 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from snowline_governance import artifacts, concurrence, decisions, graduation, shadow
 from snowline_governance.db import session_scope
+from snowline_governance.milestone_client import (
+    HttpMilestoneClient,
+    MilestoneClient,
+)
 from snowline_governance.scope_client import (
     HttpScopeClient,
     ScopeClient,
@@ -98,7 +102,9 @@ property). Scopes are owned by the platform; governance references them by slug.
 _SECURITY = TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
 
-def _register_read_tools(mcp: FastMCP, client: ScopeClient) -> None:
+def _register_read_tools(
+    mcp: FastMCP, client: ScopeClient, milestone_client: MilestoneClient
+) -> None:
     """Register the READ-REAL governance tools on `mcp` — the decision reads
     (`get_decision`, `list_decisions`, `applicable_decisions`) + the artifact
     reads (`get_artifact`, `get_artifact_version`, `list_artifacts`,
@@ -106,7 +112,12 @@ def _register_read_tools(mcp: FastMCP, client: ScopeClient) -> None:
     BOTH the `main` surface (its read half) and the `shadow` surface (its
     read-real grounding half), so the two surfaces register the SAME handlers —
     one source of truth per tool. Pure-read: no write verb is registered here, so
-    a surface that wants only grounding (shadow) gets exactly that."""
+    a surface that wants only grounding (shadow) gets exactly that.
+
+    The `milestone_client` makes the artifact reads milestone-aware (§6.1):
+    canonicality follows milestone STATE, and per-milestone reads resolve their
+    ref against the platform. It is wired on BOTH surfaces so per-milestone reads
+    work on the shadow grounding surface too."""
 
     def _get_decision_sync(decision_id: str):
         with session_scope() as session:
@@ -177,23 +188,37 @@ def _register_read_tools(mcp: FastMCP, client: ScopeClient) -> None:
             _applicable_decisions_sync, scope, include_superseded, limit
         )
 
-    def _get_artifact_sync(artifact_id, include_body):
+    def _get_artifact_sync(artifact_id, include_body, milestone):
         with session_scope() as session:
             return artifacts.get_artifact(
-                session, artifact_id, include_body=include_body
+                session,
+                artifact_id,
+                include_body=include_body,
+                milestone=milestone,
+                milestone_client=milestone_client,
             )
 
     @mcp.tool()
-    async def get_artifact(artifact_id: str, include_body: bool = True) -> dict:
+    async def get_artifact(
+        artifact_id: str, include_body: bool = True, milestone: str | None = None
+    ) -> dict:
         """Read one artifact's full record by id — identity, doc_kind, maturity,
         governs, the current leaf + all competing leaves + branch points. By
         default `current_version` carries the canonical inline content as
         `body_snapshot` (`include_body=False` for the lean header shape); the
         `leaves` rows stay lean — expand a competing or historical version via
         `get_artifact_version`. The on-demand expansion of a `list_artifacts`
-        header. Read-only."""
+        header. Read-only.
+
+        Canonicality follows milestone STATE (§6.1): `current_version` is the
+        leaf of the ELIGIBLE version subgraph (a version stamped with a still
+        `planned` milestone is `pending`, not canonical), each version row
+        carries its milestone `bucket`, and `competing_leaves` surfaces genuine
+        competition. Pass `milestone=REF` to read the version valid FOR a
+        milestone (the leaf of the subgraph stamped with it, alias-set matched);
+        no stamped version falls back to the canonical version."""
         return await anyio.to_thread.run_sync(
-            _get_artifact_sync, artifact_id, include_body
+            _get_artifact_sync, artifact_id, include_body, milestone
         )
 
     def _get_artifact_version_sync(artifact_id, version_id):
@@ -241,20 +266,23 @@ def _register_read_tools(mcp: FastMCP, client: ScopeClient) -> None:
     def _list_artifact_versions_sync(milestone, limit):
         with session_scope() as session:
             return artifacts.list_versions_by_milestone(
-                session, milestone, limit=limit
+                session, milestone, limit=limit, milestone_client=milestone_client
             )
 
     @mcp.tool()
     async def list_artifact_versions(
         milestone: str, limit: int | None = None
     ) -> dict:
-        """List every artifact VERSION stamped with a `milestone` slug, across all
+        """List every artifact VERSION stamped with a `milestone`, across all
         artifacts — the release-correlation read ("what versions did `v1-launch`
         ship as?"). Each row is a lean version header + its `artifact_id`; expand
-        one via `get_artifact_version(artifact_id, version_id)`. `milestone` is the
-        SOFT release slug stamped at register/revise time (the same slug PM tags
-        work items with) — case-insensitive, grammar-validated. Newest-first,
-        capped; `items_total` carries the true depth. Read-only."""
+        one via `get_artifact_version(artifact_id, version_id)`. The `milestone`
+        ref is RESOLVED against the platform registry and stamps are matched
+        against the target's full ALIAS SET (§6.1.5) — pass a full milestone
+        address (this portfolio-wide read has no single artifact scope to resolve
+        a bare name against). A version matched via a since-merged slug is flagged
+        `matched_via_alias`. Newest-first, capped; `items_total` carries the true
+        depth. Read-only."""
         return await anyio.to_thread.run_sync(
             _list_artifact_versions_sync, milestone, limit
         )
@@ -295,14 +323,21 @@ def _register_read_tools(mcp: FastMCP, client: ScopeClient) -> None:
         )
 
 
-def build_main_surface(scope_client: ScopeClient | None = None) -> FastMCP:
+def build_main_surface(
+    scope_client: ScopeClient | None = None,
+    milestone_client: MilestoneClient | None = None,
+) -> FastMCP:
     """Build the `main` FastMCP surface with the decision tools registered.
 
-    `scope_client` is injectable (tests pass a stub); defaults to the real
-    `HttpScopeClient` talking to the platform's scope API. Returns a fresh
-    `FastMCP` so the app builds one and the tests can build their own.
+    `scope_client` / `milestone_client` are injectable (tests pass stubs); they
+    default to the real `HttpScopeClient` / `HttpMilestoneClient` talking to the
+    platform's scope + milestone APIs. The milestone client makes the artifact
+    writes validate + resolve their stamp at mint and the reads compute
+    milestone-aware canonicality (§6.1). Returns a fresh `FastMCP` so the app
+    builds one and the tests can build their own.
     """
     client: ScopeClient = scope_client or HttpScopeClient()
+    mclient: MilestoneClient = milestone_client or HttpMilestoneClient()
 
     mcp = FastMCP(
         "snowline-governance",
@@ -564,7 +599,7 @@ def build_main_surface(scope_client: ScopeClient | None = None) -> FastMCP:
 
     # --- decision + artifact READ tools (shared with the shadow surface) ----
     # The read-real grounding set; the same handlers register on `shadow`.
-    _register_read_tools(mcp, client)
+    _register_read_tools(mcp, client, mclient)
 
     # --- artifact WRITE tools (main surface only — ABSENT from shadow) -------
 
@@ -592,7 +627,8 @@ def build_main_surface(scope_client: ScopeClient | None = None) -> FastMCP:
         return resolved
 
     def _register_artifact_sync(
-        body, doc_kind, maturity, governs, backend, milestone
+        body, doc_kind, maturity, governs, backend, milestone,
+        allow_terminal_milestone,
     ):
         resolved = _resolve_governs(governs)
         with session_scope() as session:
@@ -605,6 +641,8 @@ def build_main_surface(scope_client: ScopeClient | None = None) -> FastMCP:
                 backend=backend,
                 milestone=milestone,
                 resolved_scopes=resolved,
+                milestone_client=mclient,
+                allow_terminal_milestone=allow_terminal_milestone,
             )
 
     @mcp.tool()
@@ -615,6 +653,7 @@ def build_main_surface(scope_client: ScopeClient | None = None) -> FastMCP:
         governs=None,
         backend: str = "inline",
         milestone: str | None = None,
+        allow_terminal_milestone: bool = False,
     ) -> dict:
         """Register an INLINE governing artifact (a spec/plan/reference doc) —
         its content (`body`) lives in the substrate, versioned by governance.
@@ -623,16 +662,21 @@ def build_main_surface(scope_client: ScopeClient | None = None) -> FastMCP:
         None (ungoverned) — each slug is resolved against the platform first.
         Only `backend='inline'` is supported; `'git'` is rejected (it needs a
         repo registry that's a GitHub-plugin concern). `milestone` is an optional
-        SOFT release-correlation slug stamped on the initial version (the same
-        slug PM tags work items with) — grammar-validated, never resolved. Always
-        mints a fresh artifact + an initial version."""
+        release milestone REF (§6.1.1): RESOLVED against the platform registry
+        and stored as its CANONICAL address, unknown refs hard-fail with
+        suggestions, a bare name resolves against the artifact's single governing
+        scope (an artifact with a list/`*`/no governs needs a full address), and
+        an `achieved`/`cancelled` milestone needs `allow_terminal_milestone=True`.
+        Always mints a fresh artifact + an initial version."""
         return await anyio.to_thread.run_sync(
             _register_artifact_sync,
             body, doc_kind, maturity, governs, backend, milestone,
+            allow_terminal_milestone,
         )
 
     def _revise_artifact_sync(
-        artifact_id, relation, supersedes, body_snapshot, summary, milestone
+        artifact_id, relation, supersedes, body_snapshot, summary, milestone,
+        allow_terminal_milestone,
     ):
         with session_scope() as session:
             return artifacts.revise_artifact(
@@ -643,6 +687,8 @@ def build_main_surface(scope_client: ScopeClient | None = None) -> FastMCP:
                 body_snapshot=body_snapshot,
                 summary=summary,
                 milestone=milestone,
+                milestone_client=mclient,
+                allow_terminal_milestone=allow_terminal_milestone,
             )
 
     @mcp.tool()
@@ -653,30 +699,39 @@ def build_main_surface(scope_client: ScopeClient | None = None) -> FastMCP:
         body_snapshot: str | None = None,
         summary: str | None = None,
         milestone: str | None = None,
+        allow_terminal_milestone: bool = False,
     ) -> dict:
         """Create a new version of an artifact. `relation` is `refines` (normal
-        improve) or `pivot` (a redirection kept as a branch). `supersedes` is the
-        version id the new one follows (defaults to the current leaf); superseding
-        a NON-leaf creates a competing branch. `body_snapshot` is the new inline
-        content; `summary` a one-line "why this version". `milestone` is an
-        optional SOFT release-correlation slug stamped on THIS version (per-version,
-        not inherited) — grammar-validated, never resolved; the release stamp for
-        the version cut for it."""
+        improve) or `pivot` (a redirection kept as a branch). `body_snapshot` is
+        the new inline content; `summary` a one-line "why this version".
+
+        `supersedes` defaults to the current CANONICAL version — the leaf of the
+        eligible subgraph, NOT the DAG leaf which may be a pending draft (§6.1.4).
+        Superseding a pending/dead version explicitly is legal but the revision
+        MUST then carry an explicit `milestone` (an unstamped child of a
+        non-eligible parent is rejected). `milestone` is an optional release
+        milestone REF stamped on THIS version — RESOLVED to its canonical address
+        (bare names resolve against the artifact's single governing scope);
+        terminal milestones need `allow_terminal_milestone=True`."""
         return await anyio.to_thread.run_sync(
             _revise_artifact_sync,
             artifact_id, relation, supersedes, body_snapshot, summary, milestone,
+            allow_terminal_milestone,
         )
 
     def _resolve_artifact_sync(artifact_id, version_id):
         with session_scope() as session:
-            return artifacts.resolve_artifact(session, artifact_id, version_id)
+            return artifacts.resolve_artifact(
+                session, artifact_id, version_id, milestone_client=mclient
+            )
 
     @mcp.tool()
     async def resolve_artifact(artifact_id: str, version_id: str) -> dict:
         """Collapse an artifact's competing version leaves. `version_id` is the
         LOSING leaf — it flips to `status=superseded` (staying in the audit trail)
         and the remaining leaf becomes canonical. Requires the artifact to have >1
-        current leaf and `version_id` to be one of them."""
+        current ELIGIBLE leaf (genuine competition WITHIN the eligible bucket,
+        §6.1.3) and `version_id` to be one of them."""
         return await anyio.to_thread.run_sync(
             _resolve_artifact_sync, artifact_id, version_id
         )
@@ -714,7 +769,10 @@ def build_main_surface(scope_client: ScopeClient | None = None) -> FastMCP:
     return mcp
 
 
-def build_shadow_surface(scope_client: ScopeClient | None = None) -> FastMCP:
+def build_shadow_surface(
+    scope_client: ScopeClient | None = None,
+    milestone_client: MilestoneClient | None = None,
+) -> FastMCP:
     """Build the `shadow` FastMCP surface — the SPECULATION surface (decision
     8a7f0a11), mounted on the governance app at `/shadow/mcp`.
 
@@ -731,12 +789,15 @@ def build_shadow_surface(scope_client: ScopeClient | None = None) -> FastMCP:
     speculation session connecting to `/shadow/mcp` physically cannot mutate the
     real graph.
 
-    `scope_client` is injectable (tests pass a stub); defaults to the real
-    `HttpScopeClient`. The scope-bearing shadow tools resolve the slug →
-    `(id, slug)` against the platform BEFORE the DB write (the soft-reference
-    pattern), so a branch anchors on the STABLE `scope_id`.
+    `scope_client` / `milestone_client` are injectable (tests pass stubs); they
+    default to the real `HttpScopeClient` / `HttpMilestoneClient`. The
+    scope-bearing shadow tools resolve the slug → `(id, slug)` against the
+    platform BEFORE the DB write (the soft-reference pattern), so a branch anchors
+    on the STABLE `scope_id`. The milestone client is wired so the read-real
+    grounding tools' per-milestone reads work here too (§6.1.5).
     """
     client: ScopeClient = scope_client or HttpScopeClient()
+    mclient: MilestoneClient = milestone_client or HttpMilestoneClient()
 
     mcp = FastMCP(
         "snowline-governance-shadow",
@@ -934,6 +995,6 @@ def build_shadow_surface(scope_client: ScopeClient | None = None) -> FastMCP:
     # Read-real grounding — the SAME decision + artifact READ handlers the `main`
     # surface registers (one source of truth). NO real-write verb is registered
     # on this surface; that absence IS the isolation guarantee (decision 8a7f0a11).
-    _register_read_tools(mcp, client)
+    _register_read_tools(mcp, client, mclient)
 
     return mcp
