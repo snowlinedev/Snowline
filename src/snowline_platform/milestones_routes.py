@@ -7,7 +7,12 @@ Out-of-process plugins (governance, PM) cannot import the platform, so they read
   GET  /milestones/resolve?ref=&context=    single-ref resolution (§3)
   POST /milestones/resolve-batch            {refs:[...], context?} -> per-ref
                                             {address, status, resolved_via_alias}
+  POST /milestones/merge                    {from, into} merge → alias tombstone
   GET  /milestones/{address}                the row (audit read; 404 if unknown)
+  GET  /milestones/{address}/aliases        the tombstone closure for a target
+  GET  /milestones/{address}/dependencies   both edge directions (§4)
+  POST /milestones/{address}/dependencies   {dependency} add an edge
+  DELETE /milestones/{address}/dependencies?dependency=  remove an edge
   POST /milestones                          create (the only mint path)
   POST /milestones/{address}/activate|achieve|cancel   lifecycle verbs
   PATCH /milestones/{address}               update outcome / target_date
@@ -24,9 +29,13 @@ The MCP tool wrappers over this service now exist too — served on the platform
 `main` surface via self-registration (decision 0503fff0; `platform_tools.py`),
 not from this HTTP router.
 
-DEFERRED (spec §5 first-cut note; see the PR): the merge verb + the
-`/aliases` endpoint, and the dependency verbs + the `/dependencies` endpoint +
-readiness surfacing.
+Increment 2 adds `merge` (+ the `/aliases` closure read) and the dependency
+verbs (+ the `/dependencies` read/add/remove routes). Route ORDER: the
+`/aliases` and `/dependencies` GET suffixes are declared BEFORE the bare
+`/{address}` catch-all (same hazard as `/transitions`); `/merge` is a fixed POST
+path with no bare-address POST to shadow it. DEFERRED (see the PR): replication
+emission (§9), the governance consumer (§6.1), and readiness computation itself
+(PM-side, over these reads).
 """
 
 from __future__ import annotations
@@ -123,6 +132,35 @@ async def resolve_batch(
     return {"results": results}
 
 
+@router.post("/merge")
+async def merge_milestone(
+    request: Request,
+    payload: dict = Body(...),
+    session: Session = Depends(get_session),
+) -> dict:
+    """Merge `from` into `into` (§7) — a fixed path (`from` is a reserved word, so
+    the body carries `{from, into}` rather than typed params). `into` resolves to
+    its terminal target; the tombstone stays at `from`'s anchor. Returns
+    `{tombstone, target, reminder}`."""
+    missing = {"from", "into"} - set(payload)
+    if missing:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"merge requires {sorted({'from', 'into'})}; missing {sorted(missing)}",
+        )
+    try:
+        return milestones.merge(session, payload["from"], payload["into"])
+    except milestones.MilestoneNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from None
+    except milestones.MilestoneResolutionError as exc:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            {"detail": str(exc), "suggestions": exc.suggestions},
+        ) from None
+    except milestones.MilestoneMergeError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from None
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_milestone(
     request: Request,
@@ -201,9 +239,86 @@ async def milestone_transitions(
     return {"transitions": log}
 
 
-# Declared AFTER the `/{address}/transitions` suffix route so the greedy
-# `:path` catch-all cannot shadow it (mirrors scopes_routes' /ancestors-before-
-# /{slug} ordering). PATCH/POST verbs above don't conflict (distinct methods).
+@router.get("/{address:path}/aliases")
+async def milestone_aliases(
+    address: str,
+    request: Request,
+    session: Session = Depends(get_session),
+) -> dict:
+    """The tombstone closure resolving to `address`'s terminal target (§5)."""
+    try:
+        return milestones.aliases(session, address)
+    except milestones.MilestoneResolutionError as exc:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            {"detail": str(exc), "suggestions": exc.suggestions},
+        ) from None
+
+
+@router.get("/{address:path}/dependencies")
+async def milestone_dependencies(
+    address: str,
+    request: Request,
+    session: Session = Depends(get_session),
+) -> dict:
+    """Both directions of a milestone's dependency edges (§4)."""
+    try:
+        return milestones.dependencies(session, address)
+    except milestones.MilestoneResolutionError as exc:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            {"detail": str(exc), "suggestions": exc.suggestions},
+        ) from None
+
+
+def _dependency_edit(verb):
+    async def handler(
+        address: str,
+        request: Request,
+        dependency: str,
+        session: Session = Depends(get_session),
+    ) -> dict:
+        try:
+            return verb(session, address, dependency)
+        except milestones.MilestoneResolutionError as exc:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                {"detail": str(exc), "suggestions": exc.suggestions},
+            ) from None
+        except milestones.MilestoneDependencyError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from None
+
+    return handler
+
+
+# POST reads `dependency` from the body; DELETE reads it from the query string
+# (a request body on DELETE is non-standard). Both are edge verbs on the
+# dependent named by `{address}`.
+async def _add_dependency(
+    address: str,
+    request: Request,
+    dependency: str = Body(..., embed=True),
+    session: Session = Depends(get_session),
+) -> dict:
+    return await _dependency_edit(milestones.add_dependency)(
+        address, request, dependency, session
+    )
+
+
+router.add_api_route(
+    "/{address:path}/dependencies", _add_dependency, methods=["POST"]
+)
+router.add_api_route(
+    "/{address:path}/dependencies",
+    _dependency_edit(milestones.remove_dependency),
+    methods=["DELETE"],
+)
+
+
+# Declared AFTER the `/{address}/transitions`, `/aliases`, `/dependencies` suffix
+# routes so the greedy `:path` catch-all cannot shadow them (mirrors
+# scopes_routes' /ancestors-before-/{slug} ordering). PATCH/POST/DELETE verbs
+# above don't conflict with this GET (distinct methods).
 @router.get("/{address:path}")
 async def get_milestone(
     address: str,

@@ -64,6 +64,12 @@ _MILESTONE_TOOLS = {
     "activate_milestone",
     "achieve_milestone",
     "cancel_milestone",
+    "update_milestone",
+    "merge_milestone",
+    "add_milestone_dependency",
+    "remove_milestone_dependency",
+    "milestone_dependencies",
+    "milestone_aliases",
 }
 _ALL_PLATFORM_TOOLS = {f"platform__{t}" for t in _SCOPE_TOOLS | _MILESTONE_TOOLS}
 
@@ -307,6 +313,73 @@ def test_resolve_milestone_miss_carries_suggestions_into_the_tool_error(clean_db
     text = res.content[0].text
     assert "unknown milestone" in text
     assert "did you mean" in text and "v1-launch" in text
+
+
+def test_merge_milestone_round_trips_through_composed_surface(clean_db):
+    """The increment-2 marquee: `platform__merge_milestone` tombstones one
+    milestone into another through the composed surface, and a follow-up
+    `platform__resolve_milestone` on the merged-away address follows the alias to
+    the target with `resolved_via_alias=true` — end to end over the real
+    transport."""
+    with session_scope() as s:
+        scopes.create(s, slug="acme/widget", name="Widget", kind="project")
+        milestones.create(s, anchor="acme/widget", name="v1-launch")
+        milestones.create(s, anchor="acme/widget", name="launch")
+
+    app = _app(_connector_with_platform())
+
+    async def _merge_then_resolve(session):
+        # One session (the streamable-HTTP manager runs once per app): merge, then
+        # resolve the merged-away address to prove the alias committed.
+        merged = await session.call_tool(
+            "platform__merge_milestone",
+            {
+                "from_address": "acme/widget/v1-launch",
+                "into_address": "acme/widget/launch",
+            },
+        )
+        resolved = await session.call_tool(
+            "platform__resolve_milestone", {"ref": "acme/widget/v1-launch"}
+        )
+        return merged, resolved
+
+    res, resolved = anyio.run(_run_against_surface, app, "/mcp", _merge_then_resolve)
+    assert res.isError is not True, res.content[0].text
+    payload = json.loads(res.content[0].text)
+    assert payload["target"] == "acme/widget/launch"
+    assert payload["tombstone"]["merged_into"] == "acme/widget/launch"
+    assert "list_artifact_versions" in payload["reminder"]
+
+    body = json.loads(resolved.content[0].text)
+    assert body["address"] == "acme/widget/launch"
+    assert body["resolved_via_alias"] is True
+
+
+def test_milestone_aliases_round_trips_through_composed_surface(clean_db):
+    """`platform__milestone_aliases` returns the target's tombstone closure through
+    the composed surface — the read consumers use to match stored stamps against
+    the full alias set (§5)."""
+    with session_scope() as s:
+        scopes.create(s, slug="acme/widget", name="Widget", kind="project")
+        milestones.create(s, anchor="acme/widget", name="v1-launch")
+        milestones.create(s, anchor="acme/widget", name="launch")
+        # Merge in-process so the closure has content to return.
+        milestones.merge(s, "acme/widget/v1-launch", "acme/widget/launch")
+
+    app = _app(_connector_with_platform())
+
+    async def _call(session):
+        return await session.call_tool(
+            "platform__milestone_aliases", {"address": "acme/widget/launch"}
+        )
+
+    res = anyio.run(_run_against_surface, app, "/mcp", _call)
+    assert res.isError is not True, res.content[0].text
+    payload = json.loads(res.content[0].text)
+    assert payload == {
+        "target": "acme/widget/launch",
+        "aliases": ["acme/widget/v1-launch"],
+    }
 
 
 def test_create_scope_write_verb_round_trips_and_persists(clean_db):

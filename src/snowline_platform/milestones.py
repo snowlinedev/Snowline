@@ -18,14 +18,18 @@ name folds the same ASCII-only way (`validate_name`); everything stores canonica
 lowercase.
 
 Increment 1 (spec §5 first-cut note): model + service (create / resolve / get /
-list / lifecycle / update) + the HTTP read/resolve API. The MCP tool wrappers
-(create/resolve/list/lifecycle/get/transitions) now ALSO exist — served on the
-platform `main` surface via the platform registering itself as an upstream
-(decision 0503fff0; `platform_tools.py`), NOT by this module. DEFERRED to later
-increments: the merge verb + alias traversal source (`merged_into_id` is the
-column, always NULL here), the dependency edge verbs + readiness surfacing (the
-`milestone_dependencies` table's schema lands now but nothing writes it),
-replication emission (§9), and the governance consumer (§6.1).
+list / lifecycle / update) + the HTTP read/resolve API + the MCP tool wrappers
+(served on the platform `main` surface via the platform registering itself as an
+upstream, decision 0503fff0; `platform_tools.py`).
+
+Increment 2 (§7 + the dependency parts of §2/§4): the `merge` verb (alias
+tombstones, terminal-target resolution keeping chains depth-1, state
+compatibility, dependency-edge re-pointing with a re-run cycle guard) — which
+ACTIVATES `_follow_alias` on the resolution path — plus the `aliases` closure
+read and the dependency edge verbs (`add_dependency` / `remove_dependency` /
+`dependencies`, cycle-guarded over the global edge set). DEFERRED to later
+increments: replication emission (§9), the governance consumer (§6.1), and the
+`empty_rounds`-style health signal.
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ from __future__ import annotations
 import difflib
 import re
 import uuid
+from collections import defaultdict
 from datetime import date, datetime, timezone
 
 from sqlalchemy import select
@@ -40,7 +45,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from snowline_platform import scopes
-from snowline_platform.models import Milestone, MilestoneTransition
+from snowline_platform.models import (
+    Milestone,
+    MilestoneDependency,
+    MilestoneTransition,
+)
 from snowline_platform.scopes import canonical_slug, validate_slug
 
 # --- name / status contract (§2) --------------------------------------------
@@ -51,6 +60,17 @@ from snowline_platform.scopes import canonical_slug, validate_slug
 # makes the address grammar self-describing by segment count (§2).
 _NAME_SEG = r"[._-]*[a-z0-9][a-z0-9._-]*"
 NAME_RE = re.compile(rf"^{_NAME_SEG}$")
+
+# Names that collide with the HTTP surface's ADDRESS-SUFFIX routes
+# (`/{address}/transitions|aliases|dependencies|activate|achieve|cancel`): a
+# milestone so named would make requests to its own address misroute to the
+# suffix handler with a SHORTER address — the exact class of grammar ambiguity
+# the slash-free name rule exists to kill — so they are reserved at the name
+# level and can never exist. (The fixed single-segment paths — `resolve`,
+# `resolve-batch`, `merge` — cannot collide: an address is always ≥2 segments.)
+RESERVED_NAMES = frozenset(
+    {"transitions", "aliases", "dependencies", "activate", "achieve", "cancel"}
+)
 
 # The lifecycle status set and the LEGAL transition table (§4). Legal moves:
 # planned→active→achieved; planned|active→cancelled. `achieve` on a *planned*
@@ -83,6 +103,21 @@ class MilestoneConflictError(ValueError):
 
 class IllegalTransitionError(ValueError):
     """A lifecycle verb was applied from an illegal source status (§4)."""
+
+
+class MilestoneMergeError(ValueError):
+    """A merge is illegal (§7): the terminal target equals `from` (cycle guard),
+    the two states are not merge-compatible, or the dependency-edge union that the
+    merge would produce cycles. No partial write ever lands."""
+
+
+class MilestoneDependencyError(ValueError):
+    """A dependency edge is illegal (§2/§4): a self-edge, or (as
+    `DependencyCycleError`) an edge that would cycle the global DAG."""
+
+
+class DependencyCycleError(MilestoneDependencyError):
+    """Adding the edge would create a cycle in the global dependency DAG (§2)."""
 
 
 class MilestoneResolutionError(LookupError):
@@ -125,6 +160,12 @@ def validate_name(name: str) -> str:
         raise InvalidMilestoneNameError(
             f"invalid milestone name: {name!r} — must be a slash-free lowercase "
             "slug (§2)"
+        )
+    if folded in RESERVED_NAMES:
+        raise InvalidMilestoneNameError(
+            f"milestone name {folded!r} is reserved — it collides with the "
+            "address-suffix route grammar "
+            f"(/{{address}}/{folded} is an operation, not a milestone)"
         )
     return folded
 
@@ -218,9 +259,9 @@ def _normalize_context(context_slug: str) -> list[str]:
 
 def _follow_alias(session: Session, m: Milestone) -> tuple[Milestone, bool]:
     """Follow a merge tombstone to its terminal target (§3). Tombstones store the
-    terminal target directly so chains stay depth-1; in this increment
-    `merged_into_id` is always NULL, so this is a no-op that the merge increment
-    activates without a resolution-path change."""
+    terminal target directly (`merge` resolves `into` to its terminal target
+    first), so chains stay depth-1 and a single hop suffices; a non-tombstone
+    resolves to itself with `resolved_via_alias=False`."""
     if m.merged_into_id is None:
         return m, False
     target = session.get(Milestone, m.merged_into_id)
@@ -556,6 +597,272 @@ def transitions(session: Session, address: str) -> list[dict]:
         }
         for t in rows
     ]
+
+
+# --- dependencies (§2/§4) ---------------------------------------------------
+
+
+def _all_edges(session: Session) -> set[tuple[uuid.UUID, uuid.UUID]]:
+    """Every dependency edge as `(dependent_id, dependency_id)` tuples — the GLOBAL
+    edge set the cycle guard reasons over (cross-anchor edges included; the anchor
+    is not a fence, §2)."""
+    return {
+        (e.dependent_id, e.dependency_id)
+        for e in session.scalars(select(MilestoneDependency))
+    }
+
+
+def _has_cycle(edges: set[tuple[uuid.UUID, uuid.UUID]]) -> bool:
+    """Does the directed graph of `dependent → dependency` edges contain a cycle?
+    A dependency DAG must stay acyclic so §3's alias traversal and the dependency
+    walk are loop-free by construction (§9). Standard three-colour DFS."""
+    adj: dict[uuid.UUID, set[uuid.UUID]] = defaultdict(set)
+    for dependent, dependency in edges:
+        adj[dependent].add(dependency)
+    colour: dict[uuid.UUID, int] = {}  # 1 = on stack, 2 = done
+
+    def visit(node: uuid.UUID) -> bool:
+        colour[node] = 1
+        for nxt in adj[node]:
+            c = colour.get(nxt, 0)
+            if c == 1 or (c == 0 and visit(nxt)):
+                return True
+        colour[node] = 2
+        return False
+
+    return any(colour.get(n, 0) == 0 and visit(n) for n in list(adj))
+
+
+def _edge(
+    session: Session, dependent_id: uuid.UUID, dependency_id: uuid.UUID
+) -> MilestoneDependency | None:
+    return session.scalar(
+        select(MilestoneDependency).where(
+            MilestoneDependency.dependent_id == dependent_id,
+            MilestoneDependency.dependency_id == dependency_id,
+        )
+    )
+
+
+def add_dependency(
+    session: Session, dependent_address: str, dependency_address: str
+) -> dict:
+    """Add a `dependent → dependency` edge (§2/§4): *dependent* depends on
+    *dependency*. Both refs resolve through any merge alias to their terminal
+    target (a dependency stored via a tombstone points at the live target). A
+    self-edge is rejected; a duplicate is IDEMPOTENT (re-adding an existing edge is
+    a no-op success — documented over conflict so replay/retry is safe); the edge
+    is cycle-guarded over the GLOBAL edge set (cross-anchor edges allowed) and
+    rejected with `DependencyCycleError` if it would cycle. Returns the current
+    `dependencies` read of `dependent`."""
+    dependent = resolve(session, dependent_address)
+    dependency = resolve(session, dependency_address)
+    if dependent.id == dependency.id:
+        raise MilestoneDependencyError(
+            f"a milestone cannot depend on itself ({address_of(dependent)!r}, §2)"
+        )
+    if _edge(session, dependent.id, dependency.id) is None:
+        edges = _all_edges(session)
+        edges.add((dependent.id, dependency.id))
+        if _has_cycle(edges):
+            raise DependencyCycleError(
+                f"{address_of(dependent)!r} depending on "
+                f"{address_of(dependency)!r} would cycle the dependency DAG — "
+                "rejected (the guard runs over the global edge set, §2)"
+            )
+        session.add(
+            MilestoneDependency(
+                dependent_id=dependent.id, dependency_id=dependency.id
+            )
+        )
+        session.flush()
+    return _dependencies_of(session, dependent)
+
+
+def remove_dependency(
+    session: Session, dependent_address: str, dependency_address: str
+) -> dict:
+    """Remove a `dependent → dependency` edge (§4). Both refs resolve through any
+    merge alias. IDEMPOTENT — removing an absent edge is a no-op success (matching
+    `add_dependency`). Returns the current `dependencies` read of `dependent`."""
+    dependent = resolve(session, dependent_address)
+    dependency = resolve(session, dependency_address)
+    edge = _edge(session, dependent.id, dependency.id)
+    if edge is not None:
+        session.delete(edge)
+        session.flush()
+    return _dependencies_of(session, dependent)
+
+
+def _dep_row(m: Milestone) -> dict:
+    """A dependency neighbour as `{address, status}` — the raw status is ALWAYS
+    surfaced, including `cancelled`: a dependency on a cancelled milestone must be
+    visible so PM's readiness read can flag `blocked_by_cancelled` (§4)."""
+    return {"address": address_of(m), "status": m.status}
+
+
+def _dependencies_of(session: Session, m: Milestone) -> dict:
+    """Both directions of `m`'s dependency edges (§4): `depends_on` (what `m`
+    depends on) and `dependents` (what depends on `m`), each address-ordered with
+    raw status."""
+    depends_on = [
+        _dep_row(session.get(Milestone, dep_id))
+        for (dpt, dep_id) in _all_edges(session)
+        if dpt == m.id
+    ]
+    dependents = [
+        _dep_row(session.get(Milestone, dpt_id))
+        for (dpt_id, dep) in _all_edges(session)
+        if dep == m.id
+    ]
+    return {
+        "address": address_of(m),
+        "depends_on": sorted(depends_on, key=lambda r: r["address"]),
+        "dependents": sorted(dependents, key=lambda r: r["address"]),
+    }
+
+
+def dependencies(session: Session, address: str) -> dict:
+    """Read both directions of a milestone's dependency edges (§4). The address
+    resolves through any merge alias, so a dependency read via a tombstone reports
+    the live target's edges. Raises on an unknown ref."""
+    return _dependencies_of(session, resolve(session, address))
+
+
+# --- merge (§7) -------------------------------------------------------------
+
+
+def merge(session: Session, from_address: str, into_address: str) -> dict:
+    """Merge `from` into `into` — mark `from` an ALIAS TOMBSTONE resolving to
+    `into` forever (§7). Mechanics, all-or-nothing (no partial write on any
+    rejection):
+
+    - `into` is resolved to its TERMINAL target first and that target is stored,
+      so alias chains stay depth-1; a merge whose terminal target equals `from`
+      is rejected (cycle guard, same posture as `depends_on`).
+    - `from` must not already be a tombstone (it is already merged away).
+    - **State compatibility** (§7): legal iff `from.status == into.status` OR
+      `from.status == planned`. Otherwise rejected — merging a *cancelled*
+      milestone into a live one would resurrect dead spec versions through the
+      alias, and an *achieved* one into a planned one would retroactively demote
+      shipped stamps; those governance-history rewrites must be explicit re-stamps.
+    - **Cross-anchor merges are allowed**; the tombstone stays at its original
+      anchor, its name reserved there forever (the existing `create` check).
+    - `from`'s dependency edges, BOTH directions, are re-pointed to `into`,
+      deduplicated (self-edges from the re-point dropped), and the global cycle
+      guard re-runs — the merge FAILS if the union would cycle.
+    - Nothing is logged to the transition log (merge is not a lifecycle
+      transition); `from`'s status is left as-is (the row is now an alias, and
+      resolution never surfaces its status).
+
+    Returns `{tombstone, target, reminder}` — the reminder restates that the
+    platform never bulk-retags plugin data, so the caller must review affected
+    rows agent-side (§7)."""
+    frm = get(session, from_address)  # direct — the row to tombstone, as itself
+    if frm.merged_into_id is not None:
+        raise MilestoneMergeError(
+            f"{address_of(frm)!r} is already a merge tombstone aliased to "
+            f"{address_of(frm.merged_into)!r} (§7)"
+        )
+    into = resolve(session, into_address)  # follow to the TERMINAL target
+    if into.id == frm.id:
+        raise MilestoneMergeError(
+            f"cannot merge {address_of(frm)!r} into itself — the terminal target "
+            f"of {into_address!r} is {address_of(frm)!r} (cycle guard, §7)"
+        )
+
+    # State compatibility (§7) — the governance-history guard.
+    if not (frm.status == into.status or frm.status == "planned"):
+        raise MilestoneMergeError(
+            f"cannot merge {address_of(frm)!r} ({frm.status}) into "
+            f"{address_of(into)!r} ({into.status}) — merge is legal only when the "
+            "statuses match or `from` is still planned. Merging a "
+            f"{frm.status} milestone into a {into.status} one would rewrite "
+            "governance history through the alias (a cancelled→live merge "
+            "resurrects dead spec versions; an achieved→planned merge "
+            "retroactively demotes shipped stamps). Re-stamp explicitly if that "
+            "is truly intended (§7)."
+        )
+
+    # Re-point `from`'s edges (both directions) onto `into`, drop self-edges,
+    # dedupe, and re-run the GLOBAL cycle guard on the prospective union — fail
+    # whole if it would cycle (§7). Nothing is written until the guard passes.
+    existing = list(session.scalars(select(MilestoneDependency)))
+    touching = [
+        e for e in existing if frm.id in (e.dependent_id, e.dependency_id)
+    ]
+    untouched = {
+        (e.dependent_id, e.dependency_id) for e in existing if e not in touching
+    }
+    repointed: set[tuple[uuid.UUID, uuid.UUID]] = set()
+    for e in touching:
+        d = into.id if e.dependent_id == frm.id else e.dependent_id
+        dep = into.id if e.dependency_id == frm.id else e.dependency_id
+        if d != dep:  # a self-edge produced by the re-point is dropped
+            repointed.add((d, dep))
+    if _has_cycle(untouched | repointed):
+        raise MilestoneMergeError(
+            f"merging {address_of(frm)!r} into {address_of(into)!r} would cycle "
+            "the dependency DAG once edges are re-pointed — rejected, nothing "
+            "written (§7)"
+        )
+    for e in touching:
+        session.delete(e)
+    for d, dep in repointed:
+        if (d, dep) not in untouched:  # dedupe against edges already present
+            session.add(MilestoneDependency(dependent_id=d, dependency_id=dep))
+
+    # Re-point any tombstone that already aliases `from` onto `into` too, so the
+    # depth-1 invariant holds in BOTH merge orderings (the spec spells out only
+    # the into-is-a-tombstone direction; keeping `from`'s inbound aliases depth-1
+    # is the symmetric requirement for `_follow_alias`'s single hop to be correct
+    # when `from` is itself merged onward — §3/§7 interpretation).
+    for inbound in session.scalars(
+        select(Milestone).where(Milestone.merged_into_id == frm.id)
+    ):
+        inbound.merged_into_id = into.id
+
+    frm.merged_into_id = into.id  # the tombstone; status stays as-is
+    session.flush()
+    return {
+        "tombstone": to_row(frm),
+        "target": address_of(into),
+        "reminder": (
+            f"{address_of(frm)} is now an alias of {address_of(into)}. The "
+            "platform never bulk-retags plugin data — consumers' stored addresses "
+            "stay put and reads agree via alias-set matching. Review affected "
+            f"rows agent-side: list_artifact_versions(milestone={address_of(frm)}) "
+            f"and milestone_status({address_of(frm)}); the platform cannot count "
+            "plugin rows (§7)."
+        ),
+    }
+
+
+# --- aliases (§5) -----------------------------------------------------------
+
+
+def aliases(session: Session, address: str) -> dict:
+    """The transitive closure of tombstones resolving to the TERMINAL target of
+    `address` (§5). Resolve the input first, then collect every tombstone chain
+    pointing at that target — a milestone-keyed consumer matches stored stamps
+    against the target's full alias set, or "reads via either address agree" is
+    mechanically impossible. Depth-1 chains make this a reverse lookup in practice,
+    but it is written closure-correct."""
+    target = resolve(session, address)
+    collected: dict[uuid.UUID, Milestone] = {}
+    frontier = [target.id]
+    while frontier:
+        tid = frontier.pop()
+        for m in session.scalars(
+            select(Milestone).where(Milestone.merged_into_id == tid)
+        ):
+            if m.id not in collected:
+                collected[m.id] = m
+                frontier.append(m.id)
+    return {
+        "target": address_of(target),
+        "aliases": sorted(address_of(m) for m in collected.values()),
+    }
 
 
 # --- serialization (the HTTP/MCP JSON shape) --------------------------------
