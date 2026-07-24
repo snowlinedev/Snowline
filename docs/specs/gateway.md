@@ -28,10 +28,24 @@ composes; it never imports plugin code (plugins are addressed by URL).
 - **Isolation is plugin-side and structural**: the gateway composes *whole*
   surfaces and never reasons about individual tools, so a tool appears on a
   surface only because a plugin mapped it there (`record_decision` never lands on
-  `shadow`). The one addition to plugin-mapped tools: the **platform's own
-  native tools** (scope and milestone registry verbs — `scope-namespace.md` §4,
-  `milestones.md` §5) contribute to `main` the same way, composed as a
-  platform-internal surface rather than routed to any plugin.
+  `shadow`).
+- **Platform-native tools = the platform registering ITSELF as an upstream**
+  (decision `0503fff0`, 2026-07-23). The platform's own tools (scope + milestone
+  registry verbs — `scope-namespace.md` §4, `milestones.md` §5) are NOT an
+  in-aggregator special case. The platform mounts an MCP streamable-HTTP tool app
+  on its own HTTP app at `/platform/mcp`, and seeds a `platform` **registry
+  entry** at its own loopback `base_url` mapping `{"/platform/mcp": "main"}`. The
+  gateway then composes it onto `main` through the *ordinary* `discover_upstreams`
+  path — the aggregator does not know this upstream is the platform — and the
+  tools surface namespaced `platform__<tool>` by the same `<plugin>__<tool>`
+  convention. This keeps the invariant above intact (compose whole surfaces,
+  never reason about individual tools) and dogfoods the composition path, with
+  exact precedent in the platform's replication self-participation
+  (`replication-continuity.md` §8, "the SDK's own publisher"). The self-entry is
+  a plain manifest: it appears in `GET /plugins`, is health-checked against its
+  own loopback `/health` like any plugin, is ABSENT from isolation surfaces it
+  does not map (`shadow`), and PROJECTS onto an explicitly-allowlisted surface via
+  its `ROOT_SURFACE` mapping exactly like any plugin (§2a).
 
 ## 2a. Per-surface plugin allowlists (config)
 

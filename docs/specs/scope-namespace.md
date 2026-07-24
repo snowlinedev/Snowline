@@ -59,9 +59,14 @@ carried into the platform's read surface.)
   /scopes`, `GET /scopes/{slug}`, `GET /scopes/tree` (`?root=`), `GET
   /scopes/{slug}/ancestors`. Behind the platform trust gate.
 - **Scope MCP tools on the platform's `main` surface** (for the agent):
-  `list_scopes`, `scope_tree`, `resolve_scope`, `create_scope` / `update_scope`.
-  Thin wrappers over the service. *(First cut may land the read API + service and
-  a minimal tool set; full write tooling can follow.)*
+  `list_scopes`, `resolve_scope`, `scope_tree`, `scope_ancestors`, `create_scope`
+  / `update_scope`. Thin wrappers over the service. These reach `main` by the
+  platform **registering itself as an upstream** (decision `0503fff0`;
+  `gateway.md` §2): a FastMCP tool app mounted at `/platform/mcp`, composed onto
+  `main` through the ordinary gateway path, surfacing namespaced
+  `platform__<tool>`. *(First cut landed the read API + service; the full tool set
+  — reads + `create_scope`/`update_scope` write verbs — followed via
+  self-registration.)*
 
 ## 5. Behaviors (carried from the monolith, functionality-first)
 

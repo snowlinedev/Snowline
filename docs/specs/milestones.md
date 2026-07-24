@@ -140,8 +140,15 @@ and agents relay it — so the tools resolve it; **storage is always canonical**
   `resolve_milestone`, `list_milestones` (registry rows — distinct from PM's
   work roll-up read of the same name; prefixes disambiguate),
   `activate_milestone`, `achieve_milestone`, `cancel_milestone`,
-  `merge_milestone`, dependency verbs. *(First cut may land the service + read
-  API + create/resolve/lifecycle; merge and dependencies can follow.)*
+  `get_milestone`, `milestone_transitions`, `merge_milestone`, dependency verbs.
+  These reach `main` by the platform **registering itself as an upstream**
+  (decision `0503fff0`; `gateway.md` §2): thin FastMCP wrappers over this
+  service, mounted at `/platform/mcp` and composed onto `main` through the
+  ordinary gateway path, surfacing namespaced `platform__<tool>`. *(First cut
+  landed the service + read API + create/resolve/lifecycle; the platform MCP
+  surface — create/resolve/list/lifecycle/get/transitions — followed via
+  self-registration. Merge, dependency verbs, and `update_milestone` still
+  follow.)*
 - **Events — deferred.** The platform has **no event bus**: the only spec'd
   signed webhook bus is governance's own (governance-plugin.md §7, a plugin
   store), and the platform's replication-class scope stream is pairing-scoped
