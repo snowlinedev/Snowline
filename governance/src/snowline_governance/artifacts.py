@@ -965,23 +965,25 @@ def _milestone_alias_set(
     milestone_client: MilestoneClient,
     *,
     context: str | None,
-) -> set[str]:
-    """Resolve a milestone REF and return the folded match set `{canonical} ∪
-    aliases` (§5) — the milestone-keyed reads match stored stamps against the
-    target's FULL alias set, so a stamp stored under a since-merged slug still
-    matches. A bare ref needs `context`; unknown → the client's
-    `MilestoneResolutionError` (with suggestions) propagates."""
+) -> tuple[str, set[str]]:
+    """Resolve a milestone REF once and return `(canonical_address, match_set)`
+    where the match set is `{canonical} ∪ aliases` (§5) — the milestone-keyed
+    reads match stored stamps against the target's FULL alias set, so a stamp
+    stored under a since-merged slug still matches. A bare ref needs `context`;
+    unknown → the client's `MilestoneResolutionError` (with suggestions)
+    propagates."""
     if "/" not in ref and context is None:
         raise ValueError(
-            f"milestone {ref!r} is a bare name but this artifact has no single "
-            "governing scope to resolve it against — pass the full milestone "
-            "address (anchor/name)."
+            f"milestone {ref!r} is a bare name with no resolution context (the "
+            "artifact has no single governing scope, or this is a "
+            "portfolio-wide read) — pass the full milestone address "
+            "(anchor/name)."
         )
     row = milestone_client.resolve(ref, context=context)
     address = row.get("address")
     members = {address}
     members.update(milestone_client.aliases(address).get("aliases", []))
-    return {m for m in members if m}
+    return address, {m for m in members if m}
 
 
 def get_artifact(
@@ -1006,7 +1008,16 @@ def get_artifact(
     version."""
     a = _require_artifact(session, artifact_id)
     milestone_filter: set[str] | None = None
-    if milestone and milestone_client is not None:
+    if milestone:
+        # A per-milestone read is an explicit request — with no client to
+        # resolve against it must fail loudly, never silently degrade to the
+        # default read (§6.1.5).
+        if milestone_client is None:
+            raise ValueError(
+                f"a per-milestone read (milestone={milestone!r}) requires a "
+                "milestone client — a clientless call has no platform to "
+                "resolve the ref against"
+            )
         # Bare-name context = the artifact's single governing scope (§6.1.1).
         gov_slugs = _governs(session, a.id)
         context = (
@@ -1014,7 +1025,7 @@ def get_artifact(
             if (not a.governs_all and len(gov_slugs) == 1)
             else None
         )
-        milestone_filter = _milestone_alias_set(
+        _primary, milestone_filter = _milestone_alias_set(
             milestone, milestone_client, context=context
         )
     return _artifact_dict(
@@ -1082,11 +1093,11 @@ def list_versions_by_milestone(
         # Portfolio-wide read: no single artifact to derive a bare-name context
         # from, so the ref must be a full address (`_milestone_alias_set` rejects
         # a bare ref with context=None). Unknown → the client's resolution error
-        # (with suggestions) propagates.
-        match_set = _milestone_alias_set(
+        # (with suggestions) propagates. ONE resolve — the helper returns the
+        # canonical primary alongside the match set.
+        primary, match_set = _milestone_alias_set(
             milestone.strip(), milestone_client, context=None
         )
-        primary = milestone_client.resolve(milestone.strip()).get("address")
 
     stmt = (
         select(ArtifactVersion)

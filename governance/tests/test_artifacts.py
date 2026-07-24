@@ -916,6 +916,32 @@ def test_list_versions_by_milestone_matches_alias_set(
     assert out["versions"][0].get("matched_via_alias") is True
 
 
+def test_per_milestone_read_requires_client(db_session):
+    """A per-milestone read is an explicit request — clientless it fails loudly
+    rather than silently degrading to the default read (§6.1.5)."""
+    art = artifacts.register_artifact(db_session, body="v1")
+    with pytest.raises(ValueError, match="requires a milestone client"):
+        artifacts.get_artifact(db_session, art["id"], milestone="org/repo/v1")
+
+
+def test_list_versions_by_milestone_resolves_once(
+    db_session, stub_milestone_client
+):
+    """The clientful release-correlation read resolves its ref exactly ONCE (the
+    helper returns the canonical primary alongside the alias match set)."""
+    mc = stub_milestone_client({"org/repo/v1": "active"})
+    artifacts.register_artifact(
+        db_session, body="v1", governs="org/repo",
+        resolved_scopes=_resolved("org/repo"), milestone="org/repo/v1",
+        milestone_client=mc,
+    )
+    mc.resolve_calls.clear()
+    artifacts.list_versions_by_milestone(
+        db_session, "org/repo/v1", milestone_client=mc
+    )
+    assert len(mc.resolve_calls) == 1
+
+
 # --- 6.1.6 promotion and demotion are implicit (the marquee) ------------------
 
 
