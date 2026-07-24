@@ -46,6 +46,13 @@ target one but must never require one.
 - `name` — **slash-free** slug; canonical lowercase, case-insensitive input
   (the #134/#139 convention, composing with scope-slug folding in addresses);
   unique within its anchor scope, **including merge tombstones** (§7).
+  **Reserved names** (amendment, PR #149 review): `transitions`, `aliases`,
+  `dependencies`, `activate`, `achieve`, `cancel` can never be milestone names —
+  they collide with the HTTP surface's address-suffix route grammar, and a
+  milestone so named would make requests to its own address misroute to the
+  suffix handler with a shorter address. (The fixed single-segment paths —
+  `resolve`, `resolve-batch`, `merge` — cannot collide: an address is always
+  ≥2 segments.)
 - **Address grammar — self-describing by segment count** (possible only because
   names are slash-free): `v1-launch` = bare name, resolved via context (§3);
   `turtlesedge/v1-launch` = org-anchored; `turtlesedge/turtletracks/v1-launch`
@@ -175,7 +182,12 @@ restated here.
 
 1. **Validated at mint.** `register_artifact` / `revise_artifact` resolve the
    milestone ref against the platform and store the canonical address; unknown
-   refs hard-fail. Bare-name context = the artifact's governing scope,
+   refs hard-fail. *(Implementation note, PR #150: the validated posture rides
+   an injectable `MilestoneClient` that every wired surface always supplies; a
+   clientless DIRECT service call degrades to the pre-registry #141
+   grammar-verbatim posture so the service stays standalone-callable — no
+   production surface takes that path, and an explicit per-milestone read
+   without a client fails loudly rather than degrading.)* Bare-name context = the artifact's governing scope,
    normalized per §3 — an artifact with **list or `*` governs has no bare-name
    context**: bare refs are rejected at mint (full address required).
    Stamping a version with an **achieved or cancelled** milestone is rejected
@@ -195,9 +207,14 @@ restated here.
    must not flip canonicality (co-located loopback reads, same rationale as
    replication-continuity §6.1).
 3. **Canonical = the leaf of the eligible subgraph.** Take the version DAG
-   induced on *eligible* versions only: the canonical version is its leaf.
-   Pending/dead versions do not supersede for canonicality purposes —
-   drafting the v2 spec no longer dethrones the v1 spec. If the eligible
+   induced on *eligible* versions only — where "induced" is **transitive
+   contraction, not strict induction** (amendment, PR #150): supersession
+   edges pass *through* non-eligible intermediates, so a pending or dead
+   version sitting between two eligible ones transmits the line rather than
+   forking it (strict induction would make an eligible ancestor spuriously
+   compete with its own eligible descendant). The canonical version is that
+   subgraph's leaf. Pending/dead versions do not supersede for canonicality
+   purposes — drafting the v2 spec no longer dethrones the v1 spec. If the eligible
    subgraph has **multiple leaves** (e.g. an active-stamped fix to v1 and a
    just-activated v2 both fork from v1), that is a **genuine competition**:
    the default read returns the newest leaf by version creation **plus an
@@ -269,7 +286,12 @@ restated here.
   - `into` must not itself be a tombstone — it is resolved to its **terminal
     target** first and that target is stored, so alias chains stay depth-1;
     a merge whose terminal target equals `from` is rejected (cycle guard,
-    same posture as `depends_on`).
+    same posture as `depends_on`). **Symmetrically** (amendment, PR #149):
+    tombstones that already alias `from` are re-pointed onto the terminal
+    target too — depth-1 must hold in BOTH merge orderings (`merge(a,b)` then
+    `merge(b,c)` leaves `a` pointing at `c`, not at the tombstoned `b`), or
+    single-hop resolution returns a tombstone. A `from` that is already a
+    tombstone is rejected.
   - **Cross-anchor merges are allowed** (org-anchored into repo-anchored and
     vice versa — the known drift case *is* cross-anchor); the tombstone stays
     at its original anchor, occupying its name there forever (§4 `create`).
