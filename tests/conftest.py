@@ -124,9 +124,11 @@ def clean_db(migrated_db):
     with session_scope() as s:
         s.execute(
             sa.text(
-                "TRUNCATE scopes, replication_subscriptions, replication_outbox, "
-                "replication_stream_counters, replication_inbound_streams, "
-                "replication_parked_events RESTART IDENTITY CASCADE"
+                "TRUNCATE scopes, milestones, milestone_transitions, "
+                "milestone_dependencies, replication_subscriptions, "
+                "replication_outbox, replication_stream_counters, "
+                "replication_inbound_streams, replication_parked_events "
+                "RESTART IDENTITY CASCADE"
             )
         )
     yield

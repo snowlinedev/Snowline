@@ -21,6 +21,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from snowline_platform import (
     config,
+    milestones_routes,
     plugins_routes,
     replication,
     scopes_routes,
@@ -165,6 +166,10 @@ def create_app(
     )
     app.include_router(plugins_routes.router)
     app.include_router(scopes_routes.router)
+    # The milestone registry read/resolve + create/lifecycle surface
+    # (milestones.md §5), the platform's SECOND identity primitive beside
+    # scopes. Behind the trust gate like every other platform route.
+    app.include_router(milestones_routes.router)
     # The replication ingest + admin surface (spec §5, §8): the platform's own
     # opted-in stream, identical shape to what a plugin mounts. Rides behind
     # the trust middleware like every other route — the router's own tailnet
