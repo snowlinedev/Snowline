@@ -90,6 +90,24 @@ describe("keyboard operability", () => {
     expect(menuAfter.getAttribute("aria-expanded")).toBe("false");
   });
 
+  it("nav disclosure closes on re-tapping the current page link", async () => {
+    // Same-route click: no remount, so this exercises the closeNav
+    // onClick directly (the cross-route test above closes via remount).
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter initialEntries={["/"]}>
+        <App />
+      </MemoryRouter>,
+    );
+    const menu = screen.getByRole("button", { name: "Menu" });
+    await user.click(menu);
+    expect(menu.getAttribute("aria-expanded")).toBe("true");
+    const current = screen.getByRole("link", { name: "Home" });
+    expect(current.getAttribute("aria-current")).toBe("page");
+    await user.click(current);
+    expect(menu.getAttribute("aria-expanded")).toBe("false");
+  });
+
   it("retitles the document per route (2.4.2)", async () => {
     const user = userEvent.setup();
     render(
