@@ -66,7 +66,7 @@ from snowline_plugin_sdk.replication.models import (
 )
 from sqlalchemy import func, select
 
-from snowline_governance import concurrence, replication_stream
+from snowline_governance import artifacts, concurrence, replication_stream
 from snowline_governance.contract import (
     EVENT_ARTIFACT_GOVERNS_SET,
     EVENT_ARTIFACT_MATURITY_SET,
@@ -555,6 +555,10 @@ def _apply_artifact_registered(session, client, envelope: dict) -> None:
                 id=version_id,
                 artifact_id=artifact_id,
                 body_snapshot=version.get("body_snapshot"),
+                # DERIVED, not shipped (#168): title is a pure function of the
+                # body, so apply re-derives it — byte-convergent with the
+                # author's store without riding the payload.
+                title=artifacts.derive_title(version.get("body_snapshot")),
                 # SOFT milestone ref stamped verbatim from the payload — the
                 # author already grammar-validated/canonicalized it, and it names
                 # no scope, so apply reconstructs it directly (no re-validation,
@@ -589,6 +593,8 @@ def _apply_artifact_revised(session, client, envelope: dict) -> None:
             supersedes_id=_uuid(version.get("supersedes_id")),
             relation=version.get("relation"),
             body_snapshot=version.get("body_snapshot"),
+            # DERIVED, not shipped (#168) — see _apply_artifact_registered.
+            title=artifacts.derive_title(version.get("body_snapshot")),
             summary=version.get("summary"),
             # SOFT milestone ref, stamped verbatim (see _apply_artifact_registered).
             milestone=version.get("milestone"),

@@ -316,6 +316,35 @@ def _eligible_leaves(
     return _induced_leaves(versions, eligible_ids), stamp_buckets, versions
 
 
+_TITLE_MAX = 200
+
+
+def derive_title(body: str | None) -> str | None:
+    """The DERIVED display title (#168): the first markdown ATX heading in the
+    body (`# ...` through `###### ...`), hash markers and surrounding whitespace
+    stripped, truncated to 200 chars. A PURE function of the body — the write
+    paths AND replication apply both call it, so the stored title converges
+    without riding any event payload. None when the body has no heading (an
+    unlabeled doc stays honestly unlabeled — no first-line guessing)."""
+    if not body:
+        return None
+    in_fence = False
+    for line in body.splitlines():
+        stripped = line.strip()
+        # A `# comment` (or shebang) inside a fenced code block is not a
+        # heading — track fence state so a doc OPENING with code stays honest.
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if stripped.startswith("#"):
+            text = stripped.lstrip("#").strip()
+            if text:
+                return text[:_TITLE_MAX]
+    return None
+
+
 class ArtifactNotFoundError(Exception):
     """No artifact with the given id."""
 
@@ -468,6 +497,7 @@ def _version_dict(
         return None
     out = {
         "id": str(v.id),
+        "title": v.title,
         "status": v.status,
         "relation": v.relation,
         "supersedes_id": str(v.supersedes_id) if v.supersedes_id else None,
@@ -736,7 +766,10 @@ def register_artifact(
     session.add(artifact)
     session.flush()
     initial = ArtifactVersion(
-        artifact_id=artifact.id, body_snapshot=body, milestone=milestone
+        artifact_id=artifact.id,
+        body_snapshot=body,
+        title=derive_title(body),
+        milestone=milestone,
     )
     session.add(initial)
     if governs is not None:
@@ -856,6 +889,7 @@ def revise_artifact(
         supersedes_id=sup_id,
         relation=relation,
         body_snapshot=body_snapshot,
+        title=derive_title(body_snapshot),
         summary=summary,
         milestone=milestone,
     )
@@ -1236,18 +1270,53 @@ def _leaf_counts_for_artifacts(
     return out
 
 
+def _leaf_titles_for_artifacts(
+    session: Session, artifact_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, str | None]:
+    """The current structural leaf's derived `title` (#168) per artifact for a
+    SET of artifacts in ONE query — the batched-read companion of
+    `_artifact_compact_row`'s `_current_version(...).title`. Rows come back
+    newest-first with the same `(created_at, id)` ordering `_leaf_stmt` uses, so
+    the FIRST row seen per artifact IS its current leaf. Missing artifacts map
+    to None."""
+    out: dict[uuid.UUID, str | None] = {aid: None for aid in artifact_ids}
+    if not artifact_ids:
+        return out
+    seen: set[uuid.UUID] = set()
+    for art_id, title in session.execute(
+        select(ArtifactVersion.artifact_id, ArtifactVersion.title)
+        .where(
+            ArtifactVersion.artifact_id.in_(artifact_ids),
+            ArtifactVersion.status != "superseded",
+            branching.leaf_filter(
+                ArtifactVersion.id,
+                ArtifactVersion.supersedes_id,
+                ArtifactVersion.artifact_id.in_(artifact_ids),
+            ),
+        )
+        .order_by(ArtifactVersion.created_at.desc(), ArtifactVersion.id.desc())
+    ):
+        if art_id in seen:
+            continue
+        seen.add(art_id)
+        out[art_id] = title
+    return out
+
+
 def _compact_row_from_signals(
     a: Artifact,
     *,
     version_count: int,
     leaf_count: int,
     governs: list[str],
+    title: str | None = None,
 ) -> dict:
     """Build the `_artifact_compact_row` shape from PRE-FETCHED signals — the
     batched read path's per-artifact assembler (no DB queries). Identical shape to
     `_artifact_compact_row`."""
     return {
         "id": str(a.id),
+        "title": title,
         "doc_kind": a.doc_kind,
         "backend": a.backend,
         "repo": a.repo,
@@ -1264,11 +1333,13 @@ def _compact_row_from_signals(
 
 
 def _artifact_compact_row(session: Session, a: Artifact) -> dict:
-    """A small artifact header for `list_artifacts`: identity (id + `repo`/`path`,
-    the human-readable identity a reader needs to tell one governing doc from
-    another) + lifecycle + the two cheap derived signals a sweep needs
-    (`version_count`, `is_branched`), WITHOUT the full leaves / current_version /
-    branch_points. Expand any row via `get_artifact(id)`."""
+    """A small artifact header for `list_artifacts`: identity (id + the derived
+    `title` (#168) + `repo`/`path`, the human-readable identity a reader needs
+    to tell one governing doc from another) + lifecycle + the two cheap derived
+    signals a sweep needs (`version_count`, `is_branched`), WITHOUT the full
+    leaves / current_version / branch_points. Expand any row via
+    `get_artifact(id)`."""
+    current = _current_version(session, a.id)
     version_count = session.scalar(
         select(func.count())
         .select_from(ArtifactVersion)
@@ -1289,6 +1360,7 @@ def _artifact_compact_row(session: Session, a: Artifact) -> dict:
     )
     return {
         "id": str(a.id),
+        "title": current.title if current is not None else None,
         "doc_kind": a.doc_kind,
         "backend": a.backend,
         "repo": a.repo,
@@ -1432,6 +1504,7 @@ def applicable_artifacts(
     version_counts = _version_counts_for_artifacts(session, art_ids)
     leaf_counts = _leaf_counts_for_artifacts(session, art_ids)
     governs_map = _governs_for_artifacts(session, art_ids)
+    titles = _leaf_titles_for_artifacts(session, art_ids)
 
     collected: list[dict] = []
     for art_id, from_scope in ordered:
@@ -1447,6 +1520,7 @@ def applicable_artifacts(
             version_count=version_counts.get(art_id, 0),
             leaf_count=leaf_counts.get(art_id, 0),
             governs=governs_map.get(art_id, []),
+            title=titles.get(art_id),
         )
         if from_scope is not None:
             row["from_scope"] = from_scope

@@ -230,6 +230,13 @@ class ArtifactVersion(Base):
     git_ref: Mapped[str | None] = mapped_column(String, nullable=True)
     git_sha: Mapped[str | None] = mapped_column(String, nullable=True)
     body_snapshot: Mapped[str | None] = mapped_column(String, nullable=True)
+    # DERIVED display title (#168): the body's first markdown heading, computed
+    # at mint by `artifacts.derive_title` — a pure function of `body_snapshot`,
+    # which is why replication apply re-derives it instead of shipping it (no
+    # event/contract change). NULL when the body has no heading. Denormalized
+    # (not computed on read) so compact-row reads batch it without touching
+    # bodies.
+    title: Mapped[str | None] = mapped_column(String, nullable=True)
     summary: Mapped[str | None] = mapped_column(String, nullable=True)
     # SOFT milestone/release ref — a slug stored verbatim, never resolved (see the
     # class docstring). NULL for an unstamped version; indexed so the milestone
