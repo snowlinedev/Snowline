@@ -1214,6 +1214,20 @@ def test_artifacts_for_path_blank_raises(db_session):
         artifacts.artifacts_for_path(db_session, "  ")
 
 
+def test_artifacts_for_path_tolerates_malformed_replicated_rows(db_session):
+    """Replicated code_refs apply verbatim — a malformed peer row (no `path`)
+    must degrade to a non-match, never crash the read."""
+    art = artifacts.register_artifact(db_session, body="# spec")
+    row = db_session.get(
+        artifacts.Artifact, uuid.UUID(art["id"])
+    )
+    row.code_refs = [{"symbol": "NoPath"}, "not-a-dict", {"path": "lib/ok.dart"}]
+    db_session.flush()
+    out = artifacts.artifacts_for_path(db_session, "lib/ok.dart")
+    assert [a["id"] for a in out["artifacts"]] == [art["id"]]
+    assert out["artifacts"][0]["matching_refs"] == [{"path": "lib/ok.dart"}]
+
+
 # --- derived titles (#168) ----------------------------------------------------
 
 

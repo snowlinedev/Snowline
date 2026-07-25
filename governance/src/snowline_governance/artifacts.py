@@ -1136,6 +1136,10 @@ def artifacts_for_path(
     for a in rows:
         hits = []
         for ref in a.code_refs or []:
+            # Local writes are normalized, but replicated lists apply verbatim
+            # — a malformed peer row must degrade to a non-match, not a crash.
+            if not isinstance(ref, dict) or not isinstance(ref.get("path"), str):
+                continue
             if repo_ci is not None:
                 ref_repo = (ref.get("repo") or "").lower()
                 if ref_repo and ref_repo != repo_ci:
