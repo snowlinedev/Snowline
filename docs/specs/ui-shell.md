@@ -139,6 +139,14 @@ internally — the platform eats its own vocabulary.
 | `document` | `{ title, markdown, meta? }` | rendered markdown (e.g. branch narrative notes) |
 | `board` | `{ nodes: [BoardNode...], group_by?, facets?, empty? }` (§4.2a) | hierarchical, collapsible, read-only tree — specified for the pm roadmap (`roadmap-board.md`, snowline-pm repo) |
 
+Any page kind's response may additionally carry a top-level `page_title`
+string. When present, the shell uses it as the page header (and document
+title) once the data loads, naming the concrete entity behind a param-keyed
+route — id-keyed detail routes carry an opaque id, so only the data plane
+knows a human name (e.g. which milestone). The manifest `title` (falling
+back to `id`) remains the pre-load and fallback header. Additive and
+optional: pages that omit it render exactly as before.
+
 `search` (query box + result list, for shadow corpus search) is anticipated
 but **deferred** until the read views prove out.
 

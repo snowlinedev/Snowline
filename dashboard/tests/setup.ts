@@ -202,6 +202,9 @@ export const FIXTURES: Record<string, unknown> = {
     empty: "No branches.",
   },
   "/ui-api/governance/pages/branches/main-plan-x": {
+    // §4.2 additive page_title: the payload names the concrete entity, so
+    // the header shows it instead of the manifest's generic "Shadow branch".
+    page_title: "Branch main-plan-x",
     title: "main-plan-x",
     meta: "Status: open",
     nodes: [
