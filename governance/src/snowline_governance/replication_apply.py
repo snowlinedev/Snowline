@@ -639,15 +639,26 @@ def _apply_artifact_superseded(session, client, envelope: dict) -> None:
     re-points; apply never rejects it (rejection would park the stream)."""
     p = envelope["payload"]
     artifact_id = _uuid(p["artifact_id"])
+    replacement_id = _uuid(p["superseded_by_id"])
+    if replacement_id == artifact_id:
+        # No legitimate author produces a self-pointer (the local write rejects
+        # it) — malformed, so it parks LOUDLY (§8) rather than corrupting a row.
+        raise ValueError(
+            f"artifact.superseded event points artifact {artifact_id} at itself"
+        )
     artifact = _require(session.get(Artifact, artifact_id), "artifact")
     replacement = _require(
-        session.get(Artifact, _uuid(p["superseded_by_id"])),
-        "replacement artifact",
+        session.get(Artifact, replacement_id), "replacement artifact"
+    )
+    # Hard-key the envelope `at` fallback (the `_apply_branch_archived`
+    # pattern): a set pointer must never land with a NULL retirement stamp.
+    superseded_at = _dt(p.get("superseded_at")) or replication_stream.parse_at(
+        p["at"]
     )
 
     def set_pointer() -> None:
         artifact.superseded_by_id = replacement.id
-        artifact.superseded_at = _dt(p.get("superseded_at"))
+        artifact.superseded_at = superseded_at
 
     _lww_apply(
         session, envelope, "artifact", artifact_id, "superseded_by", set_pointer

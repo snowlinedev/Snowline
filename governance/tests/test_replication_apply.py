@@ -1045,6 +1045,34 @@ def test_artifact_superseded_lww_older_incoming_loses(db_session, apply_fn):
     assert str(row.superseded_by_id) == c["id"]  # newer incoming re-pointed
 
 
+def test_artifact_superseded_self_pointer_is_rejected(db_session, apply_fn):
+    """No legitimate author mints a self-pointer (the local write rejects it) —
+    malformed input parks loudly instead of corrupting the row."""
+    a = artifacts.register_artifact(db_session, body="# spec")
+    p = _payload(
+        artifact_id=a["id"],
+        superseded_by_id=a["id"],
+        superseded_at=utcnow().isoformat(),
+    )
+    with pytest.raises(ValueError, match="at itself"):
+        apply_fn(db_session, _envelope(EVENT_ARTIFACT_SUPERSEDED, p))
+    assert db_session.get(Artifact, uuid.UUID(a["id"])).superseded_by_id is None
+
+
+def test_artifact_superseded_missing_stamp_falls_back_to_envelope_at(
+    db_session, apply_fn
+):
+    """A payload missing `superseded_at` must never land a set pointer with a
+    NULL retirement stamp — the envelope `at` is the hard-keyed fallback."""
+    a = artifacts.register_artifact(db_session, body="# early")
+    b = artifacts.register_artifact(db_session, body="# consolidated")
+    p = _payload(artifact_id=a["id"], superseded_by_id=b["id"])
+    apply_fn(db_session, _envelope(EVENT_ARTIFACT_SUPERSEDED, p))
+    row = db_session.get(Artifact, uuid.UUID(a["id"]))
+    assert str(row.superseded_by_id) == b["id"]
+    assert row.superseded_at == replication_stream.parse_at(p["at"])
+
+
 def test_artifact_superseded_missing_replacement_is_retryable(
     db_session, apply_fn
 ):
