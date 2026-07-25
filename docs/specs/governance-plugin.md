@@ -97,7 +97,11 @@ Carried over unchanged in shape (a lift, per the develop-in-public carve), minus
   `resolve_artifact` (leaf resolution), `supersede_artifact` (#166 — retire a
   whole artifact in favor of another: the consolidation verb; the replacement
   must be live, re-pointing an already-retired artifact is the correction
-  path, and there is no un-supersede), `set_governs`, `set_maturity`,
+  path, and there is no un-supersede), `retire_artifact` (#174 — retirement
+  with a required reason and NO successor, for docs nothing live replaces:
+  completed checklists, extracted-package plans, point-in-time audits;
+  retirement is the shared state — `superseded_at` — and the pointer/reason
+  are its two orthogonal forms), `set_governs`, `set_maturity`,
   `set_code_refs` (#172 — the structured spec↔code anchor map:
   `[{repo?, path, symbol?, note?}]`, a wholesale replace mirroring governs;
   paths are stored, never resolved — the drift sweep validates anchors, and a

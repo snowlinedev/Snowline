@@ -580,6 +580,7 @@ def _artifact_dict(
         "superseded_at": (
             a.superseded_at.isoformat() if a.superseded_at else None
         ),
+        "retirement_reason": a.retirement_reason,
         # Structured code anchors (#172) — full record only; compact rows stay
         # lean (query the reverse direction via `artifacts_for_path`).
         "code_refs": a.code_refs,
@@ -1127,7 +1128,7 @@ def artifacts_for_path(
             select(Artifact)
             .where(
                 Artifact.code_refs.is_not(None),
-                Artifact.superseded_by_id.is_(None),
+                Artifact.superseded_at.is_(None),
             )
             .order_by(Artifact.created_at.desc(), Artifact.id.desc())
         )
@@ -1173,22 +1174,28 @@ def supersede_artifact(
     never gave). Many artifacts may point at one replacement (the N→1
     consolidation shape).
 
-    The REPLACEMENT must be LIVE (not itself superseded) — pointing at a retired
-    doc would chain readers through dead ends, and the rule makes supersession
-    cycles unrepresentable at write time. Superseding an ALREADY-superseded
-    artifact re-points it (the correction path; `superseded_at` tracks the
-    current supersession). There is no un-supersede — a wrongly retired doc is
-    corrected by re-pointing, or by superseding its replacement back into a
-    successor doc. Returns the refreshed (retired) artifact."""
+    The REPLACEMENT must be LIVE (not itself retired, by either #166 pointer or
+    #174 reason) — pointing at a retired doc would chain readers through dead
+    ends, and the rule makes supersession cycles unrepresentable at write time.
+    Superseding an ALREADY-retired artifact re-points it (the correction path;
+    `superseded_at` tracks the current retirement; an existing
+    `retirement_reason` is kept — the two facts are orthogonal). There is no
+    un-supersede — a wrongly retired doc is corrected by re-pointing, or by
+    superseding its replacement back into a successor doc. For retirement with
+    NO successor use `retire_artifact`. Returns the refreshed artifact."""
     a = _require_artifact(session, artifact_id)
     replacement = _require_artifact(session, replaced_by_id)
     if a.id == replacement.id:
         raise ValueError("an artifact cannot supersede itself")
-    if replacement.superseded_by_id is not None:
+    if replacement.superseded_at is not None:
+        detail = (
+            f"superseded by {replacement.superseded_by_id}"
+            if replacement.superseded_by_id
+            else f"retired: {replacement.retirement_reason!r}"
+        )
         raise ValueError(
-            f"replacement {replaced_by_id!r} is itself superseded (by "
-            f"{replacement.superseded_by_id}) — point at the LIVE end of the "
-            "chain instead"
+            f"replacement {replaced_by_id!r} is itself retired ({detail}) — "
+            "point at a LIVE artifact (the live end of the chain)"
         )
     a.superseded_by_id = replacement.id
     a.superseded_at = replication_stream.utcnow()
@@ -1196,6 +1203,51 @@ def supersede_artifact(
     # STREAM emit — register-class (§6): the pointer is one LWW register, so a
     # partitioned double-supersede of the same artifact converges on the later
     # write on both sides.
+    replication_stream.emit(
+        session,
+        EVENT_ARTIFACT_SUPERSEDED,
+        replication_stream.artifact_superseded_payload(a),
+    )
+    return _artifact_dict(session, a)
+
+
+_RETIREMENT_REASON_MAX = 1000
+
+
+def retire_artifact(session: Session, artifact_id: str, reason: str) -> dict:
+    """Retire an artifact WITHOUT a successor (#174) — the other form of the
+    #166 retirement state, for docs no live artifact replaces: completed
+    one-time checklists, plans for since-extracted packages, point-in-time
+    audits, stale indexes whose replacement is the platform itself. Sets
+    `superseded_at` + a REQUIRED `retirement_reason` (the audit trail the
+    successor pointer would otherwise carry); the artifact drops out of
+    `applicable_artifacts` and the default `list_artifacts` exactly like a
+    superseded one.
+
+    Orthogonal to the pointer: retiring does not touch `superseded_by_id`, and
+    `supersede_artifact` does not touch the reason — a reason-retired doc later
+    absorbed by a consolidation keeps both facts. Re-retiring updates the
+    reason and re-stamps `superseded_at` (the correction path). There is no
+    un-retire. Returns the refreshed artifact."""
+    a = _require_artifact(session, artifact_id)
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError(
+            "retirement needs a non-empty `reason` — it is the audit trail a "
+            "successor pointer would otherwise carry (what this doc was, why "
+            "it retires with no replacement)"
+        )
+    reason = reason.strip()
+    if len(reason) > _RETIREMENT_REASON_MAX:
+        raise ValueError(
+            f"retirement reason exceeds {_RETIREMENT_REASON_MAX} chars"
+        )
+    a.retirement_reason = reason
+    a.superseded_at = replication_stream.utcnow()
+    session.flush()
+    # STREAM emit — the SAME register-class event as supersede (§6): the
+    # payload carries the full retirement state, so a partitioned
+    # retire-vs-supersede race on one artifact converges on the later write's
+    # complete state.
     replication_stream.emit(
         session,
         EVENT_ARTIFACT_SUPERSEDED,
@@ -1488,6 +1540,7 @@ def _compact_row_from_signals(
         "superseded_by_id": (
             str(a.superseded_by_id) if a.superseded_by_id else None
         ),
+        "retirement_reason": a.retirement_reason,
         "version_count": version_count or 0,
         "is_branched": (leaf_count or 0) > 1,
     }
@@ -1532,6 +1585,7 @@ def _artifact_compact_row(session: Session, a: Artifact) -> dict:
         "superseded_by_id": (
             str(a.superseded_by_id) if a.superseded_by_id else None
         ),
+        "retirement_reason": a.retirement_reason,
         "version_count": version_count or 0,
         "is_branched": (leaf_count or 0) > 1,
     }
@@ -1563,7 +1617,7 @@ def list_artifacts(
         Artifact.created_at.desc(), Artifact.id.desc()
     )
     if not include_superseded:
-        stmt = stmt.where(Artifact.superseded_by_id.is_(None))
+        stmt = stmt.where(Artifact.superseded_at.is_(None))
     if governs is not None:
         if governs_scope_id is None:
             return {"governs": governs, "artifacts": [], "items_total": 0}
@@ -1672,9 +1726,9 @@ def applicable_artifacts(
         a = arts.get(art_id)
         if a is None:  # edge/flag row whose artifact vanished — skip defensively
             continue
-        if a.superseded_by_id is not None:
-            # Superseded artifacts (#166) no longer govern anything — their
-            # replacement (usually governing the same scopes) applies instead.
+        if a.superseded_at is not None:
+            # Retired artifacts (#166/#174) no longer govern anything — the
+            # replacement (if any) applies instead.
             continue
         row = _compact_row_from_signals(
             a,

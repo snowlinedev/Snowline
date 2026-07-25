@@ -1066,17 +1066,66 @@ def test_supersede_artifact_rejects_self_and_unknown(db_session):
 
 
 def test_supersede_artifact_requires_live_replacement(db_session):
-    """Pointing at a retired doc is rejected (chains stay live-terminated, and
-    cycles are unrepresentable at write time)."""
+    """Pointing at a retired doc — by pointer OR by reason (#174) — is rejected
+    (chains stay live-terminated, and cycles are unrepresentable at write
+    time)."""
     a = artifacts.register_artifact(db_session, body="# a")
     b = artifacts.register_artifact(db_session, body="# b")
     c = artifacts.register_artifact(db_session, body="# c")
     artifacts.supersede_artifact(db_session, a["id"], b["id"])
-    with pytest.raises(ValueError, match="itself superseded"):
+    with pytest.raises(ValueError, match="itself retired"):
         artifacts.supersede_artifact(db_session, c["id"], a["id"])
     # The 2-cycle is a special case of the same rule.
-    with pytest.raises(ValueError, match="itself superseded"):
+    with pytest.raises(ValueError, match="itself retired"):
         artifacts.supersede_artifact(db_session, b["id"], a["id"])
+    # A reason-retired doc is equally dead as a replacement.
+    r = artifacts.register_artifact(db_session, body="# r")
+    artifacts.retire_artifact(db_session, r["id"], "one-time checklist, done")
+    with pytest.raises(ValueError, match="itself retired"):
+        artifacts.supersede_artifact(db_session, c["id"], r["id"])
+
+
+def test_retire_artifact_without_successor(db_session):
+    """#174: reason-carrying retirement — hidden like a superseded artifact,
+    revealed with its reason, no pointer."""
+    art = artifacts.register_artifact(db_session, body="# QA checklist")
+    live = artifacts.register_artifact(db_session, body="# live spec")
+    out = artifacts.retire_artifact(
+        db_session, art["id"], "  completed one-time QA pass; nothing replaces it  "
+    )
+    assert out["retirement_reason"] == "completed one-time QA pass; nothing replaces it"
+    assert out["superseded_by_id"] is None
+    assert out["superseded_at"] is not None
+
+    default = artifacts.list_artifacts(db_session)
+    assert {a["id"] for a in default["artifacts"]} == {live["id"]}
+    audit = artifacts.list_artifacts(db_session, include_superseded=True)
+    row = next(a for a in audit["artifacts"] if a["id"] == art["id"])
+    assert row["retirement_reason"] == "completed one-time QA pass; nothing replaces it"
+    assert row["superseded_by_id"] is None
+
+    # Re-retiring updates the reason (the correction path).
+    out = artifacts.retire_artifact(db_session, art["id"], "better reason")
+    assert out["retirement_reason"] == "better reason"
+
+
+def test_retire_artifact_requires_reason(db_session):
+    art = artifacts.register_artifact(db_session, body="# spec")
+    with pytest.raises(ValueError, match="non-empty `reason`"):
+        artifacts.retire_artifact(db_session, art["id"], "   ")
+    with pytest.raises(ValueError, match="non-empty `reason`"):
+        artifacts.retire_artifact(db_session, art["id"], None)
+
+
+def test_retirement_forms_are_orthogonal(db_session):
+    """Superseding a reason-retired doc keeps the reason; the pointer and the
+    reason are independent facts of the retirement."""
+    a = artifacts.register_artifact(db_session, body="# a")
+    b = artifacts.register_artifact(db_session, body="# b")
+    artifacts.retire_artifact(db_session, a["id"], "extracted to its own repo")
+    out = artifacts.supersede_artifact(db_session, a["id"], b["id"])
+    assert out["superseded_by_id"] == b["id"]
+    assert out["retirement_reason"] == "extracted to its own repo"
 
 
 def test_supersede_artifact_repoint_is_the_correction_path(db_session):
@@ -1203,7 +1252,7 @@ def test_artifacts_for_path_repo_narrowing_and_superseded_exclusion(db_session):
     )
     assert {a["id"] for a in out["artifacts"]} == {anyrepo["id"]}
 
-    # A superseded artifact's refs stop matching.
+    # A retired artifact's refs stop matching (either retirement form).
     artifacts.supersede_artifact(db_session, tracks["id"], anyrepo["id"])
     out = artifacts.artifacts_for_path(db_session, "lib/main.dart")
     assert {a["id"] for a in out["artifacts"]} == {anyrepo["id"]}

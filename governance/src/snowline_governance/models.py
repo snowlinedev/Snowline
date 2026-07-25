@@ -174,14 +174,19 @@ class Artifact(Base):
     governs_all: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )
-    # Artifact-level supersession (#166): the replacement this artifact was
-    # retired in favor of (NULL = live). A self-FK within governance's own DB;
-    # `superseded_at` stamps the retirement (updated if the pointer is
-    # re-pointed — it tracks the current supersession, not the first).
+    # Artifact-level RETIREMENT (#166/#174): `superseded_at` non-NULL is the
+    # retired state; the two nullable companions record its FORM — a
+    # `superseded_by_id` successor pointer (consolidation, #166) and/or a
+    # `retirement_reason` string (successor-less retirement, #174: completed
+    # checklists, extracted packages, point-in-time audits). Both may be set
+    # (a reason-retired doc later absorbed by a consolidation keeps its
+    # history). `superseded_at` tracks the CURRENT retirement (re-point /
+    # re-reason updates it, not the first).
     superseded_by_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("artifacts.id"), nullable=True
     )
     superseded_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    retirement_reason: Mapped[str | None] = mapped_column(String, nullable=True)
     # Structured code anchors (#172): the spec↔code map — a JSONB list of
     # `{repo?, path, symbol?, note?}` rows naming the code this doc grounds in.
     # Validated + normalized at the write boundary (`artifacts.set_code_refs`,

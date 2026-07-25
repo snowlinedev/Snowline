@@ -62,7 +62,7 @@ def _artifact_stmt_parts(scope_id: uuid.UUID | None):
         branching.leaf_filter(
             ArtifactVersion.id, ArtifactVersion.supersedes_id, true()
         ),
-        Artifact.superseded_by_id.is_(None),
+        Artifact.superseded_at.is_(None),
     ]
     if scope_id is not None:
         governing = select(ArtifactGoverns.artifact_id).where(
