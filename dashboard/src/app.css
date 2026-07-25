@@ -888,20 +888,72 @@ textarea.page-action-input {
     grid-column: auto;
   }
 
-  /* tables: keep natural column widths and let the container scroll (the
-   * 1.4.10 pattern .table-scroll exists for) instead of auto-layout
-   * crushing narrow columns to one-character slivers. The first column is
-   * each table's primary content (the row link) — it keeps wrapping, with
-   * a floor so it can't be squeezed out either. */
-  .kind-table th,
+  /* tables stack: each row becomes a block — the first (row-link) cell
+   * leads, the rest render as "Label: value" lines under it, so nothing
+   * needs horizontal scrolling. The explicit roles set in kinds.tsx keep
+   * table semantics for AT through the display change; the header row is
+   * visually hidden (labels are inline) but stays in the AT tree. */
+  .kind-table,
+  .kind-table tbody,
+  .kind-table tr,
   .kind-table td {
-    white-space: nowrap;
+    display: block;
   }
 
-  .kind-table th:first-child,
+  .kind-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .kind-table tr {
+    padding: var(--space-2) 0;
+    border-bottom: 1px solid var(--hairline);
+  }
+
+  .kind-table tr:last-child {
+    border-bottom: none;
+  }
+
+  .kind-table td {
+    height: auto;
+    min-height: 0;
+    padding: 0;
+    border-bottom: none;
+  }
+
   .kind-table td:first-child {
-    white-space: normal;
-    min-width: 14em;
+    /* the row's identity line: row-height keeps the link target 1.4.10/
+     * 2.5.8-sized in comfortable, same trade as everywhere in compact */
+    min-height: var(--control-h);
+    font-weight: 600;
+    margin-bottom: var(--space-1);
+  }
+
+  .kind-table td::before {
+    content: attr(data-label) ": ";
+    /* empty alt text: SR table nav already announces the column header, so
+     * the visual label would double-announce; older browsers drop this
+     * (invalid there) and keep the line above. */
+    content: attr(data-label) ": " / "";
+    color: var(--ink-muted);
+    font-size: var(--font-small);
+    font-weight: 600;
+  }
+
+  .kind-table td:first-child::before {
+    content: none;
+  }
+
+  /* a valueless cell would render as a dangling label — drop it */
+  .kind-table td:empty {
+    display: none;
   }
 
   /* shallower nesting indent so deep trees keep usable width at 320px */
