@@ -24,6 +24,13 @@ const NATIVE_PAGES = [
 export function Layout(props: { title: string; children: ReactNode }) {
   const [theme, setTheme] = useState<Theme>(currentTheme);
   const [density, setDensity] = useState<Density>(currentDensity);
+  // Narrow-viewport nav disclosure (issue #161): the links container is
+  // CSS-collapsed below 640px unless open. State lives here so the button
+  // can announce it (aria-expanded) and navigation can close it; on desktop
+  // the button is display:none and the links are always shown, so this
+  // state is inert there.
+  const [navOpen, setNavOpen] = useState(false);
+  const closeNav = () => setNavOpen(false);
   // Registered nav (ui-shell.md §6): native pages first, then `nav: true`
   // plugin pages grouped under a small per-plugin heading. Every page
   // renders through Layout, so this one fetch/render path is how ALL nav —
@@ -47,23 +54,39 @@ export function Layout(props: { title: string; children: ReactNode }) {
 
   return (
     <div className="shell">
-      <nav className="shell-nav" aria-label="Main">
-        <div className="brand">Snowline</div>
-        {NATIVE_PAGES.map((p) => (
-          <NavLink key={p.to} to={p.to} end={p.to === "/"}>
-            {p.label}
-          </NavLink>
-        ))}
-        {navGroups.map((group) => (
-          <div className="nav-group" key={group.plugin}>
-            <p className="nav-group-heading">{group.plugin}</p>
-            {group.pages.map((p) => (
-              <NavLink key={p.to} to={p.to}>
-                {p.label}
-              </NavLink>
-            ))}
-          </div>
-        ))}
+      <nav
+        className={navOpen ? "shell-nav nav-open" : "shell-nav"}
+        aria-label="Main"
+      >
+        <div className="shell-nav-top">
+          <div className="brand">Snowline</div>
+          <button
+            type="button"
+            className="nav-toggle"
+            aria-expanded={navOpen}
+            aria-controls="shell-nav-links"
+            onClick={() => setNavOpen(!navOpen)}
+          >
+            Menu
+          </button>
+        </div>
+        <div className="shell-nav-links" id="shell-nav-links">
+          {NATIVE_PAGES.map((p) => (
+            <NavLink key={p.to} to={p.to} end={p.to === "/"} onClick={closeNav}>
+              {p.label}
+            </NavLink>
+          ))}
+          {navGroups.map((group) => (
+            <div className="nav-group" key={group.plugin}>
+              <p className="nav-group-heading">{group.plugin}</p>
+              {group.pages.map((p) => (
+                <NavLink key={p.to} to={p.to} onClick={closeNav}>
+                  {p.label}
+                </NavLink>
+              ))}
+            </div>
+          ))}
+        </div>
       </nav>
       <main className="shell-main">
         <div className="shell-header">

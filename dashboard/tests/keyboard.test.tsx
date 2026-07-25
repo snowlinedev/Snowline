@@ -55,6 +55,41 @@ describe("keyboard operability", () => {
     expect(link.getAttribute("aria-current")).toBe("page");
   });
 
+  it("nav disclosure is keyboard-operable and announces state", async () => {
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter initialEntries={["/"]}>
+        <App />
+      </MemoryRouter>,
+    );
+    const menu = screen.getByRole("button", { name: "Menu" });
+    expect(menu).toHaveProperty("type", "button");
+    expect(menu.getAttribute("aria-expanded")).toBe("false");
+    expect(menu.getAttribute("aria-controls")).toBe("shell-nav-links");
+
+    menu.focus();
+    await user.keyboard("{Enter}");
+    expect(menu.getAttribute("aria-expanded")).toBe("true");
+    await user.keyboard("{Enter}");
+    expect(menu.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("nav disclosure closes after navigating", async () => {
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter initialEntries={["/"]}>
+        <App />
+      </MemoryRouter>,
+    );
+    const menu = screen.getByRole("button", { name: "Menu" });
+    await user.click(menu);
+    expect(menu.getAttribute("aria-expanded")).toBe("true");
+    await user.click(screen.getByRole("link", { name: "Surfaces" }));
+    // re-query: navigation remounts Layout, so the old node is stale
+    const menuAfter = screen.getByRole("button", { name: "Menu" });
+    expect(menuAfter.getAttribute("aria-expanded")).toBe("false");
+  });
+
   it("retitles the document per route (2.4.2)", async () => {
     const user = userEvent.setup();
     render(
