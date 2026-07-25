@@ -38,8 +38,22 @@ export function PluginPage(props: { plugin: PluginEntry; page: UIPage }) {
     endpoint: templateData(a.endpoint, params),
   }));
 
+  // Additive `page_title` (ui-shell.md §4.2): a page payload may name the
+  // concrete entity behind a param-keyed route (which milestone, which
+  // branch) — id-keyed routes carry an opaque id, so only the data plane
+  // knows a human name. Manifest title stays the pre-load and fallback
+  // header.
+  const payload = loadable.state === "ready" ? loadable.data : undefined;
+  const payloadTitle =
+    typeof payload === "object" &&
+    payload !== null &&
+    !Array.isArray(payload) &&
+    typeof (payload as { page_title?: unknown }).page_title === "string"
+      ? (payload as { page_title: string }).page_title
+      : undefined;
+
   return (
-    <Layout title={props.page.title ?? props.page.id}>
+    <Layout title={payloadTitle ?? props.page.title ?? props.page.id}>
       <Card>
         <PageActions plugin={props.plugin.name} actions={actions} />
         <RegisteredKind

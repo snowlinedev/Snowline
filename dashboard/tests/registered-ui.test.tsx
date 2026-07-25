@@ -54,6 +54,31 @@ describe("registered nav + pages", () => {
     expect(rowLink.getAttribute("href")).toBe("/governance/shadow/main-plan-x");
   });
 
+  it("promotes a payload page_title into the header and document title", async () => {
+    render(
+      <MemoryRouter initialEntries={["/governance/shadow/main-plan-x"]}>
+        <App />
+      </MemoryRouter>,
+    );
+    // The payload's page_title replaces the manifest title once the /ui-api
+    // fetch resolves (ui-shell.md §4.2); the fallback path is pinned by the
+    // no-page_title test below.
+    await screen.findByRole("heading", { level: 1, name: "Branch main-plan-x" });
+    expect(document.title).toBe("Branch main-plan-x · Snowline");
+  });
+
+  it("keeps the manifest title when the payload has no page_title", async () => {
+    render(
+      <MemoryRouter initialEntries={["/governance/shadow"]}>
+        <App />
+      </MemoryRouter>,
+    );
+    await screen.findByText("main-plan-x");
+    expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(
+      "Shadow discussions",
+    );
+  });
+
   it("renders a registered thread page reached via the row link's route", async () => {
     const { container } = render(
       <MemoryRouter initialEntries={["/governance/shadow/main-plan-x"]}>
