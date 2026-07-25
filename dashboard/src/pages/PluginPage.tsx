@@ -48,7 +48,8 @@ export function PluginPage(props: { plugin: PluginEntry; page: UIPage }) {
     typeof payload === "object" &&
     payload !== null &&
     !Array.isArray(payload) &&
-    typeof (payload as { page_title?: unknown }).page_title === "string"
+    typeof (payload as { page_title?: unknown }).page_title === "string" &&
+    (payload as { page_title: string }).page_title.trim() !== ""
       ? (payload as { page_title: string }).page_title
       : undefined;
 
