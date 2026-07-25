@@ -106,24 +106,27 @@ export function KindTable(props: {
   }
   return (
     // Wide tables scroll inside their own container (reflow, 1.4.10): the
-    // page never scrolls horizontally; the data table may.
+    // page never scrolls horizontally; the data table may. Below 640px the
+    // rows stack instead (each cell a labeled line via data-label) — the
+    // explicit table roles keep table semantics for AT when that display
+    // change strips the implicit ones.
     <div className="table-scroll">
-      <table className="kind-table">
+      <table className="kind-table" role="table">
         <caption className="sr-only">{props.caption}</caption>
-        <thead>
-          <tr>
+        <thead role="rowgroup">
+          <tr role="row">
             {props.columns.map((c) => (
-              <th key={c.key} scope="col">
+              <th key={c.key} scope="col" role="columnheader">
                 {c.label}
               </th>
             ))}
           </tr>
         </thead>
-        <tbody>
+        <tbody role="rowgroup">
           {props.rows.map((row, i) => (
-            <tr key={i}>
+            <tr key={i} role="row">
               {props.columns.map((c, j) => (
-                <td key={c.key}>
+                <td key={c.key} role="cell" data-label={c.label}>
                   {j === 0 && row.href ? (
                     <Link to={row.href}>{row.cells[c.key]}</Link>
                   ) : (
