@@ -410,14 +410,22 @@ def maturity_set_payload(artifact) -> dict:
 
 
 def artifact_superseded_payload(artifact) -> dict:
-    """`artifact.superseded` (#166) — the retire/consolidate pointer as row
-    state. `superseded_at` rides as a DOMAIN field (apply stamps it back
-    byte-for-byte); the envelope `at` is the LWW coordinate, which the emit
-    clamp may nudge — the two are deliberately distinct."""
+    """`artifact.superseded` (#166/#174) — the FULL retirement state as row
+    state: the successor pointer (None for a #174 reason-only retirement), the
+    reason (None for a pure consolidation), and the stamp. Apply replaces all
+    three wholesale, so a partitioned retire-vs-supersede race converges on the
+    later write's complete state. `superseded_at` rides as a DOMAIN field
+    (stamped back byte-for-byte); the envelope `at` is the LWW coordinate,
+    which the emit clamp may nudge — the two are deliberately distinct."""
     return _base(
         {
             "artifact_id": str(artifact.id),
-            "superseded_by_id": str(artifact.superseded_by_id),
+            "superseded_by_id": (
+                str(artifact.superseded_by_id)
+                if artifact.superseded_by_id
+                else None
+            ),
+            "retirement_reason": artifact.retirement_reason,
             "superseded_at": (
                 artifact.superseded_at.isoformat()
                 if artifact.superseded_at

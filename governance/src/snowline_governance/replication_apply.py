@@ -632,12 +632,15 @@ def _apply_maturity_set(session, client, envelope: dict) -> None:
 
 
 def _apply_artifact_superseded(session, client, envelope: dict) -> None:
-    """Artifact-level supersession (#166) — register-class: the pointer is one
-    LWW register (`artifact.superseded_by`), so a partitioned double-supersede
-    of the SAME artifact converges on the later write. Both rows must already
-    exist here (retryable when the replacement's registration is still in
-    flight). `superseded_at` is stamped from the payload's DOMAIN field, not
-    the envelope `at` — byte-convergence on the row.
+    """Artifact-level retirement (#166/#174) — register-class: the FULL
+    retirement state (pointer + reason + stamp) is one LWW register
+    (`artifact.superseded_by`), replaced wholesale, so a partitioned
+    retire-vs-supersede race on the SAME artifact converges on the later
+    write's complete state. A reason-only retirement carries a NULL
+    `superseded_by_id` and requires no replacement row; a pointer event's
+    replacement must already exist here (retryable when its registration is
+    still in flight). `superseded_at` is stamped from the payload's DOMAIN
+    field, not the envelope `at` — byte-convergence on the row.
 
     Cross-side note: the local write's replacement-must-be-live check cannot
     run against the peer's un-replicated state, so two sides superseding two
@@ -646,7 +649,7 @@ def _apply_artifact_superseded(session, client, envelope: dict) -> None:
     re-points; apply never rejects it (rejection would park the stream)."""
     p = envelope["payload"]
     artifact_id = _uuid(p["artifact_id"])
-    replacement_id = _uuid(p["superseded_by_id"])
+    replacement_id = _uuid(p.get("superseded_by_id"))
     if replacement_id == artifact_id:
         # No legitimate author produces a self-pointer (the local write rejects
         # it) — malformed, so it parks LOUDLY (§8) rather than corrupting a row.
@@ -654,17 +657,24 @@ def _apply_artifact_superseded(session, client, envelope: dict) -> None:
             f"artifact.superseded event points artifact {artifact_id} at itself"
         )
     artifact = _require(session.get(Artifact, artifact_id), "artifact")
-    replacement = _require(
-        session.get(Artifact, replacement_id), "replacement artifact"
+    replacement = (
+        _require(
+            session.get(Artifact, replacement_id), "replacement artifact"
+        )
+        if replacement_id is not None
+        else None
     )
     # Hard-key the envelope `at` fallback (the `_apply_branch_archived`
-    # pattern): a set pointer must never land with a NULL retirement stamp.
+    # pattern): a retired row must never land with a NULL retirement stamp.
     superseded_at = _dt(p.get("superseded_at")) or replication_stream.parse_at(
         p["at"]
     )
 
     def set_pointer() -> None:
-        artifact.superseded_by_id = replacement.id
+        artifact.superseded_by_id = (
+            replacement.id if replacement is not None else None
+        )
+        artifact.retirement_reason = p.get("retirement_reason")
         artifact.superseded_at = superseded_at
 
     _lww_apply(

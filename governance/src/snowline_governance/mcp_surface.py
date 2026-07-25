@@ -68,7 +68,8 @@ read the ancestor-inherited governance that applies at a scope. Decisions: \
 `applicable_decisions`. Artifacts: `register_artifact` (inline-backed — content \
 lives in the substrate), `revise_artifact`, `resolve_artifact` (collapse \
 competing version leaves), `supersede_artifact` (retire a whole artifact in \
-favor of another — the consolidation verb), `get_artifact` (carries the \
+favor of another — the consolidation verb), `retire_artifact` (retire with a \
+reason and NO successor), `get_artifact` (carries the \
 canonical body by default), `get_artifact_version` (one version's body — \
 competing leaves, superseded history), `list_artifacts`, \
 `list_artifact_versions` (versions stamped with a release milestone slug), \
@@ -845,6 +846,27 @@ def build_main_surface(
             _set_maturity_sync, artifact_id, maturity
         )
 
+    def _retire_artifact_sync(artifact_id, reason):
+        with session_scope() as session:
+            return artifacts.retire_artifact(session, artifact_id, reason)
+
+    @mcp.tool()
+    async def retire_artifact(artifact_id: str, reason: str) -> dict:
+        """Retire an artifact WITHOUT a successor — for docs no live artifact
+        replaces: completed one-time checklists, plans for since-extracted
+        packages, point-in-time audits, stale indexes whose replacement is the
+        platform itself. `reason` is REQUIRED (it is the audit trail a
+        successor pointer would otherwise carry). The artifact drops out of
+        `applicable_artifacts` and the default `list_artifacts` exactly like a
+        superseded one (`include_superseded=True` reveals it with its
+        `retirement_reason`). When a live doc DOES absorb this one, use
+        `supersede_artifact` instead — a real pointer beats a prose reason.
+        Re-retiring updates the reason (the correction path); there is no
+        un-retire."""
+        return await anyio.to_thread.run_sync(
+            _retire_artifact_sync, artifact_id, reason
+        )
+
     def _set_code_refs_sync(artifact_id, code_refs):
         with session_scope() as session:
             return artifacts.set_code_refs(session, artifact_id, code_refs)
@@ -879,7 +901,7 @@ def build_main_surface(
         shape: revise (or register) the surviving spec first, then supersede each
         absorbed doc pointing at it.
 
-        The replacement must be LIVE (not itself superseded) — point at the live
+        The replacement must be LIVE (not itself retired) — point at the live
         end of a chain. Superseding an already-superseded artifact RE-POINTS it
         (the correction path); there is no un-supersede. Version-level
         `resolve_artifact` is unrelated — that collapses competing version

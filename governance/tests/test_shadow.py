@@ -50,8 +50,10 @@ _REAL_WRITE_VERBS = {
     "register_artifact",
     "revise_artifact",
     "resolve_artifact",
-    # artifact-level supersession (#166) — retires a whole artifact, main-only.
+    # artifact-level retirement (#166/#174) — retires a whole artifact
+    # (with or without successor), main-only.
     "supersede_artifact",
+    "retire_artifact",
     "set_governs",
     "set_maturity",
     # structured code anchors (#172) — a real write, main-only.

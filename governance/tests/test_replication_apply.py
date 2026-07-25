@@ -1115,6 +1115,37 @@ def test_code_refs_apply_is_lww_wholesale_replace(db_session, apply_fn):
     ]
 
 
+def test_reason_only_retirement_applies_without_replacement(db_session, apply_fn):
+    """#174: a reason-only retirement event (NULL pointer) needs no replacement
+    row and lands the reason + stamp; a later pointer event replaces the full
+    retirement state wholesale (LWW-newer)."""
+    a = artifacts.register_artifact(db_session, body="# checklist")
+    p = _payload(
+        artifact_id=a["id"],
+        superseded_by_id=None,
+        retirement_reason="completed one-time QA pass",
+        superseded_at=utcnow().isoformat(),
+    )
+    apply_fn(db_session, _envelope(EVENT_ARTIFACT_SUPERSEDED, p))
+    row = db_session.get(Artifact, uuid.UUID(a["id"]))
+    assert row.superseded_by_id is None
+    assert row.retirement_reason == "completed one-time QA pass"
+    assert row.superseded_at is not None
+
+    b = artifacts.register_artifact(db_session, body="# absorber")
+    newer = _payload(
+        artifact_id=a["id"],
+        superseded_by_id=b["id"],
+        retirement_reason=None,
+        superseded_at=utcnow().isoformat(),
+    )
+    newer["at"] = (utcnow() + timedelta(minutes=5)).isoformat()
+    apply_fn(db_session, _envelope(EVENT_ARTIFACT_SUPERSEDED, newer))
+    row = db_session.get(Artifact, uuid.UUID(a["id"]))
+    assert str(row.superseded_by_id) == b["id"]
+    assert row.retirement_reason is None  # wholesale state replace
+
+
 def test_artifact_superseded_missing_replacement_is_retryable(
     db_session, apply_fn
 ):
