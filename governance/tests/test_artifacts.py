@@ -1128,6 +1128,10 @@ def test_derive_title_cases():
     assert artifacts.derive_title("") is None
     long = "# " + "x" * 500
     assert len(artifacts.derive_title(long)) == 200
+    # A comment/shebang inside an OPENING code fence is not a heading.
+    fenced = "```bash\n# not a title\n```\n# Real title\n"
+    assert artifacts.derive_title(fenced) == "Real title"
+    assert artifacts.derive_title("```\n# only code\n```") is None
 
 
 def test_titles_ride_versions_and_compact_rows(db_session):

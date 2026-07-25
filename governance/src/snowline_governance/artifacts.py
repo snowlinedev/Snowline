@@ -328,8 +328,16 @@ def derive_title(body: str | None) -> str | None:
     unlabeled doc stays honestly unlabeled — no first-line guessing)."""
     if not body:
         return None
+    in_fence = False
     for line in body.splitlines():
         stripped = line.strip()
+        # A `# comment` (or shebang) inside a fenced code block is not a
+        # heading — track fence state so a doc OPENING with code stays honest.
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
         if stripped.startswith("#"):
             text = stripped.lstrip("#").strip()
             if text:
