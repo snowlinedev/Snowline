@@ -258,9 +258,10 @@ def _register_read_tools(
         limit: int | None = None,
         include_superseded: bool = False,
     ) -> dict:
-        """List registered artifacts as compact rows (id, doc_kind, backend,
-        repo, path, maturity, governs, superseded_by_id, version_count,
-        is_branched), newest-first, capped.
+        """List registered artifacts as compact rows (id, title — derived from
+        the body's first heading — doc_kind, backend, repo, path, maturity,
+        governs, superseded_by_id, version_count, is_branched), newest-first,
+        capped.
         `governs` (a scope slug, resolved against the platform) narrows to
         artifacts governing that scope — by an association row OR `governs_all`.
         Artifacts retired via `supersede_artifact` are hidden by default; pass

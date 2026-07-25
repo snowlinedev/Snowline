@@ -992,6 +992,25 @@ def test_milestone_round_trips_emit_to_apply(db_session, apply_fn):
     assert v is not None and v.milestone == "v1-launch"
 
 
+def test_title_is_rederived_at_apply_not_shipped(db_session, apply_fn):
+    """#168: `title` is a pure function of the body — apply re-derives it from
+    the payload's `body_snapshot`, converging byte-for-byte with the author's
+    store although no payload carries a title field."""
+    local = artifacts.register_artifact(db_session, body="# Author title\nbody")
+    local_v = db_session.get(
+        ArtifactVersion, uuid.UUID(local["current_version"]["id"])
+    )
+    built = replication_stream.artifact_registered_payload(
+        db_session, db_session.get(Artifact, local_v.artifact_id), local_v
+    )
+    assert "title" not in built["version"]  # derived state never rides the wire
+    built["id"] = str(uuid.uuid4())
+    built["version"]["id"] = str(uuid.uuid4())
+    apply_fn(db_session, _envelope(EVENT_ARTIFACT_REGISTERED, built))
+    v = db_session.get(ArtifactVersion, uuid.UUID(built["version"]["id"]))
+    assert v.title == "Author title"
+
+
 # --- artifact-level supersession apply (#166) ---------------------------------
 
 

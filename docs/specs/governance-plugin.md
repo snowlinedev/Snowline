@@ -68,7 +68,11 @@ Carried over unchanged in shape (a lift, per the develop-in-public carve), minus
   nullable self-FK to the artifact that replaced it, `superseded_at` the
   retirement stamp; NULL = live, and N retired docs may point at the one spec
   that absorbed them),
-  `ArtifactVersion` (supersession DAG + content snapshot/locator, plus an
+  `ArtifactVersion` (supersession DAG + content snapshot/locator, plus a
+  derived display `title` (#168) — the body's first markdown heading, a pure
+  function of the snapshot computed at mint AND re-derived at replication
+  apply (never shipped on the wire), surfaced on every version read and the
+  compact list rows — plus an
   optional `milestone` — a SOFT release-correlation slug stamped verbatim at
   mint, never resolved, the portfolio's cross-plugin key: PM tags work items
   with the same slug, so a stamped version records which artifact version a

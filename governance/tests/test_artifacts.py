@@ -1113,3 +1113,49 @@ def test_applicable_artifacts_excludes_superseded(db_session, stub_scope_client)
     ids = {a["id"] for a in out["artifacts"]}
     assert ids == {survivor["id"], replacement_everywhere["id"]}
     assert out["items_total"] == 2
+
+
+# --- derived titles (#168) ----------------------------------------------------
+
+
+def test_derive_title_cases():
+    assert artifacts.derive_title("# Sync spec\nbody") == "Sync spec"
+    assert artifacts.derive_title("intro\n\n## Deep heading\n") == "Deep heading"
+    assert artifacts.derive_title("   ###   padded   \n") == "padded"
+    assert artifacts.derive_title("no heading here") is None
+    assert artifacts.derive_title("#\n# real title") == "real title"  # bare hash skipped
+    assert artifacts.derive_title(None) is None
+    assert artifacts.derive_title("") is None
+    long = "# " + "x" * 500
+    assert len(artifacts.derive_title(long)) == 200
+
+
+def test_titles_ride_versions_and_compact_rows(db_session):
+    art = artifacts.register_artifact(db_session, body="# Family sync\ncontent")
+    assert art["current_version"]["title"] == "Family sync"
+
+    artifacts.revise_artifact(
+        db_session, art["id"], "refines", body_snapshot="# Family sync v2\nmore"
+    )
+    got = artifacts.get_artifact(db_session, art["id"])
+    assert got["current_version"]["title"] == "Family sync v2"
+
+    rows = artifacts.list_artifacts(db_session)["artifacts"]
+    assert rows[0]["title"] == "Family sync v2"
+
+    # A headingless doc stays honestly unlabeled.
+    bare = artifacts.register_artifact(db_session, body="just prose")
+    assert artifacts.get_artifact(db_session, bare["id"])["current_version"][
+        "title"
+    ] is None
+
+
+def test_titles_ride_the_batched_applicable_read(db_session, stub_scope_client):
+    artifacts.register_artifact(
+        db_session, body="# Widget spec\n...",
+        governs="acme/widget", resolved_scopes=_resolved("acme/widget"),
+    )
+    artifacts.register_artifact(db_session, body="# Conventions\n...", governs="*")
+    stub = stub_scope_client(tree={"acme": None, "acme/widget": "acme"})
+    out = artifacts.applicable_artifacts(db_session, "acme/widget", stub)
+    assert {a["title"] for a in out["artifacts"]} == {"Widget spec", "Conventions"}
