@@ -74,3 +74,31 @@ def test_main_surface_exposes_the_decision_and_artifact_tools():
         # the reverse code-map read (#172) — shared read set, both surfaces.
         "artifacts_for_path",
     }
+
+
+def test_polymorphic_tool_params_advertise_typed_schemas():
+    """Feedback e9ac7680: untyped tool params surface as schema-less, so
+    clients pass JSON-encoded strings that only fail server-side. The
+    polymorphic params must advertise their real shapes — `code_refs` an array
+    of objects, `governs` a string-or-array — so malformed input is caught at
+    the schema layer."""
+    surface = build_main_surface(scope_client=_NoopScopeClient())
+    schemas = {
+        t.name: t.inputSchema for t in anyio.run(surface.list_tools)
+    }
+
+    def _types(prop: dict) -> set[str]:
+        if "type" in prop:
+            return {prop["type"]}
+        return {
+            alt["type"]
+            for alt in prop.get("anyOf", [])
+            if isinstance(alt, dict) and "type" in alt
+        }
+
+    code_refs = schemas["set_code_refs"]["properties"]["code_refs"]
+    assert "array" in _types(code_refs)
+    assert "string" not in _types(code_refs)
+    for tool in ("set_governs", "register_artifact"):
+        governs = schemas[tool]["properties"]["governs"]
+        assert {"string", "array"} <= _types(governs)
