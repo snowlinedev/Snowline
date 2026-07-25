@@ -41,6 +41,7 @@ from sqlalchemy.orm import Session
 
 from snowline_governance import branching, replication_stream
 from snowline_governance.contract import (
+    EVENT_ARTIFACT_CODE_REFS_SET,
     EVENT_ARTIFACT_GOVERNS_SET,
     EVENT_ARTIFACT_MATURITY_SET,
     EVENT_ARTIFACT_REGISTERED,
@@ -579,6 +580,9 @@ def _artifact_dict(
         "superseded_at": (
             a.superseded_at.isoformat() if a.superseded_at else None
         ),
+        # Structured code anchors (#172) — full record only; compact rows stay
+        # lean (query the reverse direction via `artifacts_for_path`).
+        "code_refs": a.code_refs,
         "branch_points": [str(p) for p in points],
         "version_count": count or 0,
         "created_at": a.created_at.isoformat() if a.created_at else None,
@@ -999,6 +1003,159 @@ def set_governs(
         replication_stream.governs_set_payload(session, a),
     )
     return _artifact_dict(session, a)
+
+
+# --- structured code anchors (#172) ------------------------------------------
+
+_CODE_REF_KEYS = ("repo", "path", "symbol", "note")
+_CODE_REFS_MAX = 100
+_CODE_REF_FIELD_MAX = 500
+
+
+def _normalize_code_refs(refs) -> list[dict] | None:
+    """Validate + normalize a `code_refs` argument: a list of dicts with a
+    required non-empty `path` and optional `repo`/`symbol`/`note` strings.
+    Strings are stripped; empties drop to absent; unknown keys are rejected
+    LOUDLY (a typo'd key would otherwise silently vanish from the map); rows
+    de-duplicate on `(repo, path, symbol)` keeping first occurrence. `None` or
+    `[]` mean CLEAR (returns None — the unmapped state)."""
+    if refs is None:
+        return None
+    if not isinstance(refs, (list, tuple)):
+        raise ValueError(
+            f"code_refs must be a list of {{repo?, path, symbol?, note?}} "
+            f"rows or None to clear — got {refs!r}"
+        )
+    if len(refs) > _CODE_REFS_MAX:
+        raise ValueError(
+            f"code_refs is capped at {_CODE_REFS_MAX} rows (got {len(refs)}) — "
+            "anchor the load-bearing files/dirs, not the whole tree"
+        )
+    out: list[dict] = []
+    seen: set[tuple] = set()
+    for i, ref in enumerate(refs):
+        if not isinstance(ref, dict):
+            raise ValueError(f"code_refs[{i}] is not an object: {ref!r}")
+        unknown = set(ref) - set(_CODE_REF_KEYS)
+        if unknown:
+            raise ValueError(
+                f"code_refs[{i}] has unknown key(s) {sorted(unknown)} — "
+                f"allowed: {list(_CODE_REF_KEYS)}"
+            )
+        row: dict = {}
+        for key in _CODE_REF_KEYS:
+            value = ref.get(key)
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"code_refs[{i}].{key} must be a string, got {value!r}"
+                )
+            value = value.strip().strip("/") if key == "path" else value.strip()
+            if not value:
+                continue
+            if len(value) > _CODE_REF_FIELD_MAX:
+                raise ValueError(
+                    f"code_refs[{i}].{key} exceeds {_CODE_REF_FIELD_MAX} chars"
+                )
+            row[key] = value
+        if "path" not in row:
+            raise ValueError(f"code_refs[{i}] needs a non-empty `path`")
+        key = (row.get("repo"), row["path"], row.get("symbol"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(row)
+    return out or None
+
+
+def set_code_refs(session: Session, artifact_id: str, code_refs) -> dict:
+    """Set (or clear) an artifact's structured code anchors (#172) — the
+    spec↔code map: `[{repo?, path, symbol?, note?}]` naming the code this doc
+    grounds in. A WHOLESALE replace mirroring `set_governs` (the whole list is
+    one LWW-contested value); `None`/`[]` clears. Paths are stored as given
+    (repo-relative by convention, leading/trailing slashes stripped) — nothing
+    here resolves them; the drift sweep is what validates anchors against the
+    working tree, and a non-resolving path is a drift finding, not a write
+    error. Returns the refreshed artifact."""
+    a = _require_artifact(session, artifact_id)
+    a.code_refs = _normalize_code_refs(code_refs)
+    session.flush()
+    # STREAM emit — register-class (§6): the list replaces wholesale, so the
+    # whole set is the register's value (the governs pattern).
+    replication_stream.emit(
+        session,
+        EVENT_ARTIFACT_CODE_REFS_SET,
+        replication_stream.code_refs_set_payload(a),
+    )
+    return _artifact_dict(session, a)
+
+
+def _path_matches(ref_path: str, query_path: str) -> bool:
+    """Directory-prefix matching in BOTH directions: a ref anchoring a
+    directory matches every file under it, and a query naming a directory
+    matches every anchored file under IT. Exact match included."""
+    return (
+        query_path == ref_path
+        or query_path.startswith(ref_path + "/")
+        or ref_path.startswith(query_path + "/")
+    )
+
+
+def artifacts_for_path(
+    session: Session,
+    path: str,
+    repo: str | None = None,
+    limit: int | None = None,
+) -> dict:
+    """The REVERSE code-map read (#172): which LIVE artifacts cite `path`?
+    Matching is exact-or-directory-prefix in both directions (`_path_matches`);
+    `repo` narrows to refs naming that repo (case-insensitive; refs with NO
+    repo match any — the single-repo convention). Superseded artifacts are
+    excluded — their replacement carries the living map. Rows are compact
+    headers + the artifact's matching refs. Scans the mapped corpus in Python
+    (`code_refs IS NOT NULL` is a small set; prefix semantics don't index
+    cheaply in JSONB) — revisit if the mapped corpus grows 100×."""
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("`path` must be a non-empty string")
+    query_path = path.strip().strip("/")
+    repo_ci = repo.strip().lower() if isinstance(repo, str) and repo.strip() else None
+    lim = _resolve_list_limit(limit)
+
+    rows = list(
+        session.scalars(
+            select(Artifact)
+            .where(
+                Artifact.code_refs.is_not(None),
+                Artifact.superseded_by_id.is_(None),
+            )
+            .order_by(Artifact.created_at.desc(), Artifact.id.desc())
+        )
+    )
+    matched: list[tuple[Artifact, list[dict]]] = []
+    for a in rows:
+        hits = []
+        for ref in a.code_refs or []:
+            if repo_ci is not None:
+                ref_repo = (ref.get("repo") or "").lower()
+                if ref_repo and ref_repo != repo_ci:
+                    continue
+            if _path_matches(ref["path"], query_path):
+                hits.append(ref)
+        if hits:
+            matched.append((a, hits))
+
+    out = []
+    for a, hits in matched[:lim]:
+        row = _artifact_compact_row(session, a)
+        row["matching_refs"] = hits
+        out.append(row)
+    return {
+        "path": query_path,
+        "repo": repo,
+        "artifacts": out,
+        "items_total": len(matched),
+    }
 
 
 def supersede_artifact(

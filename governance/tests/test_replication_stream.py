@@ -154,6 +154,8 @@ def test_full_write_surface_emits_every_registry_event_type(db_session):
     # the first — the consolidate verb's event.
     absorbed = artifacts.register_artifact(db_session, body="# early spec")
     artifacts.supersede_artifact(db_session, absorbed["id"], art["id"])
+    # Structured code anchors (#172).
+    artifacts.set_code_refs(db_session, art["id"], [{"path": "lib/spec.dart"}])
 
     emitted = {r.event_type for r in _outbox(db_session)}
     assert emitted == set(GOVERNANCE_EVENT_TYPES)

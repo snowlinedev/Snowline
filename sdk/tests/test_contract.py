@@ -46,6 +46,7 @@ def test_event_types_frozenset():
             "artifact.maturity_set",
             "artifact.governs_set",
             "artifact.superseded",
+            "artifact.code_refs_set",
             "scope.created",
             "scope.updated",
             "memory.set",

@@ -54,6 +54,8 @@ _REAL_WRITE_VERBS = {
     "supersede_artifact",
     "set_governs",
     "set_maturity",
+    # structured code anchors (#172) — a real write, main-only.
+    "set_code_refs",
 }
 
 _SHADOW_WRITE_TOOLS = {
@@ -86,6 +88,8 @@ _READ_REAL_GROUNDING = {
     # versions + decision leaves, on the shared read set so speculation
     # sessions can find their grounding without listing everything.
     "governance_corpus_search",
+    # The reverse code-map read (#172) — pure read, shared set.
+    "artifacts_for_path",
     # §6.1 unreconciled view (replication-continuity, #79) — a pure read on the
     # shared read set, so speculation sessions see flagged pairs too.
     "unreconciled_decisions",

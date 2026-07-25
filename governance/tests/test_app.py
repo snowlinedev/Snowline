@@ -65,7 +65,11 @@ def test_main_surface_exposes_the_decision_and_artifact_tools():
         "list_artifact_versions",
         "set_governs",
         "set_maturity",
+        # structured code anchors (#172) — the spec↔code map write.
+        "set_code_refs",
         "applicable_artifacts",
         # real-graph corpus search (#170) — shared read set, both surfaces.
         "governance_corpus_search",
+        # the reverse code-map read (#172) — shared read set, both surfaces.
+        "artifacts_for_path",
     }

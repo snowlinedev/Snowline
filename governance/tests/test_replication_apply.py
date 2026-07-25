@@ -32,6 +32,7 @@ from snowline_governance.contract import (
     EVENT_ARTIFACT_MATURITY_SET,
     EVENT_ARTIFACT_REGISTERED,
     EVENT_ARTIFACT_REVISED,
+    EVENT_ARTIFACT_CODE_REFS_SET,
     EVENT_ARTIFACT_SUPERSEDED,
     EVENT_DECISION_MARKED_COMPATIBLE,
     EVENT_DECISION_RECORDED,
@@ -1090,6 +1091,28 @@ def test_artifact_superseded_missing_stamp_falls_back_to_envelope_at(
     row = db_session.get(Artifact, uuid.UUID(a["id"]))
     assert str(row.superseded_by_id) == b["id"]
     assert row.superseded_at == replication_stream.parse_at(p["at"])
+
+
+def test_code_refs_apply_is_lww_wholesale_replace(db_session, apply_fn):
+    """#172: the code-refs list rides the same §6 register the other artifact
+    mutations do — an older incoming replace loses to a newer local one; a
+    newer incoming wins wholesale."""
+    art = artifacts.register_artifact(db_session, body="# spec")
+    artifacts.set_code_refs(db_session, art["id"], [{"path": "lib/new.dart"}])
+
+    older = _payload(artifact_id=art["id"], code_refs=[{"path": "lib/old.dart"}])
+    older["at"] = (utcnow() - timedelta(minutes=5)).isoformat()
+    apply_fn(db_session, _envelope(EVENT_ARTIFACT_CODE_REFS_SET, older))
+    assert db_session.get(Artifact, uuid.UUID(art["id"])).code_refs == [
+        {"path": "lib/new.dart"}
+    ]
+
+    newer = _payload(artifact_id=art["id"], code_refs=[{"path": "lib/peer.dart"}])
+    newer["at"] = (utcnow() + timedelta(minutes=5)).isoformat()
+    apply_fn(db_session, _envelope(EVENT_ARTIFACT_CODE_REFS_SET, newer))
+    assert db_session.get(Artifact, uuid.UUID(art["id"])).code_refs == [
+        {"path": "lib/peer.dart"}
+    ]
 
 
 def test_artifact_superseded_missing_replacement_is_retryable(

@@ -52,6 +52,7 @@ from datetime import datetime, timedelta, timezone
 from snowline_plugin_sdk.replication import emit as sdk_emit
 
 from snowline_governance.contract import (
+    EVENT_ARTIFACT_CODE_REFS_SET,
     EVENT_ARTIFACT_GOVERNS_SET,
     EVENT_ARTIFACT_MATURITY_SET,
     EVENT_ARTIFACT_SUPERSEDED,
@@ -74,6 +75,7 @@ LWW_REGISTERS: dict[str, tuple[str, str, str]] = {
     EVENT_ARTIFACT_MATURITY_SET: ("artifact", "artifact_id", "maturity"),
     EVENT_ARTIFACT_GOVERNS_SET: ("artifact", "artifact_id", "governs"),
     EVENT_ARTIFACT_SUPERSEDED: ("artifact", "artifact_id", "superseded_by"),
+    EVENT_ARTIFACT_CODE_REFS_SET: ("artifact", "artifact_id", "code_refs"),
     EVENT_SHADOW_GRADUATED: ("shadow_node", "node_id", "graduated_decision_id"),
 }
 
@@ -422,6 +424,15 @@ def artifact_superseded_payload(artifact) -> dict:
                 else None
             ),
         }
+    )
+
+
+def code_refs_set_payload(artifact) -> dict:
+    """`artifact.code_refs_set` (#172) — the whole normalized list as row state
+    (a wholesale replace, so the whole list is the LWW-contested value, exactly
+    like governs)."""
+    return _base(
+        {"artifact_id": str(artifact.id), "code_refs": artifact.code_refs}
     )
 
 

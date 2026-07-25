@@ -182,6 +182,13 @@ class Artifact(Base):
         ForeignKey("artifacts.id"), nullable=True
     )
     superseded_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    # Structured code anchors (#172): the spec↔code map — a JSONB list of
+    # `{repo?, path, symbol?, note?}` rows naming the code this doc grounds in.
+    # Validated + normalized at the write boundary (`artifacts.set_code_refs`,
+    # a wholesale replace mirroring `governs`); NULL = unmapped. The weekly
+    # drift sweep populates and re-validates these — a non-resolving path is
+    # itself a drift finding, which is what keeps the map from rotting.
+    code_refs: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         server_default=func.now(), onupdate=func.now()
