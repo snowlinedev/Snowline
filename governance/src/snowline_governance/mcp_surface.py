@@ -72,9 +72,11 @@ favor of another — the consolidation verb), `get_artifact` (carries the \
 canonical body by default), `get_artifact_version` (one version's body — \
 competing leaves, superseded history), `list_artifacts`, \
 `list_artifact_versions` (versions stamped with a release milestone slug), \
-`set_governs`, `set_maturity`, `applicable_artifacts` (artifacts governing a \
+`set_governs`, `set_maturity`, `set_code_refs` (the spec↔code anchor map), \
+`applicable_artifacts` (artifacts governing a \
 scope, ancestor-inherited), `governance_corpus_search` (full-text over current \
-artifact versions + decision leaves). `applicable_*` resolve "what governs here" by walking the \
+artifact versions + decision leaves), `artifacts_for_path` (which specs cite \
+a code path). `applicable_*` resolve "what governs here" by walking the \
 scope tree UPWARD and halting at the first isolated ancestor. Scopes are owned \
 by the platform; governance references them by slug and reads the scope tree \
 from the platform to compute applicability.\
@@ -97,7 +99,8 @@ and `shadow_corpus_search` (full-text over the shadow content \
 + the real decisions backlinked to a shadow line). Read-real grounding: \
 `get_decision`, `list_decisions`, `applicable_decisions`, `get_artifact`, \
 `get_artifact_version`, `list_artifacts`, `list_artifact_versions`, \
-`applicable_artifacts`, `governance_corpus_search` — read and search the \
+`applicable_artifacts`, `governance_corpus_search`, `artifacts_for_path` — \
+read and search the \
 real graph freely to ground \
 your speculation. It deliberately exposes NO real-write verb — `record_decision`, \
 `supersede_decision`, and the artifact write verbs are ABSENT by construction, on \
@@ -321,6 +324,29 @@ def _register_read_tools(
         both instances once it replicates. Read-only; empty is the healthy state.
         """
         return await anyio.to_thread.run_sync(_unreconciled_decisions_sync, limit)
+
+    def _artifacts_for_path_sync(path, repo, limit):
+        with session_scope() as session:
+            return artifacts.artifacts_for_path(
+                session, path, repo=repo, limit=limit
+            )
+
+    @mcp.tool()
+    async def artifacts_for_path(
+        path: str, repo: str | None = None, limit: int | None = None
+    ) -> dict:
+        """The REVERSE code-map read: which LIVE artifacts cite this code
+        `path` in their structured code anchors (`set_code_refs`)? One call
+        instead of a grep-and-read pass — ask before editing a file to find the
+        specs that govern it. Matching is exact-or-directory-prefix in both
+        directions (a ref anchoring a directory matches files under it; a
+        directory query matches anchored files under it). `repo` narrows to
+        refs naming that repo (refs without a repo match any). Rows are compact
+        headers + the matching refs; superseded artifacts never match.
+        Read-only."""
+        return await anyio.to_thread.run_sync(
+            _artifacts_for_path_sync, path, repo, limit
+        )
 
     def _governance_corpus_search_sync(query, scope, limit):
         scope_id = None
@@ -817,6 +843,24 @@ def build_main_surface(
         created. Returns the refreshed artifact."""
         return await anyio.to_thread.run_sync(
             _set_maturity_sync, artifact_id, maturity
+        )
+
+    def _set_code_refs_sync(artifact_id, code_refs):
+        with session_scope() as session:
+            return artifacts.set_code_refs(session, artifact_id, code_refs)
+
+    @mcp.tool()
+    async def set_code_refs(artifact_id: str, code_refs=None) -> dict:
+        """Set (or clear) an artifact's structured CODE ANCHORS — the spec↔code
+        map: a list of `{repo?, path, symbol?, note?}` rows naming the code this
+        doc grounds in (repo-relative paths; a directory path anchors everything
+        under it). A wholesale replace; `None`/`[]` clears. Paths are stored,
+        not resolved — the drift sweep validates anchors against the working
+        tree, and a non-resolving path is a drift finding. Query the reverse
+        direction ("which specs cite this file?") via `artifacts_for_path`.
+        Returns the refreshed artifact."""
+        return await anyio.to_thread.run_sync(
+            _set_code_refs_sync, artifact_id, code_refs
         )
 
     def _supersede_artifact_sync(artifact_id, replaced_by_id):

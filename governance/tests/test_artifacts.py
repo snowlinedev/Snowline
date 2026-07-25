@@ -1115,6 +1115,119 @@ def test_applicable_artifacts_excludes_superseded(db_session, stub_scope_client)
     assert out["items_total"] == 2
 
 
+# --- structured code anchors (#172) ------------------------------------------
+
+
+def test_set_code_refs_normalizes_and_rides_the_full_record(db_session):
+    art = artifacts.register_artifact(db_session, body="# Sync spec")
+    out = artifacts.set_code_refs(
+        db_session,
+        art["id"],
+        [
+            {"path": "/lib/features/sync/", "symbol": "SyncRecordRegistry"},
+            {"path": "lib/features/sync", "symbol": "SyncRecordRegistry"},  # dupe
+            {"path": "specs/sync.md", "note": "  the doc itself  ", "repo": ""},
+        ],
+    )
+    assert out["code_refs"] == [
+        {"path": "lib/features/sync", "symbol": "SyncRecordRegistry"},
+        {"path": "specs/sync.md", "note": "the doc itself"},
+    ]
+    # Compact rows stay LEAN — refs ride the full record only.
+    assert "code_refs" not in artifacts.list_artifacts(db_session)["artifacts"][0]
+    # Clear via None or [].
+    assert artifacts.set_code_refs(db_session, art["id"], [])["code_refs"] is None
+
+
+def test_set_code_refs_rejects_bad_shapes(db_session):
+    art = artifacts.register_artifact(db_session, body="# spec")
+    with pytest.raises(ValueError, match="unknown key"):
+        artifacts.set_code_refs(db_session, art["id"], [{"path": "a", "pth": "b"}])
+    with pytest.raises(ValueError, match="needs a non-empty `path`"):
+        artifacts.set_code_refs(db_session, art["id"], [{"symbol": "X"}])
+    with pytest.raises(ValueError, match="must be a list"):
+        artifacts.set_code_refs(db_session, art["id"], "lib/foo.py")
+    with pytest.raises(ValueError, match="must be a string"):
+        artifacts.set_code_refs(db_session, art["id"], [{"path": 3}])
+
+
+def test_artifacts_for_path_prefix_matching_both_directions(db_session):
+    dir_anchor = artifacts.register_artifact(db_session, body="# Sync overview")
+    artifacts.set_code_refs(
+        db_session, dir_anchor["id"], [{"path": "lib/features/sync"}]
+    )
+    file_anchor = artifacts.register_artifact(db_session, body="# Registry spec")
+    artifacts.set_code_refs(
+        db_session, file_anchor["id"],
+        [{"path": "lib/features/sync/services/registry.dart"}],
+    )
+    artifacts.register_artifact(db_session, body="# Unmapped")
+
+    # A file query matches the directory anchor AND the exact file anchor.
+    out = artifacts.artifacts_for_path(
+        db_session, "lib/features/sync/services/registry.dart"
+    )
+    assert {a["id"] for a in out["artifacts"]} == {
+        dir_anchor["id"], file_anchor["id"],
+    }
+    # A directory query matches anchored files UNDER it.
+    out = artifacts.artifacts_for_path(db_session, "lib/features/sync/services/")
+    assert {a["id"] for a in out["artifacts"]} == {
+        dir_anchor["id"], file_anchor["id"],
+    }
+    # An unrelated path matches nothing.
+    assert artifacts.artifacts_for_path(db_session, "lib/other")["artifacts"] == []
+    # Rows carry the matching refs.
+    row = artifacts.artifacts_for_path(
+        db_session, "lib/features/sync"
+    )["artifacts"]
+    assert all(r["matching_refs"] for r in row)
+
+
+def test_artifacts_for_path_repo_narrowing_and_superseded_exclusion(db_session):
+    tracks = artifacts.register_artifact(db_session, body="# Tracks spec")
+    artifacts.set_code_refs(
+        db_session, tracks["id"],
+        [{"repo": "TurtlesEdge/turtletracks", "path": "lib/main.dart"}],
+    )
+    anyrepo = artifacts.register_artifact(db_session, body="# Conventions")
+    artifacts.set_code_refs(db_session, anyrepo["id"], [{"path": "lib/main.dart"}])
+
+    out = artifacts.artifacts_for_path(
+        db_session, "lib/main.dart", repo="turtlesedge/turtletracks"
+    )
+    # Case-insensitive repo match; repo-less refs match any repo.
+    assert {a["id"] for a in out["artifacts"]} == {tracks["id"], anyrepo["id"]}
+    out = artifacts.artifacts_for_path(
+        db_session, "lib/main.dart", repo="other/repo"
+    )
+    assert {a["id"] for a in out["artifacts"]} == {anyrepo["id"]}
+
+    # A superseded artifact's refs stop matching.
+    artifacts.supersede_artifact(db_session, tracks["id"], anyrepo["id"])
+    out = artifacts.artifacts_for_path(db_session, "lib/main.dart")
+    assert {a["id"] for a in out["artifacts"]} == {anyrepo["id"]}
+
+
+def test_artifacts_for_path_blank_raises(db_session):
+    with pytest.raises(ValueError, match="non-empty"):
+        artifacts.artifacts_for_path(db_session, "  ")
+
+
+def test_artifacts_for_path_tolerates_malformed_replicated_rows(db_session):
+    """Replicated code_refs apply verbatim — a malformed peer row (no `path`)
+    must degrade to a non-match, never crash the read."""
+    art = artifacts.register_artifact(db_session, body="# spec")
+    row = db_session.get(
+        artifacts.Artifact, uuid.UUID(art["id"])
+    )
+    row.code_refs = [{"symbol": "NoPath"}, "not-a-dict", {"path": "lib/ok.dart"}]
+    db_session.flush()
+    out = artifacts.artifacts_for_path(db_session, "lib/ok.dart")
+    assert [a["id"] for a in out["artifacts"]] == [art["id"]]
+    assert out["artifacts"][0]["matching_refs"] == [{"path": "lib/ok.dart"}]
+
+
 # --- derived titles (#168) ----------------------------------------------------
 
 

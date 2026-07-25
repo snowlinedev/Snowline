@@ -64,6 +64,10 @@ EVENT_ARTIFACT_GOVERNS_SET: str = "artifact.governs_set"
 # lands in BOTH pinned EVENT_TYPES copies in ONE commit, NO CONTRACT_VERSION
 # bump (envelope keying fields unchanged — the marked_compatible precedent).
 EVENT_ARTIFACT_SUPERSEDED: str = "artifact.superseded"
+# Structured code anchors (#172) — the spec↔code map set as one wholesale
+# replace (mirrors governs_set). Register-class (LWW on the whole list).
+# Additive vocabulary — both pinned copies, one commit, no version bump.
+EVENT_ARTIFACT_CODE_REFS_SET: str = "artifact.code_refs_set"
 # The platform's own adoption (replication-continuity §8, §9 item 5, issue
 # #81): the scope namespace dogfoods the same contract it offers plugins.
 # Governance does not emit these — they're vendored here ONLY so this copy
@@ -112,6 +116,7 @@ GOVERNANCE_EVENT_TYPES: frozenset[str] = frozenset(
         EVENT_ARTIFACT_MATURITY_SET,
         EVENT_ARTIFACT_GOVERNS_SET,
         EVENT_ARTIFACT_SUPERSEDED,
+        EVENT_ARTIFACT_CODE_REFS_SET,
     }
 )
 

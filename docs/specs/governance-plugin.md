@@ -97,7 +97,11 @@ Carried over unchanged in shape (a lift, per the develop-in-public carve), minus
   `resolve_artifact` (leaf resolution), `supersede_artifact` (#166 — retire a
   whole artifact in favor of another: the consolidation verb; the replacement
   must be live, re-pointing an already-retired artifact is the correction
-  path, and there is no un-supersede), `set_governs`, `set_maturity`.
+  path, and there is no un-supersede), `set_governs`, `set_maturity`,
+  `set_code_refs` (#172 — the structured spec↔code anchor map:
+  `[{repo?, path, symbol?, note?}]`, a wholesale replace mirroring governs;
+  paths are stored, never resolved — the drift sweep validates anchors, and a
+  non-resolving path is a drift finding, not a write error).
   **Amended for first-class milestones** (`milestones.md` §6.1): the write
   verbs validate + resolve the milestone ref against the platform registry
   (hard-fail on unknown; canonical address stored); `revise_artifact`'s
@@ -123,6 +127,10 @@ Carried over unchanged in shape (a lift, per the develop-in-public carve), minus
   hits over current artifact versions (derived title + body) and current
   decision leaves, scope-narrowable, on the shared read set (both surfaces).
   Superseded artifacts/decisions and historical versions never match.
+  `artifacts_for_path` (#172) is the reverse code-map read: which live
+  artifacts cite a code path in their `code_refs` (exact-or-directory-prefix
+  matching in both directions, optional repo narrowing) — one call replacing a
+  grep-and-read pass when editing code.
 - **Scope reads:** delegated to / proxied from the platform scope surface (a
   reader needs the tree to make sense of inheritance).
 

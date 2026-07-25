@@ -68,6 +68,7 @@ from sqlalchemy import func, select
 
 from snowline_governance import artifacts, concurrence, replication_stream
 from snowline_governance.contract import (
+    EVENT_ARTIFACT_CODE_REFS_SET,
     EVENT_ARTIFACT_GOVERNS_SET,
     EVENT_ARTIFACT_MATURITY_SET,
     EVENT_ARTIFACT_REGISTERED,
@@ -672,6 +673,24 @@ def _apply_artifact_superseded(session, client, envelope: dict) -> None:
     session.flush()
 
 
+def _apply_code_refs_set(session, client, envelope: dict) -> None:
+    """Structured code anchors (#172) — register-class wholesale replace, the
+    governs pattern minus scope resolution (paths are conventions, not
+    platform-owned identities — nothing to resolve or gate on)."""
+    p = envelope["payload"]
+    artifact_id = _uuid(p["artifact_id"])
+    artifact = _require(session.get(Artifact, artifact_id), "artifact")
+    _lww_apply(
+        session,
+        envelope,
+        "artifact",
+        artifact_id,
+        "code_refs",
+        lambda: setattr(artifact, "code_refs", p.get("code_refs")),
+    )
+    session.flush()
+
+
 def _apply_governs_set(session, client, envelope: dict) -> None:
     p = envelope["payload"]
     artifact_id = _uuid(p["artifact_id"])
@@ -721,4 +740,5 @@ _HANDLERS = {
     EVENT_ARTIFACT_MATURITY_SET: _apply_maturity_set,
     EVENT_ARTIFACT_GOVERNS_SET: _apply_governs_set,
     EVENT_ARTIFACT_SUPERSEDED: _apply_artifact_superseded,
+    EVENT_ARTIFACT_CODE_REFS_SET: _apply_code_refs_set,
 }

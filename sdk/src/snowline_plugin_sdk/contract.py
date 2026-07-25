@@ -44,6 +44,9 @@ EVENT_ARTIFACT_GOVERNS_SET: str = "artifact.governs_set"
 # (LWW on the pointer). Additive vocabulary — vendored EQUAL to the producer,
 # both packages one commit, NO CONTRACT_VERSION bump.
 EVENT_ARTIFACT_SUPERSEDED: str = "artifact.superseded"
+# Structured code anchors (#172) — register-class wholesale replace of the
+# spec↔code map. Vendored EQUAL to the producer, same additive posture.
+EVENT_ARTIFACT_CODE_REFS_SET: str = "artifact.code_refs_set"
 # The platform's own adoption (replication-continuity §8, §9 item 5, issue
 # #81): the scope namespace dogfoods the same contract it offers plugins.
 EVENT_SCOPE_CREATED: str = "scope.created"
@@ -92,6 +95,7 @@ EVENT_TYPES: frozenset[str] = frozenset(
         EVENT_ARTIFACT_MATURITY_SET,
         EVENT_ARTIFACT_GOVERNS_SET,
         EVENT_ARTIFACT_SUPERSEDED,
+        EVENT_ARTIFACT_CODE_REFS_SET,
         EVENT_SCOPE_CREATED,
         EVENT_SCOPE_UPDATED,
         EVENT_MEMORY_SET,
