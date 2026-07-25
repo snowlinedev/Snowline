@@ -57,6 +57,8 @@ def test_main_surface_exposes_the_decision_and_artifact_tools():
         "register_artifact",
         "revise_artifact",
         "resolve_artifact",
+        # artifact-level supersession (#166) — the consolidate/retire verb.
+        "supersede_artifact",
         "get_artifact",
         "get_artifact_version",
         "list_artifacts",

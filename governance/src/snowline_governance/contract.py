@@ -57,6 +57,13 @@ EVENT_ARTIFACT_REVISED: str = "artifact.revised"
 EVENT_ARTIFACT_RESOLVED: str = "artifact.resolved"
 EVENT_ARTIFACT_MATURITY_SET: str = "artifact.maturity_set"
 EVENT_ARTIFACT_GOVERNS_SET: str = "artifact.governs_set"
+# Artifact-level supersession (#166) — the consolidate/retire pointer: the
+# retired artifact's `superseded_by_id`/`superseded_at` set in one write. A
+# register-class event (LWW on the pointer — a partitioned double-supersede of
+# the same artifact converges on the later write). Additive vocabulary (§3.2):
+# lands in BOTH pinned EVENT_TYPES copies in ONE commit, NO CONTRACT_VERSION
+# bump (envelope keying fields unchanged — the marked_compatible precedent).
+EVENT_ARTIFACT_SUPERSEDED: str = "artifact.superseded"
 # The platform's own adoption (replication-continuity §8, §9 item 5, issue
 # #81): the scope namespace dogfoods the same contract it offers plugins.
 # Governance does not emit these — they're vendored here ONLY so this copy
@@ -104,6 +111,7 @@ GOVERNANCE_EVENT_TYPES: frozenset[str] = frozenset(
         EVENT_ARTIFACT_RESOLVED,
         EVENT_ARTIFACT_MATURITY_SET,
         EVENT_ARTIFACT_GOVERNS_SET,
+        EVENT_ARTIFACT_SUPERSEDED,
     }
 )
 

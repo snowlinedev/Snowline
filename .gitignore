@@ -14,3 +14,6 @@ build/
 .ruff_cache/
 .mypy_cache/
 .DS_Store
+
+# Client-side MCP registration (hardcodes tailnet IP)
+.mcp.json

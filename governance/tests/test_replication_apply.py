@@ -32,6 +32,7 @@ from snowline_governance.contract import (
     EVENT_ARTIFACT_MATURITY_SET,
     EVENT_ARTIFACT_REGISTERED,
     EVENT_ARTIFACT_REVISED,
+    EVENT_ARTIFACT_SUPERSEDED,
     EVENT_DECISION_MARKED_COMPATIBLE,
     EVENT_DECISION_RECORDED,
     EVENT_DECISION_SUPERSEDED,
@@ -989,3 +990,100 @@ def test_milestone_round_trips_emit_to_apply(db_session, apply_fn):
     apply_fn(db_session, _envelope(EVENT_ARTIFACT_REGISTERED, built))
     v = db_session.get(ArtifactVersion, uuid.UUID(built["version"]["id"]))
     assert v is not None and v.milestone == "v1-launch"
+
+
+# --- artifact-level supersession apply (#166) ---------------------------------
+
+
+def test_artifact_superseded_apply_sets_pointer_from_domain_stamp(
+    db_session, apply_fn
+):
+    """Apply reconstructs the retire pointer byte-for-byte: `superseded_by_id`
+    from the payload, `superseded_at` from the DOMAIN field (not the envelope
+    `at`). Replay is idempotent (same coordinate ties apply cleanly)."""
+    a = artifacts.register_artifact(db_session, body="# early")
+    b = artifacts.register_artifact(db_session, body="# consolidated")
+    stamped = (utcnow() - timedelta(minutes=1)).isoformat()
+    p = _payload(
+        artifact_id=a["id"], superseded_by_id=b["id"], superseded_at=stamped
+    )
+    env = _envelope(EVENT_ARTIFACT_SUPERSEDED, p)
+    apply_fn(db_session, env)
+    apply_fn(db_session, env)  # replay no-ops without conflict noise
+
+    row = db_session.get(Artifact, uuid.UUID(a["id"]))
+    assert str(row.superseded_by_id) == b["id"]
+    assert row.superseded_at.isoformat() == stamped
+
+
+def test_artifact_superseded_lww_older_incoming_loses(db_session, apply_fn):
+    """A local supersede newer than the incoming one keeps the local pointer —
+    the same §6 register the other artifact mutations ride."""
+    a = artifacts.register_artifact(db_session, body="# early")
+    b = artifacts.register_artifact(db_session, body="# local replacement")
+    c = artifacts.register_artifact(db_session, body="# peer replacement")
+    artifacts.supersede_artifact(db_session, a["id"], b["id"])  # local, newer
+
+    older = _payload(
+        artifact_id=a["id"],
+        superseded_by_id=c["id"],
+        superseded_at=(utcnow() - timedelta(minutes=5)).isoformat(),
+    )
+    older["at"] = (utcnow() - timedelta(minutes=5)).isoformat()
+    apply_fn(db_session, _envelope(EVENT_ARTIFACT_SUPERSEDED, older))
+    row = db_session.get(Artifact, uuid.UUID(a["id"]))
+    assert str(row.superseded_by_id) == b["id"]  # local write stood
+
+    newer = _payload(
+        artifact_id=a["id"],
+        superseded_by_id=c["id"],
+        superseded_at=utcnow().isoformat(),
+    )
+    newer["at"] = (utcnow() + timedelta(minutes=5)).isoformat()
+    apply_fn(db_session, _envelope(EVENT_ARTIFACT_SUPERSEDED, newer))
+    row = db_session.get(Artifact, uuid.UUID(a["id"]))
+    assert str(row.superseded_by_id) == c["id"]  # newer incoming re-pointed
+
+
+def test_artifact_superseded_self_pointer_is_rejected(db_session, apply_fn):
+    """No legitimate author mints a self-pointer (the local write rejects it) —
+    malformed input parks loudly instead of corrupting the row."""
+    a = artifacts.register_artifact(db_session, body="# spec")
+    p = _payload(
+        artifact_id=a["id"],
+        superseded_by_id=a["id"],
+        superseded_at=utcnow().isoformat(),
+    )
+    with pytest.raises(ValueError, match="at itself"):
+        apply_fn(db_session, _envelope(EVENT_ARTIFACT_SUPERSEDED, p))
+    assert db_session.get(Artifact, uuid.UUID(a["id"])).superseded_by_id is None
+
+
+def test_artifact_superseded_missing_stamp_falls_back_to_envelope_at(
+    db_session, apply_fn
+):
+    """A payload missing `superseded_at` must never land a set pointer with a
+    NULL retirement stamp — the envelope `at` is the hard-keyed fallback."""
+    a = artifacts.register_artifact(db_session, body="# early")
+    b = artifacts.register_artifact(db_session, body="# consolidated")
+    p = _payload(artifact_id=a["id"], superseded_by_id=b["id"])
+    apply_fn(db_session, _envelope(EVENT_ARTIFACT_SUPERSEDED, p))
+    row = db_session.get(Artifact, uuid.UUID(a["id"]))
+    assert str(row.superseded_by_id) == b["id"]
+    assert row.superseded_at == replication_stream.parse_at(p["at"])
+
+
+def test_artifact_superseded_missing_replacement_is_retryable(
+    db_session, apply_fn
+):
+    """The replacement's registration still in flight → raise (bounded
+    retryable), never a silent skip or a dangling pointer."""
+    a = artifacts.register_artifact(db_session, body="# early")
+    p = _payload(
+        artifact_id=a["id"],
+        superseded_by_id=str(uuid.uuid4()),
+        superseded_at=utcnow().isoformat(),
+    )
+    with pytest.raises(ValueError, match="replacement artifact"):
+        apply_fn(db_session, _envelope(EVENT_ARTIFACT_SUPERSEDED, p))
+    assert db_session.get(Artifact, uuid.UUID(a["id"])).superseded_by_id is None

@@ -1022,3 +1022,94 @@ def test_clientless_list_versions_by_milestone_empty_input(db_session):
     artifacts.register_artifact(db_session, body="v1", milestone="v1-launch")
     out = artifacts.list_versions_by_milestone(db_session, "   ")
     assert out["versions"] == [] and out["items_total"] == 0
+
+
+# --- artifact-level supersession (#166) --------------------------------------
+
+
+def test_supersede_artifact_retires_with_pointer(db_session):
+    """The consolidate/retire verb: the retired artifact carries
+    `superseded_by_id`/`superseded_at`, drops out of the default list, and
+    surfaces under `include_superseded=True` with its pointer."""
+    old = artifacts.register_artifact(db_session, body="# early spec")
+    survivor = artifacts.register_artifact(db_session, body="# consolidated spec")
+
+    out = artifacts.supersede_artifact(db_session, old["id"], survivor["id"])
+    assert out["superseded_by_id"] == survivor["id"]
+    assert out["superseded_at"] is not None
+
+    full = artifacts.get_artifact(db_session, old["id"])
+    assert full["superseded_by_id"] == survivor["id"]
+    # The survivor stays live.
+    assert artifacts.get_artifact(db_session, survivor["id"])["superseded_by_id"] is None
+
+    default = artifacts.list_artifacts(db_session)
+    default_ids = {a["id"] for a in default["artifacts"]}
+    assert old["id"] not in default_ids and survivor["id"] in default_ids
+    assert default["items_total"] == 1
+
+    audit = artifacts.list_artifacts(db_session, include_superseded=True)
+    by_id = {a["id"]: a for a in audit["artifacts"]}
+    assert audit["items_total"] == 2
+    assert by_id[old["id"]]["superseded_by_id"] == survivor["id"]
+    assert by_id[survivor["id"]]["superseded_by_id"] is None
+
+
+def test_supersede_artifact_rejects_self_and_unknown(db_session):
+    art = artifacts.register_artifact(db_session, body="# spec")
+    with pytest.raises(ValueError, match="cannot supersede itself"):
+        artifacts.supersede_artifact(db_session, art["id"], art["id"])
+    with pytest.raises(artifacts.ArtifactNotFoundError):
+        artifacts.supersede_artifact(db_session, art["id"], str(uuid.uuid4()))
+    with pytest.raises(artifacts.ArtifactNotFoundError):
+        artifacts.supersede_artifact(db_session, str(uuid.uuid4()), art["id"])
+
+
+def test_supersede_artifact_requires_live_replacement(db_session):
+    """Pointing at a retired doc is rejected (chains stay live-terminated, and
+    cycles are unrepresentable at write time)."""
+    a = artifacts.register_artifact(db_session, body="# a")
+    b = artifacts.register_artifact(db_session, body="# b")
+    c = artifacts.register_artifact(db_session, body="# c")
+    artifacts.supersede_artifact(db_session, a["id"], b["id"])
+    with pytest.raises(ValueError, match="itself superseded"):
+        artifacts.supersede_artifact(db_session, c["id"], a["id"])
+    # The 2-cycle is a special case of the same rule.
+    with pytest.raises(ValueError, match="itself superseded"):
+        artifacts.supersede_artifact(db_session, b["id"], a["id"])
+
+
+def test_supersede_artifact_repoint_is_the_correction_path(db_session):
+    a = artifacts.register_artifact(db_session, body="# a")
+    b = artifacts.register_artifact(db_session, body="# b")
+    c = artifacts.register_artifact(db_session, body="# c")
+    artifacts.supersede_artifact(db_session, a["id"], b["id"])
+    out = artifacts.supersede_artifact(db_session, a["id"], c["id"])
+    assert out["superseded_by_id"] == c["id"]
+
+
+def test_applicable_artifacts_excludes_superseded(db_session, stub_scope_client):
+    """A retired artifact no longer governs — its replacement (governing the
+    same scope) applies instead; governs_all rows are filtered the same way."""
+    old = artifacts.register_artifact(
+        db_session, body="# early",
+        governs="acme/widget", resolved_scopes=_resolved("acme/widget"),
+    )
+    survivor = artifacts.register_artifact(
+        db_session, body="# consolidated",
+        governs="acme/widget", resolved_scopes=_resolved("acme/widget"),
+    )
+    everywhere = artifacts.register_artifact(db_session, body="# conventions", governs="*")
+    replacement_everywhere = artifacts.register_artifact(
+        db_session, body="# conventions v2", governs="*"
+    )
+    artifacts.supersede_artifact(db_session, old["id"], survivor["id"])
+    artifacts.supersede_artifact(
+        db_session, everywhere["id"], replacement_everywhere["id"]
+    )
+
+    stub = stub_scope_client(tree={"acme": None, "acme/widget": "acme"})
+    out = artifacts.applicable_artifacts(db_session, "acme/widget", stub)
+    ids = {a["id"] for a in out["artifacts"]}
+    assert ids == {survivor["id"], replacement_everywhere["id"]}
+    assert out["items_total"] == 2

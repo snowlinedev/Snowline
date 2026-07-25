@@ -6,9 +6,10 @@ Mirrors the frozen monolith's FastMCP registration pattern (`mcp_server.py`):
   - `build_main_surface` — the REAL-WRITE governance surface, mounted at `/mcp`.
     The 5 decision tools (`record_decision`, `supersede_decision`, `get_decision`,
     `list_decisions`, `applicable_decisions`) + the artifact tools
-    (`register_artifact`, `revise_artifact`, `resolve_artifact`, `get_artifact`,
-    `get_artifact_version`, `list_artifacts`, `list_artifact_versions`,
-    `set_governs`, `set_maturity`, `applicable_artifacts`).
+    (`register_artifact`, `revise_artifact`, `resolve_artifact`,
+    `supersede_artifact`, `get_artifact`, `get_artifact_version`,
+    `list_artifacts`, `list_artifact_versions`, `set_governs`, `set_maturity`,
+    `applicable_artifacts`).
 
   - `build_shadow_surface` — the SPECULATION surface, mounted at `/shadow/mcp`.
     The 8 shadow-WRITE tools (`create_branch`, `list_branches`, `get_branch`,
@@ -59,12 +60,13 @@ read the ancestor-inherited governance that applies at a scope. Decisions: \
 `record_decision`, `supersede_decision`, `get_decision`, `list_decisions`, \
 `applicable_decisions`. Artifacts: `register_artifact` (inline-backed — content \
 lives in the substrate), `revise_artifact`, `resolve_artifact` (collapse \
-competing version leaves), `get_artifact` (carries the canonical body by \
-default), `get_artifact_version` (one version's body — competing leaves, \
-superseded history), `list_artifacts`, `list_artifact_versions` (versions \
-stamped with a release milestone slug), `set_governs`, \
-`set_maturity`, `applicable_artifacts` (artifacts governing a scope, \
-ancestor-inherited). `applicable_*` resolve "what governs here" by walking the \
+competing version leaves), `supersede_artifact` (retire a whole artifact in \
+favor of another — the consolidation verb), `get_artifact` (carries the \
+canonical body by default), `get_artifact_version` (one version's body — \
+competing leaves, superseded history), `list_artifacts`, \
+`list_artifact_versions` (versions stamped with a release milestone slug), \
+`set_governs`, `set_maturity`, `applicable_artifacts` (artifacts governing a \
+scope, ancestor-inherited). `applicable_*` resolve "what governs here" by walking the \
 scope tree UPWARD and halting at the first isolated ancestor. Scopes are owned \
 by the platform; governance references them by slug and reads the scope tree \
 from the platform to compute applicability.\
@@ -236,7 +238,7 @@ def _register_read_tools(
             _get_artifact_version_sync, artifact_id, version_id
         )
 
-    def _list_artifacts_sync(governs, limit):
+    def _list_artifacts_sync(governs, limit, include_superseded):
         governs_scope_id = None
         if governs is not None:
             sc = client.resolve(governs)
@@ -247,20 +249,26 @@ def _register_read_tools(
                 governs=governs,
                 governs_scope_id=governs_scope_id,
                 limit=limit,
+                include_superseded=include_superseded,
             )
 
     @mcp.tool()
     async def list_artifacts(
-        governs: str | None = None, limit: int | None = None
+        governs: str | None = None,
+        limit: int | None = None,
+        include_superseded: bool = False,
     ) -> dict:
         """List registered artifacts as compact rows (id, doc_kind, backend,
-        repo, path, maturity, governs, version_count, is_branched), newest-first,
-        capped.
+        repo, path, maturity, governs, superseded_by_id, version_count,
+        is_branched), newest-first, capped.
         `governs` (a scope slug, resolved against the platform) narrows to
         artifacts governing that scope — by an association row OR `governs_all`.
+        Artifacts retired via `supersede_artifact` are hidden by default; pass
+        `include_superseded=True` to reveal them for audit (each row carries the
+        `superseded_by_id` pointer to its replacement).
         Expand any row via `get_artifact(id)`. Read-only."""
         return await anyio.to_thread.run_sync(
-            _list_artifacts_sync, governs, limit
+            _list_artifacts_sync, governs, limit, include_superseded
         )
 
     def _list_artifact_versions_sync(milestone, limit):
@@ -766,6 +774,31 @@ def build_main_surface(
             _set_maturity_sync, artifact_id, maturity
         )
 
+    def _supersede_artifact_sync(artifact_id, replaced_by_id):
+        with session_scope() as session:
+            return artifacts.supersede_artifact(
+                session, artifact_id, replaced_by_id
+            )
+
+    @mcp.tool()
+    async def supersede_artifact(artifact_id: str, replaced_by_id: str) -> dict:
+        """Mark an ARTIFACT superseded by another artifact — the
+        consolidate/retire verb. The retired artifact drops out of
+        `applicable_artifacts` and the default `list_artifacts` while staying in
+        the store with `superseded_by_id` pointing at its replacement (audit
+        trail). Many artifacts may point at one replacement — the consolidation
+        shape: revise (or register) the surviving spec first, then supersede each
+        absorbed doc pointing at it.
+
+        The replacement must be LIVE (not itself superseded) — point at the live
+        end of a chain. Superseding an already-superseded artifact RE-POINTS it
+        (the correction path); there is no un-supersede. Version-level
+        `resolve_artifact` is unrelated — that collapses competing version
+        leaves WITHIN one artifact; this retires the whole artifact."""
+        return await anyio.to_thread.run_sync(
+            _supersede_artifact_sync, artifact_id, replaced_by_id
+        )
+
     return mcp
 
 
@@ -784,8 +817,9 @@ def build_shadow_surface(
     `_register_read_tools`) so a speculation agent can ground in the real graph.
 
     NO real-write verb is registered here — `record_decision`, `supersede_decision`,
-    `register_artifact`, `revise_artifact`, `resolve_artifact`, `set_governs`,
-    `set_maturity` are ABSENT by construction. That absence IS the isolation: a
+    `register_artifact`, `revise_artifact`, `resolve_artifact`,
+    `supersede_artifact`, `set_governs`, `set_maturity` are ABSENT by
+    construction. That absence IS the isolation: a
     speculation session connecting to `/shadow/mcp` physically cannot mutate the
     real graph.
 
