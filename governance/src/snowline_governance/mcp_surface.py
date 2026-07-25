@@ -40,7 +40,14 @@ import anyio
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-from snowline_governance import artifacts, concurrence, decisions, graduation, shadow
+from snowline_governance import (
+    artifacts,
+    concurrence,
+    decisions,
+    graduation,
+    search,
+    shadow,
+)
 from snowline_governance.db import session_scope
 from snowline_governance.milestone_client import (
     HttpMilestoneClient,
@@ -66,7 +73,8 @@ canonical body by default), `get_artifact_version` (one version's body — \
 competing leaves, superseded history), `list_artifacts`, \
 `list_artifact_versions` (versions stamped with a release milestone slug), \
 `set_governs`, `set_maturity`, `applicable_artifacts` (artifacts governing a \
-scope, ancestor-inherited). `applicable_*` resolve "what governs here" by walking the \
+scope, ancestor-inherited), `governance_corpus_search` (full-text over current \
+artifact versions + decision leaves). `applicable_*` resolve "what governs here" by walking the \
 scope tree UPWARD and halting at the first isolated ancestor. Scopes are owned \
 by the platform; governance references them by slug and reads the scope tree \
 from the platform to compute applicability.\
@@ -89,7 +97,7 @@ and `shadow_corpus_search` (full-text over the shadow content \
 + the real decisions backlinked to a shadow line). Read-real grounding: \
 `get_decision`, `list_decisions`, `applicable_decisions`, `get_artifact`, \
 `get_artifact_version`, `list_artifacts`, `list_artifact_versions`, \
-`applicable_artifacts` — read the \
+`applicable_artifacts`, `governance_corpus_search` — read and search the \
 real graph freely to ground \
 your speculation. It deliberately exposes NO real-write verb — `record_decision`, \
 `supersede_decision`, and the artifact write verbs are ABSENT by construction, on \
@@ -110,7 +118,8 @@ def _register_read_tools(
     """Register the READ-REAL governance tools on `mcp` — the decision reads
     (`get_decision`, `list_decisions`, `applicable_decisions`) + the artifact
     reads (`get_artifact`, `get_artifact_version`, `list_artifacts`,
-    `list_artifact_versions`, `applicable_artifacts`). Shared by
+    `list_artifact_versions`, `applicable_artifacts`) + the real-graph
+    `governance_corpus_search` (#170). Shared by
     BOTH the `main` surface (its read half) and the `shadow` surface (its
     read-real grounding half), so the two surfaces register the SAME handlers —
     one source of truth per tool. Pure-read: no write verb is registered here, so
@@ -312,6 +321,41 @@ def _register_read_tools(
         both instances once it replicates. Read-only; empty is the healthy state.
         """
         return await anyio.to_thread.run_sync(_unreconciled_decisions_sync, limit)
+
+    def _governance_corpus_search_sync(query, scope, limit):
+        scope_id = None
+        scope_slug = None
+        if scope is not None:
+            sc = client.resolve(scope)
+            if sc is None:
+                raise ScopeNotFoundError(
+                    f"no scope with slug {scope!r} — register it on the "
+                    "platform first"
+                )
+            scope_id, scope_slug = sc["id"], sc["slug"]
+        with session_scope() as session:
+            return search.corpus_search(
+                session, query, scope_id=scope_id, scope_slug=scope_slug,
+                limit=limit,
+            )
+
+    @mcp.tool()
+    async def governance_corpus_search(
+        query: str, scope: str | None = None, limit: int | None = None
+    ) -> dict:
+        """Full-text search over the REAL governance graph: the current version
+        (title + body) of every live artifact, and the current decision leaves
+        (statement + rationale). Ranked headers merged across the two corpora —
+        kinds `artifact` (rows carry `title` + `governs`) and `decision` (rows
+        carry `scope`); expand a hit via `get_artifact` / `get_decision`.
+        Superseded artifacts, non-current versions, and superseded decisions
+        never match — a hit is always current content. Pass `scope` (resolved
+        against the platform) to narrow: decisions to that exact scope,
+        artifacts to those governing it (edge or `governs_all`). Raises on a
+        blank query or unknown scope. Read-only."""
+        return await anyio.to_thread.run_sync(
+            _governance_corpus_search_sync, query, scope, limit
+        )
 
     def _applicable_artifacts_sync(scope, limit):
         with session_scope() as session:

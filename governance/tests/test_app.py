@@ -66,4 +66,6 @@ def test_main_surface_exposes_the_decision_and_artifact_tools():
         "set_governs",
         "set_maturity",
         "applicable_artifacts",
+        # real-graph corpus search (#170) — shared read set, both surfaces.
+        "governance_corpus_search",
     }

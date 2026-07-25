@@ -50,6 +50,8 @@ _REAL_WRITE_VERBS = {
     "register_artifact",
     "revise_artifact",
     "resolve_artifact",
+    # artifact-level supersession (#166) — retires a whole artifact, main-only.
+    "supersede_artifact",
     "set_governs",
     "set_maturity",
 }
@@ -80,6 +82,10 @@ _READ_REAL_GROUNDING = {
     "list_artifacts",
     "list_artifact_versions",
     "applicable_artifacts",
+    # Real-graph corpus search (#170) — a pure read over current artifact
+    # versions + decision leaves, on the shared read set so speculation
+    # sessions can find their grounding without listing everything.
+    "governance_corpus_search",
     # §6.1 unreconciled view (replication-continuity, #79) — a pure read on the
     # shared read set, so speculation sessions see flagged pairs too.
     "unreconciled_decisions",

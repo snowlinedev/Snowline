@@ -119,6 +119,10 @@ Carried over unchanged in shape (a lift, per the develop-in-public carve), minus
   stamped with a given `milestone` slug — the release-correlation read). Every
   version read surfaces its `milestone`; `applicable_artifacts` never returns
   a superseded artifact (its replacement applies instead).
+  `governance_corpus_search` (#170) is the real-graph full-text read: ranked
+  hits over current artifact versions (derived title + body) and current
+  decision leaves, scope-narrowable, on the shared read set (both surfaces).
+  Superseded artifacts/decisions and historical versions never match.
 - **Scope reads:** delegated to / proxied from the platform scope surface (a
   reader needs the tree to make sense of inheritance).
 
