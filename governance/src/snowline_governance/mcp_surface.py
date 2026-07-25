@@ -730,7 +730,7 @@ def build_main_surface(
         body: str,
         doc_kind: str = "spec",
         maturity: str = "draft",
-        governs=None,
+        governs: str | list[str] | None = None,
         backend: str = "inline",
         milestone: str | None = None,
         allow_terminal_milestone: bool = False,
@@ -824,7 +824,9 @@ def build_main_surface(
             )
 
     @mcp.tool()
-    async def set_governs(artifact_id: str, governs=None) -> dict:
+    async def set_governs(
+        artifact_id: str, governs: str | list[str] | None = None
+    ) -> dict:
         """Set (or clear) an artifact's `governs` after registration. `governs`
         accepts a scope slug, a list of slugs, `'*'` (all scopes), or None (clear
         both). Each slug is resolved against the platform first; the new set
@@ -872,7 +874,9 @@ def build_main_surface(
             return artifacts.set_code_refs(session, artifact_id, code_refs)
 
     @mcp.tool()
-    async def set_code_refs(artifact_id: str, code_refs=None) -> dict:
+    async def set_code_refs(
+        artifact_id: str, code_refs: list[dict] | None = None
+    ) -> dict:
         """Set (or clear) an artifact's structured CODE ANCHORS — the spec↔code
         map: a list of `{repo?, path, symbol?, note?}` rows naming the code this
         doc grounds in (repo-relative paths; a directory path anchors everything
