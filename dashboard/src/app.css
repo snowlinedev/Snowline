@@ -6,6 +6,7 @@
 .shell {
   display: flex;
   min-height: 100vh;
+  min-height: 100dvh; /* mobile browsers: exclude the collapsing toolbar */
 }
 
 .shell-nav {
@@ -18,10 +19,43 @@
   gap: var(--space-1);
 }
 
+.shell-nav-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--space-4);
+}
+
 .shell-nav .brand {
   font-weight: 700;
   font-size: var(--font-body);
-  margin-bottom: var(--space-4);
+}
+
+/* nav disclosure button (issue #161): a real button so keyboard + AT get it
+ * for free; hidden on desktop where the links are always shown. */
+.nav-toggle {
+  display: none;
+  align-items: center;
+  min-height: var(--control-h);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  background: var(--surface-card);
+  color: var(--ink-secondary);
+  font-size: var(--font-small);
+  cursor: pointer;
+}
+
+.nav-toggle[aria-expanded="true"] {
+  color: var(--accent);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+
+.shell-nav-links {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
 }
 
 .shell-nav a {
@@ -797,8 +831,10 @@ textarea.page-action-input {
 }
 
 /* Reflow (1.4.10): at narrow widths / 400% zoom the shell stacks — nav
- * becomes a wrapping top bar, content takes the full width. No page-level
- * horizontal scrolling at 320 CSS px. */
+ * becomes a top bar with the links collapsed behind the Menu disclosure
+ * (issue #161), content takes the full width. No page-level horizontal
+ * scrolling at 320 CSS px. display:none keeps the collapsed links out of
+ * the tab order and the accessibility tree. */
 @media (max-width: 640px) {
   .shell {
     flex-direction: column;
@@ -806,23 +842,65 @@ textarea.page-action-input {
 
   .shell-nav {
     width: auto;
-    flex-direction: row;
-    flex-wrap: wrap;
-    align-items: center;
     border-right: none;
     border-bottom: 1px solid var(--hairline);
+    padding: var(--space-3) var(--space-4);
   }
 
-  .shell-nav .brand {
+  .shell-nav-top {
     margin-bottom: 0;
-    margin-right: var(--space-3);
+  }
+
+  .nav-toggle {
+    display: inline-flex;
+  }
+
+  .shell-nav-links {
+    display: none;
+    padding-top: var(--space-3);
+  }
+
+  .shell-nav.nav-open .shell-nav-links {
+    display: flex;
   }
 
   .shell-main {
     padding: var(--space-4);
   }
 
+  .shell-header {
+    flex-wrap: wrap;
+  }
+
   .grid {
     grid-template-columns: 1fr;
+  }
+
+  /* span-2 would force an implicit second column in the 1fr grid */
+  .grid > .span-2 {
+    grid-column: auto;
+  }
+
+  /* shallower nesting indent so deep trees keep usable width at 320px */
+  .board-children {
+    padding-left: var(--space-3);
+  }
+
+  .tree ul {
+    padding-left: var(--space-3);
+  }
+
+  .tree > ul {
+    padding-left: 0;
+  }
+}
+
+/* iOS Safari zooms the whole page when a focused control's font-size is
+ * under 16px — a device behavior, not a density choice, so this floors
+ * form-control type on touch devices in both densities. */
+@media (pointer: coarse) {
+  .thread-composer-input,
+  .page-action-input {
+    font-size: max(16px, var(--font-body));
   }
 }
