@@ -54,6 +54,7 @@ from snowline_plugin_sdk.replication import emit as sdk_emit
 from snowline_governance.contract import (
     EVENT_ARTIFACT_GOVERNS_SET,
     EVENT_ARTIFACT_MATURITY_SET,
+    EVENT_ARTIFACT_SUPERSEDED,
     EVENT_SHADOW_GRADUATED,
     EVENT_SHADOW_NOTES_SET,
 )
@@ -72,6 +73,7 @@ LWW_REGISTERS: dict[str, tuple[str, str, str]] = {
     EVENT_SHADOW_NOTES_SET: ("shadow_branch", "branch_id", "narrative_notes"),
     EVENT_ARTIFACT_MATURITY_SET: ("artifact", "artifact_id", "maturity"),
     EVENT_ARTIFACT_GOVERNS_SET: ("artifact", "artifact_id", "governs"),
+    EVENT_ARTIFACT_SUPERSEDED: ("artifact", "artifact_id", "superseded_by"),
     EVENT_SHADOW_GRADUATED: ("shadow_node", "node_id", "graduated_decision_id"),
 }
 
@@ -403,6 +405,24 @@ def artifact_resolved_payload(artifact_id, version_id) -> dict:
 
 def maturity_set_payload(artifact) -> dict:
     return _base({"artifact_id": str(artifact.id), "maturity": artifact.maturity})
+
+
+def artifact_superseded_payload(artifact) -> dict:
+    """`artifact.superseded` (#166) — the retire/consolidate pointer as row
+    state. `superseded_at` rides as a DOMAIN field (apply stamps it back
+    byte-for-byte); the envelope `at` is the LWW coordinate, which the emit
+    clamp may nudge — the two are deliberately distinct."""
+    return _base(
+        {
+            "artifact_id": str(artifact.id),
+            "superseded_by_id": str(artifact.superseded_by_id),
+            "superseded_at": (
+                artifact.superseded_at.isoformat()
+                if artifact.superseded_at
+                else None
+            ),
+        }
+    )
 
 
 def governs_set_payload(session, artifact) -> dict:

@@ -39,6 +39,11 @@ EVENT_ARTIFACT_REVISED: str = "artifact.revised"
 EVENT_ARTIFACT_RESOLVED: str = "artifact.resolved"
 EVENT_ARTIFACT_MATURITY_SET: str = "artifact.maturity_set"
 EVENT_ARTIFACT_GOVERNS_SET: str = "artifact.governs_set"
+# Artifact-level supersession (#166) — the consolidate/retire pointer
+# (`superseded_by_id`/`superseded_at` on the retired artifact). Register-class
+# (LWW on the pointer). Additive vocabulary — vendored EQUAL to the producer,
+# both packages one commit, NO CONTRACT_VERSION bump.
+EVENT_ARTIFACT_SUPERSEDED: str = "artifact.superseded"
 # The platform's own adoption (replication-continuity §8, §9 item 5, issue
 # #81): the scope namespace dogfoods the same contract it offers plugins.
 EVENT_SCOPE_CREATED: str = "scope.created"
@@ -86,6 +91,7 @@ EVENT_TYPES: frozenset[str] = frozenset(
         EVENT_ARTIFACT_RESOLVED,
         EVENT_ARTIFACT_MATURITY_SET,
         EVENT_ARTIFACT_GOVERNS_SET,
+        EVENT_ARTIFACT_SUPERSEDED,
         EVENT_SCOPE_CREATED,
         EVENT_SCOPE_UPDATED,
         EVENT_MEMORY_SET,

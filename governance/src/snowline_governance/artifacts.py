@@ -1,4 +1,5 @@
-"""The artifact substrate — register / revise / resolve / read of governing docs.
+"""The artifact substrate — register / revise / resolve / supersede / read of
+governing docs.
 
 Carried (functionality-first, NOT imported) from the frozen monolith's
 `snowline_server.artifacts`, de-PM'd and INLINE-ONLY (spec §4 / §6.3, toward
@@ -45,6 +46,7 @@ from snowline_governance.contract import (
     EVENT_ARTIFACT_REGISTERED,
     EVENT_ARTIFACT_RESOLVED,
     EVENT_ARTIFACT_REVISED,
+    EVENT_ARTIFACT_SUPERSEDED,
 )
 from snowline_governance.models import (
     ARTIFACT_BACKEND_GIT,
@@ -539,6 +541,14 @@ def _artifact_dict(
         "maturity": a.maturity,
         "governs": _governs(session, a.id),
         "governs_all": a.governs_all,
+        # Artifact-level supersession (#166): non-NULL = retired in favor of
+        # that artifact (it no longer applies/lists by default).
+        "superseded_by_id": (
+            str(a.superseded_by_id) if a.superseded_by_id else None
+        ),
+        "superseded_at": (
+            a.superseded_at.isoformat() if a.superseded_at else None
+        ),
         "branch_points": [str(p) for p in points],
         "version_count": count or 0,
         "created_at": a.created_at.isoformat() if a.created_at else None,
@@ -957,6 +967,48 @@ def set_governs(
     return _artifact_dict(session, a)
 
 
+def supersede_artifact(
+    session: Session, artifact_id: str, replaced_by_id: str
+) -> dict:
+    """Mark an ARTIFACT superseded by another artifact (#166) — the
+    consolidate/retire verb. Sets the retired artifact's `superseded_by_id` →
+    `replaced_by_id` and stamps `superseded_at`; the artifact drops out of
+    `applicable_artifacts` and the default `list_artifacts` while staying in the
+    store with a pointer to what replaced it (the audit trail `set_governs(None)`
+    never gave). Many artifacts may point at one replacement (the N→1
+    consolidation shape).
+
+    The REPLACEMENT must be LIVE (not itself superseded) — pointing at a retired
+    doc would chain readers through dead ends, and the rule makes supersession
+    cycles unrepresentable at write time. Superseding an ALREADY-superseded
+    artifact re-points it (the correction path; `superseded_at` tracks the
+    current supersession). There is no un-supersede — a wrongly retired doc is
+    corrected by re-pointing, or by superseding its replacement back into a
+    successor doc. Returns the refreshed (retired) artifact."""
+    a = _require_artifact(session, artifact_id)
+    replacement = _require_artifact(session, replaced_by_id)
+    if a.id == replacement.id:
+        raise ValueError("an artifact cannot supersede itself")
+    if replacement.superseded_by_id is not None:
+        raise ValueError(
+            f"replacement {replaced_by_id!r} is itself superseded (by "
+            f"{replacement.superseded_by_id}) — point at the LIVE end of the "
+            "chain instead"
+        )
+    a.superseded_by_id = replacement.id
+    a.superseded_at = replication_stream.utcnow()
+    session.flush()
+    # STREAM emit — register-class (§6): the pointer is one LWW register, so a
+    # partitioned double-supersede of the same artifact converges on the later
+    # write on both sides.
+    replication_stream.emit(
+        session,
+        EVENT_ARTIFACT_SUPERSEDED,
+        replication_stream.artifact_superseded_payload(a),
+    )
+    return _artifact_dict(session, a)
+
+
 # --- reads ------------------------------------------------------------------
 
 
@@ -1203,6 +1255,9 @@ def _compact_row_from_signals(
         "maturity": a.maturity,
         "governs": governs,
         "governs_all": a.governs_all,
+        "superseded_by_id": (
+            str(a.superseded_by_id) if a.superseded_by_id else None
+        ),
         "version_count": version_count or 0,
         "is_branched": (leaf_count or 0) > 1,
     }
@@ -1241,6 +1296,9 @@ def _artifact_compact_row(session: Session, a: Artifact) -> dict:
         "maturity": a.maturity,
         "governs": _governs(session, a.id),
         "governs_all": a.governs_all,
+        "superseded_by_id": (
+            str(a.superseded_by_id) if a.superseded_by_id else None
+        ),
         "version_count": version_count or 0,
         "is_branched": (leaf_count or 0) > 1,
     }
@@ -1251,6 +1309,7 @@ def list_artifacts(
     governs: str | None = None,
     governs_scope_id: uuid.UUID | str | None = None,
     limit: int | None = None,
+    include_superseded: bool = False,
 ) -> dict:
     """List registered artifacts as compact rows. Newest first, capped at `limit`
     (default 50, max 500) with `items_total` carrying the true depth. Expand any
@@ -1261,11 +1320,17 @@ def list_artifacts(
     `scope_id` via an association row OR the all-scopes `governs_all` flag (a
     `governs_all` artifact governs every scope, so it surfaces under a per-scope
     filter too). An unresolved/None scope id with a `governs` slug yields an empty
-    list (not an error)."""
+    list (not an error).
+
+    SUPERSEDED artifacts (#166 — retired in favor of another) are hidden by
+    default; `include_superseded=True` reveals them for audit, each row carrying
+    its `superseded_by_id`."""
     lim = _resolve_list_limit(limit)
     stmt = select(Artifact).order_by(
         Artifact.created_at.desc(), Artifact.id.desc()
     )
+    if not include_superseded:
+        stmt = stmt.where(Artifact.superseded_by_id.is_(None))
     if governs is not None:
         if governs_scope_id is None:
             return {"governs": governs, "artifacts": [], "items_total": 0}
@@ -1372,6 +1437,10 @@ def applicable_artifacts(
     for art_id, from_scope in ordered:
         a = arts.get(art_id)
         if a is None:  # edge/flag row whose artifact vanished — skip defensively
+            continue
+        if a.superseded_by_id is not None:
+            # Superseded artifacts (#166) no longer govern anything — their
+            # replacement (usually governing the same scopes) applies instead.
             continue
         row = _compact_row_from_signals(
             a,

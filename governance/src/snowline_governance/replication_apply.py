@@ -73,6 +73,7 @@ from snowline_governance.contract import (
     EVENT_ARTIFACT_REGISTERED,
     EVENT_ARTIFACT_RESOLVED,
     EVENT_ARTIFACT_REVISED,
+    EVENT_ARTIFACT_SUPERSEDED,
     EVENT_DECISION_MARKED_COMPATIBLE,
     EVENT_DECISION_RECORDED,
     EVENT_DECISION_SUPERSEDED,
@@ -623,6 +624,37 @@ def _apply_maturity_set(session, client, envelope: dict) -> None:
     session.flush()
 
 
+def _apply_artifact_superseded(session, client, envelope: dict) -> None:
+    """Artifact-level supersession (#166) — register-class: the pointer is one
+    LWW register (`artifact.superseded_by`), so a partitioned double-supersede
+    of the SAME artifact converges on the later write. Both rows must already
+    exist here (retryable when the replacement's registration is still in
+    flight). `superseded_at` is stamped from the payload's DOMAIN field, not
+    the envelope `at` — byte-convergence on the row.
+
+    Cross-side note: the local write's replacement-must-be-live check cannot
+    run against the peer's un-replicated state, so two sides superseding two
+    artifacts at each other during a partition CAN merge into a mutual pair —
+    a degenerate but CONVERGENT state (both sides hold the same rows) a human
+    re-points; apply never rejects it (rejection would park the stream)."""
+    p = envelope["payload"]
+    artifact_id = _uuid(p["artifact_id"])
+    artifact = _require(session.get(Artifact, artifact_id), "artifact")
+    replacement = _require(
+        session.get(Artifact, _uuid(p["superseded_by_id"])),
+        "replacement artifact",
+    )
+
+    def set_pointer() -> None:
+        artifact.superseded_by_id = replacement.id
+        artifact.superseded_at = _dt(p.get("superseded_at"))
+
+    _lww_apply(
+        session, envelope, "artifact", artifact_id, "superseded_by", set_pointer
+    )
+    session.flush()
+
+
 def _apply_governs_set(session, client, envelope: dict) -> None:
     p = envelope["payload"]
     artifact_id = _uuid(p["artifact_id"])
@@ -671,4 +703,5 @@ _HANDLERS = {
     EVENT_ARTIFACT_RESOLVED: _apply_artifact_resolved,
     EVENT_ARTIFACT_MATURITY_SET: _apply_maturity_set,
     EVENT_ARTIFACT_GOVERNS_SET: _apply_governs_set,
+    EVENT_ARTIFACT_SUPERSEDED: _apply_artifact_superseded,
 }

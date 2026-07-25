@@ -150,6 +150,10 @@ def test_full_write_surface_emits_every_registry_event_type(db_session):
         ["acme/other"],
         resolved_scopes={"acme/other": _scope_row("acme/other")},
     )
+    # Artifact-level supersession (#166): retire a second artifact in favor of
+    # the first — the consolidate verb's event.
+    absorbed = artifacts.register_artifact(db_session, body="# early spec")
+    artifacts.supersede_artifact(db_session, absorbed["id"], art["id"])
 
     emitted = {r.event_type for r in _outbox(db_session)}
     assert emitted == set(GOVERNANCE_EVENT_TYPES)
@@ -227,6 +231,32 @@ def test_idempotent_rearchive_emits_nothing(db_session):
     n = len(_outbox(db_session))
     shadow.archive_branch(db_session, scope, "line-a")  # idempotent re-archive
     assert len(_outbox(db_session)) == n
+
+
+def test_supersede_artifact_is_register_class(db_session):
+    """#166: `supersede_artifact` emits `artifact.superseded` with the pointer +
+    the DOMAIN `superseded_at`, and keeps the §6 LWW coordinate on
+    `(artifact, superseded_by)` so a partitioned double-supersede converges."""
+    from snowline_governance.contract import EVENT_ARTIFACT_SUPERSEDED
+
+    _subscribe(db_session)
+    old = artifacts.register_artifact(db_session, body="# early")
+    survivor = artifacts.register_artifact(db_session, body="# consolidated")
+    out = artifacts.supersede_artifact(db_session, old["id"], survivor["id"])
+
+    row = next(
+        r for r in _outbox(db_session)
+        if r.event_type == EVENT_ARTIFACT_SUPERSEDED
+    )
+    body = row.payload["payload"]
+    assert body["artifact_id"] == old["id"]
+    assert body["superseded_by_id"] == survivor["id"]
+    assert body["superseded_at"] == out["superseded_at"]
+
+    reg = db_session.get(
+        LwwRegister, ("artifact", uuid.UUID(old["id"]), "superseded_by")
+    )
+    assert reg is not None and reg.event_ref == body["event_id"]
 
 
 def test_milestone_rides_the_artifact_version_payloads(db_session):

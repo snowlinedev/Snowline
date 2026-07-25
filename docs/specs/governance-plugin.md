@@ -63,7 +63,11 @@ Carried over unchanged in shape (a lift, per the develop-in-public carve), minus
   branch, or a real decision — never the reverse), `ShadowConversationEvent`
   (durable, resumable per-branch conversation log).
 - **Artifacts** — `Artifact` (a governing doc: `doc_kind` spec/plan/reference,
-  `backend` git|inline, `maturity` draft→exploratory→stable, `governs_all`),
+  `backend` git|inline, `maturity` draft→exploratory→stable, `governs_all`,
+  plus the #166 artifact-level supersession pointer — `superseded_by_id` a
+  nullable self-FK to the artifact that replaced it, `superseded_at` the
+  retirement stamp; NULL = live, and N retired docs may point at the one spec
+  that absorbed them),
   `ArtifactVersion` (supersession DAG + content snapshot/locator, plus an
   optional `milestone` — a SOFT release-correlation slug stamped verbatim at
   mint, never resolved, the portfolio's cross-plugin key: PM tags work items
@@ -86,7 +90,10 @@ Carried over unchanged in shape (a lift, per the develop-in-public carve), minus
   (ancestor-inherited — §6.1).
 - **Artifacts (write):** `register_artifact`, `revise_artifact`
   (both accept an optional `milestone` release slug stamped on the version),
-  `resolve_artifact` (leaf resolution), `set_governs`, `set_maturity`.
+  `resolve_artifact` (leaf resolution), `supersede_artifact` (#166 — retire a
+  whole artifact in favor of another: the consolidation verb; the replacement
+  must be live, re-pointing an already-retired artifact is the correction
+  path, and there is no un-supersede), `set_governs`, `set_maturity`.
   **Amended for first-class milestones** (`milestones.md` §6.1): the write
   verbs validate + resolve the milestone ref against the platform registry
   (hard-fail on unknown; canonical address stored); `revise_artifact`'s
@@ -102,10 +109,12 @@ Carried over unchanged in shape (a lift, per the develop-in-public carve), minus
   carries the canonical inline body by default; `include_body=False` for the
   lean header), `get_artifact_version` (one version's body by (artifact,
   version) pair — competing leaves for branch comparison, superseded versions
-  for audit/pinned reads), `list_artifacts` (lean headers only),
-  `list_artifact_versions` (versions across all artifacts stamped with a given
-  `milestone` slug — the release-correlation read). Every version read surfaces
-  its `milestone`.
+  for audit/pinned reads), `list_artifacts` (lean headers only; superseded
+  artifacts hidden unless `include_superseded=True`, each row carrying its
+  `superseded_by_id`), `list_artifact_versions` (versions across all artifacts
+  stamped with a given `milestone` slug — the release-correlation read). Every
+  version read surfaces its `milestone`; `applicable_artifacts` never returns
+  a superseded artifact (its replacement applies instead).
 - **Scope reads:** delegated to / proxied from the platform scope surface (a
   reader needs the tree to make sense of inheritance).
 
@@ -135,6 +144,12 @@ Carried over unchanged in shape (a lift, per the develop-in-public carve), minus
    maturity is a descriptor ladder (not a gate); content resolves via a backend
    adapter — `git` (repo doc, sha-pinnable) or `inline` (content in the
    substrate). `resolve_artifact` collapses competing version leaves.
+   **Artifact-level supersession** (#166): `supersede_artifact` retires a whole
+   artifact in favor of a live replacement — the N→1 consolidation shape
+   (revise/register the surviving spec, then supersede each absorbed doc
+   pointing at it). Distinct from version-level resolution: the version DAG is
+   untouched. Register-class for replication (LWW on the pointer, the
+   `artifact.superseded` event).
 4. **Shadow isolation + graduation:** speculation is invisible to the real graph
    until explicitly graduated; graduation translates a shadow node into the real
    primitives it implies (`record_decision` + `set_governs`), agent-curated,

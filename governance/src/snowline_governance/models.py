@@ -142,6 +142,14 @@ class Artifact(Base):
     registry that's a GitHub-plugin concern). The monolith's partial unique index
     on `(lower(repo), path) WHERE backend='git'` is carried for schema-compat —
     it constrains git rows only, so inline-only writes never trip it.
+
+    ARTIFACT-LEVEL SUPERSESSION (#166): `superseded_by_id` is a nullable self-FK
+    — the retired artifact points at its replacement, so N consolidated docs can
+    all point at the one spec that absorbed them (many-to-one, the inverse
+    orientation of `Decision.supersedes_id` where the NEW row carries the edge —
+    here the write is "retire old in favor of X", so the OLD row mutates). NULL =
+    live. The write path requires the replacement to be LIVE, which makes cycles
+    unrepresentable at write time; `superseded_at` records the retirement.
     """
 
     __tablename__ = "artifacts"
@@ -166,6 +174,14 @@ class Artifact(Base):
     governs_all: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )
+    # Artifact-level supersession (#166): the replacement this artifact was
+    # retired in favor of (NULL = live). A self-FK within governance's own DB;
+    # `superseded_at` stamps the retirement (updated if the pointer is
+    # re-pointed — it tracks the current supersession, not the first).
+    superseded_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("artifacts.id"), nullable=True
+    )
+    superseded_at: Mapped[datetime | None] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         server_default=func.now(), onupdate=func.now()
