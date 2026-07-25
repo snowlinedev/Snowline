@@ -156,6 +156,13 @@
   gap: var(--space-4);
 }
 
+/* grid items default to min-width:auto, so a wide child (e.g. a nowrap
+ * table) would inflate its 1fr track past the viewport; this keeps
+ * overflow inside the card's own scroll container instead. */
+.grid > * {
+  min-width: 0;
+}
+
 .grid > .span-2 {
   grid-column: span 2;
 }
@@ -879,6 +886,22 @@ textarea.page-action-input {
   /* span-2 would force an implicit second column in the 1fr grid */
   .grid > .span-2 {
     grid-column: auto;
+  }
+
+  /* tables: keep natural column widths and let the container scroll (the
+   * 1.4.10 pattern .table-scroll exists for) instead of auto-layout
+   * crushing narrow columns to one-character slivers. The first column is
+   * each table's primary content (the row link) — it keeps wrapping, with
+   * a floor so it can't be squeezed out either. */
+  .kind-table th,
+  .kind-table td {
+    white-space: nowrap;
+  }
+
+  .kind-table th:first-child,
+  .kind-table td:first-child {
+    white-space: normal;
+    min-width: 14em;
   }
 
   /* shallower nesting indent so deep trees keep usable width at 320px */
