@@ -17,12 +17,40 @@ per kind and the OAuth models stay the source of truth.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 from mcp.server.auth.provider import AuthorizationCode, RefreshToken
 from mcp.shared.auth import OAuthClientInformationFull
+from pydantic import BaseModel, ValidationError
+
+log = logging.getLogger("snowline_remote_front.store")
+
+_M = TypeVar("_M", bound=BaseModel)
+
+
+def _load(model: type[_M], raw: str | None, kind: str) -> _M | None:
+    """Decode one stored record, degrading a CORRUPT/schema-drifted blob to
+    "absent" (with a WARNING) instead of raising.
+
+    A record written by an older model version — or a truncated write — would
+    otherwise raise `ValidationError` out of every read that touches it: an
+    unreadable client registration would 500 the whole OAuth flow rather than
+    letting the client re-register, and an unreadable refresh token would 500
+    the refresh instead of 401-ing the client into a fresh authorization. The
+    corruption is never silent: it is logged, and the caller's None path is the
+    same recoverable "unknown record" branch it already handles."""
+    if not raw:
+        return None
+    try:
+        return model.model_validate_json(raw)
+    except ValidationError as exc:
+        log.warning(
+            "remote-front: discarding unreadable stored %s record: %s", kind, exc
+        )
+        return None
 
 
 class Store(Protocol):
@@ -48,8 +76,7 @@ class InMemoryStore:
         self._refresh: dict[str, str] = {}
 
     def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
-        raw = self._clients.get(client_id)
-        return OAuthClientInformationFull.model_validate_json(raw) if raw else None
+        return _load(OAuthClientInformationFull, self._clients.get(client_id), "client")
 
     def put_client(self, client: OAuthClientInformationFull) -> None:
         assert client.client_id is not None
@@ -62,9 +89,15 @@ class InMemoryStore:
         broken by a registration flood. Returns True if there is room."""
         if len(self._clients) < max_clients:
             return True
+        # An unreadable refresh-token row can't vouch for a client, but it must
+        # not break the prune either (`_load` logs and returns None).
         active = {
-            RefreshToken.model_validate_json(raw).client_id
-            for raw in self._refresh.values()
+            token.client_id
+            for token in (
+                _load(RefreshToken, raw, "refresh token")
+                for raw in self._refresh.values()
+            )
+            if token is not None
         }
         for client_id in list(self._clients):
             if len(self._clients) < max_clients:
@@ -74,8 +107,7 @@ class InMemoryStore:
         return len(self._clients) < max_clients
 
     def get_auth_code(self, code: str) -> AuthorizationCode | None:
-        raw = self._codes.get(code)
-        return AuthorizationCode.model_validate_json(raw) if raw else None
+        return _load(AuthorizationCode, self._codes.get(code), "authorization code")
 
     def put_auth_code(self, auth_code: AuthorizationCode) -> None:
         self._codes[auth_code.code] = auth_code.model_dump_json()
@@ -84,8 +116,7 @@ class InMemoryStore:
         self._codes.pop(code, None)
 
     def get_refresh_token(self, token: str) -> RefreshToken | None:
-        raw = self._refresh.get(token)
-        return RefreshToken.model_validate_json(raw) if raw else None
+        return _load(RefreshToken, self._refresh.get(token), "refresh token")
 
     def put_refresh_token(self, refresh_token: RefreshToken) -> None:
         self._refresh[refresh_token.token] = refresh_token.model_dump_json()
@@ -134,8 +165,9 @@ class SqliteStore:
             self._conn.commit()
 
     def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
-        raw = self._get("clients", client_id)
-        return OAuthClientInformationFull.model_validate_json(raw) if raw else None
+        return _load(
+            OAuthClientInformationFull, self._get("clients", client_id), "client"
+        )
 
     def put_client(self, client: OAuthClientInformationFull) -> None:
         assert client.client_id is not None
@@ -149,13 +181,24 @@ class SqliteStore:
             (count,) = self._conn.execute("SELECT COUNT(*) FROM clients").fetchone()
             if count < max_clients:
                 return True
-            active = {
-                row[0]
-                for row in self._conn.execute(
-                    "SELECT DISTINCT json_extract(json, '$.client_id') "
-                    "FROM refresh_tokens"
+            # `json_valid` guard: json_extract raises OperationalError
+            # ("malformed JSON") on a corrupt row, which would turn one bad
+            # blob into a failure of every subsequent registration. An
+            # unreadable row simply vouches for no client (logged below).
+            rows = self._conn.execute(
+                "SELECT DISTINCT json_extract(json, '$.client_id') "
+                "FROM refresh_tokens WHERE json_valid(json)"
+            ).fetchall()
+            (skipped,) = self._conn.execute(
+                "SELECT COUNT(*) FROM refresh_tokens WHERE NOT json_valid(json)"
+            ).fetchone()
+            active = {row[0] for row in rows if row[0] is not None}
+            if skipped:
+                log.warning(
+                    "remote-front: %d unreadable refresh-token row(s) ignored "
+                    "while pruning clients",
+                    skipped,
                 )
-            }
             for (client_id,) in self._conn.execute(
                 "SELECT id FROM clients ORDER BY rowid"
             ).fetchall():
@@ -170,8 +213,9 @@ class SqliteStore:
             return count < max_clients
 
     def get_auth_code(self, code: str) -> AuthorizationCode | None:
-        raw = self._get("auth_codes", code)
-        return AuthorizationCode.model_validate_json(raw) if raw else None
+        return _load(
+            AuthorizationCode, self._get("auth_codes", code), "authorization code"
+        )
 
     def put_auth_code(self, auth_code: AuthorizationCode) -> None:
         self._put("auth_codes", auth_code.code, auth_code.model_dump_json())
@@ -180,8 +224,9 @@ class SqliteStore:
         self._delete("auth_codes", code)
 
     def get_refresh_token(self, token: str) -> RefreshToken | None:
-        raw = self._get("refresh_tokens", token)
-        return RefreshToken.model_validate_json(raw) if raw else None
+        return _load(
+            RefreshToken, self._get("refresh_tokens", token), "refresh token"
+        )
 
     def put_refresh_token(self, refresh_token: RefreshToken) -> None:
         self._put("refresh_tokens", refresh_token.token, refresh_token.model_dump_json())

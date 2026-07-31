@@ -61,7 +61,13 @@ export function useData<T>(
           if (!live || mine !== generation) return;
           if (!hasData.current) {
             setValue({ state: "error", message: String(err) });
-          } // else: keep last-good data through a transient poll failure
+          } else {
+            // Keep last-good data through a transient poll failure — but say so
+            // in the console: a poll that has been failing since the first
+            // success renders as indefinitely-fresh data with no signal at all,
+            // which is how a broken endpoint hides behind a stale card.
+            console.warn("useData: poll failed, keeping last-good data:", err);
+          }
         },
       );
     };

@@ -152,3 +152,43 @@ def test_import_purity_no_platform_fly_or_tailscale():
     )
     assert result.returncode == 0, result.stderr
     assert "clean" in result.stdout
+
+
+def test_corrupt_stored_records_read_as_absent(tmp_path, caplog):
+    """A schema-drifted / truncated blob must degrade to "unknown record" — the
+    recoverable path every caller already handles (re-register, re-authorize) —
+    instead of raising a ValidationError that 500s the whole OAuth flow. Loudly:
+    the discard is logged."""
+    import logging
+
+    from mcp.server.auth.provider import RefreshToken
+    from mcp.shared.auth import OAuthClientInformationFull
+
+    from snowline_remote_front.store import InMemoryStore
+
+    sqlite_store = SqliteStore(str(tmp_path / "corrupt.db"))
+    memory_store = InMemoryStore()
+    for store in (sqlite_store, memory_store):
+        store.put_client(
+            OAuthClientInformationFull(client_id="c-1", redirect_uris=[REDIRECT_URI])
+        )
+        store.put_refresh_token(
+            RefreshToken(
+                token="rt-1", client_id="c-1", scopes=[], expires_at=2**31 - 1
+            )
+        )
+
+    # Corrupt both records in place, the way an older model version or a
+    # truncated write would leave them.
+    sqlite_store._put("clients", "c-1", '{"nope": true}')
+    sqlite_store._put("refresh_tokens", "rt-1", "not-json-at-all")
+    memory_store._clients["c-1"] = '{"nope": true}'
+    memory_store._refresh["rt-1"] = "not-json-at-all"
+
+    with caplog.at_level(logging.WARNING):
+        for store in (sqlite_store, memory_store):
+            assert store.get_client("c-1") is None
+            assert store.get_refresh_token("rt-1") is None
+            # And the prune walk over an unreadable token row still works.
+            assert store.prune_clients(1) is True
+    assert "unreadable stored" in caplog.text
