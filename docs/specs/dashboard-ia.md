@@ -120,11 +120,9 @@ optional field:
   layout, not brick registration.
 - **Additive, no `contract_version` bump.** The field is optional with
   today's behavior as its absence-semantics, so existing v1 blocks are
-  untouched. Ordering constraint (first-party fleet): the platform ships and
-  deploys the field **before** any plugin declares it — a plugin sending
-  `intent` to an older platform is rejected 422 by `extra="forbid"`. That is
-  the documented cost of fail-loud manifest validation; it is paid once, at
-  rollout, by deploy order.
+  untouched. Deploy the platform before plugins declare the field (a plugin
+  sending `intent` to an older platform is rejected 422 by `extra="forbid"`)
+  — a non-event in a single-operator deployment.
 - **`intent` and `nav` interact predictably.** When `intent` is present it
   fully determines placement and `nav` is ignored; absent `intent`, `nav`
   keeps its current meaning. `detail` and `nav: false` are equivalent;
@@ -164,11 +162,11 @@ planned daily audit digest lands. It is composed, not synthesized:
 ## 6. Permalinks
 
 Every entity detail page (`intent: detail`) is a stable, shareable URL —
-plugin-namespaced routes already guarantee uniqueness; this spec makes
-stability a requirement rather than an accident. Rationale: agents cite
+plugin-namespaced routes already guarantee uniqueness. Rationale: agents cite
 dashboard URLs in session output and work-item bodies (feedback `4bd3e4d3`
 — the GitHub mirror is currently the only followable citation for a human).
-Renaming a route is a breaking change to be called out in review.
+Stability is best-effort, not governed: the sole operator owns both ends of
+every link, so a renamed route just means older citations go stale.
 
 ## 7. Accessibility
 
