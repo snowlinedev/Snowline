@@ -68,6 +68,16 @@ def test_action_fields_equal_sdk():
     assert set(sdk_ui.ACTION_FIELD_SHAPE) == sdk_ui.ACTION_FIELD_FIELDS
 
 
+def test_placement_intents_equal_sdk():
+    # Placement intent (dashboard-ia.md §4.1) — same never-silently-fork
+    # discipline as the kind vocabulary above. `intent` is a free string on
+    # UIWidget/UIPage (like `kind`, not pydantic-enforced), so the constant
+    # IS the vocabulary — pinned equal between the platform and the SDK.
+    assert platform_manifest.PLACEMENT_INTENTS == sdk_ui.PLACEMENT_INTENTS
+    assert "intent" in platform_manifest.UIWidget.model_fields
+    assert "intent" in platform_manifest.UIPage.model_fields
+
+
 def test_write_body_limit_equals_sdk():
     # The proxy's POST cap is contract, not implementation detail: governance's
     # message route (#70) rejects at the same boundary by importing the SDK
