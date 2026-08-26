@@ -142,6 +142,26 @@ def test_future_contract_version_registers_ok():
     assert m.ui.contract_version == 999
 
 
+def test_intent_defaults_none():
+    m = _manifest({"widgets": [_widget()], "pages": [_page()]})
+    assert m.ui.widgets[0].intent is None
+    assert m.ui.pages[0].intent is None
+
+
+def test_unknown_intent_registers_ok():
+    # Intents are shell-version-dependent (dashboard-ia.md §4.2 fail-visible,
+    # same posture as kinds) — an unrecognized one is NOT a registration-time
+    # concern; it degrades to the plugin-grouped fallback at composition time.
+    m = _manifest(
+        {
+            "widgets": [_widget(intent="an-intent-from-the-future")],
+            "pages": [_page(intent="attention")],
+        }
+    )
+    assert m.ui.widgets[0].intent == "an-intent-from-the-future"
+    assert m.ui.pages[0].intent == "attention"
+
+
 # --- composer (shadow-conversations.md §4) ----------------------------------
 
 

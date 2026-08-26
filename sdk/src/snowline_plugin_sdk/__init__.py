@@ -38,6 +38,7 @@ from .ui import (
     PAGE_KIND_TABLE,
     PAGE_KIND_THREAD,
     PAGE_KINDS,
+    PLACEMENT_INTENTS,
     UI_CONTRACT_VERSION,
     UI_KIND_SHAPES,
     UI_KINDS,
@@ -65,6 +66,7 @@ __all__ = [
     "PAGE_KIND_DOCUMENT",
     "PAGE_KIND_BOARD",
     "PAGE_KINDS",
+    "PLACEMENT_INTENTS",
     "UI_KINDS",
     "UI_KIND_SHAPES",
 ]

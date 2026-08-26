@@ -64,7 +64,9 @@ ACTION_FIELD_KINDS: frozenset[str] = frozenset({"text", "multiline", "scope"})
 # UIWidget/UIPage below (fail-visible, same posture as `kind`, §4.2): an
 # unrecognized value registers fine and degrades to the plugin-grouped
 # fallback group at composition time — this constant documents the
-# vocabulary, it does not gate it.
+# vocabulary, it does not gate it. NOT the same `intent` as the payload-level
+# semantic color hint ('good'|'bad'|'neutral') in stat/list/badge response
+# bodies — that one lives in the data plane; this one lives on the manifest.
 PLACEMENT_INTENTS: frozenset[str] = frozenset(
     {
         "attention",
@@ -349,9 +351,8 @@ class UIPage(BaseModel):
     )
     intent: str | None = Field(
         default=None,
-        description="optional placement intent — see docs/specs/dashboard-ia.md "
-        "§4. NOT validated against PLACEMENT_INTENTS: an unrecognized value "
-        "fails visible (degrades to the fallback group), same posture as `kind`",
+        description="optional placement intent — same contract and fail-visible "
+        "posture as UIWidget.intent (docs/specs/dashboard-ia.md §4)",
     )
 
     _valid_data = field_validator("data")(_valid_ui_data)

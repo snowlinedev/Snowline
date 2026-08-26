@@ -15,7 +15,7 @@ export type UIWidget = {
   data: string;
   refresh_seconds?: number;
   /** optional placement intent — see docs/specs/dashboard-ia.md §4 */
-  intent?: string;
+  intent?: string | null;
 };
 
 /** `thread` pages may declare a composer (shadow-conversations.md §4): an
@@ -63,7 +63,7 @@ export type UIPage = {
   composer?: UIComposer | null;
   actions?: UIAction[] | null;
   /** optional placement intent — see docs/specs/dashboard-ia.md §4 */
-  intent?: string;
+  intent?: string | null;
 };
 
 export type UIBlock = {

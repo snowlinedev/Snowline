@@ -77,7 +77,10 @@ ACTION_FIELD_KINDS: frozenset[str] = frozenset({"text", "multiline", "scope"})
 # `intent` is a FREE string on the manifest's page/widget entries (fail-visible,
 # same posture as `kind`, §4.2): an unrecognized value registers fine and
 # degrades to the plugin-grouped fallback group at composition time — this
-# constant documents the vocabulary, it does not gate it.
+# constant documents the vocabulary, it does not gate it. NOT the same `intent`
+# as the payload-level semantic color hint ('good'|'bad'|'neutral') in
+# STAT_SHAPE/LIST_ITEM_SHAPE/board badges below — that one lives in the data
+# plane; this one lives on the manifest. Crossing them fails silently.
 PLACEMENT_INTENTS: frozenset[str] = frozenset(
     {
         "attention",
@@ -112,7 +115,8 @@ STAT_SHAPE: dict[str, str] = {
     "value": "required — the number/short string to render",
     "label": "optional — a caption under the value",
     "delta": "optional — a trend value, e.g. '+3' (shell may color by sign)",
-    "intent": "optional — a semantic color hint, e.g. 'good'|'bad'|'neutral'",
+    "intent": "optional — a semantic color hint, e.g. 'good'|'bad'|'neutral' "
+    "(unrelated to the manifest-level placement intent, PLACEMENT_INTENTS)",
 }
 
 LIST_ITEM_SHAPE: dict[str, str] = {
