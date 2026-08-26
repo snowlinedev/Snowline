@@ -56,6 +56,30 @@ ACTION_FIELDS: frozenset[str] = frozenset({"id", "label", "endpoint", "fields"})
 ACTION_FIELD_FIELDS: frozenset[str] = frozenset({"name", "label", "kind", "required"})
 ACTION_FIELD_KINDS: frozenset[str] = frozenset({"text", "multiline", "scope"})
 
+# Placement-intent vocabulary (docs/specs/dashboard-ia.md §4.1): a plugin's
+# optional declaration of WHERE a page/widget belongs in the platform-owned
+# IA. Same drift-guard treatment as UI_KINDS/COMPOSER_FIELDS/ACTION_FIELDS
+# above — the SDK ships an identical PLACEMENT_INTENTS constant, pinned equal
+# by test_ui_contract_drift.py. `intent` itself is a FREE string on
+# UIWidget/UIPage below (fail-visible, same posture as `kind`, §4.2): an
+# unrecognized value registers fine and degrades to the plugin-grouped
+# fallback group at composition time — this constant documents the
+# vocabulary, it does not gate it. NOT the same `intent` as the payload-level
+# semantic color hint ('good'|'bad'|'neutral') in stat/list/badge response
+# bodies — that one lives in the data plane; this one lives on the manifest.
+PLACEMENT_INTENTS: frozenset[str] = frozenset(
+    {
+        "attention",
+        "digest",
+        "activity",
+        "roadmap",
+        "feature-status",
+        "review-queue",
+        "detail",
+        "admin",
+    }
+)
+
 # Route path-param segments template verbatim into `data` (ui-shell.md §3):
 # `{name}` where `name` is a simple identifier. A literal segment is a
 # generic url-safe token (letters/digits/`_`/`-`/`.`) — permissive on purpose,
@@ -179,6 +203,12 @@ class UIWidget(BaseModel):
     data: str = Field(description="plugin-relative path, proxied via /ui-api (§5)")
     refresh_seconds: int | None = Field(
         default=None, description="shell polling hint; the shell may clamp it"
+    )
+    intent: str | None = Field(
+        default=None,
+        description="optional placement intent — see docs/specs/dashboard-ia.md "
+        "§4. NOT validated against PLACEMENT_INTENTS: an unrecognized value "
+        "fails visible (degrades to the fallback group), same posture as `kind`",
     )
 
     _valid_data = field_validator("data")(_valid_ui_data)
@@ -318,6 +348,11 @@ class UIPage(BaseModel):
         default_factory=list,
         description="optional page-level write affordances (ui-shell.md §5 "
         "actions[]); valid on any page kind, unlike the thread-only composer",
+    )
+    intent: str | None = Field(
+        default=None,
+        description="optional placement intent — same contract and fail-visible "
+        "posture as UIWidget.intent (docs/specs/dashboard-ia.md §4)",
     )
 
     _valid_data = field_validator("data")(_valid_ui_data)

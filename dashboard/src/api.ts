@@ -4,7 +4,9 @@
 
 /** A manifest's declarative widget/page contributions (ui-shell.md §3). `kind`
  * is a free string on purpose — an unknown kind registers fine and fails
- * visible at render (§4.4), so the shell never validates it here. */
+ * visible at render (§4.4), so the shell never validates it here. `intent`
+ * (both types, below) is an optional placement intent — see
+ * docs/specs/dashboard-ia.md §4 — same free-string, fail-visible posture. */
 export type UIWidget = {
   id: string;
   slot: "home";
@@ -12,6 +14,8 @@ export type UIWidget = {
   title?: string;
   data: string;
   refresh_seconds?: number;
+  /** optional placement intent — see docs/specs/dashboard-ia.md §4 */
+  intent?: string | null;
 };
 
 /** `thread` pages may declare a composer (shadow-conversations.md §4): an
@@ -58,6 +62,8 @@ export type UIPage = {
   data: string;
   composer?: UIComposer | null;
   actions?: UIAction[] | null;
+  /** optional placement intent — see docs/specs/dashboard-ia.md §4 */
+  intent?: string | null;
 };
 
 export type UIBlock = {

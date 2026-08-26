@@ -68,6 +68,32 @@ ACTION_FIELDS: frozenset[str] = frozenset({"id", "label", "endpoint", "fields"})
 ACTION_FIELD_FIELDS: frozenset[str] = frozenset({"name", "label", "kind", "required"})
 ACTION_FIELD_KINDS: frozenset[str] = frozenset({"text", "multiline", "scope"})
 
+# --- Placement intent (docs/specs/dashboard-ia.md §4.1) ---------------------
+#
+# A plugin's optional declaration of WHERE a page/widget belongs in the
+# platform-owned IA — same drift-guard treatment as UI_KINDS/COMPOSER_FIELDS
+# above: the platform (`snowline_platform.manifest.PLACEMENT_INTENTS`) is the
+# source of truth, pinned equal to this copy by `test_ui_contract_drift.py`.
+# `intent` is a FREE string on the manifest's page/widget entries (fail-visible,
+# same posture as `kind`, §4.2): an unrecognized value registers fine and
+# degrades to the plugin-grouped fallback group at composition time — this
+# constant documents the vocabulary, it does not gate it. NOT the same `intent`
+# as the payload-level semantic color hint ('good'|'bad'|'neutral') in
+# STAT_SHAPE/LIST_ITEM_SHAPE/board badges below — that one lives in the data
+# plane; this one lives on the manifest. Crossing them fails silently.
+PLACEMENT_INTENTS: frozenset[str] = frozenset(
+    {
+        "attention",
+        "digest",
+        "activity",
+        "roadmap",
+        "feature-status",
+        "review-queue",
+        "detail",
+        "admin",
+    }
+)
+
 # The /ui-api proxy's POST body cap (shadow-conversations.md §3): a
 # conversation message, not an upload. THE shared value — the platform's
 # proxy enforcement (`snowline_platform.ui_api.POST_BODY_LIMIT`) is pinned
@@ -89,7 +115,8 @@ STAT_SHAPE: dict[str, str] = {
     "value": "required — the number/short string to render",
     "label": "optional — a caption under the value",
     "delta": "optional — a trend value, e.g. '+3' (shell may color by sign)",
-    "intent": "optional — a semantic color hint, e.g. 'good'|'bad'|'neutral'",
+    "intent": "optional — a semantic color hint, e.g. 'good'|'bad'|'neutral' "
+    "(unrelated to the manifest-level placement intent, PLACEMENT_INTENTS)",
 }
 
 LIST_ITEM_SHAPE: dict[str, str] = {
@@ -307,6 +334,7 @@ __all__ = [
     "PAGE_KIND_BOARD",
     "PAGE_KINDS",
     "UI_KINDS",
+    "PLACEMENT_INTENTS",
     "STAT_SHAPE",
     "LIST_ITEM_SHAPE",
     "LIST_SHAPE",
