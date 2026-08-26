@@ -79,8 +79,21 @@
   font-weight: 600;
 }
 
-/* registered-page nav groups (ui-shell.md §6): native pages first, then one
- * small heading per contributing plugin. */
+/* the five demand-side sections (dashboard-ia.md §3): a section link, with
+ * its composed tenants indented under it. */
+.nav-section,
+.nav-section-pages {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.nav-section-pages {
+  padding-left: var(--space-3);
+}
+
+/* fallback nav groups (dashboard-ia.md §3 / ui-shell.md §6): after the
+ * sections, one small heading per plugin whose pages declared no intent. */
 .nav-group {
   display: flex;
   flex-direction: column;

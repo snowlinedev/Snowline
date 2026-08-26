@@ -1,6 +1,11 @@
-/** Home — the widget grid (ui-shell.md §6): platform-native widgets built
- * THROUGH the kind vocabulary, then registered plugin widgets (slot "home")
- * appended after them, each its own polling Card. */
+/** Today (`/`) — the owner's briefing surface (dashboard-ia.md §3), and for
+ * now exactly the Home grid it replaces (ui-shell.md §6): platform-native
+ * widgets built THROUGH the kind vocabulary, then registered plugin widgets
+ * (slot "home") appended after them, each its own polling Card.
+ *
+ * The banded composition by widget intent, and the native cards' move to
+ * System, are step 3 (§5/§8) — this step changes the identity at `/`, not yet
+ * what renders there. */
 
 import type { PluginEntry, UIWidget } from "../api";
 import { fetchPlugins, fetchSurfaces } from "../api";
@@ -41,12 +46,12 @@ function WidgetCard(props: { plugin: PluginEntry; widget: UIWidget }) {
   );
 }
 
-export function Home() {
+export function Today() {
   const plugins = useData(fetchPlugins, 10);
   const surfaces = useData(fetchSurfaces, 30);
 
   return (
-    <Layout title="Home">
+    <Layout title="Today">
       <div className="grid">
         <Card title="Plugins up">
           {plugins.state === "ready" ? (

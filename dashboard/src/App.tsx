@@ -2,12 +2,13 @@ import { Route, Routes } from "react-router-dom";
 
 import { fetchPlugins } from "./api";
 import { PendingNote } from "./kinds/kinds";
-import { Home } from "./pages/Home";
 import { Plugins } from "./pages/Plugins";
 import { PluginPage } from "./pages/PluginPage";
 import { Scopes } from "./pages/Scopes";
+import { SectionPage } from "./pages/Section";
 import { Surfaces } from "./pages/Surfaces";
-import { pluginRoutes } from "./registry";
+import { Today } from "./pages/Today";
+import { SECTIONS, pluginRoutes } from "./registry";
 import { Layout } from "./shell/Layout";
 import { useData } from "./useData";
 
@@ -21,7 +22,15 @@ export function App() {
 
   return (
     <Routes>
-      <Route path="/" element={<Home />} />
+      {/* The five sections (dashboard-ia.md §3) route from the same table nav
+       * lists them from, so a section can never be nav-listed without
+       * resolving. Today is the widget grid at `/`; the others are section
+       * pages. The native views keep their own cited routes — System is
+       * where they're FOUND, not a re-namespacing. */}
+      <Route path="/" element={<Today />} />
+      {SECTIONS.filter((s) => s.to !== "/").map((s) => (
+        <Route key={s.id} path={s.to} element={<SectionPage section={s} />} />
+      ))}
       <Route path="/plugins" element={<Plugins />} />
       <Route path="/surfaces" element={<Surfaces />} />
       <Route path="/scopes" element={<Scopes />} />

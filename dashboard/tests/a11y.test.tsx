@@ -20,6 +20,14 @@ import { App } from "../src/App";
 // placeholder/error cards) via the same fixture.
 const PAGES = [
   "/",
+  // The demand-side sections (dashboard-ia.md §3): audits the section pages'
+  // tenant lists and — with the shared fixture declaring no intents yet —
+  // their empty states, which are the state they'll be in most often until
+  // the adoption steps land.
+  "/roadmap",
+  "/features",
+  "/review",
+  "/system",
   "/plugins",
   "/surfaces",
   "/scopes",

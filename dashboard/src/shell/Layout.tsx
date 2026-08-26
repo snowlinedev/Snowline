@@ -11,15 +11,8 @@ import {
   type Density,
   type Theme,
 } from "../prefs";
-import { pluginNavGroups } from "../registry";
+import { SECTIONS, pluginNavGroups, sectionNavEntries } from "../registry";
 import { useData } from "../useData";
-
-const NATIVE_PAGES = [
-  { to: "/", label: "Home" },
-  { to: "/plugins", label: "Plugins" },
-  { to: "/surfaces", label: "Surfaces" },
-  { to: "/scopes", label: "Scopes" },
-];
 
 export function Layout(props: { title: string; children: ReactNode }) {
   const [theme, setTheme] = useState<Theme>(currentTheme);
@@ -31,12 +24,16 @@ export function Layout(props: { title: string; children: ReactNode }) {
   // state is inert there.
   const [navOpen, setNavOpen] = useState(false);
   const closeNav = () => setNavOpen(false);
-  // Registered nav (ui-shell.md §6): native pages first, then `nav: true`
-  // plugin pages grouped under a small per-plugin heading. Every page
-  // renders through Layout, so this one fetch/render path is how ALL nav —
-  // native and registered — stays in sync with the live plugin registry.
+  // Demand-side nav (dashboard-ia.md §3): the five platform-owned sections,
+  // each listing the contributions whose `intent` placed them there, then the
+  // per-plugin fallback groups for everything that declared no intent. Every
+  // page renders through Layout, so this one fetch/render path is how ALL nav
+  // stays in sync with the live plugin registry. Sections render from the
+  // static table even before the fetch resolves — the chrome is stable, only
+  // its tenants arrive late.
   const plugins = useData(fetchPlugins, 30);
-  const navGroups = plugins.state === "ready" ? pluginNavGroups(plugins.data) : [];
+  const registry = plugins.state === "ready" ? plugins.data : [];
+  const navGroups = pluginNavGroups(registry);
 
   // Page titled (WCAG 2.4.2): SPA route changes must retitle the document —
   // tabs, history, and screen readers all read this, not the <h1>.
@@ -71,11 +68,29 @@ export function Layout(props: { title: string; children: ReactNode }) {
           </button>
         </div>
         <div className="shell-nav-links" id="shell-nav-links">
-          {NATIVE_PAGES.map((p) => (
-            <NavLink key={p.to} to={p.to} end={p.to === "/"} onClick={closeNav}>
-              {p.label}
-            </NavLink>
-          ))}
+          {SECTIONS.map((section) => {
+            const entries = sectionNavEntries(registry, section.id);
+            return (
+              <div className="nav-section" key={section.id}>
+                <NavLink
+                  to={section.to}
+                  end={section.to === "/"}
+                  onClick={closeNav}
+                >
+                  {section.label}
+                </NavLink>
+                {entries.length > 0 && (
+                  <div className="nav-section-pages">
+                    {entries.map((e) => (
+                      <NavLink key={e.key} to={e.to} onClick={closeNav}>
+                        {e.label}
+                      </NavLink>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
           {navGroups.map((group) => (
             <div className="nav-group" key={group.plugin}>
               <p className="nav-group-heading">{group.plugin}</p>
