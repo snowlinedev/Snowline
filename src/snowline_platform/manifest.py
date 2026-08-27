@@ -92,6 +92,29 @@ PLACEMENT_INTENTS: frozenset[str] = frozenset(
     }
 )
 
+# Per-intent meaning + placement (dashboard-ia.md §4.1's table), one line
+# each: what declaring this intent says about the view, and where the
+# platform places it. Same doc-not-schema posture as UI_KIND_SHAPES /
+# ACTION_FIELD_SHAPE above — a plain dict for a manifest author to read, not
+# validated against anywhere; nothing here enforces PLACEMENT_INTENTS'
+# fail-visible posture above. Same drift-guard treatment: the SDK ships an
+# identical copy, pinned equal by test_ui_contract_drift.py, and pinned to
+# cover PLACEMENT_INTENTS exactly.
+PLACEMENT_INTENT_SHAPE: dict[str, str] = {
+    "attention": "a needs-you / blocked / overdue surface — Today, first band",
+    "digest": "a summary of state (\"since you last looked\") — Today, second "
+    "band",
+    "activity": "a recent-events feed (shipped, decided, changed) — Today, "
+    "third band",
+    "roadmap": "planning structure (what's queued, in what order) — Roadmap",
+    "feature-status": "cross-scope progress on a named body of work — "
+    "Features",
+    "review-queue": "items awaiting explicit human judgment — Review",
+    "detail": "an entity page reached by links, never browsed to — no nav "
+    "entry (subsumes `nav: false`)",
+    "admin": "an operational / registry / diagnostic view — System",
+}
+
 # Route path-param segments template verbatim into `data` (ui-shell.md §3):
 # `{name}` where `name` is a simple identifier. A literal segment is a
 # generic url-safe token (letters/digits/`_`/`-`/`.`) — permissive on purpose,
