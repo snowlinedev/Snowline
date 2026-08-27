@@ -15,7 +15,7 @@
 import { useId } from "react";
 
 import type { PluginEntry, UIWidget } from "../api";
-import { Card, KindList, PendingNote, RegisteredKind, StateNote, useUiData } from "../kinds/kinds";
+import { Card, KindList, PendingNote, RegisteredKind, StateNote, WIDGET_ONLY_KINDS, useUiData } from "../kinds/kinds";
 import { usePlugins } from "../plugins-context";
 import {
   clampRefreshSeconds,
@@ -36,6 +36,8 @@ function WidgetCard(props: { plugin: PluginEntry; widget: UIWidget }) {
     props.widget.kind,
     contractOk,
     clampRefreshSeconds(props.widget.refresh_seconds),
+    undefined,
+    WIDGET_ONLY_KINDS,
   );
   return (
     // h3: the card sits under its band's h2 heading (see Band below).
@@ -46,6 +48,7 @@ function WidgetCard(props: { plugin: PluginEntry; widget: UIWidget }) {
         kind={props.widget.kind}
         contractOk={contractOk}
         loadable={loadable}
+        allowedKinds={WIDGET_ONLY_KINDS}
       />
     </Card>
   );

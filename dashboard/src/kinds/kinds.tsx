@@ -18,7 +18,7 @@ import {
   type KeyboardEvent,
   type ReactNode,
 } from "react";
-import { Link, useNavigate, useSearchParams } from "react-router-dom";
+import { Link, useLocation, useNavigate, useSearchParams } from "react-router-dom";
 
 import {
   fetchScopeSlugs,
@@ -997,6 +997,14 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 
 const KNOWN_KINDS = new Set(["stat", "list", "table", "thread", "document", "board"]);
 
+/** The kinds a WIDGET slot may render (§4.1: widget kinds are stat/list —
+ * everything else is a page kind). Enforced at dispatch, not just documented:
+ * a widget declaring a page kind (e.g. "board") fails visible via
+ * UnsupportedKindCard instead of silently rendering — which for "board"
+ * would also mint a second owner of the route's query string (§4.2a's
+ * one-board-per-route premise). */
+export const WIDGET_ONLY_KINDS: ReadonlySet<string> = new Set(["stat", "list"]);
+
 function validateStat(d: unknown) {
   if (!isRecord(d)) return null;
   if (typeof d.value !== "string" && typeof d.value !== "number") return null;
@@ -1114,7 +1122,14 @@ function validateBoardData(d: unknown) {
     d.facets !== undefined &&
     (!Array.isArray(d.facets) ||
       d.facets.some(
-        (f) => !isRecord(f) || typeof f.key !== "string" || typeof f.label !== "string",
+        // An empty key is rejected as malformed (fail-visible): it would
+        // round-trip through ?show=/?hide= as a bare param that the read
+        // side strips, leaving a toggle permanently stuck instead of loud.
+        (f) =>
+          !isRecord(f) ||
+          typeof f.key !== "string" ||
+          f.key === "" ||
+          typeof f.label !== "string",
       ))
   ) {
     return null;
@@ -1180,8 +1195,11 @@ export function RegisteredKind(props: {
   composer?: UIComposer | null;
   composerPath?: string;
   onComposerSent?: () => void;
+  /** The kind vocabulary valid for THIS slot — widgets pass WIDGET_ONLY_KINDS
+   * (§4.1); pages default to the full set. */
+  allowedKinds?: ReadonlySet<string>;
 }) {
-  if (!props.contractOk || !KNOWN_KINDS.has(props.kind)) {
+  if (!props.contractOk || !(props.allowedKinds ?? KNOWN_KINDS).has(props.kind)) {
     return <UnsupportedKindCard plugin={props.plugin} kind={props.kind} />;
   }
   if (props.loadable.state !== "ready") {
@@ -1341,6 +1359,7 @@ function useScopeSlugs(enabled: boolean): string[] {
 
 function PageAction(props: { plugin: string; action: UIAction }) {
   const navigate = useNavigate();
+  const location = useLocation();
   const fields = props.action.fields ?? [];
   const [open, setOpen] = useState(false);
   const [values, setValues] = useState<Record<string, string>>({});
@@ -1401,7 +1420,14 @@ function PageAction(props: { plugin: string; action: UIAction }) {
         // table row `href`. Absent/dropped = nothing to land on, so just
         // close the form.
         const to = prefixHref(props.plugin, safeNavigateHref(nav));
-        if (to) navigate(to);
+        // A same-route navigate ("refresh this view") must not wipe the
+        // user's URL view state (board filters, §4.2a): when the target is
+        // exactly this pathname with no query of its own, carry the current
+        // query along. A different route, or a target that names its own
+        // query, is followed verbatim.
+        if (to && !to.includes("?") && to === location.pathname && location.search) {
+          navigate({ pathname: to, search: location.search });
+        } else if (to) navigate(to);
         else close();
       },
       (err) => {
@@ -1534,8 +1560,9 @@ export function useUiData(
   contractOk: boolean,
   refreshSeconds?: number,
   pauseWhenHidden?: boolean,
+  allowedKinds?: ReadonlySet<string>,
 ): DataResult<unknown> {
-  const renderable = contractOk && KNOWN_KINDS.has(kind);
+  const renderable = contractOk && (allowedKinds ?? KNOWN_KINDS).has(kind);
   return useData(
     () => (renderable ? fetchUiData(plugin, path) : Promise.resolve(undefined)),
     refreshSeconds,

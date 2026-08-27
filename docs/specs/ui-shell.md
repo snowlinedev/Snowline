@@ -449,4 +449,9 @@ colorblind-safe series palette.
 - Remote-module escape hatch (documented direction only).
 - `search` page kind; websockets/SSE liveness (poll first); mobile-dedicated
   layouts (responsive reflow only); theming beyond light/dark.
+- Stored per-user UI defaults (e.g. remembered board filters): board view
+  state travels in the URL (§4.2a) and a bare URL always renders the plugin's
+  declared defaults. The only persisted preferences are §7's theme/density
+  toggles — deliberately that narrow; a stored view-state default would fight
+  the URL scheme.
 - Auth beyond the tailnet edge (unchanged platform posture).

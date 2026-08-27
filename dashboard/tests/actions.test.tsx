@@ -10,11 +10,12 @@
  * plain queries and property/attribute checks. */
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
 
 import { App } from "../src/App";
 import type { UIAction } from "../src/api";
+import { PageActions } from "../src/kinds/kinds";
 import { jsonResponse, renderActionsInRouter as renderInRouter } from "./helpers";
 import { FIXTURES } from "./setup";
 
@@ -51,6 +52,49 @@ describe("page actions[]", () => {
     // The optional multiline field renders as a textarea, labelled.
     const note = screen.getByLabelText(/Opening note/) as HTMLTextAreaElement;
     expect(note.tagName).toBe("TEXTAREA");
+  });
+
+  it("a same-route navigate keeps the URL view state (board filters, §4.2a)", async () => {
+    // An action whose success-navigate points back at ITS OWN route (the
+    // "refresh this view" pattern) must not wipe ?show/?hide/?group — the
+    // filters now live in the URL, where local state used to survive this.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse({ ok: true, navigate: "/shadow" })),
+    );
+    function Probe() {
+      const loc = useLocation();
+      return <div data-testid="loc">{loc.pathname + loc.search}</div>;
+    }
+    const refresh: UIAction = {
+      id: "refresh",
+      label: "Refresh",
+      endpoint: "/ui-api/pages/branches",
+      fields: [{ name: "note", label: "Note", kind: "text", required: false }],
+    };
+    render(
+      <MemoryRouter initialEntries={["/governance/shadow?show=stale"]}>
+        <Routes>
+          <Route
+            path="/governance/shadow"
+            element={
+              <>
+                <PageActions plugin="governance" actions={[refresh]} />
+                <Probe />
+              </>
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("loc").textContent).toBe(
+        "/governance/shadow?show=stale",
+      ),
+    );
   });
 
   it("gates submit until required fields are filled", async () => {
