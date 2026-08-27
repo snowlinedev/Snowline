@@ -55,6 +55,15 @@ def build_manifest(base_url: str | None = None) -> dict:
     module docstring for why: branch names are only unique WITHIN a scope, so
     a `<scope>:<name>` route would need a two-segment or percent-encoded
     param; `id` round-trips in one).
+
+    Placement intents (dashboard-ia.md §4/§8 step 5, snowline-pm#97):
+    `shadow-branches` → `review-queue` (Review's "what's waiting on my
+    judgment" tenant); `shadow-branch` → `detail` (a `{branch_id}`-routed
+    page the shell would refuse a nav entry for anyway). Of the two widgets,
+    only `unreconciled-decisions` carries an intent (`attention` — an
+    unreconciled pair awaits a human, dashboard-ia.md §5 "Needs you" band);
+    `shadow-activity`'s open-branch count is status, not a to-do, so it stays
+    intent-less in Today's fallback band.
     """
     return {
         "name": PLUGIN_NAME,
@@ -95,6 +104,7 @@ def build_manifest(base_url: str | None = None) -> dict:
                     "id": "unreconciled-decisions",
                     "slot": "home",
                     "kind": "stat",
+                    "intent": "attention",
                     "title": "Unreconciled decisions",
                     "data": "/ui-api/widgets/unreconciled-decisions",
                     "refresh_seconds": 30,
@@ -108,6 +118,7 @@ def build_manifest(base_url: str | None = None) -> dict:
                     "nav": True,
                     "kind": "table",
                     "data": "/ui-api/pages/branches",
+                    "intent": "review-queue",
                     # The page-level WRITE seam (ui-shell.md §5 actions[], issue
                     # #123): a "New branch" affordance so a speculation line can
                     # be born from the dashboard (phone/MBP over tailnet) without
@@ -160,6 +171,7 @@ def build_manifest(base_url: str | None = None) -> dict:
                     "nav": False,
                     "kind": "thread",
                     "data": "/ui-api/pages/branches/{branch_id}",
+                    "intent": "detail",
                     # The composer write seam (shadow-conversations §4/§5): the
                     # shell renders a markdown textarea + send button at the thread
                     # foot that POSTs `{ "markdown": ... }` through the /ui-api
