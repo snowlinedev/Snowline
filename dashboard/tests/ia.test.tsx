@@ -15,13 +15,16 @@ import { MemoryRouter } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
 
 import { App } from "../src/App";
-import type { PluginEntry, UIPage } from "../src/api";
+import type { PluginEntry, UIPage, UIWidget } from "../src/api";
 import {
+  INTENT_SECTIONS,
   SECTIONS,
+  TODAY_BANDS,
   pageNavEntry,
   sectionDef,
   sectionForIntent,
   sectionNavEntries,
+  todayBands,
 } from "../src/registry";
 import { jsonResponse } from "./helpers";
 import { FIXTURES } from "./setup";
@@ -43,19 +46,24 @@ function stubRegistry(plugins: PluginEntry[], extra: Record<string, unknown> = {
   );
 }
 
-/** One plugin named `acme` contributing exactly the given pages. */
-function acme(pages: UIPage[]): PluginEntry {
+/** One plugin named `acme` contributing exactly the given pages (and, for the
+ * Today-band tests, widgets). */
+function acme(pages: UIPage[], widgets: UIWidget[] = []): PluginEntry {
+  return named("acme", pages, widgets);
+}
+
+function named(name: string, pages: UIPage[], widgets: UIWidget[] = []): PluginEntry {
   return {
-    name: "acme",
+    name,
     status: "up",
     manifest: {
-      name: "acme",
+      name,
       base_url: "http://127.0.0.1:8899",
       mcp_path: "/mcp",
       health_path: "/health",
       ui_path: null,
       surfaces: {},
-      ui: { contract_version: 1, widgets: [], pages },
+      ui: { contract_version: 1, widgets, pages },
     },
   };
 }
@@ -351,7 +359,7 @@ describe("nav link hygiene", () => {
   it("lists a today-intent page under Today in nav AND on the Today page itself", async () => {
     // The §3 nav↔page invariant holds for Today like any section: an
     // attention/digest/activity page nav-lists under Today, so `/` must
-    // surface it too (the interim links card, until step 3's bands).
+    // surface it too — as a link entry inside its own band (§5).
     const digestPage: UIPage = {
       id: "digest",
       route: "/digest",
@@ -392,5 +400,183 @@ describe("nav link hygiene", () => {
     // The native System tenants get the same association.
     const system = within(nav).getByRole("group", { name: "System views" });
     expect(within(system).getByRole("link", { name: "Plugins" })).toBeTruthy();
+  });
+});
+
+describe("Today: banded composition (§5)", () => {
+  /** A home widget of the `stat` kind, optionally declaring an intent. */
+  function statWidget(id: string, intent?: string | null): UIWidget {
+    return {
+      id,
+      slot: "home",
+      kind: "stat",
+      title: `Widget ${id}`,
+      data: `/ui-api/widgets/${id}`,
+      ...(intent === undefined ? {} : { intent }),
+    };
+  }
+
+  const statPayload = (id: string, plugin = "acme") => ({
+    [`/ui-api/${plugin}/widgets/${id}`]: { value: 1, label: id },
+  });
+
+  /** The band headings, in rendered order — h2 is the band level (card titles
+   * inside a band are h3), so this reads the page's band outline exactly. */
+  const bandHeadings = () =>
+    within(screen.getByRole("main"))
+      .queryAllByRole("heading", { level: 2 })
+      .map((h) => h.textContent);
+
+  it("covers every Today intent with a band", () => {
+    // The band table and the intent table cannot drift: a `today` intent with
+    // no band would nav-list under Today and land nowhere on the page.
+    const todayIntents = [...INTENT_SECTIONS]
+      .filter(([, section]) => section === "today")
+      .map(([intent]) => intent);
+    expect(TODAY_BANDS.map((b) => b.intent)).toEqual(todayIntents);
+  });
+
+  it("renders the bands in spec order, and only the populated ones", async () => {
+    // attention + activity contribute; digest doesn't — so Digest collapses
+    // entirely, heading and all, and the surviving two keep spec order.
+    stubRegistry(
+      [
+        acme(
+          [
+            {
+              id: "shipped",
+              route: "/shipped",
+              title: "What shipped",
+              nav: false,
+              kind: "list",
+              data: "/ui-api/pages/shipped",
+              intent: "activity",
+            },
+          ],
+          [statWidget("blocked", "attention")],
+        ),
+      ],
+      statPayload("blocked"),
+    );
+    renderAt("/");
+    await screen.findByText("Needs you");
+    expect(bandHeadings()).toEqual(["Needs you", "Recent activity"]);
+    expect(screen.queryByText("Digest")).toBeNull();
+  });
+
+  it("renders a digest-intent widget's card inside the Digest band", async () => {
+    stubRegistry(
+      [acme([], [statWidget("since-you-looked", "digest")])],
+      statPayload("since-you-looked"),
+    );
+    renderAt("/");
+    // The band is a labelled region, so the card is findable BY BAND — the
+    // placement, not just the presence, is what §5 promises.
+    const band = await screen.findByRole("region", { name: "Digest" });
+    expect(
+      within(band).getByRole("heading", { level: 3, name: "Widget since-you-looked" }),
+    ).toBeTruthy();
+    // …and it rendered its own polled data, not a merged summary.
+    expect(within(band).getByText("since-you-looked")).toBeTruthy();
+    expect(bandHeadings()).toEqual(["Digest"]);
+  });
+
+  it("lands an intent-less home widget in its plugin's fallback band", async () => {
+    // §4.2: `slot: "home"` with no intent keeps working — demoted to the
+    // per-plugin fallback band, never dropped.
+    stubRegistry([acme([], [statWidget("legacy")])], statPayload("legacy"));
+    renderAt("/");
+    const band = await screen.findByRole("region", { name: "More from acme" });
+    expect(within(band).getByRole("heading", { level: 3, name: "Widget legacy" })).toBeTruthy();
+    expect(bandHeadings()).toEqual(["More from acme"]);
+  });
+
+  it("falls a widget's unknown intent back to the plugin band (§2.4)", async () => {
+    stubRegistry(
+      [acme([], [statWidget("future", "an-intent-from-a-newer-plugin")])],
+      statPayload("future"),
+    );
+    renderAt("/");
+    const band = await screen.findByRole("region", { name: "More from acme" });
+    expect(within(band).getByRole("heading", { level: 3, name: "Widget future" })).toBeTruthy();
+  });
+
+  it("banks a today-intent page as a link inside its band", async () => {
+    stubRegistry([
+      acme([
+        {
+          id: "needs-you",
+          route: "/needs-you",
+          title: "Needs your judgment",
+          nav: false,
+          kind: "list",
+          data: "/ui-api/pages/needs-you",
+          intent: "attention",
+        },
+      ]),
+    ]);
+    renderAt("/");
+    const band = await screen.findByRole("region", { name: "Needs you" });
+    const link = within(band).getByRole("link", { name: "Needs your judgment" });
+    expect(link.getAttribute("href")).toBe("/acme/needs-you");
+  });
+
+  it("renders an explicit empty state when nothing composes into Today", async () => {
+    stubRegistry([]);
+    renderAt("/");
+    const note = await screen.findByText(sectionDef("today").empty);
+    expect(note.getAttribute("role")).toBe("status");
+    expect(bandHeadings()).toEqual([]);
+    // …and Today stays in nav (§3: a section never vanishes).
+    expect(within(mainNav()).getByRole("link", { name: "Today" })).toBeTruthy();
+  });
+
+  it("orders bands' contributions by plugin registration (§4.2)", () => {
+    // Unit-level: two plugins both contributing to one band, plus each one's
+    // own fallback band, in registration order.
+    const bands = todayBands([
+      named("first", [], [statWidget("a", "attention"), statWidget("legacy-a")]),
+      named("second", [], [statWidget("b", "attention"), statWidget("legacy-b")]),
+    ]);
+    expect(bands.map((b) => b.heading)).toEqual([
+      "Needs you",
+      "More from first",
+      "More from second",
+    ]);
+    expect(bands[0].widgets.map((w) => w.key)).toEqual(["first:a", "second:b"]);
+  });
+
+  it("does not render the machine's health cards on Today (§3)", async () => {
+    // The native cards moved to System — Today is the owner's work.
+    stubRegistry([acme([], [statWidget("legacy")])], statPayload("legacy"));
+    renderAt("/");
+    await screen.findByText("More from acme");
+    const main = screen.getByRole("main");
+    expect(within(main).queryByText("Plugins up")).toBeNull();
+    expect(within(main).queryByText("Plugin status")).toBeNull();
+  });
+});
+
+describe("System hosts the native health cards (§3)", () => {
+  it("renders them above the section's tenant links", async () => {
+    stubRegistry([acme([], [])]);
+    renderAt("/system");
+    const main = screen.getByRole("main");
+    // By heading, not by text: "Surfaces" is also a tenant LINK on this page,
+    // and the card titles are what this test is about.
+    await within(main).findByRole("heading", { level: 2, name: "Plugins up" });
+    expect(
+      within(main).getByRole("heading", { level: 2, name: "Plugin status" }),
+    ).toBeTruthy();
+    expect(within(main).getByRole("heading", { level: 2, name: "Surfaces" })).toBeTruthy();
+    // The plugins-up stat reads the shared /plugins result (1 registered, up).
+    expect(within(main).getByText("1 / 1")).toBeTruthy();
+    // Surfaces come from the shared fixture's own /surfaces fetch.
+    await within(main).findByRole("link", { name: "main" });
+    // …and the native tenant links still follow.
+    const links = within(main).getAllByRole("link").map((a) => a.textContent);
+    expect(links).toContain("Plugins");
+    expect(links).toContain("Scopes");
+    expect(links.indexOf("Plugins")).toBeGreaterThan(links.indexOf("main"));
   });
 });

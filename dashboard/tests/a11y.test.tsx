@@ -16,8 +16,10 @@ import { App } from "../src/App";
 // are REGISTERED pages (ui-shell.md §3, fixture in tests/setup.ts) — they
 // render through the exact same kind components as the native pages, so
 // they're audited the same way, not treated as a special case. "/" also
-// covers the home-grid widget kinds (stat, plus the fail-visible
-// placeholder/error cards) via the same fixture.
+// covers Today's banded composition (dashboard-ia.md §5) — the band headings
+// and labelled regions, plus the widget kinds inside them (stat, and the
+// fail-visible placeholder/error cards) via the same fixture. "/system"
+// covers the native health cards Today handed over.
 const PAGES = [
   "/",
   // The demand-side sections (dashboard-ia.md §3): audits the section pages'

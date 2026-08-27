@@ -21,8 +21,8 @@ describe("registered nav + pages", () => {
         <App />
       </MemoryRouter>,
     );
-    // "governance" also appears as a Plugin-status list item on Home, so
-    // scope to the nav landmark to find the group heading unambiguously.
+    // "governance" also names Today's fallback band ("More from governance"),
+    // so scope to the nav landmark to find the group heading unambiguously.
     const nav = screen.getByRole("navigation", { name: "Main" });
     await within(nav).findByText("governance");
     const link = await within(nav).findByRole("link", { name: "Shadow discussions" });

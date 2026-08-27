@@ -1,33 +1,30 @@
-/** Today (`/`) — the owner's briefing surface (dashboard-ia.md §3), and for
- * now exactly the Home grid it replaces (ui-shell.md §6): platform-native
- * widgets built THROUGH the kind vocabulary, then registered plugin widgets
- * (slot "home") appended after them, each its own polling Card.
+/** Today (`/`) — the owner's briefing surface, composed into bands
+ * (dashboard-ia.md §5): **Needs you** (`attention`), **Digest** (`digest`),
+ * **Recent activity** (`activity`), then one "More from <plugin>" fallback
+ * band per plugin whose home widgets declared no recognized intent.
  *
- * The banded composition by widget intent, and the native cards' move to
- * System, are step 3 (§5/§8) — this step changes the identity at `/`, not yet
- * what renders there. */
+ * Composition is LAYOUT, never synthesis (§2.3): a band is N contributions
+ * from N plugins arranged under one heading — nothing is merged, joined, or
+ * interpreted here. Every widget keeps its own `useUiData` poll, so a slow or
+ * down plugin greys out its own card and cannot blank the page.
+ *
+ * The machine's own health (plugins up, plugin status, surfaces) is NOT here:
+ * §3 moves those native cards to System — Today is the owner's work.
+ */
+
+import { useId } from "react";
 
 import type { PluginEntry, UIWidget } from "../api";
-import { fetchSurfaces } from "../api";
-import {
-  Card,
-  KindList,
-  PendingNote,
-  RegisteredKind,
-  Stat,
-  StatusChip,
-  useUiData,
-} from "../kinds/kinds";
+import { Card, KindList, PendingNote, RegisteredKind, StateNote, useUiData } from "../kinds/kinds";
 import { usePlugins } from "../plugins-context";
 import {
   clampRefreshSeconds,
   contractSupported,
-  pluginWidgets,
   sectionDef,
-  sectionNavEntries,
+  todayBands,
+  type TodayBand,
 } from "../registry";
 import { Layout } from "../shell/Layout";
-import { useData } from "../useData";
 
 /** One registered widget's own Card — its own fetch/poll hook, so a slow or
  * down plugin's widget can't block or clobber another's. */
@@ -41,7 +38,8 @@ function WidgetCard(props: { plugin: PluginEntry; widget: UIWidget }) {
     clampRefreshSeconds(props.widget.refresh_seconds),
   );
   return (
-    <Card title={props.widget.title ?? props.widget.id}>
+    // h3: the card sits under its band's h2 heading (see Band below).
+    <Card title={props.widget.title ?? props.widget.id} headingLevel={3}>
       <RegisteredKind
         plugin={props.plugin.name}
         path={props.widget.data}
@@ -53,68 +51,70 @@ function WidgetCard(props: { plugin: PluginEntry; widget: UIWidget }) {
   );
 }
 
+/** One band: a REAL heading (§7 — h2, the level below Layout's page h1) over
+ * the contributions the platform placed in it, so the document outline mirrors
+ * the visual bands. Labelled `<section>`, so assistive tech can navigate
+ * band-by-band rather than through one flat run of cards.
+ *
+ * Pages come first as a single links card — a page is a destination (an entry
+ * point into the full view), and grouping them keeps one band from reading as
+ * a row of near-empty cards — then the self-polling widget cards, in
+ * plugin-registration order (§4.2). */
+function Band(props: { band: TodayBand }) {
+  // Minted, not derived from the band key: an id built from a plugin-supplied
+  // name could collide after any normalization, and a duplicate idref breaks
+  // the labelling for everyone (same reason the board rows mint theirs).
+  const headingId = useId();
+  return (
+    <section className="band" aria-labelledby={headingId}>
+      <h2 className="band-heading" id={headingId}>
+        {props.band.heading}
+      </h2>
+      <div className="grid">
+        {props.band.pages.length > 0 && (
+          <Card>
+            <KindList
+              items={props.band.pages.map((e) => ({ text: e.label, href: e.to }))}
+            />
+          </Card>
+        )}
+        {props.band.widgets.map(({ key, plugin, widget }) => (
+          <WidgetCard key={key} plugin={plugin} widget={widget} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
 export function Today() {
   const plugins = usePlugins();
-  const surfaces = useData(fetchSurfaces, 30);
-  // Pages placed on Today by intent (attention/digest/activity) are nav-listed
-  // under the Today link, so the page must list them too — the §3 nav↔page
-  // invariant holds for Today like any section. A links card is the interim
-  // surface; step 3's bands replace it.
-  const tenants =
-    plugins.state === "ready"
-      ? sectionNavEntries(plugins.data, sectionDef("today"))
-      : [];
+  const bands = plugins.state === "ready" ? todayBands(plugins.data) : [];
+
+  if (plugins.state !== "ready") {
+    return (
+      <Layout title="Today">
+        <Card>
+          <PendingNote loadable={plugins} />
+        </Card>
+      </Layout>
+    );
+  }
 
   return (
     <Layout title="Today">
-      <div className="grid">
-        <Card title="Plugins up">
-          {plugins.state === "ready" ? (
-            <Stat
-              value={`${plugins.data.filter((p) => p.status === "up").length} / ${plugins.data.length}`}
-              label="registered plugins healthy"
-            />
-          ) : (
-            <PendingNote loadable={plugins} />
-          )}
+      {bands.length === 0 ? (
+        // §3: nothing composed here says so in words (a status message, so
+        // it's announced) — Today never renders blank.
+        <Card>
+          <StateNote>{sectionDef("today").empty}</StateNote>
         </Card>
-        <Card title="Plugin status">
-          {plugins.state === "ready" ? (
-            <KindList
-              items={plugins.data.map((p) => ({
-                text: p.name,
-                meta: <StatusChip status={p.status} />,
-              }))}
-              empty="No plugins registered."
-            />
-          ) : (
-            <PendingNote loadable={plugins} />
-          )}
-        </Card>
-        <Card title="Surfaces">
-          {surfaces.state === "ready" ? (
-            <KindList
-              items={surfaces.data.map((s) => ({
-                text: s.name,
-                href: "/surfaces",
-                meta: `${s.plugins.length} plugin${s.plugins.length === 1 ? "" : "s"}`,
-              }))}
-              empty="No surfaces mounted."
-            />
-          ) : (
-            <PendingNote loadable={surfaces} />
-          )}
-        </Card>
-        {tenants.length > 0 && (
-          <Card title="Composed into Today">
-            <KindList items={tenants.map((e) => ({ text: e.label, href: e.to }))} />
-          </Card>
-        )}
-        {plugins.state === "ready" &&
-          pluginWidgets(plugins.data).map(({ key, plugin, widget }) => (
-            <WidgetCard key={key} plugin={plugin} widget={widget} />
+      ) : (
+        <div className="page-stack">
+          {bands.map((band) => (
+            <Band key={band.key} band={band} />
           ))}
-      </div>
+        </div>
+      )}
     </Layout>
   );
 }

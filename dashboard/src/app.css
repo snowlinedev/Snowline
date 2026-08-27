@@ -180,6 +180,24 @@
   grid-column: span 2;
 }
 
+/* Blocks stacked down a page: Today's bands (dashboard-ia.md §5) and the
+ * System section's native health grid above its tenant list. The grid's own
+ * gap spaces cards WITHIN a block; this spaces the blocks themselves. */
+.page-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+/* A Today band's heading (§5/§7): a real h2, styled as the page's structural
+ * label — one step above the card titles it sits over. */
+.band-heading {
+  margin: 0 0 var(--space-3);
+  font-size: var(--font-body);
+  font-weight: 700;
+  color: var(--ink-primary);
+}
+
 /* kind: stat */
 .stat .stat-value {
   font-size: var(--font-stat);

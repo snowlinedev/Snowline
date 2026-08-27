@@ -30,10 +30,24 @@ import {
 } from "../api";
 import { useData, type DataResult, type Loadable } from "../useData";
 
-export function Card(props: { title?: string; children: ReactNode }) {
+export function Card(props: {
+  title?: string;
+  children: ReactNode;
+  /** Heading level for the card's title. Default 2 — the level below Layout's
+   * page h1. A card nested under a heading of its own (Today's band headings,
+   * dashboard-ia.md §5) passes 3 so the document outline mirrors the nesting
+   * instead of flattening it (and never skips a level, which axe's
+   * heading-order rule flags). */
+  headingLevel?: 2 | 3;
+}) {
   return (
     <section className="card">
-      {props.title && <h2 className="card-title">{props.title}</h2>}
+      {props.title &&
+        createElement(
+          `h${props.headingLevel ?? 2}`,
+          { className: "card-title" },
+          props.title,
+        )}
       {props.children}
     </section>
   );
