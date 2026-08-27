@@ -65,14 +65,26 @@ export function pluginRoutes(plugins: PluginEntry[]): PluginRouteEntry[] {
 
 export type SectionId = "today" | "roadmap" | "features" | "review" | "system";
 
+export type SectionNavEntry = { key: string; to: string; label: string };
+
 export type SectionDef = {
   id: SectionId;
   label: string;
   to: string;
   /** Copy for the nothing-landed-here state. A section with nothing to show
    * renders this and NEVER disappears from nav (§3) — a vanishing entry reads
-   * as breakage, and the shell's chrome is meant to be stable. */
+   * as breakage, and the shell's chrome is meant to be stable. (For a section
+   * with `native` tenants the copy is unreachable by construction — kept so
+   * the table stays uniform and a future de-nativing can't forget it.) */
   empty: string;
+  /** Platform-native tenants this section owns unconditionally, ahead of any
+   * registered contribution (§3: System absorbs Plugins/Surfaces/Scopes —
+   * their routes stay put; System is where they're FOUND). Declared HERE so
+   * the table remains the single source both nav and the section pages
+   * derive from. Keys lead with ":" — a registered page's key is
+   * `<plugin>:<page-id>` with a non-empty plugin name, so a leading colon
+   * can never collide with one. */
+  native?: readonly SectionNavEntry[];
 };
 
 /** The five sections, in nav order — the owner's questions, not the plugin
@@ -110,8 +122,21 @@ export const SECTIONS: readonly SectionDef[] = [
     label: "System",
     to: "/system",
     empty: "No system views are registered yet.",
+    native: [
+      { key: ":plugins", to: "/plugins", label: "Plugins" },
+      { key: ":surfaces", to: "/surfaces", label: "Surfaces" },
+      { key: ":scopes", to: "/scopes", label: "Scopes" },
+    ],
   },
 ];
+
+/** Look a section up by id. The table is closed (§3: adding a section is a
+ * platform PR), so a miss is a programming error, not a data state. */
+export function sectionDef(id: SectionId): SectionDef {
+  const def = SECTIONS.find((s) => s.id === id);
+  if (!def) throw new Error(`unknown section: ${id}`);
+  return def;
+}
 
 /** The intent vocabulary this shell version understands (§4.1). A Map, not an
  * object literal, so a contribution declaring `intent: "constructor"` can't
@@ -148,38 +173,45 @@ export function sectionForIntent(
   return INTENT_SECTIONS.get(intent) ?? "fallback";
 }
 
-export type SectionNavEntry = { key: string; to: string; label: string };
+/** The one place a registered page becomes a nav destination: href, label,
+ * and React key for every list that links to it (section tenants, fallback
+ * groups). Returns null for a `{param}` route — a parameterized page has no
+ * single URL to link to, so nav must visibly refuse rather than emit a
+ * literal-brace dead link (`/governance/shadow/{branch}`); such pages are
+ * reached from row links and should declare `intent: "detail"`, but a
+ * mis-declared section intent must degrade to "not listed", never to a
+ * broken link. */
+export function pageNavEntry(
+  plugin: PluginEntry,
+  page: UIPage,
+): SectionNavEntry | null {
+  if (page.route.includes("{")) return null;
+  return {
+    key: `${plugin.name}:${page.id}`,
+    to: `/${plugin.name}${page.route}`,
+    label: page.title ?? page.id,
+  };
+}
 
-/** The native views System absorbs (§3). Their routes stay `/plugins`,
- * `/surfaces`, `/scopes` — diagnostics and agent output cite those URLs, so
- * System changes where they're FOUND, not where they live. */
-const SYSTEM_NATIVE_PAGES: readonly SectionNavEntry[] = [
-  { key: "native:plugins", to: "/plugins", label: "Plugins" },
-  { key: "native:surfaces", to: "/surfaces", label: "Surfaces" },
-  { key: "native:scopes", to: "/scopes", label: "Scopes" },
-];
-
-/** A section's tenants — the native views it owns, then every registered page
- * whose `intent` places it here, in plugin-registration order (§4.2). Nav
- * renders these under the section's own link; the section's page lists the
- * same entries (or its empty state), so the two can't disagree.
+/** A section's tenants — the native views it owns (`SectionDef.native`), then
+ * every registered linkable page whose `intent` places it here, in
+ * plugin-registration order (§4.2). Nav renders these under the section's own
+ * link; the section's page lists the same entries (or its empty state), so
+ * the two can't disagree.
  *
  * Pages only: widget intents compose Today's bands, which is step 3 (§5/§8).
  * A page's route is untouched — it stays `/<plugin><route>`; a section is a
  * PLACE in the IA, not a re-namespacing. */
 export function sectionNavEntries(
   plugins: PluginEntry[],
-  section: SectionId,
+  section: SectionDef,
 ): SectionNavEntry[] {
-  const out: SectionNavEntry[] = section === "system" ? [...SYSTEM_NATIVE_PAGES] : [];
+  const out: SectionNavEntry[] = [...(section.native ?? [])];
   for (const plugin of plugins) {
     for (const page of plugin.manifest.ui?.pages ?? []) {
-      if (sectionForIntent(page.intent) !== section) continue;
-      out.push({
-        key: `${plugin.name}:${page.id}`,
-        to: `/${plugin.name}${page.route}`,
-        label: page.title ?? page.id,
-      });
+      if (sectionForIntent(page.intent) !== section.id) continue;
+      const entry = pageNavEntry(plugin, page);
+      if (entry) out.push(entry);
     }
   }
   return out;
@@ -187,28 +219,25 @@ export function sectionNavEntries(
 
 export type PluginNavGroup = {
   plugin: string;
-  pages: { to: string; label: string }[];
+  pages: SectionNavEntry[];
 };
 
 /** The fallback groups (dashboard-ia.md §3): `nav: true` pages that no intent
  * placed in a section, grouped under a small per-plugin heading (ui-shell.md
  * §6) and rendered AFTER the five sections. Unchanged behavior, demoted from
  * being the whole IA to being the escape hatch — supply-side grouping is
- * where a contribution lands when it hasn't said what it's for. */
+ * where a contribution lands when it hasn't said what it's for. Entries come
+ * from the same `pageNavEntry` the sections use, so a `{param}` route can't
+ * produce a dead link here either. */
 export function pluginNavGroups(plugins: PluginEntry[]): PluginNavGroup[] {
   const groups: PluginNavGroup[] = [];
   for (const plugin of plugins) {
-    const navPages = (plugin.manifest.ui?.pages ?? []).filter(
-      (p) => p.nav && sectionForIntent(p.intent) === "fallback",
-    );
-    if (navPages.length === 0) continue;
-    groups.push({
-      plugin: plugin.name,
-      pages: navPages.map((p) => ({
-        to: `/${plugin.name}${p.route}`,
-        label: p.title ?? p.id,
-      })),
-    });
+    const pages = (plugin.manifest.ui?.pages ?? [])
+      .filter((p) => p.nav && sectionForIntent(p.intent) === "fallback")
+      .map((p) => pageNavEntry(plugin, p))
+      .filter((e): e is SectionNavEntry => e !== null);
+    if (pages.length === 0) continue;
+    groups.push({ plugin: plugin.name, pages });
   }
   return groups;
 }

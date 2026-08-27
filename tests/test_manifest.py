@@ -162,6 +162,18 @@ def test_unknown_intent_registers_ok():
     assert m.ui.pages[0].intent == "attention"
 
 
+def test_reserved_plugin_name_rejected():
+    # Plugin names become top-level shell routes (/<name>/<route>), so the IA
+    # section slugs and the native views' routes are off limits
+    # (dashboard-ia.md §3): a plugin named "review" with a root page would
+    # out-rank the platform's /review in the router and silently shadow the
+    # section. Fail-loud, same posture as the name grammar.
+    with pytest.raises(ValidationError, match="reserved"):
+        PluginManifest(name="review", base_url="http://x")
+    # A reserved word as a PREFIX is fine — only the exact slug collides.
+    assert PluginManifest(name="reviewer", base_url="http://x").name == "reviewer"
+
+
 # --- composer (shadow-conversations.md §4) ----------------------------------
 
 

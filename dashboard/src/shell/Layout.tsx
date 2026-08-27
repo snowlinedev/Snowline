@@ -1,7 +1,6 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { NavLink } from "react-router-dom";
 
-import { fetchPlugins } from "../api";
 import {
   applyPrefs,
   currentDensity,
@@ -11,8 +10,8 @@ import {
   type Density,
   type Theme,
 } from "../prefs";
+import { usePlugins } from "../plugins-context";
 import { SECTIONS, pluginNavGroups, sectionNavEntries } from "../registry";
-import { useData } from "../useData";
 
 export function Layout(props: { title: string; children: ReactNode }) {
   const [theme, setTheme] = useState<Theme>(currentTheme);
@@ -27,13 +26,19 @@ export function Layout(props: { title: string; children: ReactNode }) {
   // Demand-side nav (dashboard-ia.md §3): the five platform-owned sections,
   // each listing the contributions whose `intent` placed them there, then the
   // per-plugin fallback groups for everything that declared no intent. Every
-  // page renders through Layout, so this one fetch/render path is how ALL nav
-  // stays in sync with the live plugin registry. Sections render from the
-  // static table even before the fetch resolves — the chrome is stable, only
-  // its tenants arrive late.
-  const plugins = useData(fetchPlugins, 30);
-  const registry = plugins.state === "ready" ? plugins.data : [];
-  const navGroups = pluginNavGroups(registry);
+  // page renders through Layout and shares App's one /plugins fetch
+  // (plugins-context.tsx), so nav and page content derive from the SAME
+  // result. Sections render from the static table even before the fetch
+  // resolves — the chrome is stable, only its tenants arrive late. The
+  // bucketing memoizes on the fetch's data (stable between polls), not on the
+  // per-render Loadable wrapper.
+  const plugins = usePlugins();
+  const registry = plugins.state === "ready" ? plugins.data : null;
+  const sectionEntries = useMemo(
+    () => new Map(SECTIONS.map((s) => [s.id, sectionNavEntries(registry ?? [], s)])),
+    [registry],
+  );
+  const navGroups = useMemo(() => pluginNavGroups(registry ?? []), [registry]);
 
   // Page titled (WCAG 2.4.2): SPA route changes must retitle the document —
   // tabs, history, and screen readers all read this, not the <h1>.
@@ -69,18 +74,25 @@ export function Layout(props: { title: string; children: ReactNode }) {
         </div>
         <div className="shell-nav-links" id="shell-nav-links">
           {SECTIONS.map((section) => {
-            const entries = sectionNavEntries(registry, section.id);
+            const entries = sectionEntries.get(section.id) ?? [];
             return (
               <div className="nav-section" key={section.id}>
-                <NavLink
-                  to={section.to}
-                  end={section.to === "/"}
-                  onClick={closeNav}
-                >
+                {/* `end` on every section link: sections have no legitimate
+                 * child routes, so a deeper URL (a stale citation, or a
+                 * plugin route) must not leave the section marked
+                 * aria-current="page" by prefix match. */}
+                <NavLink to={section.to} end onClick={closeNav}>
                   {section.label}
                 </NavLink>
                 {entries.length > 0 && (
-                  <div className="nav-section-pages">
+                  /* role="group" + label: the tenant/section association is
+                   * otherwise only CSS indentation, which assistive tech
+                   * flattens into one run of links (WCAG 1.3.1). */
+                  <div
+                    className="nav-section-pages"
+                    role="group"
+                    aria-label={`${section.label} views`}
+                  >
                     {entries.map((e) => (
                       <NavLink key={e.key} to={e.to} onClick={closeNav}>
                         {e.label}
@@ -92,10 +104,21 @@ export function Layout(props: { title: string; children: ReactNode }) {
             );
           })}
           {navGroups.map((group) => (
-            <div className="nav-group" key={group.plugin}>
-              <p className="nav-group-heading">{group.plugin}</p>
+            /* Same 1.3.1 association as the section groups, but the fallback
+             * groups already have a visible heading — point the group at it
+             * rather than duplicating the text in an aria-label. Plugin names
+             * are unique, so the id is too. */
+            <div
+              className="nav-group"
+              key={group.plugin}
+              role="group"
+              aria-labelledby={`nav-group-${group.plugin}`}
+            >
+              <p className="nav-group-heading" id={`nav-group-${group.plugin}`}>
+                {group.plugin}
+              </p>
               {group.pages.map((p) => (
-                <NavLink key={p.to} to={p.to} onClick={closeNav}>
+                <NavLink key={p.key} to={p.to} onClick={closeNav}>
                   {p.label}
                 </NavLink>
               ))}
