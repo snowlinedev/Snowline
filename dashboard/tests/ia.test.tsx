@@ -493,6 +493,60 @@ describe("Today: banded composition (§5)", () => {
     expect(bandHeadings()).toEqual(["More from acme"]);
   });
 
+  it("fails a page-kind widget visible instead of rendering it (§4.1)", async () => {
+    // Widget kinds are stat/list; a widget declaring a PAGE kind (board)
+    // must hit the UnsupportedKindCard, not silently render — a board
+    // widget would also mint a second owner of the route's query string
+    // (§4.2a's one-board-per-route premise).
+    stubRegistry([
+      acme(
+        [],
+        [
+          {
+            id: "sneaky",
+            slot: "home",
+            kind: "board",
+            title: "Sneaky board",
+            data: "/ui-api/widgets/sneaky",
+          },
+        ],
+      ),
+    ]);
+    renderAt("/");
+    await screen.findByText(
+      "acme offers a view this platform version can't render (kind 'board')",
+    );
+  });
+
+  it("rejects an empty facet key as malformed board data", async () => {
+    // An empty key would round-trip through ?show=/?hide= as a bare param
+    // the read side strips — a permanently stuck toggle. Malformed, loudly.
+    stubRegistry(
+      [
+        acme([
+          {
+            id: "b",
+            route: "/b",
+            title: "B",
+            nav: false,
+            kind: "board",
+            data: "/ui-api/pages/b",
+            intent: "roadmap",
+          },
+        ]),
+      ],
+      {
+        "/ui-api/acme/pages/b": {
+          nodes: [{ id: "n1", label: "Node" }],
+          facets: [{ key: "", label: "Hide drafts", hidden_by_default: true }],
+        },
+      },
+    );
+    renderAt("/acme/b");
+    const error = await screen.findByRole("alert");
+    expect(error.textContent).toContain("malformed data");
+  });
+
   it("banks a today-intent page as a link inside its band", async () => {
     stubRegistry([
       acme([

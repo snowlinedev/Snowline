@@ -224,6 +224,28 @@ refetches, and a parent whose every child is filtered out still renders
 (collapsed to show 0 visible children, not hidden itself) so the tree's shape
 stays legible.
 
+**View state lives in the URL.** The group-by and facet toggles serialize onto
+the board page's own route as query params, so the filters survive a refresh, a
+board URL deep-links a particular view, and back/forward stay sane (each toggle
+REPLACES the history entry rather than pushing one — a view toggle is not a
+place to come back to; navigating BETWEEN routes still pushes normally).
+NON-DEFAULTS ONLY: a facet sitting at its `hidden_by_default` state writes
+nothing, so a default view's URL stays bare and a plugin later changing a
+default can never silently re-read an old link as something else.
+`?show=<key>` names a facet forced VISIBLE, `?hide=<key>` a facet forced HIDDEN
+(both repeat for several keys — `?show=a&show=b`, which stays readable where a
+delimited list would come back percent-encoded), and `?group=1` selects the
+grouped view (`Flat` being the default is never written). A key naming a facet
+the payload never declared matches no toggle and filters nothing (the same
+degrade-silently rule an undeclared `group_by.key` gets above) and is LEFT in
+the URL untouched — the shell rewrites only the params it owns, so the next
+toggle normalizes the stray key away. `board` is a
+page kind, so at most one board owns a route's query string; no namespacing.
+Per-node expand/collapse stays local, as `collapsed_by_default` says. This is
+STATELESS, SHAREABLE view state carried by a URL — NOT the per-user persisted
+UI state §9 still excludes: nothing is stored anywhere, and a bare URL always
+renders the plugin's declared defaults.
+
 **Validation** (fail-visible, §4.4, same posture as every other kind): a
 response missing `nodes` (or `nodes` not an array), or any node missing
 `id`/`label`, renders the malformed-data card. `group_by`/`facets`/per-node
@@ -235,10 +257,10 @@ when grouped view is selected, never an error.
 **Deferred, this increment:** drag-to-reorder (§4.3 already names this as a
 later `board` capability — a reorder endpoint + capability flag, once a
 plugin needs write-from-board); `search`-style free-text filtering (facets are
-plugin-declared booleans, not an open query); persisting a user's toggle
-choices across sessions (local component state only, resets on reload,
-consistent with §9's "no persistence beyond the tailnet trust edge" posture
-for v1 UI state generally).
+plugin-declared booleans, not an open query); STORING a user's toggle choices
+as a remembered preference (the URL carries them, which is stateless and
+shareable — a stored per-user default is the §9 persistence this v1 still
+leaves out).
 
 ### 4.3 Actions (page-level write affordances — specified, §5)
 
@@ -427,4 +449,9 @@ colorblind-safe series palette.
 - Remote-module escape hatch (documented direction only).
 - `search` page kind; websockets/SSE liveness (poll first); mobile-dedicated
   layouts (responsive reflow only); theming beyond light/dark.
+- Stored per-user UI defaults (e.g. remembered board filters): board view
+  state travels in the URL (§4.2a) and a bare URL always renders the plugin's
+  declared defaults. The only persisted preferences are §7's theme/density
+  toggles — deliberately that narrow; a stored view-state default would fight
+  the URL scheme.
 - Auth beyond the tailnet edge (unchanged platform posture).

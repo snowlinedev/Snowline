@@ -1,6 +1,7 @@
 /** The `board` kind (ui-shell.md §4.2a): a hierarchical, collapsible,
  * read-only tree with client-side group-by / facet toggles applied to one
- * already-fetched payload — no refetch, no persistence. Driven through the
+ * already-fetched payload — no refetch, and the toggle state carried by the
+ * route's query string rather than stored anywhere. Driven through the
  * registered `/governance/roadmap` page (fixture in tests/setup.ts) so it
  * renders through the exact same kind dispatch as everything else.
  *
@@ -10,15 +11,37 @@
  * node's `.hidden` property, the state the collapse control toggles. */
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { describe, expect, it } from "vitest";
 
 import { App } from "../src/App";
 
-function renderRoadmap() {
+/** The board's view state lives in the route's query string (§4.2a), so the
+ * tests need to READ the current URL — a probe rendered inside the same
+ * MemoryRouter is the observable. */
+function LocationProbe() {
+  const loc = useLocation();
+  return <span data-testid="url">{loc.pathname + loc.search}</span>;
+}
+function currentUrl(): string {
+  return screen.getByTestId("url").textContent ?? "";
+}
+
+/** A real Back, for the "toggles replace rather than push" test. */
+function BackButton() {
+  const navigate = useNavigate();
+  return (
+    <button type="button" onClick={() => navigate(-1)}>
+      GO BACK
+    </button>
+  );
+}
+
+function renderRoadmap(entry = "/governance/roadmap") {
   return render(
-    <MemoryRouter initialEntries={["/governance/roadmap"]}>
+    <MemoryRouter initialEntries={[entry]}>
       <App />
+      <LocationProbe />
     </MemoryRouter>,
   );
 }
@@ -168,6 +191,123 @@ describe("board kind: group-by toggle", () => {
     await waitFor(() =>
       expect(screen.queryByRole("heading", { name: "snowlinedev" })).toBeNull(),
     );
+  });
+});
+
+/** ui-shell.md §4.2a: the board's view state lives in the route's query string
+ * (`?show=<facet>` / `?hide=<facet>` / `?group=1`, non-defaults only), so the
+ * filters survive a refresh, a board URL deep-links a view, and toggling
+ * replaces rather than pushes history. */
+describe("board kind: view state in the URL", () => {
+  it("a show= param pre-applies the filter and its toggle reflects it", async () => {
+    renderRoadmap("/governance/roadmap?show=stale");
+    await screen.findByText("Replication continuity");
+    // `stale` is hidden_by_default; ?show=stale un-hides it before any click.
+    expect(screen.getByText("Stale exploration")).toBeTruthy();
+    expect(
+      screen
+        .getByRole("button", { name: "Hide stale scopes" })
+        .getAttribute("aria-pressed"),
+    ).toBe("false");
+  });
+
+  it("a hide= param filters a default-visible facet's nodes out", async () => {
+    renderRoadmap("/governance/roadmap?hide=initiative_only");
+    await screen.findByText("Replication continuity");
+    // "Verify peer" carries `initiative_only`, so the forced-on facet drops it.
+    expect(screen.queryByText("Verify peer")).toBeNull();
+    expect(
+      screen
+        .getByRole("button", { name: "Initiative work only" })
+        .getAttribute("aria-pressed"),
+    ).toBe("true");
+  });
+
+  it("toggling writes the param and toggling back to default leaves a bare URL", async () => {
+    const user = userEvent.setup();
+    renderRoadmap();
+    await screen.findByText("Replication continuity");
+    expect(currentUrl()).toBe("/governance/roadmap");
+    const hideStale = screen.getByRole("button", { name: "Hide stale scopes" });
+    await user.click(hideStale);
+    expect(currentUrl()).toBe("/governance/roadmap?show=stale");
+    await user.click(hideStale);
+    // Back at the declared default => nothing to say, so the URL says nothing.
+    expect(currentUrl()).toBe("/governance/roadmap");
+  });
+
+  it("the group param round-trips the grouped view", async () => {
+    const user = userEvent.setup();
+    renderRoadmap("/governance/roadmap?group=1");
+    await screen.findByRole("heading", { name: "snowlinedev" });
+    expect(
+      screen.getByRole("button", { name: "By org" }).getAttribute("aria-pressed"),
+    ).toBe("true");
+    // Flat is the default, so selecting it clears the param rather than
+    // writing ?group=0.
+    await user.click(screen.getByRole("button", { name: "Flat" }));
+    expect(currentUrl()).toBe("/governance/roadmap");
+    await user.click(screen.getByRole("button", { name: "By org" }));
+    expect(currentUrl()).toBe("/governance/roadmap?group=1");
+    await screen.findByRole("heading", { name: "snowlinedev" });
+  });
+
+  it("an unknown facet key degrades silently and leaves the toggles working", async () => {
+    const user = userEvent.setup();
+    renderRoadmap("/governance/roadmap?show=no-such-facet");
+    await screen.findByText("Replication continuity");
+    // No declared facet matches, so the board renders its plain defaults.
+    expect(screen.queryByText("Stale exploration")).toBeNull();
+    const hideStale = screen.getByRole("button", { name: "Hide stale scopes" });
+    expect(hideStale.getAttribute("aria-pressed")).toBe("true");
+    // The shell rewrites only the params it owns; the first toggle recomputes
+    // show/hide from the DECLARED facets, normalizing the stray key away.
+    await user.click(hideStale);
+    await screen.findByText("Stale exploration");
+    expect(currentUrl()).toBe("/governance/roadmap?show=stale");
+  });
+
+  it("refreshing the page keeps the filters applied", async () => {
+    const user = userEvent.setup();
+    const first = renderRoadmap();
+    await screen.findByText("Replication continuity");
+    await user.click(screen.getByRole("button", { name: "Hide stale scopes" }));
+    await user.click(screen.getByRole("button", { name: "By org" }));
+    const url = currentUrl();
+    expect(url).toBe("/governance/roadmap?show=stale&group=1");
+
+    // A refresh: tear the app down and mount a brand-new one at that URL.
+    first.unmount();
+    renderRoadmap(url);
+    await screen.findByText("Stale exploration");
+    expect(
+      screen
+        .getByRole("button", { name: "Hide stale scopes" })
+        .getAttribute("aria-pressed"),
+    ).toBe("false");
+    expect(
+      screen.getByRole("button", { name: "By org" }).getAttribute("aria-pressed"),
+    ).toBe("true");
+    await screen.findByRole("heading", { name: "acme" });
+  });
+
+  it("toggling replaces history, so Back leaves the page instead of undoing a toggle", async () => {
+    const user = userEvent.setup();
+    render(
+      // Arrived at the board FROM Today, the way a person would.
+      <MemoryRouter initialEntries={["/", "/governance/roadmap"]} initialIndex={1}>
+        <App />
+        <LocationProbe />
+        <BackButton />
+      </MemoryRouter>,
+    );
+    await screen.findByText("Replication continuity");
+    await user.click(screen.getByRole("button", { name: "Hide stale scopes" }));
+    await user.click(screen.getByRole("button", { name: "By org" }));
+    expect(currentUrl()).toBe("/governance/roadmap?show=stale&group=1");
+    // Two toggles pushed NOTHING, so one Back crosses the route boundary.
+    await user.click(screen.getByRole("button", { name: "GO BACK" }));
+    await waitFor(() => expect(currentUrl()).toBe("/"));
   });
 });
 
