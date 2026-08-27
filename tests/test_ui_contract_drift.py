@@ -76,6 +76,13 @@ def test_placement_intents_equal_sdk():
     assert platform_manifest.PLACEMENT_INTENTS == sdk_ui.PLACEMENT_INTENTS
     assert "intent" in platform_manifest.UIWidget.model_fields
     assert "intent" in platform_manifest.UIPage.model_fields
+    # Per-intent meaning + placement (dashboard-ia.md §4.1's table) — same
+    # never-silently-fork discipline, and pinned to cover the vocabulary
+    # exactly so a new intent can't ship without a documented meaning.
+    assert (
+        platform_manifest.PLACEMENT_INTENT_SHAPE == sdk_ui.PLACEMENT_INTENT_SHAPE
+    )
+    assert set(sdk_ui.PLACEMENT_INTENT_SHAPE) == sdk_ui.PLACEMENT_INTENTS
 
 
 def test_write_body_limit_equals_sdk():

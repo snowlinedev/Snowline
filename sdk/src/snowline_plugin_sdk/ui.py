@@ -94,6 +94,30 @@ PLACEMENT_INTENTS: frozenset[str] = frozenset(
     }
 )
 
+# Per-intent meaning + placement (dashboard-ia.md §4.1's table), one line
+# each: what declaring this intent says about the view, and where the
+# platform places it. Same doc-not-schema posture as UI_KIND_SHAPES /
+# ACTION_FIELD_SHAPE below — a plain dict for a plugin author to read, not
+# validated against anywhere; nothing here enforces PLACEMENT_INTENTS' own
+# fail-visible posture above. Same drift-guard treatment: the platform
+# (`snowline_platform.manifest.PLACEMENT_INTENT_SHAPE`) is the source of
+# truth, pinned equal to this copy by test_ui_contract_drift.py, and pinned
+# to cover PLACEMENT_INTENTS exactly.
+PLACEMENT_INTENT_SHAPE: dict[str, str] = {
+    "attention": "a needs-you / blocked / overdue surface — Today, first band",
+    "digest": "a summary of state (\"since you last looked\") — Today, second "
+    "band",
+    "activity": "a recent-events feed (shipped, decided, changed) — Today, "
+    "third band",
+    "roadmap": "planning structure (what's queued, in what order) — Roadmap",
+    "feature-status": "cross-scope progress on a named body of work — "
+    "Features",
+    "review-queue": "items awaiting explicit human judgment — Review",
+    "detail": "an entity page reached by links, never browsed to — no nav "
+    "entry (subsumes `nav: false`)",
+    "admin": "an operational / registry / diagnostic view — System",
+}
+
 # The /ui-api proxy's POST body cap (shadow-conversations.md §3): a
 # conversation message, not an upload. THE shared value — the platform's
 # proxy enforcement (`snowline_platform.ui_api.POST_BODY_LIMIT`) is pinned
@@ -335,6 +359,7 @@ __all__ = [
     "PAGE_KINDS",
     "UI_KINDS",
     "PLACEMENT_INTENTS",
+    "PLACEMENT_INTENT_SHAPE",
     "STAT_SHAPE",
     "LIST_ITEM_SHAPE",
     "LIST_SHAPE",
