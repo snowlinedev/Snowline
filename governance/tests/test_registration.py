@@ -56,11 +56,17 @@ def test_register_posts_the_right_manifest():
     assert widget["kind"] == "stat"
     assert widget["data"] == "/ui-api/widgets/shadow-activity"
     assert widget["refresh_seconds"] == 30
-    # The §6.1 unreconciled-pairs stat (replication-continuity, #79).
+    # The open-branch count is status, not a to-do (dashboard-ia.md §8 step
+    # 5, snowline-pm#97) — it stays intent-less, in Today's fallback band.
+    assert "intent" not in widget
+    # The §6.1 unreconciled-pairs stat (replication-continuity, #79). An
+    # unreconciled pair awaits a human, so it carries `attention` and lands
+    # in Today's "Needs you" band (dashboard-ia.md §5/§8 step 5).
     unreconciled = ui["widgets"][1]
     assert unreconciled["slot"] == "home"
     assert unreconciled["kind"] == "stat"
     assert unreconciled["data"] == "/ui-api/widgets/unreconciled-decisions"
+    assert unreconciled["intent"] == "attention"
     # The replication opt-in block (replication-continuity §4, #79): advisory
     # metadata the pairing step reads — contract version + ingest route + the
     # FULL drift-guarded event vocabulary.
@@ -76,10 +82,16 @@ def test_register_posts_the_right_manifest():
     assert table_page["nav"] is True
     assert table_page["kind"] == "table"
     assert table_page["data"] == "/ui-api/pages/branches"
+    # Review's tenant: shadow branches await explicit human judgment
+    # (dashboard-ia.md §3/§8 step 5).
+    assert table_page["intent"] == "review-queue"
     assert thread_page["route"] == "/shadow/{branch_id}"
     assert thread_page["nav"] is False
     assert thread_page["kind"] == "thread"
     assert thread_page["data"] == "/ui-api/pages/branches/{branch_id}"
+    # `{branch_id}`-routed — the shell refuses a nav entry for it regardless,
+    # so `detail` is the honest declaration (dashboard-ia.md §4.1).
+    assert thread_page["intent"] == "detail"
     # The composer write seam (shadow-conversations §4/§5): its endpoint's
     # `{branch_id}` param matches the page's own route param (platform validation
     # enforces endpoint-params ⊆ route-params), and `disabled_when: "archived"` is
@@ -126,6 +138,13 @@ def test_manifest_is_accepted_by_the_platform_model():
     ]
     assert [p.id for p in m.ui.pages] == ["shadow-branches", "shadow-branch"]
     assert [p.route for p in m.ui.pages] == ["/shadow", "/shadow/{branch_id}"]
+    # Placement intents (dashboard-ia.md §4/§8 step 5, snowline-pm#97) survive
+    # the platform's own UIWidget/UIPage models, same contract both sides
+    # share.
+    assert m.ui.widgets[0].intent is None
+    assert m.ui.widgets[1].intent == "attention"
+    assert m.ui.pages[0].intent == "review-queue"
+    assert m.ui.pages[1].intent == "detail"
     # The thread page's composer validates against the platform's UIComposer /
     # UIPage._valid_composer_for_kind (endpoint-params ⊆ route-params, PR #72).
     thread_page = m.ui.pages[1]
