@@ -369,7 +369,9 @@ right concrete path.
 shell href the shell lands on after a successful submit (re-prefixed with
 `/<plugin>`, same as a table row `href`). Everything else in the body is
 ignored by the generic shell. Absent `navigate` = the shell just closes the
-form. This is how "New branch" (issue #123) lands the user on the newly-created
+form. A same-route `navigate` (the "refresh this view" pattern) carries the
+current query string along rather than wiping URL-held view state (§4.2a).
+This is how "New branch" (issue #123) lands the user on the newly-created
 branch's thread page while the shell stays ignorant of branches.
 
 **Registration validation** (`manifest.py`/`UIAction`): 422 on an `endpoint`
