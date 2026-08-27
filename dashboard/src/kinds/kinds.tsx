@@ -18,7 +18,7 @@ import {
   type KeyboardEvent,
   type ReactNode,
 } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 
 import {
   fetchScopeSlugs,
@@ -611,7 +611,9 @@ export function Document(props: { title: string; markdown: string; meta?: ReactN
  * This is the ONE kind where the shell keeps a small amount of client-side
  * view state (which facets are hidden, flat vs grouped) over one
  * already-fetched payload — a deliberate, narrow exception (§4.2a), not a
- * precedent for shell-side business logic. The shell does not know what "org"
+ * precedent for shell-side business logic. That view state lives in the
+ * ROUTE'S QUERY STRING (see BOARD_*_PARAM below), so it survives a refresh and
+ * deep-links. The shell does not know what "org"
  * or "stale" MEAN: it groups nodes by a `group_by.key` the plugin names and
  * hides nodes an already-plugin-stamped `facets` boolean flags, the same
  * "plugin computes meaning, shell only renders" split every other kind holds. */
@@ -803,11 +805,53 @@ function groupNodes(
   return order.map((label) => ({ label, nodes: buckets.get(label)! }));
 }
 
+/* Board view state lives in the ROUTE'S QUERY STRING (ui-shell.md §4.2a), not
+ * in local component state: the filters survive a refresh, a board URL
+ * deep-links a particular view, and back/forward stay sane. The scheme is
+ * NON-DEFAULTS ONLY — a facet sitting at its `hidden_by_default` state
+ * contributes nothing — so a bare URL stays bare and a plugin later changing a
+ * default never silently re-reads an old link as something else:
+ *
+ *   ?show=stale              facet keys forced VISIBLE (their default is hidden)
+ *   ?hide=initiative_only    facet keys forced HIDDEN  (their default is visible)
+ *   ?group=1                 the grouped view (Flat is the default, so never written)
+ *
+ * `show`/`hide` REPEAT for several keys (`?show=a&show=b`) rather than packing
+ * a delimited list, which would come back out of `URLSearchParams` percent-
+ * encoded (`show=a%2Cb`) and stop being readable. A key naming an UNDECLARED
+ * facet matches no toggle and filters nothing — the same silently-degrade
+ * posture §4.2a gives an undeclared `group_by.key` — and is left in the URL
+ * untouched, since the shell rewrites only the params it owns; the first
+ * toggle after that recomputes `show`/`hide` from the declared facets and so
+ * normalizes the stray key away. Toggling REPLACES the history entry: view
+ * toggles must not fill the back button, while navigation BETWEEN routes still
+ * pushes normally. `board` is a PAGE kind (widget kinds are `stat`/`list`
+ * only, §4.1), so at most one board owns a route's query string — no
+ * namespacing, deliberately. */
+const BOARD_SHOW_PARAM = "show";
+const BOARD_HIDE_PARAM = "hide";
+const BOARD_GROUP_PARAM = "group";
+
+function readKeys(params: URLSearchParams, name: string): Set<string> {
+  return new Set(params.getAll(name).filter((v) => v !== ""));
+}
+
+/** Rewrite one repeated param to exactly `keys` — which for an EMPTY list means
+ * the param disappears, the non-defaults-only rule that keeps a default view's
+ * URL bare. */
+function writeKeys(params: URLSearchParams, name: string, keys: string[]) {
+  params.delete(name);
+  for (const k of keys) params.append(name, k);
+}
+
 /** The `board` kind (ui-shell.md §4.2a). Group-by (Flat / grouped) and
- * per-facet toggles are LOCAL component state sitting above the tree, applied
- * to the ALREADY-fetched `nodes` array — no refetch, no `useUiData` change,
- * never persisted across sessions. Flat is selected by default; a facet whose
- * `hidden_by_default` is true starts filtering. */
+ * per-facet toggles are DERIVED FROM THE URL (see above) and applied to the
+ * ALREADY-fetched `nodes` array — no refetch, no `useUiData` change. There is
+ * no duplicate copy in `useState`, so a re-render at the same URL (a refresh,
+ * a back/forward, a shared link) reproduces exactly the same view. Flat is
+ * selected by default; a facet whose `hidden_by_default` is true starts
+ * filtering. This is view state in a shareable, stateless URL — NOT a stored
+ * per-user preference, which §9 still excludes. */
 export function Board(props: {
   plugin: string;
   nodes: BoardNode[];
@@ -820,19 +864,47 @@ export function Board(props: {
   // degrades to "no facets" here rather than crashing every `.map`/iteration
   // below — the same fail-visible-by-degradation rule `badges` follows.
   const facets = Array.isArray(props.facets) ? props.facets : [];
-  const [grouped, setGrouped] = useState(false);
-  const [hidden, setHidden] = useState<Set<string>>(() => {
-    const s = new Set<string>();
-    for (const f of facets) if (f.hidden_by_default) s.add(f.key);
-    return s;
-  });
-  const toggleFacet = (key: string) =>
-    setHidden((prev) => {
-      const next = new Set(prev);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
+  const [searchParams, setSearchParams] = useSearchParams();
+
+  // Only DECLARED facets can be toggled, so a `show`/`hide` key naming an
+  // undeclared one lands nowhere and filters nothing.
+  const forcedShown = readKeys(searchParams, BOARD_SHOW_PARAM);
+  const forcedHidden = readKeys(searchParams, BOARD_HIDE_PARAM);
+  const hidden = new Set(
+    facets
+      .filter((f) =>
+        f.hidden_by_default ? !forcedShown.has(f.key) : forcedHidden.has(f.key),
+      )
+      .map((f) => f.key),
+  );
+  const grouped = searchParams.get(BOARD_GROUP_PARAM) === "1";
+
+  /** Serialize a whole next view onto the current route, keeping every param
+   * we don't own. `replace` (never push): a filter toggle is a view change on
+   * the page you're already on, not a place to come back to. */
+  const writeView = (nextHidden: Set<string>, nextGrouped: boolean) => {
+    const next = new URLSearchParams(searchParams);
+    writeKeys(
+      next,
+      BOARD_SHOW_PARAM,
+      facets.filter((f) => f.hidden_by_default && !nextHidden.has(f.key)).map((f) => f.key),
+    );
+    writeKeys(
+      next,
+      BOARD_HIDE_PARAM,
+      facets.filter((f) => !f.hidden_by_default && nextHidden.has(f.key)).map((f) => f.key),
+    );
+    if (nextGrouped) next.set(BOARD_GROUP_PARAM, "1");
+    else next.delete(BOARD_GROUP_PARAM);
+    setSearchParams(next, { replace: true });
+  };
+  const toggleFacet = (key: string) => {
+    const next = new Set(hidden);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    writeView(next, grouped);
+  };
+  const setGrouped = (g: boolean) => writeView(hidden, g);
   const visible = facetFilter(props.nodes, hidden);
 
   const tree =

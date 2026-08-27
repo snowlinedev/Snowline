@@ -253,7 +253,15 @@ export const FIXTURES: Record<string, unknown> = {
                 href: "/roadmap/item-sign",
                 facets: { initiative_only: false },
               },
-              { id: "item-verify", label: "Verify peer", kind: "item" },
+              {
+                id: "item-verify",
+                label: "Verify peer",
+                kind: "item",
+                // The one node the (default-VISIBLE) `initiative_only` facet
+                // hides, so the `?hide=` direction of the URL scheme has
+                // something observable to filter.
+                facets: { initiative_only: true },
+              },
             ],
           },
           {
