@@ -30,10 +30,24 @@ import {
 } from "../api";
 import { useData, type DataResult, type Loadable } from "../useData";
 
-export function Card(props: { title?: string; children: ReactNode }) {
+export function Card(props: {
+  title?: string;
+  children: ReactNode;
+  /** Heading level for the card's title. Default 2 — the level below Layout's
+   * page h1. A card nested under a heading of its own (Today's band headings,
+   * dashboard-ia.md §5) passes 3 so the document outline mirrors the nesting
+   * instead of flattening it (and never skips a level, which axe's
+   * heading-order rule flags). */
+  headingLevel?: 2 | 3;
+}) {
   return (
     <section className="card">
-      {props.title && <h2 className="card-title">{props.title}</h2>}
+      {props.title &&
+        createElement(
+          `h${props.headingLevel ?? 2}`,
+          { className: "card-title" },
+          props.title,
+        )}
       {props.children}
     </section>
   );
@@ -186,6 +200,28 @@ export function PendingNote(props: { loadable: Loadable<unknown> }) {
     <StateNote>Loading…</StateNote>
   ) : (
     <StateNote error>Failed to load: {props.loadable.message}</StateNote>
+  );
+}
+
+/** A Card over a Loadable: the ready branch renders `children(data)`, any
+ * other state renders the PendingNote — the guard-then-render shape
+ * RegisteredKind already follows, extracted because the inline ternary was
+ * being copied per card (four times in Section.tsx alone). One place to
+ * change the loading treatment for every card-shaped fetch. */
+export function LoadableCard<T>(props: {
+  title?: string;
+  headingLevel?: 2 | 3;
+  loadable: Loadable<T>;
+  children: (data: T) => ReactNode;
+}) {
+  return (
+    <Card title={props.title} headingLevel={props.headingLevel}>
+      {props.loadable.state === "ready" ? (
+        props.children(props.loadable.data)
+      ) : (
+        <PendingNote loadable={props.loadable} />
+      )}
+    </Card>
   );
 }
 

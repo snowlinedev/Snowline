@@ -138,13 +138,23 @@ export function sectionDef(id: SectionId): SectionDef {
   return def;
 }
 
+/** Today's bands, in order, each named by the intent it composes (§5). The
+ * headings are PLATFORM copy — a plugin declares what a view is for, never
+ * what the band is called (§2.2). This table is the source of truth for WHICH
+ * intents are Today intents: INTENT_SECTIONS below derives its `today` rows
+ * from it, so a Today intent can never be nav-listed with no band to land in
+ * — by construction, not by test. */
+export const TODAY_BANDS: readonly { intent: string; heading: string }[] = [
+  { intent: "attention", heading: "Needs you" },
+  { intent: "digest", heading: "Digest" },
+  { intent: "activity", heading: "Recent activity" },
+];
+
 /** The intent vocabulary this shell version understands (§4.1). A Map, not an
  * object literal, so a contribution declaring `intent: "constructor"` can't
  * inherit a prototype member as its "section". */
 export const INTENT_SECTIONS: ReadonlyMap<string, SectionId> = new Map([
-  ["attention", "today"],
-  ["digest", "today"],
-  ["activity", "today"],
+  ...TODAY_BANDS.map((b): [string, SectionId] => [b.intent, "today"]),
   ["roadmap", "roadmap"],
   ["feature-status", "features"],
   ["review-queue", "review"],
@@ -199,7 +209,8 @@ export function pageNavEntry(
  * link; the section's page lists the same entries (or its empty state), so
  * the two can't disagree.
  *
- * Pages only: widget intents compose Today's bands, which is step 3 (§5/§8).
+ * Pages only: widget intents compose Today's bands (`todayBands` below) — a
+ * widget has no route to link to, so it is never a nav entry.
  * A page's route is untouched — it stays `/<plugin><route>`; a section is a
  * PLACE in the IA, not a re-namespacing. */
 export function sectionNavEntries(
@@ -248,8 +259,9 @@ export type PluginWidgetEntry = {
   widget: UIWidget;
 };
 
-/** All registered home-slot widgets, in plugin-list order — the home grid
- * appends these after the native cards (§6). */
+/** All registered home-slot widgets, in plugin-list order — the order
+ * `todayBands` places them in (§4.2: ordering within a band is
+ * plugin-registration order). */
 export function pluginWidgets(plugins: PluginEntry[]): PluginWidgetEntry[] {
   const out: PluginWidgetEntry[] = [];
   for (const plugin of plugins) {
@@ -258,6 +270,87 @@ export function pluginWidgets(plugins: PluginEntry[]): PluginWidgetEntry[] {
     }
   }
   return out;
+}
+
+/* ---- Today's bands (dashboard-ia.md §5) ----------------------------------- */
+
+export type TodayBand = {
+  /** Stable React key: the band's intent, or `plugin:<name>` for a fallback
+   * band. Intents never contain ":" in the v1 vocabulary, and a plugin band's
+   * key is prefixed, so the two families can't collide. */
+  key: string;
+  heading: string;
+  /** Pages placed here by intent — link entries (§5: a page is a destination,
+   * not a card the shell can poll into the band). */
+  pages: SectionNavEntry[];
+  /** Widgets placed here by intent, each rendered as its own self-polling
+   * card. */
+  widgets: PluginWidgetEntry[];
+};
+
+/** Compose Today (§5): intent-declared pages and widgets into the three named
+ * bands, then one per-plugin fallback band ("More from <plugin>") for every
+ * home widget an intent didn't place. Layout only — nothing is merged, joined,
+ * or interpreted (§2.3); the caller renders each widget as its own polling
+ * card.
+ *
+ * A widget whose intent is unknown, absent, or names a section that composes
+ * PAGES only (roadmap/features/review/system) lands in the fallback band
+ * rather than being dropped: the fail-visible posture (§2.4) means a
+ * contribution the shell can't place still shows up where it lives today.
+ *
+ * Empty bands are dropped here rather than at render, so "a band with no
+ * contributions collapses entirely — heading and all" is one decision in one
+ * place, and an empty result means "nothing composes into Today" for the
+ * caller's empty state. */
+export function todayBands(plugins: PluginEntry[]): TodayBand[] {
+  const named: TodayBand[] = TODAY_BANDS.map((b) => ({
+    key: b.intent,
+    heading: b.heading,
+    pages: [],
+    widgets: [],
+  }));
+  // A Map, same reason INTENT_SECTIONS is one: an `intent: "constructor"`
+  // must not inherit a prototype member as its band.
+  const byIntent = new Map(named.map((b) => [b.key, b]));
+
+  for (const plugin of plugins) {
+    for (const page of plugin.manifest.ui?.pages ?? []) {
+      const band = page.intent == null ? undefined : byIntent.get(page.intent);
+      if (!band) continue;
+      // Same `pageNavEntry` nav uses, so Today's bands and the Today nav
+      // entries can't disagree — including its refusal to link a `{param}`
+      // route.
+      const entry = pageNavEntry(plugin, page);
+      if (entry) band.pages.push(entry);
+    }
+  }
+
+  const fallbacks = new Map<string, TodayBand>();
+  for (const entry of pluginWidgets(plugins)) {
+    const intent = entry.widget.intent;
+    const band = intent == null ? undefined : byIntent.get(intent);
+    if (band) {
+      band.widgets.push(entry);
+      continue;
+    }
+    const name = entry.plugin.name;
+    let fallback = fallbacks.get(name);
+    if (!fallback) {
+      fallback = {
+        key: `plugin:${name}`,
+        heading: `More from ${name}`,
+        pages: [],
+        widgets: [],
+      };
+      fallbacks.set(name, fallback);
+    }
+    fallback.widgets.push(entry);
+  }
+
+  return [...named, ...fallbacks.values()].filter(
+    (b) => b.pages.length > 0 || b.widgets.length > 0,
+  );
 }
 
 const MIN_REFRESH_SECONDS = 5;
