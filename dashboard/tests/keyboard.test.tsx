@@ -102,7 +102,7 @@ describe("keyboard operability", () => {
     const menu = screen.getByRole("button", { name: "Menu" });
     await user.click(menu);
     expect(menu.getAttribute("aria-expanded")).toBe("true");
-    const current = screen.getByRole("link", { name: "Home" });
+    const current = screen.getByRole("link", { name: "Today" });
     expect(current.getAttribute("aria-current")).toBe("page");
     await user.click(current);
     expect(menu.getAttribute("aria-expanded")).toBe("false");
@@ -115,8 +115,29 @@ describe("keyboard operability", () => {
         <App />
       </MemoryRouter>,
     );
-    expect(document.title).toBe("Home · Snowline");
+    expect(document.title).toBe("Today · Snowline");
     await user.click(screen.getByRole("link", { name: "Surfaces" }));
     expect(document.title).toBe("Surfaces · Snowline");
+  });
+
+  it("the nav disclosure exposes sections and fallback groups alike", async () => {
+    // dashboard-ia.md §7: the <640px disclosure pattern is unchanged, and the
+    // five sections plus the per-plugin fallback groups must stay operable
+    // inside it — including the section links nested a level deeper.
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter initialEntries={["/"]}>
+        <App />
+      </MemoryRouter>,
+    );
+    const menu = screen.getByRole("button", { name: "Menu" });
+    await user.click(menu);
+    // A fallback-group link (the shared fixture declares no intents yet).
+    await screen.findByRole("link", { name: "Shadow discussions" });
+    await user.click(screen.getByRole("link", { name: "Review" }));
+    expect(document.title).toBe("Review · Snowline");
+    expect(screen.getByRole("button", { name: "Menu" }).getAttribute("aria-expanded")).toBe(
+      "false",
+    );
   });
 });

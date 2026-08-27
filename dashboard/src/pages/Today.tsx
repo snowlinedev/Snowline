@@ -1,9 +1,14 @@
-/** Home — the widget grid (ui-shell.md §6): platform-native widgets built
- * THROUGH the kind vocabulary, then registered plugin widgets (slot "home")
- * appended after them, each its own polling Card. */
+/** Today (`/`) — the owner's briefing surface (dashboard-ia.md §3), and for
+ * now exactly the Home grid it replaces (ui-shell.md §6): platform-native
+ * widgets built THROUGH the kind vocabulary, then registered plugin widgets
+ * (slot "home") appended after them, each its own polling Card.
+ *
+ * The banded composition by widget intent, and the native cards' move to
+ * System, are step 3 (§5/§8) — this step changes the identity at `/`, not yet
+ * what renders there. */
 
 import type { PluginEntry, UIWidget } from "../api";
-import { fetchPlugins, fetchSurfaces } from "../api";
+import { fetchSurfaces } from "../api";
 import {
   Card,
   KindList,
@@ -13,7 +18,14 @@ import {
   StatusChip,
   useUiData,
 } from "../kinds/kinds";
-import { clampRefreshSeconds, contractSupported, pluginWidgets } from "../registry";
+import { usePlugins } from "../plugins-context";
+import {
+  clampRefreshSeconds,
+  contractSupported,
+  pluginWidgets,
+  sectionDef,
+  sectionNavEntries,
+} from "../registry";
 import { Layout } from "../shell/Layout";
 import { useData } from "../useData";
 
@@ -41,12 +53,20 @@ function WidgetCard(props: { plugin: PluginEntry; widget: UIWidget }) {
   );
 }
 
-export function Home() {
-  const plugins = useData(fetchPlugins, 10);
+export function Today() {
+  const plugins = usePlugins();
   const surfaces = useData(fetchSurfaces, 30);
+  // Pages placed on Today by intent (attention/digest/activity) are nav-listed
+  // under the Today link, so the page must list them too — the §3 nav↔page
+  // invariant holds for Today like any section. A links card is the interim
+  // surface; step 3's bands replace it.
+  const tenants =
+    plugins.state === "ready"
+      ? sectionNavEntries(plugins.data, sectionDef("today"))
+      : [];
 
   return (
-    <Layout title="Home">
+    <Layout title="Today">
       <div className="grid">
         <Card title="Plugins up">
           {plugins.state === "ready" ? (
@@ -85,6 +105,11 @@ export function Home() {
             <PendingNote loadable={surfaces} />
           )}
         </Card>
+        {tenants.length > 0 && (
+          <Card title="Composed into Today">
+            <KindList items={tenants.map((e) => ({ text: e.label, href: e.to }))} />
+          </Card>
+        )}
         {plugins.state === "ready" &&
           pluginWidgets(plugins.data).map(({ key, plugin, widget }) => (
             <WidgetCard key={key} plugin={plugin} widget={widget} />

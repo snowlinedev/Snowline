@@ -20,6 +20,18 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 # name a registered plugin fails at boot instead of silently matching nothing.
 PLUGIN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
+# Plugin names also become top-level shell routes (/<name>/<route>, ui-shell.md
+# §3), so the shell's own top-level paths are off limits: the IA sections
+# (dashboard-ia.md §3) and the native views System absorbs. Without this, a
+# plugin named "review" with a root page out-ranks the platform's /review in
+# the router (a trailing-slash pattern beats the static route) and silently
+# shadows the section. Fail-loud at registration (422), same posture as the
+# name grammar above — this is a registration-time collision, not a
+# shell-version-dependent vocabulary, so fail-visible would be wrong here.
+RESERVED_PLUGIN_NAMES: frozenset[str] = frozenset(
+    {"today", "roadmap", "features", "review", "system", "plugins", "surfaces", "scopes"}
+)
+
 # --- UI block (ui-shell.md §3/§4) ------------------------------------------
 #
 # These constants are the PLATFORM's source of truth for the UI contract's
@@ -582,6 +594,12 @@ class PluginManifest(BaseModel):
             raise ValueError(
                 f"plugin name {v!r} must be a lowercase url-safe slug "
                 "([a-z0-9][a-z0-9-]*)"
+            )
+        if v in RESERVED_PLUGIN_NAMES:
+            raise ValueError(
+                f"plugin name {v!r} is reserved — it would shadow a shell "
+                f"route (dashboard-ia.md §3); reserved: "
+                f"{sorted(RESERVED_PLUGIN_NAMES)}"
             )
         return v
 

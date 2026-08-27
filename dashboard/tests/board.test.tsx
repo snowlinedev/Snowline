@@ -180,6 +180,13 @@ describe("board kind: registered nav omission", () => {
     );
     const nav = screen.getByRole("navigation", { name: "Main" });
     await within(nav).findByText("governance");
-    expect(within(nav).queryByRole("link", { name: "Roadmap" })).toBeNull();
+    // By HREF, not by name: the fixture page is titled "Roadmap", which is
+    // also the platform's Roadmap SECTION (dashboard-ia.md §3) — the page's
+    // own plugin-namespaced link is the thing that must be absent.
+    expect(
+      within(nav)
+        .getAllByRole("link")
+        .map((a) => a.getAttribute("href")),
+    ).not.toContain("/governance/roadmap");
   });
 });
