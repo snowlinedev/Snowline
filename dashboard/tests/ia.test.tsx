@@ -428,8 +428,10 @@ describe("Today: banded composition (§5)", () => {
       .map((h) => h.textContent);
 
   it("covers every Today intent with a band", () => {
-    // The band table and the intent table cannot drift: a `today` intent with
-    // no band would nav-list under Today and land nowhere on the page.
+    // Held by construction — INTENT_SECTIONS derives its `today` rows from
+    // TODAY_BANDS — so a `today` intent can't nav-list with no band to land
+    // in. This pin guards the derivation itself (someone re-inlining the
+    // rows), not a second table.
     const todayIntents = [...INTENT_SECTIONS]
       .filter(([, section]) => section === "today")
       .map(([intent]) => intent);
@@ -491,16 +493,6 @@ describe("Today: banded composition (§5)", () => {
     expect(bandHeadings()).toEqual(["More from acme"]);
   });
 
-  it("falls a widget's unknown intent back to the plugin band (§2.4)", async () => {
-    stubRegistry(
-      [acme([], [statWidget("future", "an-intent-from-a-newer-plugin")])],
-      statPayload("future"),
-    );
-    renderAt("/");
-    const band = await screen.findByRole("region", { name: "More from acme" });
-    expect(within(band).getByRole("heading", { level: 3, name: "Widget future" })).toBeTruthy();
-  });
-
   it("banks a today-intent page as a link inside its band", async () => {
     stubRegistry([
       acme([
@@ -544,6 +536,14 @@ describe("Today: banded composition (§5)", () => {
       "More from second",
     ]);
     expect(bands[0].widgets.map((w) => w.key)).toEqual(["first:a", "second:b"]);
+    // Unknown intent converges with null intent BEFORE render — same fallback
+    // band (§2.4 degrade, never drop); the rendered outcome is covered once by
+    // the intent-less test above.
+    const unknown = todayBands([
+      named("first", [], [statWidget("future", "an-intent-from-a-newer-plugin")]),
+    ]);
+    expect(unknown.map((b) => b.heading)).toEqual(["More from first"]);
+    expect(unknown[0].widgets.map((w) => w.key)).toEqual(["first:future"]);
   });
 
   it("does not render the machine's health cards on Today (§3)", async () => {

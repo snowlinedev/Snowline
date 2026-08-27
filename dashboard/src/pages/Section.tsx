@@ -15,7 +15,7 @@
 
 import type { PluginEntry } from "../api";
 import { fetchSurfaces } from "../api";
-import { Card, KindList, PendingNote, StateNote, Stat, StatusChip } from "../kinds/kinds";
+import { KindList, LoadableCard, StateNote, Stat, StatusChip } from "../kinds/kinds";
 import { usePlugins } from "../plugins-context";
 import { sectionNavEntries, type SectionDef } from "../registry";
 import { Layout } from "../shell/Layout";
@@ -40,61 +40,56 @@ function SystemHealth() {
   const surfaces = useData(fetchSurfaces, 30);
   return (
     <div className="grid">
-      <Card title="Plugins up">
-        {plugins.state === "ready" ? (
+      <LoadableCard title="Plugins up" loadable={plugins}>
+        {(data) => (
           <Stat
-            value={`${plugins.data.filter((p) => p.status === "up").length} / ${plugins.data.length}`}
+            value={`${data.filter((p) => p.status === "up").length} / ${data.length}`}
             label="registered plugins healthy"
           />
-        ) : (
-          <PendingNote loadable={plugins} />
         )}
-      </Card>
-      <Card title="Plugin status">
-        {plugins.state === "ready" ? (
+      </LoadableCard>
+      <LoadableCard title="Plugin status" loadable={plugins}>
+        {(data) => (
           <KindList
-            items={plugins.data.map((p) => ({
+            items={data.map((p) => ({
               text: p.name,
               meta: <StatusChip status={p.status} />,
             }))}
             empty="No plugins registered."
           />
-        ) : (
-          <PendingNote loadable={plugins} />
         )}
-      </Card>
-      <Card title="Surfaces">
-        {surfaces.state === "ready" ? (
+      </LoadableCard>
+      <LoadableCard title="Surfaces" loadable={surfaces}>
+        {(data) => (
           <KindList
-            items={surfaces.data.map((s) => ({
+            items={data.map((s) => ({
               text: s.name,
               href: "/surfaces",
               meta: `${s.plugins.length} plugin${s.plugins.length === 1 ? "" : "s"}`,
             }))}
             empty="No surfaces mounted."
           />
-        ) : (
-          <PendingNote loadable={surfaces} />
         )}
-      </Card>
+      </LoadableCard>
     </div>
   );
 }
 
 export function SectionPage(props: { section: SectionDef }) {
   const plugins = usePlugins();
+  const system = props.section.id === "system";
   const tenants = (
-    <Card>
-      {plugins.state === "ready" ? (
-        <SectionTenants section={props.section} plugins={plugins.data} />
-      ) : (
-        <PendingNote loadable={plugins} />
-      )}
-    </Card>
+    // On System the tenant list has titled siblings (the health cards), so it
+    // needs a heading of its own — an untitled section is no boundary for
+    // heading navigation, and the links would read as content of "Surfaces".
+    // Elsewhere the card is the page's sole content under the h1: untitled.
+    <LoadableCard title={system ? "Views" : undefined} loadable={plugins}>
+      {(data) => <SectionTenants section={props.section} plugins={data} />}
+    </LoadableCard>
   );
   // System is the one section with native content of its own; every other
   // section is exactly its tenant list, unchanged.
-  if (props.section.id !== "system") {
+  if (!system) {
     return <Layout title={props.section.label}>{tenants}</Layout>;
   }
   return (

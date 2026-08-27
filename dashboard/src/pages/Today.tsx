@@ -88,7 +88,6 @@ function Band(props: { band: TodayBand }) {
 
 export function Today() {
   const plugins = usePlugins();
-  const bands = plugins.state === "ready" ? todayBands(plugins.data) : [];
 
   if (plugins.state !== "ready") {
     return (
@@ -99,6 +98,8 @@ export function Today() {
       </Layout>
     );
   }
+
+  const bands = todayBands(plugins.data);
 
   return (
     <Layout title="Today">

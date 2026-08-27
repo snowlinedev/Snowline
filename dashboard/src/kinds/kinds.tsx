@@ -203,6 +203,28 @@ export function PendingNote(props: { loadable: Loadable<unknown> }) {
   );
 }
 
+/** A Card over a Loadable: the ready branch renders `children(data)`, any
+ * other state renders the PendingNote — the guard-then-render shape
+ * RegisteredKind already follows, extracted because the inline ternary was
+ * being copied per card (four times in Section.tsx alone). One place to
+ * change the loading treatment for every card-shaped fetch. */
+export function LoadableCard<T>(props: {
+  title?: string;
+  headingLevel?: 2 | 3;
+  loadable: Loadable<T>;
+  children: (data: T) => ReactNode;
+}) {
+  return (
+    <Card title={props.title} headingLevel={props.headingLevel}>
+      {props.loadable.state === "ready" ? (
+        props.children(props.loadable.data)
+      ) : (
+        <PendingNote loadable={props.loadable} />
+      )}
+    </Card>
+  );
+}
+
 /* ---- markdown: a tiny SAFE subset renderer --------------------------------
  *
  * Plugin data is "trusted-ish" (§4.4 rationale) but the shell must not be an

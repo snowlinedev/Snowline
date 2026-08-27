@@ -138,13 +138,23 @@ export function sectionDef(id: SectionId): SectionDef {
   return def;
 }
 
+/** Today's bands, in order, each named by the intent it composes (§5). The
+ * headings are PLATFORM copy — a plugin declares what a view is for, never
+ * what the band is called (§2.2). This table is the source of truth for WHICH
+ * intents are Today intents: INTENT_SECTIONS below derives its `today` rows
+ * from it, so a Today intent can never be nav-listed with no band to land in
+ * — by construction, not by test. */
+export const TODAY_BANDS: readonly { intent: string; heading: string }[] = [
+  { intent: "attention", heading: "Needs you" },
+  { intent: "digest", heading: "Digest" },
+  { intent: "activity", heading: "Recent activity" },
+];
+
 /** The intent vocabulary this shell version understands (§4.1). A Map, not an
  * object literal, so a contribution declaring `intent: "constructor"` can't
  * inherit a prototype member as its "section". */
 export const INTENT_SECTIONS: ReadonlyMap<string, SectionId> = new Map([
-  ["attention", "today"],
-  ["digest", "today"],
-  ["activity", "today"],
+  ...TODAY_BANDS.map((b): [string, SectionId] => [b.intent, "today"]),
   ["roadmap", "roadmap"],
   ["feature-status", "features"],
   ["review-queue", "review"],
@@ -263,17 +273,6 @@ export function pluginWidgets(plugins: PluginEntry[]): PluginWidgetEntry[] {
 }
 
 /* ---- Today's bands (dashboard-ia.md §5) ----------------------------------- */
-
-/** Today's bands, in order, each named by the intent it composes (§5). The
- * headings are PLATFORM copy — a plugin declares what a view is for, never
- * what the band is called (§2.2). Kept as a table beside `INTENT_SECTIONS`
- * (whose `today` entries this must cover exactly — pinned by a test) so a new
- * Today intent can't be nav-listed under Today with no band to land in. */
-export const TODAY_BANDS: readonly { intent: string; heading: string }[] = [
-  { intent: "attention", heading: "Needs you" },
-  { intent: "digest", heading: "Digest" },
-  { intent: "activity", heading: "Recent activity" },
-];
 
 export type TodayBand = {
   /** Stable React key: the band's intent, or `plugin:<name>` for a fallback
