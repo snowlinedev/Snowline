@@ -8,8 +8,9 @@
 > component set with each component's data story. Companion specs:
 > `replication-continuity.md` (§5 spoke posture, §7 seeding),
 > `docs/ops/roam-runbook.md` (the operational drill this channel automates),
-> `deploy-continuity.md` (restart visibility), `ui-shell.md` §6 (dashboard
-> dist resolution).
+> `deploy-continuity.md` (restart visibility). Dashboard dist resolution is
+> `config.dashboard_dist()` in the platform source (`SNOWLINE_DASHBOARD_DIST`
+> override + checkout-relative fallback).
 
 ## 1. Scope, precisely
 
@@ -36,8 +37,10 @@ release artifacts. Single operator (Sean), machines on the shared tailnet,
 
 **Correction to the framing in #201:** the item body says "governance/memory
 … have no replication". They do — governance (#79) and memory (#80) shipped
-full replication streams (`replication_stream.py` + apply paths are live
-code), and the roam runbook already stands both up as spoke services. The
+full replication streams (governance carries its own `replication_stream.py`
++ `replication_apply.py`; memory's rides `snowline_plugin_sdk.replication`
+with its apply seam inside `memory.py`), and the roam runbook already stands
+both up as spoke services. The
 open data-story questions narrow to walkthrough and musher (§7).
 
 ## 2. Decision D1 — artifact format: wheels on per-repo GitHub Releases, installed by uv into managed venvs
@@ -46,23 +49,32 @@ Each release ships **Python wheels** built in CI and attached to a GitHub
 Release on the repo that owns the code:
 
 - `snowlinedev/Snowline` release: wheels for `snowline-platform`,
-  `snowline-governance`, `snowline-memory`, `snowline-plugin-sdk` (one
-  `uv build --all-packages` over the workspace), plus three non-wheel
-  assets: `dashboard-dist-<v>.tar.gz` (§2.2), `train.json` (§4), and
-  `install.sh` (§5).
+  `snowline-governance`, `snowline-memory`, `snowline-plugin-sdk` — built
+  from the workspace, but note `uv build --all-packages` also produces
+  `snowline-remote-front` (a workspace member): the pipeline builds
+  per-package or prunes that wheel; it never ships in this release. Plus
+  three non-wheel assets: `dashboard-dist-<v>.tar.gz` (§2.2), `train.json`
+  (§4), and `install.sh` (§5).
 - `snowlinedev/snowline-pm` release: the `snowline-pm` wheel. The repo is
   **private**; assets are fetched with `gh release download`, which rides
   the operator's existing auth. Nothing private ever lands on the public
   platform release.
 - Per-service dependency locks: CI also attaches a `requirements-<service>.txt`
-  exported from the repo's `uv.lock` (`uv export --frozen`), so the installed
-  environment reproduces the tested transitive closure, not whatever PyPI
-  resolves on install day.
+  exported from the repo's `uv.lock` — specifically `uv export --frozen
+  --package <service> --no-emit-workspace`: the bare export emits workspace
+  members (the SDK, sibling services) as local *path* entries, unresolvable
+  off-checkout — the same "source dragged back in" failure risk #6 catches
+  for pm's git pin. Workspace-internal deps are exactly what
+  `--no-emit-workspace` drops; they install as wheel pins from the release
+  assets alongside the service package itself. The result reproduces the
+  tested transitive closure, not whatever PyPI resolves on install day.
 
 On the target, `snowline stack sync` (§5) creates **one venv per service**
 with uv (`uv venv --python 3.12` against a uv-managed interpreter, then
 `uv pip install --find-links <downloaded-assets> -r requirements-<service>.txt
-<package>==<train-version>`). launchd runs `<venv>/bin/uvicorn` directly —
+<package>==<manifest-pinned version>` — per-component, since a PATCH respin
+(§4) leaves non-respun components on the prior version). launchd runs
+`<venv>/bin/uvicorn` directly —
 uv is an install-time tool only, never a runtime dependency, and the plists
 need no `WorkingDirectory` because nothing runs from a checkout.
 
@@ -132,9 +144,14 @@ makes that coupling honest.
   respin) rather than a maintenance branch.
 - **The manifest is the source of truth:** `release/train.json` in the
   platform repo — `{ "version": "v0.4.0", "components": { "<service>":
-  { "repo", "sha", "wheel" } } }`. Cutting a train = update the manifest
-  with the blessed SHAs, tag **each component repo** with the train tag
-  (each repo's release workflow builds and attaches its own wheels — no
+  { "repo", "tag", "sha", "wheel" } } }`. The per-component `tag` names the
+  release each component's assets are fetched from — it is what makes a
+  PATCH respin coherent: `v0.4.1` re-tags and rebuilds **only** the respun
+  component; every other entry keeps its `v0.4.0` tag, and sync downloads
+  each component from its manifest-recorded tag rather than assuming one
+  uniform tag exists on every repo. Cutting a MINOR train = update the
+  manifest with the blessed SHAs, tag **each component repo** with the train
+  tag (each repo's release workflow builds and attaches its own wheels — no
   cross-repo checkout, so no PAT gymnastics and nothing fights the
   private-repo boundary), and publish the platform release carrying the
   manifest. A `snowline release cut` helper can automate the tagging later;
@@ -153,8 +170,11 @@ curl -fsSL https://github.com/snowlinedev/Snowline/releases/latest/download/inst
 `install.sh` (public asset, no auth needed) checks prerequisites (Homebrew,
 `gh auth status` — required for the private pm wheel), installs uv if
 absent, `uv python install 3.12`, builds the **platform service venv** for
-the train it shipped with, symlinks its `snowline` entry point into
-`~/.local/bin`, and hands off to:
+the train it shipped with, points `venvs/platform/current` at it, and
+symlinks `~/.local/bin/snowline` → `venvs/platform/current/bin/snowline` —
+**through `current`, never at a train-versioned path**, or every later sync
+would repoint `current` while PATH stays pinned to (and the keep-2 GC
+eventually deletes) the bootstrap venv. It then hands off to:
 
 ```bash
 snowline stack sync --role spoke [--train vX.Y.Z]
@@ -170,9 +190,12 @@ everything else, idempotently:
    (`gh release download` per component repo).
 2. Build each service's venv at
    `~/Library/Application Support/Snowline/venvs/<service>/<train>/` and
-   atomically repoint `<service>/current`. **The symlink swap is the whole
-   deploy and the whole rollback**; the previous train's venv is retained
-   (keep 2).
+   atomically repoint `<service>/current` — build a temp symlink and
+   `rename(2)` it over the old one (`os.replace`; plain `ln -sfn` is
+   unlink-then-create and leaves a no-`current` window that a launchd
+   KeepAlive respawn or the step-4 kickstart can race). **The symlink swap
+   is the whole code deploy and the whole code rollback**; the previous
+   train's venv is retained (keep 2).
 3. Unpack the dashboard dist; render env files into
    `~/.config/snowline/*.env` from packaged templates — the roam posture
    verbatim (`env.roam.example` promoted from example to template):
@@ -192,11 +215,14 @@ everything else, idempotently:
   Done.
 - Rollback **across a schema migration**: boot-migrate is forward-only by
   design, so the DB does not roll back. On a spoke this is recoverable by
-  construction: drain the outbox (deliver pending spoke-authored events),
-  then **reseed from the primary** (`snowline replicate seed`, the §7
-  ordering). The runbook gains a "rollback with schema change" section
-  stating exactly this; it is the accepted cost of keeping migrations
-  forward-only.
+  construction — but by the **re-seed protocol**, not a bare seed: drain the
+  outbox (deliver pending spoke-authored events), verify the primary's
+  parked set is empty (a park ACKs as delivered, so reseeding over an
+  unresolved park loses that write — the runbook's documented data-loss
+  case), then `reseed-check` + `seed --reseed` under a fresh epoch, per
+  replication-continuity §7 and the runbook's re-seed section. The runbook
+  gains a "rollback with schema change" section stating exactly this; it is
+  the accepted cost of keeping migrations forward-only.
 
 Tailnet exposure of the local gateway/dashboard is item 39c092c9
 (Tailscale Serve), layered on the loopback-only posture above — this spec
@@ -215,14 +241,14 @@ Pairing + seeding (the actual spoke data bootstrap) stays an explicit,
 separate step — item 71317cd6 wires `snowline replicate pair`/`seed`
 into a guided `snowline stack bootstrap-spoke` that runs after the first
 sync. Software install and data topology are deliberately not fused: sync
-must stay safe to run at any time, and seeding is a §7-ordered, operator-
-attended operation.
+must stay safe to run at any time, and seeding is an operator-attended
+operation ordered by replication-continuity §7.
 
 ## 7. Decision D5 — v1 component set and each component's data story
 
 | Component | In v1? | Data story on the spoke |
 |---|---|---|
-| platform | yes | Scope stream replication (spec §8) — pair + seed per runbook. |
+| platform | yes | Scope stream replication (replication-continuity §8) — pair + seed per runbook. |
 | governance | yes | Replication shipped (#79) — spoke peer, seeded. |
 | memory | yes | Replication shipped (#80) — spoke peer, seeded. |
 | pm | yes | Replication-ready (pm PRs #33–36); `SNOWLINE_PM_ROLE=spoke`. |
@@ -238,7 +264,10 @@ attended operation.
   + cut procedure, and the §2.1 wheel-boot smoke tests. First output: train
   `v0.1.0`.
 - **b70b0359 (one-command install/update):** `install.sh` + `snowline stack
-  sync` per §5–6, env/plist templates promoted from `ops/roam/`.
+  sync` per §5–6, env/plist templates promoted from `ops/roam/`. Includes
+  the runbook update this spec obsoletes in place: the spoke is now **four**
+  services and **four** databases (pm joins the drill — the runbook's
+  prerequisite list and service set predate pm on the spoke).
 - **71317cd6 (spoke bootstrap, pm scope):** `snowline stack bootstrap-spoke`
   wrapping pair/seed + `SNOWLINE_PM_ROLE=spoke` verification.
 - **39c092c9 (Tailscale Serve):** hosted interface on top of the loopback
