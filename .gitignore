@@ -9,6 +9,11 @@ build/
 # uv
 .uv/
 
+# `snowline release cut` build output (wheels, lock exports, smoke venvs).
+# Kept after a cut on purpose — a re-run reuses it and it is the evidence for
+# what was published.
+.release-build/
+
 # Tooling / OS
 .pytest_cache/
 .ruff_cache/
