@@ -264,7 +264,19 @@ def resolve_checkout(config: ReleaseConfig, component: Component, overrides: Map
     """
     if component.name in overrides:
         return Path(overrides[component.name]).expanduser().resolve()
-    root = config.source.parent.parent if config.source else Path.cwd()
+    # The `<root>/release/components.json` layout is what makes
+    # `source.parent.parent` the repo root. For a config anywhere else the
+    # derivation would silently point at unrelated directories (#207 review:
+    # `--config ~/copy.json` would resolve components against `~`), so refuse
+    # loudly instead of guessing — overrides are the escape hatch.
+    if config.source is None or config.source.parent.name != "release":
+        raise ReleaseError(
+            f"cannot derive the repo root from a config at {config.source} — "
+            "the checked-in location is <repo-root>/release/components.json; "
+            f"for a config elsewhere pass --checkout {component.name}=PATH "
+            "for every component"
+        )
+    root = config.source.parent.parent
     return (root / component.path).resolve()
 
 
@@ -372,6 +384,25 @@ class TrainPlan:
                 for p in self.services
             },
         }
+
+
+def sdk_train_version(config: ReleaseConfig, plan: TrainPlan) -> str:
+    """The PEP 440 version of the SDK wheel THIS train actually carries.
+
+    On a MINOR cut that equals the train version; on a respin of a component
+    that does not rebuild the SDK, the SDK entry is carried forward and keeps
+    its previous tag — pinning pm's rewritten SDK requirement to the *cut*
+    version would then name a wheel that does not exist in any release's
+    assets (#207 review). The pin must come from the SDK's own plan entry."""
+    for comp, svc in config.services():
+        if svc.package == SDK_PACKAGE:
+            for p in plan.services:
+                if p.service == svc.name:
+                    return pep440(p.tag)
+    raise ReleaseError(
+        f"no service in the release config packages {SDK_PACKAGE!r} — cannot "
+        "resolve the SDK wheel version for the pin rewrite"
+    )
 
 
 def plan_train(

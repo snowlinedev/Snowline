@@ -74,8 +74,14 @@ def make_handler(*, heads=None, dirty=False, branch="main", tags=None, releases=
                 return "true\n"
             if argv[2:3] == ["--abbrev-ref"]:
                 return f"{branch}\n"
-            if argv[2:] == ["origin/main"]:
+            if argv[2:] == ["--verify", "--quiet", "origin/main"]:
                 return f"{head}\n" if pushed else f"{'f' * 40}\n"
+            if argv[2:3] == ["--verify"]:
+                # Local-tag lookups (`refs/tags/<v>^{commit}`): none exist
+                # unless a test seeds one under a ("<dir>", "local:<tag>") key.
+                ref = argv[4].removeprefix("refs/tags/").removesuffix("^{commit}")
+                sha = tags.get((name, f"local:{ref}"))
+                return f"{sha}\n" if sha else ""
             return f"{head}\n"
         if argv[:2] == ["git", "status"]:
             return " M src/x.py\n" if dirty else ""
@@ -118,6 +124,9 @@ def checkouts(tmp_path) -> dict[str, Path]:
 
 
 def _cutter(config, checkouts, runner, tmp_path, **kw) -> cut_mod.Cutter:
+    # Direct-Cutter tests get the sdk version pre-resolved, the way `cut()`
+    # sets it from `m.sdk_train_version(config, plan)`.
+    kw.setdefault("sdk_version", "0.1.0")
     return cut_mod.Cutter(
         config=config,
         runner=runner,
@@ -416,6 +425,113 @@ def test_respin_fetches_carried_forward_wheels_from_the_manifest_tag(config, che
     assert "v0.1.0" in download and "snowlinedev/Snowline" in download
     assert "*.whl" in download
     assert len(dirs) == 2
+
+
+def test_respin_publishes_a_manifest_carrier_platform_release(config, checkouts, tmp_path):
+    """A respin of pm still ends in a PLATFORM release tagged with the train
+    version and carrying train.json — spec §4's 'latest' resolution reads the
+    manifest off the platform repo's latest release, so without this the
+    respun train is invisible to every target (#207 review). The platform is
+    tagged at its CARRIED-FORWARD sha; the release carries the manifest only."""
+    runner = FakeRunner(make_handler())
+    cutter = _cutter(config, checkouts, runner, tmp_path)
+    previous = m.plan_train(
+        config, "v0.1.0", heads={"platform": PLATFORM_SHA, "pm": PM_SHA}
+    ).to_manifest()
+    plan = m.plan_train(
+        config, "v0.1.1",
+        heads={"pm": "c" * 40},
+        previous=previous, respin="pm",
+    )
+    cutter.write_manifest(plan)
+
+    cutter.publish_manifest_only(plan, "v0.1.1")
+
+    tag = runner.ran("git", "tag", "-a")[0]
+    assert tag[3] == "v0.1.1" and tag[4] == PLATFORM_SHA  # carried sha
+    create = runner.ran("gh", "release", "create")[0]
+    assert create[3] == "v0.1.1" and "snowlinedev/Snowline" in create
+    # the manifest is the ONLY asset
+    assets = [a for a in create if a.endswith(".json")]
+    assert len(assets) == 1 and assets[0].endswith("train.json")
+    assert not any(a.endswith(".whl") for a in create)
+
+
+def test_sdk_train_version_uses_the_carried_tag_on_a_respin(config):
+    """Pinning pm's rewritten SDK requirement to the CUT version on a respin
+    would name a wheel that exists in no release's assets — the pin must come
+    from the SDK's own (carried-forward) plan entry (#207 review)."""
+    previous = m.plan_train(
+        config, "v0.1.0", heads={"platform": PLATFORM_SHA, "pm": PM_SHA}
+    ).to_manifest()
+    plan = m.plan_train(
+        config, "v0.1.1",
+        heads={"pm": "c" * 40},
+        previous=previous, respin="pm",
+    )
+    assert m.sdk_train_version(config, plan) == "0.1.0"
+    minor = m.plan_train(
+        config, "v0.2.0", heads={"platform": PLATFORM_SHA, "pm": PM_SHA}
+    )
+    assert m.sdk_train_version(config, minor) == "0.2.0"
+
+
+def test_publish_deletes_a_stale_local_tag_before_retagging(config, checkouts, tmp_path):
+    """A local tag left by a run whose push failed points at the wrong sha;
+    pushing it as-is would publish a tag that lies about what was released
+    (#207 review). Origin has no tag (tag_decision said create), so the stale
+    local one is deleted and recreated at the blessed sha."""
+    stale = "d" * 40
+    runner = FakeRunner(make_handler(
+        heads={"snowline-pm": PM_SHA},
+        tags={("snowline-pm", "local:v0.1.0"): stale},
+    ))
+    cutter = _cutter(config, checkouts, runner, tmp_path)
+    cutter.out_dir.mkdir(parents=True, exist_ok=True)
+    _pm_dist(cutter, config)
+    plan = m.plan_train(config, "v0.1.0", heads={"platform": PLATFORM_SHA, "pm": PM_SHA})
+
+    cutter.publish(config.component("pm"), plan, "v0.1.0")
+
+    assert runner.ran("git", "tag", "-d") == [("git", "tag", "-d", "v0.1.0")]
+    retag = runner.ran("git", "tag", "-a")[0]
+    assert retag[3] == "v0.1.0" and retag[4] == PM_SHA
+
+
+def test_write_manifest_does_not_touch_the_checkout_until_recorded(config, checkouts, tmp_path):
+    """The checkout train record arms plan_train's immutability check, so a
+    cut that fails before publishing must leave it unwritten — the advertised
+    re-run-at-the-same-version recovery depends on it (#207 review).
+    `write_manifest` produces only the release asset; `record_manifest` (run
+    after publish) writes the record."""
+    runner = FakeRunner(make_handler())
+    cutter = _cutter(config, checkouts, runner, tmp_path)
+    plan = m.plan_train(config, "v0.1.0", heads={"platform": PLATFORM_SHA, "pm": PM_SHA})
+
+    asset = cutter.write_manifest(plan)
+
+    assert asset.exists()
+    checked_in = checkouts["platform"] / cut_mod.MANIFEST_RELPATH
+    assert not checked_in.exists()
+    cutter.record_manifest(plan)
+    assert checked_in.exists()
+    assert json.loads(checked_in.read_text())["version"] == "v0.1.0"
+
+
+def test_resolve_checkout_refuses_a_config_outside_the_release_dir(config, tmp_path):
+    """`--config ~/somewhere/copy.json` must not silently resolve components
+    against the config's grandparent directory (#207 review) — overrides are
+    the escape hatch, and the refusal says so."""
+    from dataclasses import replace
+
+    moved = replace(config, source=tmp_path / "copy.json")
+    with pytest.raises(m.ReleaseError, match="--checkout"):
+        m.resolve_checkout(moved, config.components[0], {})
+    # an override still works without root derivation
+    path = m.resolve_checkout(
+        moved, config.components[0], {config.components[0].name: str(tmp_path / "co")}
+    )
+    assert path == (tmp_path / "co").resolve()
 
 
 # -- status ----------------------------------------------------------------

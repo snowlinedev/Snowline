@@ -114,8 +114,14 @@ def checkout_state(runner: Runner, component: str, path: Path) -> CheckoutState:
     head = runner.read(["git", "rev-parse", "HEAD"], cwd=path).strip()
     # Refresh remote refs so "is it pushed" is a fact, not a stale cache.
     runner.read(["git", "fetch", "--quiet", "origin", "main"], cwd=path, check=False)
+    # `--verify --quiet`: a missing ref yields EMPTY stdout (-> None). A bare
+    # `rev-parse origin/main` would print the literal string "origin/main" on
+    # failure, and with check=False that literal would be stored as the sha —
+    # producing nonsense "push first" diagnostics when the real problem is an
+    # unresolvable ref (#207 review).
     origin_head = runner.read(
-        ["git", "rev-parse", "origin/main"], cwd=path, check=False
+        ["git", "rev-parse", "--verify", "--quiet", "origin/main"],
+        cwd=path, check=False,
     ).strip() or None
     # "Pushed" means origin/main contains HEAD — equal to the tip, or an
     # ancestor of it (someone landed more after the sha we're blessing).
@@ -166,6 +172,18 @@ def existing_tag_sha(runner: Runner, path: Path, tag: str) -> str | None:
     if peeled:
         sha = peeled.split()[0]
     return sha
+
+
+def local_tag_sha(runner: Runner, path: Path, tag: str) -> str | None:
+    """The commit sha a LOCAL tag points at, or None — used to detect (and
+    safely delete) a stale local tag left by a run whose push failed (#207
+    review): the origin check (`existing_tag_sha`) is what decides whether a
+    tag may be created; this only tells us whether `git tag -a` would refuse."""
+    out = runner.read(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/tags/{tag}^{{commit}}"],
+        cwd=path, check=False,
+    ).strip()
+    return out or None
 
 
 def previous_tag(runner: Runner, path: Path, before: str) -> str | None:

@@ -56,6 +56,7 @@ class Cutter:
     report: r.Report = print
     skip_tests: bool = False
     skip_smoke: bool = False
+    sdk_version: str | None = None  # the SDK wheel version THIS train carries
     notes: list[str] = field(default_factory=list)
 
     # -- paths ------------------------------------------------------------
@@ -66,11 +67,14 @@ class Cutter:
     def dist_dir(self, comp: Component) -> Path:
         return self.out_dir / "dist" / comp.name
 
-    def assets_dir(self, comp: Component) -> Path:
-        """Where a component's wheels can be found for an install — its own
-        freshly built dist, or (on a respin) the ones downloaded from the tag
-        the manifest carried forward."""
-        return self.dist_dir(comp)
+    def carried_dir(self, comp: Component) -> Path:
+        """Where a NON-rebuilt component's downloaded wheels land on a respin.
+
+        Deliberately not `dist_dir`: dist is what `publish` uploads, and a
+        manifest-only platform release on a respin must carry the manifest
+        alone — mixing downloaded old-version wheels into dist would re-upload
+        them under the new tag (#207 review)."""
+        return self.out_dir / "carried" / comp.name
 
     # -- 1. preflight -----------------------------------------------------
 
@@ -135,9 +139,9 @@ class Cutter:
             self._export_locks(comp, tree, dist, version)
             self._stamp(comp, tree, version)
             self._build_wheels(comp, tree, dist)
-        self._prune(comp, dist, version)
-        if comp.dashboard:
-            self._build_dashboard(comp, dist, version)
+            self._prune(comp, dist, version)
+            if comp.dashboard:
+                self._build_dashboard(comp, tree, dist, version)
 
     def _export_locks(self, comp: Component, tree: Path, dist: Path, version: str) -> None:
         """Per-service `requirements-<service>.txt` (spec §2).
@@ -155,7 +159,11 @@ class Cutter:
                 argv += ["--package", svc.package]
             text = self.runner.read(argv, cwd=tree)
             if comp.rewrite_sdk_pin:
-                text = self._rewrite_sdk_pin(comp, svc, text, version)
+                # Pin to the SDK wheel THIS train carries — on a respin that
+                # is the carried-forward version, not the cut version (#207
+                # review; `m.sdk_train_version` is the single source).
+                assert self.sdk_version is not None
+                text = self._rewrite_sdk_pin(comp, svc, text, self.sdk_version)
             target = dist / m.requirements_filename(svc.name)
             target.write_text(text)
             self.report(f"  lock export: {target.name}")
@@ -236,17 +244,20 @@ class Cutter:
                     f"{sorted(p.name for p in dist.iterdir())})"
                 )
 
-    def _build_dashboard(self, comp: Component, dist: Path, version: str) -> None:
+    def _build_dashboard(self, comp: Component, tree: Path, dist: Path, version: str) -> None:
         """`npm run build` -> `dashboard-dist-<v>.tar.gz` (spec §2.2).
 
-        Built in the REAL checkout rather than the throwaway worktree: the
-        preflight already proved that checkout clean and at the blessed sha, so
-        the tree is identical, and a fresh worktree would mean a full `npm ci`
-        on every cut for no added fidelity. The npm build carries its own gates
+        Built in the THROWAWAY worktree, same isolation as the wheels: the
+        preflight's `git status` proves tracked files clean but says nothing
+        about ignored ones — a `dashboard/.env.local` in the real checkout
+        would get its VITE_* values baked into the shipped bundle (#207
+        review), an artifact that no longer corresponds to the blessed sha.
+        The `npm ci` this costs per cut is the price of a tarball that is a
+        pure function of the tag. The npm build carries its own gates
         (`validate:tokens`, `tsc -b`).
         """
         assert comp.dashboard is not None
-        dash = self.checkout(comp) / comp.dashboard.dir
+        dash = tree / comp.dashboard.dir
         if comp.dashboard.install:
             self.report(f"  dashboard: {' '.join(comp.dashboard.install)} (in {dash})")
             self.runner.read(list(comp.dashboard.install), cwd=dash)
@@ -261,19 +272,29 @@ class Cutter:
     # -- 4. manifest ------------------------------------------------------
 
     def write_manifest(self, plan: TrainPlan) -> Path:
+        """The RELEASE-ASSET copy only. The checkout copy is written by
+        `record_manifest` AFTER a successful publish — writing it earlier
+        armed `plan_train`'s immutability check against a cut that failed
+        before publishing anything, wrongly blocking the advertised
+        re-run-at-the-same-version recovery path (#207 review)."""
         comp = self.config.manifest_component
         asset = self.dist_dir(comp) / MANIFEST_RELPATH.name
         asset.parent.mkdir(parents=True, exist_ok=True)
         asset.write_text(m.render_manifest(plan))
+        self.report(f"  manifest asset written: {asset}")
+        return asset
+
+    def record_manifest(self, plan: TrainPlan) -> None:
+        """Write the checkout copy — the train RECORD — once publish succeeded."""
+        comp = self.config.manifest_component
         checked_in = self.checkout(comp) / MANIFEST_RELPATH
         checked_in.parent.mkdir(parents=True, exist_ok=True)
         checked_in.write_text(m.render_manifest(plan))
-        self.report(f"  manifest written: {asset} (and {checked_in})")
+        self.report(f"  train recorded: {checked_in}")
         self.notes.append(
             f"commit {MANIFEST_RELPATH} in {comp.repo} as the train record — the "
             "copy attached to the release is what sync reads"
         )
-        return asset
 
     # -- 5. smoke ---------------------------------------------------------
 
@@ -305,14 +326,18 @@ class Cutter:
             carried = [p for p in plan.for_component(comp.name) if not p.rebuilt]
             if not carried:
                 continue
-            dist.mkdir(parents=True, exist_ok=True)
+            # Downloaded carried wheels live OUTSIDE dist — dist is what
+            # `publish` uploads, and old-version wheels must never ride a new
+            # tag's release (#207 review).
+            into = self.carried_dir(comp)
+            into.mkdir(parents=True, exist_ok=True)
             tag = carried[0].tag
             self.report(f"  fetching {comp.name} wheels from {comp.repo} {tag} (carried forward)")
             self.runner.read(
                 ["gh", "release", "download", tag, "--repo", comp.repo,
-                 "--pattern", "*.whl", "--dir", str(dist), "--clobber"]
+                 "--pattern", "*.whl", "--dir", str(into), "--clobber"]
             )
-            dirs.append(dist)
+            dirs.append(into)
         return dirs
 
     def _smoke_one(self, comp: Component, svc: Service, version: str, find_links: list[Path]) -> None:
@@ -330,10 +355,19 @@ class Cutter:
         install = ["uv", "pip", "install", "--python", str(python)]
         for link in find_links:
             install += ["--find-links", str(link)]
-        install += [
-            "-r", str(self.dist_dir(comp) / m.requirements_filename(svc.name)),
-            f"{svc.package}=={m.pep440(version)}",
-        ]
+        # The snowline wheels are named by FILE PATH, never by package name:
+        # name-based resolution would let PyPI (still in the path for the
+        # lock's third-party deps) mask a missing release asset — or resolve a
+        # name-squatted `snowline-*` package and execute it host-side (#207
+        # review). `_wheel_path` hard-fails on a missing asset instead.
+        wheels = [_wheel_path(find_links, m.wheel_filename(svc.package, version))]
+        if comp.rewrite_sdk_pin:
+            assert self.sdk_version is not None
+            wheels.append(
+                _wheel_path(find_links, m.wheel_filename(m.SDK_PACKAGE, self.sdk_version))
+            )
+        install += [str(w) for w in wheels]
+        install += ["-r", str(self.dist_dir(comp) / m.requirements_filename(svc.name))]
         self.runner.read(install)
         driver = work / "_smoke_boot.py"
         shutil.copyfile(Path(__file__).with_name("_smoke_boot.py"), driver)
@@ -358,22 +392,39 @@ class Cutter:
 
     # -- 6. publish -------------------------------------------------------
 
-    def publish(self, comp: Component, plan: TrainPlan, version: str) -> None:
+    def _ensure_tag(self, comp: Component, sha: str, version: str) -> None:
+        """Tag `version` -> `sha` on `comp`'s repo, idempotently and safely."""
         path = self.checkout(comp)
-        plans = plan.for_component(comp.name)
-        sha = plans[0].sha
         existing = r.existing_tag_sha(self.runner, path, version)
         action = m.tag_decision(tag=version, target_sha=sha, existing_sha=existing)
         if action == "skip":
             self.report(f"  tag {version} already on {comp.repo} at {sha[:12]} — skipping")
-        else:
-            self.report(f"  tagging {comp.repo} {version} -> {sha[:12]}")
+            return
+        # A LOCAL tag left by a run whose push failed may point at a stale
+        # sha; `git tag -a` would silently no-op under check=False and the
+        # unconditional push would then publish the STALE tag — a tag that
+        # lies about what was released (#207 review). Origin has no such
+        # tag (action != "skip"), so deleting the local leftover is safe.
+        local = r.local_tag_sha(self.runner, path, version)
+        if local is not None and local != sha:
+            self.report(
+                f"  stale local tag {version} @ {local[:12]} (failed prior "
+                f"run) — deleting before re-tagging at {sha[:12]}"
+            )
+            self.runner.run(["git", "tag", "-d", version], cwd=path)
+        self.report(f"  tagging {comp.repo} {version} -> {sha[:12]}")
+        if local is None or local != sha:
             self.runner.run(
                 ["git", "tag", "-a", version, sha, "-m", f"Snowline train {version}"],
                 cwd=path,
-                check=False,  # a local tag may already exist from a failed run
             )
-            self.runner.run(["git", "push", "origin", version], cwd=path)
+        self.runner.run(["git", "push", "origin", version], cwd=path)
+
+    def publish(self, comp: Component, plan: TrainPlan, version: str) -> None:
+        path = self.checkout(comp)
+        plans = plan.for_component(comp.name)
+        sha = plans[0].sha
+        self._ensure_tag(comp, sha, version)
 
         assets = sorted(
             str(p) for p in self.dist_dir(comp).iterdir()
@@ -407,6 +458,49 @@ class Cutter:
              "--notes-file", str(notes_file)]
         )
 
+    def publish_manifest_only(self, plan: TrainPlan, version: str) -> None:
+        """Respin publishing for the manifest component when it was NOT rebuilt.
+
+        Spec §4: the installer resolves "latest" from the platform repo's
+        latest release and pins everything off the manifest inside it — so
+        EVERY train, respins included, must end in a platform release carrying
+        the new train.json, or the respun train is invisible to every target
+        (#207 review). The platform repo is tagged `version` at its
+        carried-forward sha (nothing rebuilt — its wheels stay on their
+        manifest-recorded tag), and the release carries the manifest alone.
+        """
+        comp = self.config.manifest_component
+        sha = plan.for_component(comp.name)[0].sha
+        self._ensure_tag(comp, sha, version)
+        asset = self.dist_dir(comp) / MANIFEST_RELPATH.name
+        if not asset.exists():
+            raise ReleaseError(
+                f"manifest asset missing at {asset} — write_manifest must run "
+                "before publish"
+            )
+        if r.release_exists(self.runner, comp.repo, version):
+            self.report(f"  release {comp.repo} {version} exists — refreshing manifest")
+            self.runner.run(
+                ["gh", "release", "upload", version, str(asset),
+                 "--repo", comp.repo, "--clobber"]
+            )
+            return
+        notes = (
+            f"Train {version} — respin of `{plan.respin}`. This release exists "
+            f"to carry `{MANIFEST_RELPATH.name}` (the train manifest); "
+            f"{comp.name}'s own wheels were not rebuilt and live on the tag "
+            "recorded in the manifest."
+        )
+        notes_file = self.out_dir / f"notes-{comp.name}.md"
+        notes_file.write_text(notes)
+        self.report(f"  creating manifest-carrier release {comp.repo} {version}")
+        self.runner.run(
+            ["gh", "release", "create", version, str(asset),
+             "--repo", comp.repo,
+             "--title", f"Snowline {version} — {comp.name} (manifest)",
+             "--notes-file", str(notes_file)]
+        )
+
 
 # --------------------------------------------------------------------------
 # Entry points
@@ -427,9 +521,14 @@ def cut(
 ) -> TrainPlan:
     m.validate_version(version)
     manifest_comp = config.manifest_component
-    previous = m.load_manifest(checkouts[manifest_comp.name] / MANIFEST_RELPATH)
 
     to_build = [config.component(respin)] if respin else list(config.components)
+    # The manifest component's checkout is READ (carry-forward source) and
+    # WRITTEN (the new train record) on every cut, respins included — so it is
+    # preflighted on every cut, not only when it rebuilds (#207 review).
+    preflight_comps = list(to_build)
+    if manifest_comp.name not in {c.name for c in preflight_comps}:
+        preflight_comps.append(manifest_comp)
     cutter = Cutter(
         config=config,
         runner=runner,
@@ -440,7 +539,11 @@ def cut(
         skip_smoke=skip_smoke,
     )
     out_dir.mkdir(parents=True, exist_ok=True)
-    states = cutter.preflight(to_build)
+    states = cutter.preflight(preflight_comps)
+    # Load the previous train only AFTER the manifest checkout passed
+    # preflight — reading carry-forward entries from an unverified checkout is
+    # how a stale manifest silently poisons a respin (#207 review).
+    previous = m.load_manifest(checkouts[manifest_comp.name] / MANIFEST_RELPATH)
     plan = m.plan_train(
         config,
         version,
@@ -448,6 +551,7 @@ def cut(
         previous=previous,
         respin=respin,
     )
+    cutter.sdk_version = m.sdk_train_version(config, plan)
 
     report(f"\ntrain {version}" + (f" (respin of {respin})" if respin else ""))
     for sp in plan.services:
@@ -473,6 +577,15 @@ def cut(
     report("\npublish")
     for comp in to_build:
         cutter.publish(comp, plan, version)
+    if manifest_comp.name not in {c.name for c in to_build}:
+        # A respin of another component still ends in a platform release —
+        # the manifest carrier "latest" resolves against (spec §4; #207
+        # review: without this the respun train is invisible to sync).
+        cutter.publish_manifest_only(plan, version)
+
+    # The checkout train record is written ONLY once everything published —
+    # a failed cut must not arm plan_train's immutability check (#207 review).
+    cutter.record_manifest(plan)
 
     report(f"\ncut {version} complete.")
     for note in cutter.notes:
@@ -536,6 +649,24 @@ def _state(runner: r.Runner, name: str, path: Path, ignore: tuple[str, ...]) -> 
     from dataclasses import replace
 
     return replace(state, dirty=bool(remaining))
+
+
+def _wheel_path(find_links: list[Path], filename: str) -> Path:
+    """The exact wheel FILE for a smoke install — never resolved by name.
+
+    Hard-fails on a missing asset: with PyPI still in the resolution path for
+    the lock's third-party deps, a name-based install of a snowline package
+    could mask a missing release asset (or resolve a name-squat) instead of
+    failing the smoke test (#207 review)."""
+    for d in find_links:
+        candidate = d / filename
+        if candidate.exists():
+            return candidate
+    raise ReleaseError(
+        f"expected wheel {filename} not found in any asset dir "
+        f"({', '.join(str(d) for d in find_links)}) — a missing release asset "
+        "must fail smoke here, not be masked by an index fallback"
+    )
 
 
 def _stamp_targets(comp: Component, tree: Path) -> list[Path]:

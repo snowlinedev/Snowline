@@ -196,6 +196,16 @@ def _release_context(args):
             raise release_lib.ReleaseError(f"--checkout wants NAME=PATH, got {pair!r}")
         name, _, path = pair.partition("=")
         overrides[name] = path
+    # An override naming no component is a typo, and a silently ignored one
+    # means the cut proceeds against the DEFAULT checkout — potentially
+    # blessing the wrong sha (#207 review). Refuse loudly instead.
+    known = {comp.name for comp in config.components}
+    unknown = sorted(set(overrides) - known)
+    if unknown:
+        raise release_lib.ReleaseError(
+            f"--checkout names unknown component(s) {', '.join(unknown)} — "
+            f"components are: {', '.join(sorted(known))}"
+        )
     checkouts = {
         comp.name: release_lib.resolve_checkout(config, comp, overrides)
         for comp in config.components
