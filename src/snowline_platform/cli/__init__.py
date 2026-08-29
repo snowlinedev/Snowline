@@ -1,12 +1,17 @@
 """The `snowline` operator CLI (console-script entry point).
 
-Today it hosts the replication operator surface (replication-continuity §5/§7,
-issue #82) under `snowline replicate ...`. Pairing and seeding are deliberately
-CLI steps, not MCP surfaces — agents never manage replication plumbing (§5) — and
-the CLI is a thin argparse shell over the pure libraries `replication_pairing`
-and `replication_seed`, which do the real work over the SDK's tailnet-gated
-admin surface + Postgres. Adding a subcommand is a new `add_parser` here plus a
-handler.
+Two operator surfaces live here today:
+
+- `snowline replicate ...` — replication pairing + seeding
+  (replication-continuity §5/§7, issue #82). Deliberately CLI, not MCP: agents
+  never manage replication plumbing (§5).
+- `snowline release ...` — cutting the packaged stable channel's release trains
+  (macOS distribution spec §2/§4, issue #202). Host-side by design; see
+  `snowline_platform.release.cutter` for why it is not a set of CI workflows.
+
+Both are thin argparse shells over pure libraries — `replication_pairing` /
+`replication_seed`, and `release.model` / `release.cutter`. Adding a subcommand is
+a new `add_parser` here plus a handler.
 """
 
 from __future__ import annotations
@@ -14,21 +19,27 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from pathlib import Path
 
+from snowline_platform import release as release_lib
 from snowline_platform import replication_pairing as pairing
 from snowline_platform import replication_seed as seed
 
 DEFAULT_LOCAL_PLATFORM_URL = "http://127.0.0.1:8848"
+
+# Where `release/components.json` is looked for when --config is not given.
+RELEASE_CONFIG_RELPATH = Path("release/components.json")
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="snowline", description="Snowline operator CLI")
     sub = parser.add_subparsers(dest="group", required=True)
     _build_replicate(sub.add_parser("replicate", help="replication pairing + seeding (§5/§7)"))
+    _build_release(sub.add_parser("release", help="cut packaged release trains (§2/§4)"))
     args = parser.parse_args(argv)
     try:
         return args.handler(args)
-    except (pairing.PairingError, seed.SeedError) as exc:
+    except (pairing.PairingError, seed.SeedError, release_lib.ReleaseError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
@@ -101,6 +112,127 @@ def _build_replicate(p: argparse.ArgumentParser) -> None:
     )
     check.add_argument("--config", required=True, help="path to the seed config JSON")
     check.set_defaults(handler=_cmd_reseed_check)
+
+
+def _build_release(p: argparse.ArgumentParser) -> None:
+    rsub = p.add_subparsers(dest="command", required=True)
+
+    cut = rsub.add_parser(
+        "cut",
+        help="build, smoke-test, tag and publish a release train",
+        description=(
+            "Cut a release train HOST-SIDE from local checkouts (item #202: no "
+            "GitHub Actions in plugin repos). Builds each component's wheels "
+            "from a throwaway worktree at its blessed main sha, exports "
+            "per-service locks, boots every service from its wheel against an "
+            "empty database (spec §2.1), writes release/train.json, then tags "
+            "each repo and publishes its own assets. Safe to re-run after a "
+            "partial failure: existing tags and releases are reported and "
+            "skipped, never duplicated."
+        ),
+    )
+    cut.add_argument("--version", required=True, help="the train version, e.g. v0.1.0")
+    cut.add_argument(
+        "--respin", default=None, metavar="COMPONENT",
+        help="PATCH respin: rebuild and re-tag ONLY this component; every other "
+        "service keeps its previous manifest entry, tag included (spec §4)",
+    )
+    cut.add_argument("--skip-tests", action="store_true", help="skip the per-repo test runs")
+    cut.add_argument(
+        "--skip-smoke", action="store_true",
+        help="skip the §2.1 wheel-boot smoke tests (they need local Postgres)",
+    )
+    cut.add_argument(
+        "--dry-run", action="store_true",
+        help="preflight + plan only; builds, tags, releases and databases are untouched",
+    )
+    _add_release_common(cut)
+    cut.add_argument(
+        "--out", default=None,
+        help="build directory (default: <platform checkout>/.release-build/<version>)",
+    )
+    cut.set_defaults(handler=_cmd_release_cut)
+
+    status = rsub.add_parser(
+        "status",
+        help="show the current train vs the checkouts' HEADs",
+        description="What release/train.json records, and what a cut would pick up now.",
+    )
+    _add_release_common(status)
+    status.set_defaults(handler=_cmd_release_status)
+
+
+def _add_release_common(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--config", default=os.environ.get("SNOWLINE_RELEASE_CONFIG"),
+        help="path to release/components.json (default: found upward from cwd)",
+    )
+    p.add_argument(
+        "--checkout", action="append", default=[], metavar="NAME=PATH",
+        help="override a component's checkout path; repeatable",
+    )
+    p.add_argument(
+        "-v", "--verbose", action="store_true", help="echo every command as it runs"
+    )
+
+
+def _find_release_config(explicit: str | None) -> Path:
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    here = Path.cwd().resolve()
+    for candidate in [here, *here.parents]:
+        found = candidate / RELEASE_CONFIG_RELPATH
+        if found.exists():
+            return found
+    # Report the miss against cwd so the error names a real path.
+    return here / RELEASE_CONFIG_RELPATH
+
+
+def _release_context(args):
+    config = release_lib.load_config(_find_release_config(args.config))
+    overrides: dict[str, str] = {}
+    for pair in args.checkout:
+        if "=" not in pair:
+            raise release_lib.ReleaseError(f"--checkout wants NAME=PATH, got {pair!r}")
+        name, _, path = pair.partition("=")
+        overrides[name] = path
+    checkouts = {
+        comp.name: release_lib.resolve_checkout(config, comp, overrides)
+        for comp in config.components
+    }
+    return config, checkouts
+
+
+def _cmd_release_cut(args) -> int:
+    from snowline_platform.release import runner as release_runner
+
+    config, checkouts = _release_context(args)
+    out = (
+        Path(args.out).expanduser().resolve()
+        if args.out
+        else checkouts[config.manifest_component.name] / ".release-build" / args.version
+    )
+    runner = release_runner.Runner(report=print, dry_run=args.dry_run, verbose=args.verbose)
+    release_lib.cut(
+        config,
+        args.version,
+        checkouts=checkouts,
+        out_dir=out,
+        runner=runner,
+        respin=args.respin,
+        skip_tests=args.skip_tests,
+        skip_smoke=args.skip_smoke,
+        report=print,
+    )
+    return 0
+
+
+def _cmd_release_status(args) -> int:
+    from snowline_platform.release import runner as release_runner
+
+    config, checkouts = _release_context(args)
+    runner = release_runner.Runner(report=print, verbose=args.verbose)
+    return release_lib.status(config, checkouts=checkouts, runner=runner, report=print)
 
 
 def _client():

@@ -45,8 +45,9 @@ open data-story questions narrow to walkthrough and musher (§7).
 
 ## 2. Decision D1 — artifact format: wheels on per-repo GitHub Releases, installed by uv into managed venvs
 
-Each release ships **Python wheels** built in CI and attached to a GitHub
-Release on the repo that owns the code:
+Each release ships **Python wheels** built by the release cutter (§4 —
+host-side, not CI) and attached to a GitHub Release on the repo that owns
+the code:
 
 - `snowlinedev/Snowline` release: wheels for `snowline-platform`,
   `snowline-governance`, `snowline-memory`, `snowline-plugin-sdk` — built
@@ -59,7 +60,7 @@ Release on the repo that owns the code:
   **private**; assets are fetched with `gh release download`, which rides
   the operator's existing auth. Nothing private ever lands on the public
   platform release.
-- Per-service dependency locks: CI also attaches a `requirements-<service>.txt`
+- Per-service dependency locks: the cutter also attaches a `requirements-<service>.txt`
   exported from the repo's `uv.lock` — specifically `uv export --frozen
   --package <service> --no-emit-workspace`: the bare export emits workspace
   members (the SDK, sibling services) as local *path* entries, unresolvable
@@ -104,10 +105,11 @@ need no `WorkingDirectory` because nothing runs from a checkout.
 same package-internal pattern but each needs the smoke test: install the
 wheel into a clean venv, boot against an empty DB, confirm migrate-to-head).
 
-### 2.2 Dashboard: built in CI, shipped as a dist tarball
+### 2.2 Dashboard: built by the cutter, shipped as a dist tarball
 
-Node stays in CI. The release carries `dashboard-dist-<v>.tar.gz` (the
-`npm run build` output, contrast-validator and `tsc -b` gates included);
+Node stays on the cutting host (§4), never on the target. The release
+carries `dashboard-dist-<v>.tar.gz` (the `npm ci && npm run build` output,
+contrast-validator and `tsc -b` gates included);
 sync unpacks it under the stack root and sets `SNOWLINE_DASHBOARD_DIST`
 in the platform env file. **Sync must always set this env** — the code's
 fallback path (`parents[2]/dashboard/dist`) points into site-packages
@@ -136,6 +138,16 @@ compatibility matrix nobody tests — the SDK contract drift guards and pm's
 git-pinned SDK dependency already couple the repos in practice; the train
 makes that coupling honest.
 
+- **Who cuts a train: the operator's machine, not CI.** `snowline release cut`
+  is a **host-side** command. Item #202 forbids GitHub Actions in plugin
+  repos, and the pm repo is private — an Actions-driven cut would need a PAT
+  crossing the public/private boundary, exactly the gymnastics this design
+  refuses. The operator's machine already holds every checkout, `gh` auth for
+  both repos, node, and Postgres 16, so the cutter runs there and reaches each
+  repo through its local checkout. Wheels are still built per repo, from a
+  throwaway git worktree at that repo's blessed sha, and attached to *that
+  repo's own* release; nothing private ever lands on the public platform
+  release. The executor moved; the mechanics below did not.
 - **Scheme:** SemVer-shaped `v0.MINOR.PATCH`. MINOR increments per train
   cut; PATCH is a hotfix rebuild of a train (same blessed set, one component
   respun).
@@ -151,11 +163,15 @@ makes that coupling honest.
   each component from its manifest-recorded tag rather than assuming one
   uniform tag exists on every repo. Cutting a MINOR train = update the
   manifest with the blessed SHAs, tag **each component repo** with the train
-  tag (each repo's release workflow builds and attaches its own wheels — no
-  cross-repo checkout, so no PAT gymnastics and nothing fights the
-  private-repo boundary), and publish the platform release carrying the
-  manifest. A `snowline release cut` helper can automate the tagging later;
-  v1 is a documented procedure.
+  tag (the cutter builds and attaches each repo's own wheels to that repo's
+  own release — nothing fights the private-repo boundary), and publish the
+  platform release carrying the manifest. `snowline release cut --version
+  vX.Y.Z [--respin <component>]` is that procedure, with the component set in
+  `release/components.json`: it preflights every checkout (clean, on main,
+  HEAD pushed), builds, exports locks, runs the §2.1 smoke tests, writes the
+  manifest, then tags and publishes — and is safe to re-run after a partial
+  failure, skipping tags and releases that already exist rather than
+  duplicating them.
 - The installer resolves "latest" from the platform repo's latest release
   and pins everything else off the manifest inside it.
 
@@ -259,10 +275,11 @@ operation ordered by replication-continuity §7.
 
 ## 8. Hand-off to the implementation items
 
-- **a0ef1bd4 (release pipeline):** per-repo release workflows (`uv build
-  --all-packages`, lock exports, dashboard dist build), `release/train.json`
-  + cut procedure, and the §2.1 wheel-boot smoke tests. First output: train
-  `v0.1.0`.
+- **a0ef1bd4 (release pipeline):** the host-side cutter `snowline release
+  cut` (`uv build --all-packages`, lock exports, dashboard dist build,
+  per-repo tags and releases), the component set in
+  `release/components.json`, `release/train.json`, and the §2.1 wheel-boot
+  smoke tests. First output: train `v0.1.0`.
 - **b70b0359 (one-command install/update):** `install.sh` + `snowline stack
   sync` per §5–6, env/plist templates promoted from `ops/roam/`. Includes
   the runbook update this spec obsoletes in place: the spoke is now **four**

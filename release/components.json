@@ -1,0 +1,107 @@
+{
+  "_comment": [
+    "The release train's component set — what `snowline release cut` builds,",
+    "tags and publishes (macOS distribution spec §2/§4, item #202).",
+    "",
+    "A COMPONENT is a repo: the tagging + GitHub-release unit. A SERVICE is a",
+    "wheel: the unit `snowline stack sync` builds a venv for, and the key",
+    "`release/train.json` is written against. The platform component publishes",
+    "four services from one repo and one tag; pm publishes one from its own.",
+    "",
+    "`path` is relative to the platform checkout (the repo this file lives in);",
+    "override per run with `snowline release cut --checkout pm=/some/where`.",
+    "",
+    "`boot` drives the §2.1 wheel-boot smoke test. Every service names its",
+    "`create_app` factory rather than the module-level `app` singleton: the",
+    "singletons opt into health polling, registration heartbeats and",
+    "replication loops, none of which belong in a test that only wants to prove",
+    "boot-migrate reaches head against an empty database."
+  ],
+  "components": [
+    {
+      "name": "platform",
+      "repo": "snowlinedev/Snowline",
+      "path": ".",
+      "build": "workspace",
+      "carries_manifest": true,
+      "test": ["uv", "run", "python", "-m", "pytest", "-q"],
+      "prune_wheels": ["snowline_remote_front"],
+      "dashboard": {
+        "dir": "dashboard",
+        "install": ["npm", "ci"],
+        "build": ["npm", "run", "build"],
+        "dist": "dist"
+      },
+      "services": [
+        {
+          "name": "platform",
+          "package": "snowline-platform",
+          "pyproject": "pyproject.toml",
+          "boot": {
+            "module": "snowline_platform.app",
+            "factory": "create_app",
+            "kwargs": {"poll_health": false, "replicate": false},
+            "database_url_env": "SNOWLINE_PLATFORM_DATABASE_URL"
+          }
+        },
+        {
+          "name": "governance",
+          "package": "snowline-governance",
+          "pyproject": "governance/pyproject.toml",
+          "boot": {
+            "module": "snowline_governance.app",
+            "factory": "create_app",
+            "kwargs": {"register_on_startup": false},
+            "database_url_env": "SNOWLINE_GOVERNANCE_DATABASE_URL"
+          }
+        },
+        {
+          "name": "memory",
+          "package": "snowline-memory",
+          "pyproject": "memory/pyproject.toml",
+          "boot": {
+            "module": "snowline_memory.app",
+            "factory": "create_app",
+            "kwargs": {"register_on_startup": false, "replicate_on_startup": false},
+            "database_url_env": "SNOWLINE_MEMORY_DATABASE_URL"
+          }
+        },
+        {
+          "name": "sdk",
+          "package": "snowline-plugin-sdk",
+          "pyproject": "sdk/pyproject.toml",
+          "kind": "library"
+        }
+      ]
+    },
+    {
+      "name": "pm",
+      "repo": "snowlinedev/snowline-pm",
+      "path": "../snowline-pm",
+      "build": "package",
+      "rewrite_sdk_pin": true,
+      "test": ["uv", "run", "python", "-m", "pytest", "-q"],
+      "test_env": {
+        "SNOWLINE_PM_TEST_DATABASE_URL": "postgresql+psycopg:///snowline_pm_release_test"
+      },
+      "services": [
+        {
+          "name": "pm",
+          "package": "snowline-pm",
+          "pyproject": "pyproject.toml",
+          "boot": {
+            "module": "snowline_pm.app",
+            "factory": "create_app",
+            "kwargs": {
+              "register_on_startup": false,
+              "scheduler_enabled": false,
+              "reconcile_enabled": false,
+              "replicate_enabled": false
+            },
+            "database_url_env": "SNOWLINE_PM_DATABASE_URL"
+          }
+        }
+      ]
+    }
+  ]
+}
