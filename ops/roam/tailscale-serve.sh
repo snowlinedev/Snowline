@@ -25,9 +25,10 @@ set -euo pipefail
 PLATFORM_PORT="${SNOWLINE_PLATFORM_PORT:-8848}"
 GOV_PORT="${SNOWLINE_GOVERNANCE_PORT:-8801}"
 MEM_PORT="${SNOWLINE_MEMORY_PORT:-8802}"
+PM_PORT="${SNOWLINE_PM_PORT:-8803}"
 
 echo "Configuring tailscale serve (TCP, port-preserving) -> loopback..."
-for port in "$PLATFORM_PORT" "$GOV_PORT" "$MEM_PORT"; do
+for port in "$PLATFORM_PORT" "$GOV_PORT" "$MEM_PORT" "$PM_PORT"; do
   echo "  tailnet:${port} -> 127.0.0.1:${port}"
   tailscale serve --bg --tcp "${port}" "tcp://127.0.0.1:${port}"
 done
@@ -37,5 +38,5 @@ echo "Current serve config:"
 tailscale serve status
 echo
 echo "Done. This host's services are now reachable on the tailnet at"
-echo "  http://\$(tailscale ip -4):{${PLATFORM_PORT},${GOV_PORT},${MEM_PORT}}"
+echo "  http://\$(tailscale ip -4):{${PLATFORM_PORT},${GOV_PORT},${MEM_PORT},${PM_PORT}}"
 echo "Reset with: tailscale serve reset"

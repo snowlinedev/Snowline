@@ -142,6 +142,20 @@ class Cutter:
             self._prune(comp, dist, version)
             if comp.dashboard:
                 self._build_dashboard(comp, tree, dist, version)
+            if comp.carries_manifest:
+                # Ship release/install.sh as a platform release asset — the
+                # documented `releases/latest/download/install.sh` bootstrap
+                # URL 404s otherwise (#210 review: install.sh's own comment
+                # promised this and nothing did it). Copied from the blessed
+                # worktree, same source fidelity as the wheels.
+                src = tree / "release" / "install.sh"
+                if not src.exists():
+                    raise ReleaseError(
+                        "release/install.sh missing from the build tree — the "
+                        "manifest component must ship the bootstrap script"
+                    )
+                shutil.copyfile(src, dist / "install.sh")
+                self.report("  install.sh staged as a release asset")
 
     def _export_locks(self, comp: Component, tree: Path, dist: Path, version: str) -> None:
         """Per-service `requirements-<service>.txt` (spec §2).

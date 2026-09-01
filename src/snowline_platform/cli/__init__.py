@@ -8,10 +8,13 @@ Two operator surfaces live here today:
 - `snowline release ...` — cutting the packaged stable channel's release trains
   (macOS distribution spec §2/§4, issue #202). Host-side by design; see
   `snowline_platform.release.cutter` for why it is not a set of CI workflows.
+- `snowline stack sync` — installing/updating a packaged spoke instance from a
+  release train (macOS distribution spec §5/§6, issue #203); see
+  `snowline_platform.stack.sync`.
 
-Both are thin argparse shells over pure libraries — `replication_pairing` /
-`replication_seed`, and `release.model` / `release.cutter`. Adding a subcommand is
-a new `add_parser` here plus a handler.
+All three are thin argparse shells over pure libraries — `replication_pairing` /
+`replication_seed`, `release.model` / `release.cutter`, and `stack.model` /
+`stack.sync`. Adding a subcommand is a new `add_parser` here plus a handler.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from pathlib import Path
 from snowline_platform import release as release_lib
 from snowline_platform import replication_pairing as pairing
 from snowline_platform import replication_seed as seed
+from snowline_platform import stack as stack_lib
 
 DEFAULT_LOCAL_PLATFORM_URL = "http://127.0.0.1:8848"
 
@@ -36,10 +40,11 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="group", required=True)
     _build_replicate(sub.add_parser("replicate", help="replication pairing + seeding (§5/§7)"))
     _build_release(sub.add_parser("release", help="cut packaged release trains (§2/§4)"))
+    _build_stack(sub.add_parser("stack", help="install/update a packaged spoke instance (§5/§6)"))
     args = parser.parse_args(argv)
     try:
         return args.handler(args)
-    except (pairing.PairingError, seed.SeedError, release_lib.ReleaseError) as exc:
+    except (pairing.PairingError, seed.SeedError, release_lib.ReleaseError, stack_lib.StackError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
@@ -160,6 +165,80 @@ def _build_release(p: argparse.ArgumentParser) -> None:
     )
     _add_release_common(status)
     status.set_defaults(handler=_cmd_release_status)
+
+
+def _build_stack(p: argparse.ArgumentParser) -> None:
+    ssub = p.add_subparsers(dest="command", required=True)
+
+    sync_p = ssub.add_parser(
+        "sync",
+        help="install or update this spoke to a release train, idempotently",
+        description=(
+            "One idempotent command for install, update, and rollback (macOS "
+            "distribution spec §5, issue #203). Resolves the train, builds "
+            "each service's venv, atomically repoints `current`, unpacks the "
+            "dashboard dist, renders env/plist templates, creates missing "
+            "databases, kickstarts changed services, and health-checks the "
+            "gateway. `--train vPrev` is rollback via the SAME code path. "
+            "Spoke-only in v1 (decision 54447516) — refuses to run against "
+            "an instance configured as primary."
+        ),
+    )
+    sync_p.add_argument(
+        "--role", default="spoke", choices=["spoke"],
+        help="instance role — spoke is the only role sync accepts in v1 (spec §6)",
+    )
+    sync_p.add_argument(
+        "--train", default=None, metavar="vX.Y.Z",
+        help="the train to sync to (default: the platform repo's latest release); "
+        "an older train is rollback, the same code path",
+    )
+    sync_p.add_argument(
+        "--auto", action="store_true",
+        help="unattended mode: no prompts, clean exit discipline (0 = "
+        "upgraded/already current, nonzero = failed with the reason on "
+        "stderr), a no-op when the train hasn't changed — for a launchd timer",
+    )
+    sync_p.add_argument(
+        "--dry-run", action="store_true",
+        help="plan only — no download, build, symlink swap, env/plist write, "
+        "createdb, or kickstart",
+    )
+    sync_p.add_argument(
+        "--health-url", default=stack_lib.DEFAULT_HEALTH_URL,
+        help="the local gateway health endpoint to check after a swap",
+    )
+    sync_p.add_argument(
+        "-v", "--verbose", action="store_true", help="echo every command as it runs"
+    )
+    sync_p.set_defaults(handler=_cmd_stack_sync)
+
+
+def _cmd_stack_sync(args) -> int:
+    from snowline_platform.release import runner as release_runner
+    from snowline_platform.stack import model as stack_model
+
+    runner = release_runner.Runner(report=print, dry_run=args.dry_run, verbose=args.verbose)
+    report = stack_lib.run_sync(
+        home=Path.home(),
+        role=args.role,
+        train=args.train,
+        auto=args.auto,
+        dry_run=args.dry_run,
+        runner=runner,
+        # tty_prompt, not input: the documented `curl … | sh` flow leaves
+        # stdin at EOF, so the first-run prompt must read /dev/tty (#210).
+        prompt=(None if args.auto else stack_lib.tty_prompt),
+        health_url=args.health_url,
+        report=print,
+    )
+    code = stack_model.exit_code(report.outcome)
+    if report.detail:
+        # nonzero = failed, reason on stderr (work item body's --auto exit
+        # discipline); "noop"/"ok" details (e.g. "already on the resolved
+        # train") are informational, not an error.
+        print(f"error: {report.detail}" if code != 0 else report.detail, file=sys.stderr if code != 0 else sys.stdout)
+    return code
 
 
 def _add_release_common(p: argparse.ArgumentParser) -> None:
