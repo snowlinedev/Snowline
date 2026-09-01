@@ -16,7 +16,8 @@
 > from packaged templates, and health-checks the gateway — one command
 > instead of §§0-3 below. This runbook stays the reference for what that
 > command automates, the pairing/seeding steps it deliberately does NOT do
-> (§4-6, still a separate `snowline stack bootstrap-spoke` step per
+> (§4-6, WRAPPED — not replaced — by the guided `snowline stack
+> bootstrap-spoke` step, item 71317cd6 / §6b below, per
 > macOS-distribution.md §6), and the manual two-machine drill.**
 
 The load-bearing rule for the whole document: **§7's ordering is not advisory.**
@@ -240,6 +241,60 @@ ordinary sync, just naming an older train. Two cases:
   write), then `reseed-check` + `seed --reseed` under a fresh epoch. This is
   the accepted cost of keeping migrations forward-only (macOS distribution
   spec §5); there is no cheaper undo for a migration that already ran.
+
+## 6b. Packaged spoke (`snowline stack bootstrap-spoke`, item 71317cd6)
+
+`snowline stack bootstrap-spoke [--dry-run] [--reseed]` is the guided,
+packaged-channel equivalent of §§4-6 above — it WRAPS `snowline replicate
+seed`/`reseed-check` verbatim (never reimplements them) and drives the same
+ordering §7 states, plus the local ops (kickstart, health, pm role) this
+runbook's manual drill leaves to the operator. It does **not** run a bare
+`pair` (§4's note applies: a fresh spoke stand-up skips straight to seeding,
+since `seed`'s priming step IS the forward pairing).
+
+Mapping the manual drill to the command:
+
+| Manual drill step | `bootstrap-spoke` equivalent |
+|---|---|
+| §0 prerequisites (both machines up, DBs exist) | Preconditions: refuses unless `~/.config/snowline/stack.json` exists, local services are installed (`snowline stack sync` already ran), and the local gateway is healthy. |
+| "with the primary up" (§5) | Precondition: curls the primary's gateway `/health` over the tailnet before touching anything; refuses loudly if unreachable (see "primary unreachable" below). |
+| Fill `seed-config.example.json` → `seed.json` by hand | Built automatically from `stack.json` (`primary_gateway_url`, `local_tailnet_address` — prompted once if missing, same posture as `sync`'s own prompts) plus one interactive prompt for the primary's Postgres user; written to `~/.config/snowline/seed.json`. |
+| `snowline replicate seed --config seed.json` (§5 steps 1-3) | Run as a subprocess through the same argv, unmodified. |
+| "boot the spoke" (§5, between steps 3 and 4) | Kickstarts all four services via `launchctl kickstart`, in the same order as §2's by-hand commands (platform, governance, memory, pm), then re-polls local health. |
+| `snowline replicate seed --config seed.json --reverse-pair` (§5 step 4) | Run as a subprocess through the same argv, unmodified. |
+| (not previously machine-checked) | Verifies `~/.config/snowline/pm.env` declares `SNOWLINE_PM_ROLE=spoke` — refuses loudly (without undoing the seed) if it says anything else. |
+| §6 re-seed (`reseed-check` then `seed --config … --reseed`) | `--reseed`: runs `reseed-check` first (its failure — either precondition, outbox or parked-set — surfaces verbatim in the command's output/report, never swallowed), then `seed --config seed.json --reseed`, then boots + reverse-pairs exactly as the fresh path. |
+
+A machine-readable record of every run (each precondition, each command,
+outcome) is appended to `~/Library/Application Support/Snowline/bootstrap-history/`
+(parallel to `sync`'s own `sync-history/` — see the PR that introduced this
+command for why it is a parallel report rather than a reuse of `sync`'s
+`RunReport`).
+
+### Failure modes
+
+- **Primary unreachable at install time.** The precondition check (curling
+  the primary's gateway `/health` over the tailnet) runs and fails BEFORE
+  any pairing/seeding command is invoked — nothing is primed, dumped, or
+  touched on either side. Fix connectivity (tailscaled up on both ends, the
+  primary actually running) and re-run; this is always safe to retry.
+- **Seed interrupted or restarted.** `snowline replicate seed`'s priming
+  step (§5 step 1 / §7) is itself idempotent against a prior partial run: it
+  retires any orphaned forward subscription it left behind before minting a
+  fresh epoch (`replication_seed.py`'s `_retire_orphan_forward`), so simply
+  re-running `snowline stack bootstrap-spoke` after an interruption is the
+  correct recovery — it is not a special case. If the interruption happened
+  **after** boot + reverse-pair already succeeded (rare — bootstrap-spoke
+  only reaches that point once the spoke is confirmed healthy), do not
+  re-run the fresh path; use `--reseed` instead (see §6 above) rather than
+  re-seeding over a partially-live pairing.
+- **Re-pairing.** A live pair refuses a second `pair`/plain-`seed` run by
+  design (§4: "pairing runs once per pair"). To rotate a secret, use the
+  ordinary rotation path (not covered by `bootstrap-spoke` — it is a
+  standing-pair operation, not a bootstrap one). To recover after long
+  divergence, use `snowline stack bootstrap-spoke --reseed`, which is this
+  runbook's §6 procedure end to end, including the fresh-epoch retirement of
+  the old streams.
 
 ## 7. Acceptance — the §10 criteria and how to check each
 
