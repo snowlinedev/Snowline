@@ -213,6 +213,43 @@ def _build_stack(p: argparse.ArgumentParser) -> None:
     )
     sync_p.set_defaults(handler=_cmd_stack_sync)
 
+    bootstrap_p = ssub.add_parser(
+        "bootstrap-spoke",
+        help="pair + seed this spoke from the primary, guided (§6, snowline-pm#122)",
+        description=(
+            "Guided, operator-ATTENDED spoke data bootstrap — separate from "
+            "`stack sync` by design (macOS distribution spec §6: software "
+            "install and data topology are not fused). Checks preconditions "
+            "(stack.json, local services installed + healthy, primary "
+            "reachable + healthy), then WRAPS `snowline replicate seed` (§7 "
+            "steps 1-3: prime, dump, scrub + inject), kickstarts the local "
+            "services, re-checks health, wraps `snowline replicate seed "
+            "--reverse-pair` (§7 step 4), and verifies "
+            "SNOWLINE_PM_ROLE=spoke on the rendered pm.env. NEVER offers an "
+            "--auto mode: seeding is operator-attended by design, and "
+            "prompts for anything stack.json is missing (e.g. the primary's "
+            "full gateway URL, this machine's own tailnet address)."
+        ),
+    )
+    bootstrap_p.add_argument(
+        "--dry-run", action="store_true",
+        help="check preconditions and show the planned replicate/seed/pair "
+        "commands — nothing is seeded, kickstarted, or paired",
+    )
+    bootstrap_p.add_argument(
+        "--reseed", action="store_true",
+        help="re-seed under a fresh epoch (§7 step 5): `reseed-check` first "
+        "(surfaces the parked-set precondition), then `seed --reseed`",
+    )
+    bootstrap_p.add_argument(
+        "--health-url", default=stack_lib.DEFAULT_HEALTH_URL,
+        help="the local gateway health endpoint to check before/after",
+    )
+    bootstrap_p.add_argument(
+        "-v", "--verbose", action="store_true", help="echo every command as it runs"
+    )
+    bootstrap_p.set_defaults(handler=_cmd_stack_bootstrap_spoke)
+
 
 def _cmd_stack_sync(args) -> int:
     from snowline_platform.release import runner as release_runner
@@ -237,6 +274,28 @@ def _cmd_stack_sync(args) -> int:
         # nonzero = failed, reason on stderr (work item body's --auto exit
         # discipline); "noop"/"ok" details (e.g. "already on the resolved
         # train") are informational, not an error.
+        print(f"error: {report.detail}" if code != 0 else report.detail, file=sys.stderr if code != 0 else sys.stdout)
+    return code
+
+
+def _cmd_stack_bootstrap_spoke(args) -> int:
+    from snowline_platform.release import runner as release_runner
+    from snowline_platform.stack import model as stack_model
+
+    runner = release_runner.Runner(report=print, dry_run=args.dry_run, verbose=args.verbose)
+    report = stack_lib.run_bootstrap_spoke(
+        home=Path.home(),
+        dry_run=args.dry_run,
+        reseed=args.reseed,
+        runner=runner,
+        # NEVER an --auto mode (seeding is deliberately operator-attended) —
+        # unlike `stack sync`, prompt is never optional here.
+        prompt=stack_lib.tty_prompt,
+        health_url=args.health_url,
+        report=print,
+    )
+    code = stack_model.bootstrap_exit_code(report.outcome)
+    if report.detail:
         print(f"error: {report.detail}" if code != 0 else report.detail, file=sys.stderr if code != 0 else sys.stdout)
     return code
 

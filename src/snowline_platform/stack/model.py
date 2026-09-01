@@ -258,21 +258,39 @@ class StackConfig:
     role: str
     instance_id: str
     primary_tailnet_address: str
+    # Added by `snowline stack bootstrap-spoke` (item 71317cd6) — ADDITIVE to
+    # the schema_version-1 shape `sync` writes: a stack.json from before this
+    # item has neither field, and that must stay a loadable file (a missing
+    # key means "prompt for it", not "reject the file", spec §6/#211 review).
+    # `primary_gateway_url`: the primary's FULL gateway URL (scheme+host+port)
+    # — the hub binds :8850 in practice, which is NOT the roam runbook's
+    # illustrative :8848, so this cannot be derived from
+    # `primary_tailnet_address` alone without a port; bootstrap-spoke prompts
+    # for it once with a default built from `primary_tailnet_address` (§ see
+    # `default_primary_gateway_url`).
+    # `local_tailnet_address`: THIS machine's own tailnet host/IP — needed so
+    # the primary can dial the spoke's ingest endpoints during seeding (§7
+    # step 1); nothing else in stack.json carries it, since `sync` never
+    # needs to address this machine from outside.
+    primary_gateway_url: str | None = None
+    local_tailnet_address: str | None = None
 
     def to_json(self) -> str:
-        return (
-            json.dumps(
-                {
-                    "schema_version": STACK_CONFIG_SCHEMA_VERSION,
-                    "role": self.role,
-                    "instance_id": self.instance_id,
-                    "primary_tailnet_address": self.primary_tailnet_address,
-                },
-                indent=2,
-                sort_keys=False,
-            )
-            + "\n"
-        )
+        data: dict[str, object] = {
+            "schema_version": STACK_CONFIG_SCHEMA_VERSION,
+            "role": self.role,
+            "instance_id": self.instance_id,
+            "primary_tailnet_address": self.primary_tailnet_address,
+        }
+        # Only written once bootstrap-spoke has them — an old-shape file that
+        # never ran bootstrap-spoke stays byte-for-byte old-shape (no null
+        # clutter), and `sync` (which never touches these fields) leaves them
+        # untouched on any file that already carries them.
+        if self.primary_gateway_url is not None:
+            data["primary_gateway_url"] = self.primary_gateway_url
+        if self.local_tailnet_address is not None:
+            data["local_tailnet_address"] = self.local_tailnet_address
+        return json.dumps(data, indent=2, sort_keys=False) + "\n"
 
 
 def parse_stack_config(data: Mapping[str, object]) -> StackConfig:
@@ -292,7 +310,18 @@ def parse_stack_config(data: Mapping[str, object]) -> StackConfig:
         raise StackError(
             f"stack.json is missing required field(s): {', '.join(missing)}"
         )
-    return StackConfig(role=role, instance_id=instance_id, primary_tailnet_address=primary)
+    # Additive fields (bootstrap-spoke, item 71317cd6): absent on any
+    # schema_version-1 file written before this item — that is not an error,
+    # it is "not bootstrapped yet", so it loads as None rather than raising.
+    gateway = data.get("primary_gateway_url")
+    local_addr = data.get("local_tailnet_address")
+    return StackConfig(
+        role=role,
+        instance_id=instance_id,
+        primary_tailnet_address=primary,
+        primary_gateway_url=str(gateway) if gateway else None,
+        local_tailnet_address=str(local_addr) if local_addr else None,
+    )
 
 
 def load_stack_config(text: str | None) -> StackConfig | None:
@@ -668,3 +697,253 @@ def decide_post_upgrade_outcome(*, health_ok: bool, migration_crossed: bool) -> 
     if migration_crossed:
         return "needs_attention"
     return "reverted"
+
+
+# ==========================================================================
+# `snowline stack bootstrap-spoke` (macOS distribution spec §6, item
+# 71317cd6 / snowline-pm#122) — WRAPS `snowline replicate pair`/`seed`/
+# `reseed-check` verbatim (docs/ops/roam-runbook.md §4-6): this module never
+# reimplements any replication logic, only the argv/config that drives it and
+# the local pre/postconditions around it. Deliberately separate from `sync`
+# (spec §6: "software install and data topology are not fused") — the
+# orchestration lives in `bootstrap.py`, mirroring the model/sync split above.
+# ==========================================================================
+
+# The hub's REAL gateway port (this decision's finding, corroborated by
+# docs/specs/deploy-continuity.md §4 and replication-continuity.md's
+# `localhost:8850` reference) — NOT the roam runbook's illustrative :8848
+# (that is the SPOKE's own platform port, SERVICE_PORTS["platform"]). A
+# `primary_gateway_url` therefore cannot be derived from
+# `primary_tailnet_address` + SERVICE_PORTS; it needs its own default.
+DEFAULT_PRIMARY_GATEWAY_PORT = 8850
+
+# The primary's SNOWLINE_INSTANCE_ID, by convention across every doc in this
+# repo (ops/roam/env.primary.example, the runbook's `--peer-instance primary`
+# example) — v1 has exactly one primary, so this is not prompted.
+PRIMARY_INSTANCE_ID = "primary"
+
+# Participants seeded per the macOS distribution spec §7 table — platform
+# (the scope stream) plus every replicating plugin, pm included (pm is NEW to
+# the packaged spoke, spec §8). Order matches `sync.SERVICE_ORDER` /
+# `docs/ops/roam-runbook.md` §2's boot order.
+SEED_PARTICIPANTS: tuple[str, ...] = ("platform", "governance", "memory", "pm")
+
+# The ingest path each participant serves its replication admin surface on
+# (`snowline_platform.replication.INGEST_PATH` for the platform's own scope
+# stream; `snowline_plugin_sdk.replication.admin`'s default — used verbatim
+# by governance's and memory's `INGEST_PATH` — for every SDK-based plugin,
+# pm included, since pm rides the same SDK per pm.env.tmpl's replication
+# vars).
+PARTICIPANT_INGEST_PATH: Mapping[str, str] = {
+    "platform": "/replication/events/ingest",
+    "governance": "/events/ingest",
+    "memory": "/events/ingest",
+    "pm": "/events/ingest",
+}
+
+# The primary's Postgres port — same default the runbook's
+# `seed-config.example.json` uses (`mini.CHANGEME.ts.net:5432`).
+PRIMARY_POSTGRES_PORT = 5432
+
+
+def default_primary_gateway_url(primary_tailnet_address: str) -> str:
+    return f"http://{primary_tailnet_address}:{DEFAULT_PRIMARY_GATEWAY_PORT}"
+
+
+def check_bootstrap_stack_config(cfg: StackConfig | None) -> StackConfig:
+    """Precondition 1, checked before anything else touches the filesystem or
+    the network."""
+    if cfg is None:
+        raise StackError(
+            "no ~/.config/snowline/stack.json — run `snowline stack sync` "
+            "first (macOS distribution spec §5)"
+        )
+    return cfg
+
+
+def check_local_services_installed(current_trains: Mapping[str, str | None]) -> None:
+    """Precondition 2: every service's `current` symlink exists — i.e. at
+    least one `snowline stack sync` has actually completed here. Order
+    matches SEED_PARTICIPANTS."""
+    missing = [svc for svc in SEED_PARTICIPANTS if current_trains.get(svc) is None]
+    if missing:
+        raise StackError(
+            f"local service(s) not installed yet: {', '.join(missing)} — run "
+            "`snowline stack sync` first (macOS distribution spec §5)"
+        )
+
+
+def check_local_gateway_healthy(health_ok: bool) -> None:
+    """Precondition 3."""
+    if not health_ok:
+        raise StackError(
+            "the local gateway is not healthy — bootstrap-spoke refuses to "
+            "seed a spoke whose own services are not up; check launchctl and "
+            "the service logs, then re-run"
+        )
+
+
+def check_primary_gateway_healthy(health_ok: bool, primary_gateway_url: str) -> None:
+    """Precondition 4 — the primary is reachable and healthy over the
+    tailnet before ANY pairing/seeding step runs (docs/ops/roam-runbook.md
+    §5: seeding needs 'the primary up')."""
+    if not health_ok:
+        raise StackError(
+            f"the primary's gateway at {primary_gateway_url} is not reachable "
+            "or not healthy over the tailnet — check tailscaled on both "
+            "machines and that the primary is up before bootstrapping a spoke "
+            "(this is the 'primary unreachable at install time' failure mode, "
+            "docs/ops/roam-runbook.md)"
+        )
+
+
+def check_pm_role_is_spoke(pm_env_text: str | None) -> None:
+    """The pm-side verification the work item body asks for explicitly: read
+    the RENDERED pm.env (never assume the template — an operator edit or a
+    stale render both matter) and refuse loudly if it does not declare
+    `SNOWLINE_PM_ROLE=spoke`."""
+    if pm_env_text is None:
+        raise StackError(
+            "~/.config/snowline/pm.env does not exist — run `snowline stack "
+            "sync` first so pm's env is rendered"
+        )
+    role = parse_env_exports(pm_env_text).get("SNOWLINE_PM_ROLE")
+    if role != "spoke":
+        raise StackError(
+            f"pm.env declares SNOWLINE_PM_ROLE={role!r} (expected 'spoke') — "
+            "refusing: bootstrap-spoke stands this instance up as a "
+            "replication SPOKE of the primary, and a pm not configured as a "
+            "spoke would seed against the wrong topology. Fix pm.env (or "
+            "re-run `snowline stack sync`, which never overwrites an "
+            "operator-edited env file — see the reported drift) before "
+            "re-running bootstrap-spoke."
+        )
+
+
+def build_seed_config(cfg: StackConfig, *, local_platform_port: int, pg_user: str) -> dict:
+    """The `snowline replicate seed --config <this>.json` input
+    (docs/ops/roam-runbook.md §5, `ops/roam/seed-config.example.json`'s
+    shape) — built from stack.json plus the one thing seeding needs that
+    stack.json cannot carry: the Postgres user for the primary-side pg_dump
+    connection (a credential, re-prompted per bootstrap run rather than
+    persisted)."""
+    if not cfg.primary_gateway_url or not cfg.local_tailnet_address:
+        raise StackError(
+            "stack.json is missing primary_gateway_url/local_tailnet_address "
+            "— bootstrap-spoke must resolve these before building a seed "
+            "config (internal error: ensure_bootstrap_config was skipped)"
+        )
+    primary_host = _hostname(cfg.primary_gateway_url)
+    participants = {}
+    for svc in SEED_PARTICIPANTS:
+        port = SERVICE_PORTS[svc]
+        path = PARTICIPANT_INGEST_PATH[svc]
+        db = DB_NAME[svc]
+        participants[svc] = {
+            "spoke_ingest_url": f"http://{cfg.local_tailnet_address}:{port}{path}",
+            "primary_dump_url": f"postgresql://{pg_user}@{primary_host}:{PRIMARY_POSTGRES_PORT}/{db}",
+            "spoke_db_url": f"postgresql:///{db}",
+        }
+    return {
+        "primary": {"platform_url": cfg.primary_gateway_url, "instance": PRIMARY_INSTANCE_ID},
+        "spoke": {
+            "platform_url": f"http://127.0.0.1:{local_platform_port}",
+            "instance": cfg.instance_id,
+        },
+        "participants": participants,
+    }
+
+
+def _hostname(url: str) -> str:
+    from urllib.parse import urlsplit
+
+    host = urlsplit(url).hostname
+    if not host:
+        raise StackError(f"{url!r} is not a valid URL (no host)")
+    return host
+
+
+def seed_config_path(home: Path) -> Path:
+    return config_dir(home) / "seed.json"
+
+
+# -- CLI argv builders (pure — the fake-runner tests assert these exactly) --
+
+
+def seed_cli_argv(config_path: Path, *, reverse_pair: bool = False, reseed: bool = False) -> list[str]:
+    argv = ["snowline", "replicate", "seed", "--config", str(config_path)]
+    if reverse_pair:
+        argv.append("--reverse-pair")
+    if reseed:
+        argv.append("--reseed")
+    return argv
+
+
+def reseed_check_cli_argv(config_path: Path) -> list[str]:
+    return ["snowline", "replicate", "reseed-check", "--config", str(config_path)]
+
+
+# -- machine-readable outcome (work item body: "a machine-readable outcome
+# appended to the stack run-report history") — a PARALLEL report to
+# `RunReport`, not a reuse of it: a bootstrap run is an ordered sequence of
+# named steps (precondition checks, seed, boot, verify), not a per-service
+# train swap, so `RunReport`'s shape (train/services/migration_crossed) does
+# not fit without either stuffing steps into `detail` strings (losing
+# machine-readability) or growing `RunReport` with bootstrap-only optional
+# fields that would sit unused on every `sync` run. See the PR body for this
+# call written out.
+
+
+@dataclass(frozen=True)
+class BootstrapStep:
+    name: str
+    status: str  # "ok" | "skipped" | "failed"
+    detail: str | None = None
+
+
+@dataclass(frozen=True)
+class BootstrapReport:
+    instance_id: str
+    primary_gateway_url: str | None
+    started_at: str
+    finished_at: str
+    dry_run: bool
+    reseed: bool
+    steps: tuple[BootstrapStep, ...]
+    pm_role_ok: bool | None
+    health_ok: bool | None
+    # "ok" | "failed"
+    outcome: str
+    detail: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "instance_id": self.instance_id,
+            "primary_gateway_url": self.primary_gateway_url,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "dry_run": self.dry_run,
+            "reseed": self.reseed,
+            "outcome": self.outcome,
+            "detail": self.detail,
+            "pm_role_ok": self.pm_role_ok,
+            "health_ok": self.health_ok,
+            "steps": [
+                {"name": s.name, "status": s.status, "detail": s.detail} for s in self.steps
+            ],
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), indent=2, sort_keys=False) + "\n"
+
+
+def bootstrap_exit_code(outcome: str) -> int:
+    return 0 if outcome == "ok" else 1
+
+
+def bootstrap_report_path(home: Path) -> Path:
+    return app_support_dir(home) / "bootstrap-report.json"
+
+
+def bootstrap_report_history_dir(home: Path) -> Path:
+    return app_support_dir(home) / "bootstrap-history"

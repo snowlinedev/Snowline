@@ -11,6 +11,7 @@ on top of it is covered by `test_stack_sync.py` against a fake runner.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -183,7 +184,7 @@ def test_any_migration_crossed_aggregates_per_service():
 
 
 def test_head_probe_argv_uses_the_service_package_mapping():
-    argv = m.head_probe_argv(__import__("pathlib").Path("/venv/bin/python"), "governance")
+    argv = m.head_probe_argv(Path("/venv/bin/python"), "governance")
     assert argv[0] == "/venv/bin/python"
     assert "snowline_governance" in argv[2]
 
@@ -233,7 +234,7 @@ def test_trains_to_gc_keeps_everything_named():
 
 def test_plan_env_file_writes_when_absent():
     result = m.plan_env_file(
-        service="platform", path=__import__("pathlib").Path("/x/platform.env"),
+        service="platform", path=Path("/x/platform.env"),
         existing=None, rendered="export X=1\n",
     )
     assert result.action == "written"
@@ -241,7 +242,7 @@ def test_plan_env_file_writes_when_absent():
 
 def test_plan_env_file_unchanged_when_identical():
     result = m.plan_env_file(
-        service="platform", path=__import__("pathlib").Path("/x/platform.env"),
+        service="platform", path=Path("/x/platform.env"),
         existing="export X=1\n", rendered="export X=1\n",
     )
     assert result.action == "unchanged"
@@ -249,7 +250,7 @@ def test_plan_env_file_unchanged_when_identical():
 
 def test_plan_env_file_drifts_without_clobbering():
     result = m.plan_env_file(
-        service="platform", path=__import__("pathlib").Path("/x/platform.env"),
+        service="platform", path=Path("/x/platform.env"),
         existing="export X=1  # operator edit\n", rendered="export X=2\n",
     )
     assert result.action == "drifted"
@@ -374,3 +375,175 @@ def test_parse_env_exports_strips_unquoted_inline_comments():
     assert parsed["SNOWLINE_INSTANCE_ID"] == "primary"
     assert parsed["SNOWLINE_PM_ROLE"] == "spoke"
     assert parsed["KEEP_HASH"] == "a#b"
+
+
+# ==========================================================================
+# `snowline stack bootstrap-spoke` (item 71317cd6 / snowline-pm#122)
+# ==========================================================================
+
+
+# -- stack.json additive migration --------------------------------------
+
+
+def test_stack_config_old_shape_loads_with_bootstrap_fields_none():
+    """A stack.json written by `sync` alone (pre-bootstrap-spoke) has neither
+    additive field — that must stay a loadable file, not a schema error
+    (spec §6: "missing key = prompt", not "reject the file")."""
+    cfg = m.parse_stack_config(
+        {"schema_version": 1, "role": "spoke", "instance_id": "roam",
+         "primary_tailnet_address": "mini.ts.net"}
+    )
+    assert cfg.primary_gateway_url is None
+    assert cfg.local_tailnet_address is None
+    # round-trips without emitting the missing keys as nulls
+    assert "primary_gateway_url" not in json.loads(cfg.to_json())
+
+
+def test_stack_config_new_shape_round_trips_bootstrap_fields():
+    cfg = m.StackConfig(
+        role="spoke", instance_id="roam", primary_tailnet_address="mini.ts.net",
+        primary_gateway_url="http://mini.ts.net:8850", local_tailnet_address="roam.ts.net",
+    )
+    data = json.loads(cfg.to_json())
+    assert data["primary_gateway_url"] == "http://mini.ts.net:8850"
+    assert data["local_tailnet_address"] == "roam.ts.net"
+    reloaded = m.parse_stack_config(data)
+    assert reloaded == cfg
+
+
+def test_default_primary_gateway_url_uses_the_hub_real_port_8850_not_8848():
+    """The hub's real gateway port is :8850 — NOT the roam runbook's
+    illustrative :8848 (that's SERVICE_PORTS["platform"], the SPOKE's own
+    port)."""
+    assert m.default_primary_gateway_url("mini.tailnet.ts.net") == "http://mini.tailnet.ts.net:8850"
+
+
+# -- preconditions --------------------------------------------------------
+
+
+def test_check_bootstrap_stack_config_refuses_when_missing():
+    with pytest.raises(m.StackError, match="run `snowline stack sync` first"):
+        m.check_bootstrap_stack_config(None)
+
+
+def test_check_bootstrap_stack_config_passes_through_when_present():
+    cfg = m.StackConfig(role="spoke", instance_id="roam", primary_tailnet_address="mini.ts.net")
+    assert m.check_bootstrap_stack_config(cfg) is cfg
+
+
+def test_check_local_services_installed_refuses_when_any_missing():
+    trains = {"platform": "v0.2.0", "governance": None, "memory": "v0.2.0", "pm": "v0.2.0"}
+    with pytest.raises(m.StackError, match="governance.*run `snowline stack sync` first"):
+        m.check_local_services_installed(trains)
+
+
+def test_check_local_services_installed_passes_when_all_present():
+    trains = {"platform": "v0.2.0", "governance": "v0.2.0", "memory": "v0.2.0", "pm": "v0.2.0"}
+    m.check_local_services_installed(trains)  # does not raise
+
+
+def test_check_local_gateway_healthy_refuses_when_unhealthy():
+    with pytest.raises(m.StackError, match="local gateway is not healthy"):
+        m.check_local_gateway_healthy(False)
+
+
+def test_check_primary_gateway_healthy_refuses_when_unreachable():
+    with pytest.raises(m.StackError, match="primary's gateway.*not reachable"):
+        m.check_primary_gateway_healthy(False, "http://mini.ts.net:8850")
+
+
+def test_check_pm_role_is_spoke_refuses_when_missing_file():
+    with pytest.raises(m.StackError, match="pm.env does not exist"):
+        m.check_pm_role_is_spoke(None)
+
+
+def test_check_pm_role_is_spoke_refuses_loudly_on_any_other_role():
+    with pytest.raises(m.StackError, match="SNOWLINE_PM_ROLE='primary'"):
+        m.check_pm_role_is_spoke("export SNOWLINE_PM_ROLE=primary\n")
+
+
+def test_check_pm_role_is_spoke_refuses_when_unset():
+    with pytest.raises(m.StackError, match="SNOWLINE_PM_ROLE=None"):
+        m.check_pm_role_is_spoke("export SNOWLINE_INSTANCE_ID=roam\n")
+
+
+def test_check_pm_role_is_spoke_passes_when_declared_spoke():
+    m.check_pm_role_is_spoke("export SNOWLINE_PM_ROLE=spoke\n")  # does not raise
+
+
+# -- seed-config construction ---------------------------------------------
+
+
+def test_build_seed_config_shapes_participants_from_stack_config():
+    cfg = m.StackConfig(
+        role="spoke", instance_id="roam", primary_tailnet_address="mini.ts.net",
+        primary_gateway_url="http://mini.ts.net:8850", local_tailnet_address="roam.ts.net",
+    )
+    config = m.build_seed_config(cfg, local_platform_port=8848, pg_user="sean")
+    assert config["primary"] == {"platform_url": "http://mini.ts.net:8850", "instance": "primary"}
+    assert config["spoke"] == {"platform_url": "http://127.0.0.1:8848", "instance": "roam"}
+    assert set(config["participants"]) == {"platform", "governance", "memory", "pm"}
+    platform_p = config["participants"]["platform"]
+    assert platform_p["spoke_ingest_url"] == "http://roam.ts.net:8848/replication/events/ingest"
+    assert platform_p["primary_dump_url"] == "postgresql://sean@mini.ts.net:5432/snowline_platform"
+    assert platform_p["spoke_db_url"] == "postgresql:///snowline_platform"
+    pm_p = config["participants"]["pm"]
+    assert pm_p["spoke_ingest_url"] == "http://roam.ts.net:8803/events/ingest"
+    assert pm_p["primary_dump_url"] == "postgresql://sean@mini.ts.net:5432/snowline_pm"
+    governance_p = config["participants"]["governance"]
+    assert governance_p["spoke_ingest_url"] == "http://roam.ts.net:8801/events/ingest"
+
+
+def test_build_seed_config_refuses_without_the_additive_fields():
+    cfg = m.StackConfig(role="spoke", instance_id="roam", primary_tailnet_address="mini.ts.net")
+    with pytest.raises(m.StackError, match="missing primary_gateway_url"):
+        m.build_seed_config(cfg, local_platform_port=8848, pg_user="sean")
+
+
+# -- CLI argv builders (the fake-runner orchestration tests assert these
+# exactly, but the builders themselves are pure and independently checked) --
+
+
+def test_seed_cli_argv_plain():
+    path = Path("/home/roam/.config/snowline/seed.json")
+    assert m.seed_cli_argv(path) == ["snowline", "replicate", "seed", "--config", str(path)]
+
+
+def test_seed_cli_argv_reverse_pair():
+    path = Path("/x/seed.json")
+    assert m.seed_cli_argv(path, reverse_pair=True) == [
+        "snowline", "replicate", "seed", "--config", str(path), "--reverse-pair",
+    ]
+
+
+def test_seed_cli_argv_reseed():
+    path = Path("/x/seed.json")
+    assert m.seed_cli_argv(path, reseed=True) == [
+        "snowline", "replicate", "seed", "--config", str(path), "--reseed",
+    ]
+
+
+def test_reseed_check_cli_argv():
+    path = Path("/x/seed.json")
+    assert m.reseed_check_cli_argv(path) == [
+        "snowline", "replicate", "reseed-check", "--config", str(path),
+    ]
+
+
+def test_bootstrap_exit_code_contract():
+    assert m.bootstrap_exit_code("ok") == 0
+    assert m.bootstrap_exit_code("failed") == 1
+
+
+def test_bootstrap_report_round_trips_steps_through_json():
+    report = m.BootstrapReport(
+        instance_id="roam", primary_gateway_url="http://mini.ts.net:8850",
+        started_at="2026-09-01T07:00:00+00:00", finished_at="2026-09-01T07:00:05+00:00",
+        dry_run=False, reseed=False,
+        steps=(m.BootstrapStep(name="seed", status="ok", detail="primed, dumped, scrubbed"),),
+        pm_role_ok=True, health_ok=True, outcome="ok",
+    )
+    data = json.loads(report.to_json())
+    assert data["instance_id"] == "roam"
+    assert data["steps"][0]["name"] == "seed"
+    assert data["pm_role_ok"] is True
