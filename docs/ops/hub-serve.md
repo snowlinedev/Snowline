@@ -6,6 +6,15 @@
 > `ops/hub/tailscale-serve.sh` and this doc; nothing here runs automatically,
 > and no CI job or installer invokes it.
 
+> **Prerequisites discovered on the real hub (2026-09-01):**
+> 1. **HTTPS certificates must be enabled for the tailnet** (admin console →
+>    DNS → HTTPS Certificates). Without it, `tailscale serve --bg` HANGS
+>    silently — no error, no config written. Enable the toggle first.
+> 2. The macOS **GUI app** doesn't put `tailscale` on PATH; the script now
+>    resolves the app-bundle CLI itself (override with `TAILSCALE_BIN`).
+>    Invoking that binary via a symlink aborts on a bundle-identifier check —
+>    call it by real path.
+
 ## 1. What it does
 
 The hub (the always-on Mac mini, macOS distribution spec §1: "the primary
