@@ -45,6 +45,7 @@ from .sync import (
     kickstart_service,
     read_current_train,
     read_stack_config,
+    report_history_stamp,
 )
 
 
@@ -101,15 +102,35 @@ def ensure_bootstrap_config(
             )
         local_addr = raw
         changed = True
+    # Validate WHATEVER we ended up with — prompted now or persisted by an
+    # earlier run (#212 review: the preceding prompt asks for a full URL,
+    # inviting a pasted 'http://…' here; the primary persists the resulting
+    # malformed ingest URL silently and the spoke never converges).
+    if "://" in local_addr or "/" in local_addr or " " in local_addr:
+        raise m.StackError(
+            f"local_tailnet_address must be a bare host or IP (e.g. "
+            f"roam.tailnet-name.ts.net), not a URL — got {local_addr!r}; fix "
+            f"it in {m.stack_config_path(home)} if it was persisted"
+        )
     if not changed:
         return cfg
     updated = dataclasses.replace(
         cfg, primary_gateway_url=gateway, local_tailnet_address=local_addr
     )
     if not dry_run:
+        # ADDITIVE merge into the raw document (#212 review: a parse->to_json
+        # round-trip silently dropped unknown keys and stamped
+        # schema_version back to 1 — this is the operator's file).
         path = m.stack_config_path(home)
+        try:
+            raw_doc = json.loads(path.read_text())
+        except (OSError, ValueError):
+            raw_doc = {}
+        raw_doc.setdefault("schema_version", 1)
+        raw_doc["primary_gateway_url"] = gateway
+        raw_doc["local_tailnet_address"] = local_addr
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(updated.to_json())
+        path.write_text(json.dumps(raw_doc, indent=2) + "\n")
     return updated
 
 
@@ -132,7 +153,7 @@ def write_bootstrap_report(home: Path, report: m.BootstrapReport, *, dry_run: bo
     path.write_text(report.to_json())
     history_dir = m.bootstrap_report_history_dir(home)
     history_dir.mkdir(parents=True, exist_ok=True)
-    stamp = report.finished_at.replace(":", "").replace("+00:00", "Z")
+    stamp = report_history_stamp(report.finished_at)
     suffix = "reseed" if report.reseed else "seed"
     (history_dir / f"{stamp}-{suffix}.json").write_text(report.to_json())
 
@@ -164,10 +185,23 @@ def run_bootstrap_spoke(
         report(f"[{name}] skipped: {detail}")
 
     try:
-        # -- precondition 1: stack.json exists ------------------------------
+        # -- precondition 1: stack.json exists AND declares role=spoke -------
+        # (#212 review: sync's spoke-only guard, decision 54447516, must hold
+        # here too — a hand-edited role=primary stack.json was previously
+        # seeded and reverse-paired as a spoke.)
         cfg = m.check_bootstrap_stack_config(read_stack_config(home))
+        m.check_spoke_posture(requested_role="spoke", existing=cfg)
         instance_id = cfg.instance_id
-        ok("stack-config", f"instance_id={cfg.instance_id}")
+        ok("stack-config", f"instance_id={cfg.instance_id} role={cfg.role}")
+
+        # -- precondition 1b: pm.env declares SNOWLINE_PM_ROLE=spoke ---------
+        # Checked BEFORE any mutation (#212 review: this guard previously ran
+        # LAST — after seed, kickstart, and reverse-pair — so the wrong
+        # topology it refuses had already been stood up). pm.env is not
+        # touched by any bootstrap step, so checking here loses nothing; the
+        # post-pair re-verify below still confirms it end-of-run.
+        m.check_pm_role_is_spoke(_read_optional(m.env_file_path(home, "pm")))
+        ok("pm-role-precheck", "pm.env declares SNOWLINE_PM_ROLE=spoke")
 
         # -- precondition 2: local services installed -----------------------
         current_trains = {svc: read_current_train(home, svc) for svc in m.SEED_PARTICIPANTS}
@@ -212,16 +246,25 @@ def run_bootstrap_spoke(
         # -- drive `snowline replicate seed`/`reseed-check` (docs/ops/roam- --
         # -- runbook.md §5-6) — wraps them verbatim, argv only ---------------
         if reseed:
-            report(
-                "re-seed: checking §7 step-5 preconditions before touching "
-                "state (`snowline replicate reseed-check`)"
-            )
-            runner.read(m.reseed_check_cli_argv(seed_path))
-            ok(
-                "reseed-check",
-                "preconditions met: spoke outbox drained AND primary parked "
-                "set empty for the spoke's streams (§7 step 5)",
-            )
+            if dry_run:
+                # `Runner.read` executes even under --dry-run, and the dry run
+                # never wrote seed.json — running the real check would crash
+                # on a fresh machine or validate a STALE config (#212 review).
+                skipped(
+                    "reseed-check",
+                    "would run: " + " ".join(m.reseed_check_cli_argv(seed_path)),
+                )
+            else:
+                report(
+                    "re-seed: checking §7 step-5 preconditions before touching "
+                    "state (`snowline replicate reseed-check`)"
+                )
+                runner.read(m.reseed_check_cli_argv(seed_path))
+                ok(
+                    "reseed-check",
+                    "preconditions met: spoke outbox drained AND primary parked "
+                    "set empty for the spoke's streams (§7 step 5)",
+                )
             runner.run(m.seed_cli_argv(seed_path, reseed=True))
             ok(
                 "seed",
@@ -244,12 +287,23 @@ def run_bootstrap_spoke(
             for svc in m.SEED_PARTICIPANTS:
                 skipped(f"kickstart-{svc}", "dry-run: nothing was seeded to boot against")
         else:
+            kick_failed: list[str] = []
             for svc in m.SEED_PARTICIPANTS:
                 kicked = kickstart_service(runner, home, svc)
                 steps.append(
                     m.BootstrapStep(name=f"kickstart-{svc}", status="ok" if kicked else "failed")
                 )
                 report(f"[kickstart-{svc}] {'ok' if kicked else 'FAILED'}")
+                if not kicked:
+                    kick_failed.append(svc)
+            if kick_failed:
+                # A failed step must fail the RUN (#212 review: a dead pm was
+                # previously reverse-paired anyway and the CLI exited 0).
+                raise m.StackError(
+                    f"kickstart failed for: {', '.join(kick_failed)} — refusing "
+                    "to reverse-pair against dead ingest endpoints; check the "
+                    "plists (launchctl print) and the service logs, then re-run"
+                )
 
         # -- re-check local health after boot ---------------------------------
         if dry_run:

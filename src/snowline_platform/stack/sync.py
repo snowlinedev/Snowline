@@ -35,7 +35,9 @@ Report = Callable[[str], None]
 PromptFn = Callable[[str], str]
 
 PLATFORM_REPO = "snowlinedev/Snowline"
-SERVICE_ORDER = ("platform", "governance", "memory", "pm")
+# Canonical tuple lives in model (derived from SERVICE_PORTS — #212 review);
+# this alias keeps every existing `s.SERVICE_ORDER` reference working.
+SERVICE_ORDER = m.SERVICE_ORDER
 DEFAULT_HEALTH_URL = "http://127.0.0.1:8848/health"
 
 _TEMPLATES_DIR = Path(__file__).with_name("templates") / "env"
@@ -464,6 +466,15 @@ def check_health(
 # --------------------------------------------------------------------------
 
 
+def report_history_stamp(finished_at: str) -> str:
+    """ISO timestamp -> filename-safe history stamp. Z-normalize BEFORE
+    stripping colons: the other order turns '+00:00' into '+0000' first,
+    leaving the Z replacement dead and a '+' in every filename (#212
+    review — the bug existed here and was copy-pasted into the bootstrap
+    report before this shared helper existed)."""
+    return finished_at.replace("+00:00", "Z").replace(":", "")
+
+
 def write_report(home: Path, report: m.RunReport, *, dry_run: bool) -> None:
     if dry_run:
         return
@@ -472,7 +483,7 @@ def write_report(home: Path, report: m.RunReport, *, dry_run: bool) -> None:
     path.write_text(report.to_json())
     history_dir = m.report_history_dir(home)
     history_dir.mkdir(parents=True, exist_ok=True)
-    stamp = report.finished_at.replace(":", "").replace("+00:00", "Z")
+    stamp = report_history_stamp(report.finished_at)
     (history_dir / f"{stamp}-{report.train}.json").write_text(report.to_json())
 
 

@@ -132,6 +132,7 @@ def test_refuses_when_local_services_not_installed(tmp_path):
     _write_stack_config(
         home, m.StackConfig(role="spoke", instance_id="roam", primary_tailnet_address="mini.ts.net")
     )
+    _write_pm_env(home)
     runner = FakeRunner(_health_ok_handler)
     report = b.run_bootstrap_spoke(home=home, runner=runner, prompt=_no_prompt, health_sleep=_noop_sleep)
     assert report.outcome == "failed"
@@ -145,6 +146,7 @@ def test_refuses_when_local_gateway_unhealthy(tmp_path):
     _write_stack_config(
         home, m.StackConfig(role="spoke", instance_id="roam", primary_tailnet_address="mini.ts.net")
     )
+    _write_pm_env(home)
 
     def handler(argv, cwd):
         if argv[:1] == ["curl"]:
@@ -171,6 +173,7 @@ def test_refuses_when_primary_gateway_unreachable(tmp_path):
             primary_gateway_url="http://mini.ts.net:8850", local_tailnet_address="roam.ts.net",
         ),
     )
+    _write_pm_env(home)
 
     def handler(argv, cwd):
         if argv[:1] == ["curl"]:
@@ -316,10 +319,9 @@ def test_refuses_loudly_when_pm_env_declares_a_non_spoke_role(tmp_path):
     report = b.run_bootstrap_spoke(home=home, runner=runner, prompt=_default_prompt, health_sleep=_noop_sleep)
     assert report.outcome == "failed"
     assert "SNOWLINE_PM_ROLE='primary'" in report.detail
-    assert report.pm_role_ok is False
-    # the pm check runs LAST — everything else (seed, kickstart, reverse
-    # pair) already happened by the time it refuses.
-    assert runner.ran("snowline", "replicate", "seed", "--config")
+    # the check now runs at PRECONDITION time (#212 review): the wrong
+    # topology is refused BEFORE seed/kickstart/reverse-pair ever run.
+    assert not runner.ran("snowline", "replicate", "seed", "--config")
 
 
 def test_refuses_when_pm_env_is_missing_entirely(tmp_path):

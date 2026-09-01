@@ -132,11 +132,12 @@ From a device that is on the same tailnet but is NOT the hub itself (your
 phone with the Tailscale app installed, or the MBP spoke):
 
 1. Open `https://<hub-hostname>.<tailnet>.ts.net/ui` in a browser. You
-   should see the dashboard load — the same UI `http://127.0.0.1:8850/ui`
-   serves locally on the hub.
+   should see the dashboard load — the same UI the hub serves directly at
+   `http://<hub-tailnet-address>:8850/ui` (per §3, the hub's platform binds
+   its tailnet address, NOT loopback — a loopback curl on the hub refuses).
 2. Confirm the API surface too:
    `curl -fsS https://<hub-hostname>.<tailnet>.ts.net/health` should return
-   the same healthy response the hub's own loopback `/health` does.
+   the same healthy response as `http://<hub-tailnet-address>:8850/health`.
 3. Turn off Wi-Fi and confirm it still works over cellular (still on the
    tailnet via Tailscale's client) — this is the actual point of a stable
    tailnet URL: reaching the hub from **anywhere**, not just the home LAN.

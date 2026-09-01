@@ -25,6 +25,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from snowline_platform.replication import INGEST_PATH as _PLATFORM_INGEST_PATH
+
 _VERSION_RE = re.compile(r"^v0\.(\d+)\.(\d+)$")
 
 
@@ -722,23 +724,29 @@ DEFAULT_PRIMARY_GATEWAY_PORT = 8850
 # example) — v1 has exactly one primary, so this is not prompted.
 PRIMARY_INSTANCE_ID = "primary"
 
+# THE canonical spoke service tuple (#212 review: previously copied by hand
+# in three places). `SERVICE_PORTS`' insertion order is the boot order
+# (runbook §2), and everything else — sync's SERVICE_ORDER, the seed
+# participants — derives from it, so a fifth replicating service added to
+# SERVICE_PORTS is automatically installed, seeded, and kickstarted (or
+# fails loudly), never silently skipped.
+SERVICE_ORDER: tuple[str, ...] = tuple(SERVICE_PORTS)
+
 # Participants seeded per the macOS distribution spec §7 table — platform
 # (the scope stream) plus every replicating plugin, pm included (pm is NEW to
-# the packaged spoke, spec §8). Order matches `sync.SERVICE_ORDER` /
-# `docs/ops/roam-runbook.md` §2's boot order.
-SEED_PARTICIPANTS: tuple[str, ...] = ("platform", "governance", "memory", "pm")
+# the packaged spoke, spec §8).
+SEED_PARTICIPANTS: tuple[str, ...] = SERVICE_ORDER
 
-# The ingest path each participant serves its replication admin surface on
-# (`snowline_platform.replication.INGEST_PATH` for the platform's own scope
-# stream; `snowline_plugin_sdk.replication.admin`'s default — used verbatim
-# by governance's and memory's `INGEST_PATH` — for every SDK-based plugin,
-# pm included, since pm rides the same SDK per pm.env.tmpl's replication
-# vars).
+# Every SDK-based plugin serves the SDK's default ingest path (verified
+# against pm's registration.py: REPLICATION_INGEST_PATH = "/events/ingest");
+# the platform's own scope stream imports its constant rather than
+# restating it (#212 review — comment-synced copies drift).
+SDK_INGEST_PATH = "/events/ingest"
 PARTICIPANT_INGEST_PATH: Mapping[str, str] = {
-    "platform": "/replication/events/ingest",
-    "governance": "/events/ingest",
-    "memory": "/events/ingest",
-    "pm": "/events/ingest",
+    "platform": _PLATFORM_INGEST_PATH,
+    "governance": SDK_INGEST_PATH,
+    "memory": SDK_INGEST_PATH,
+    "pm": SDK_INGEST_PATH,
 }
 
 # The primary's Postgres port — same default the runbook's

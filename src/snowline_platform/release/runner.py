@@ -56,14 +56,22 @@ class Runner:
         merged.update(env or {})
         # argv lists, never a shell string. `check=False` because the
         # returncode is inspected below — `check` here is the CALLER's contract.
-        proc = subprocess.run(
-            list(argv),
-            cwd=str(cwd) if cwd else None,
-            env=merged,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        try:
+            proc = subprocess.run(
+                list(argv),
+                cwd=str(cwd) if cwd else None,
+                env=merged,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as exc:
+            # A binary missing from PATH (or an unexecutable file) must
+            # surface as the CommandError every caller already handles — a
+            # raw FileNotFoundError escaped the stack/bootstrap error
+            # handling entirely, skipping the machine-readable report
+            # (#212 review).
+            raise CommandError(argv, 127, f"failed to launch: {exc}") from exc
         out = (proc.stdout or "") + (proc.stderr or "")
         if check and proc.returncode != 0:
             raise CommandError(argv, proc.returncode, out)
