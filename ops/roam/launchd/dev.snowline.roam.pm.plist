@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd agent for the roam pm (replication-continuity §5.1; macOS
+  distribution spec §7/§8 — pm joins the spoke drill, item b70b0359).
+  Install: edit the two PATHs below, then
+    cp dev.snowline.roam.pm.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/dev.snowline.roam.pm.plist
+  KeepAlive restarts it after a crash; loopback bind is enforced by
+  run-service.sh (--host 127.0.0.1). Repeat for platform/governance/memory.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.snowline.roam.pm</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <!-- EDIT: absolute path to ops/roam/run-service.sh in your checkout -->
+        <string>/Users/CHANGEME/Projects/Snowline/snowline/ops/roam/run-service.sh</string>
+        <string>pm</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- EDIT: absolute path to your filled-in env file -->
+        <key>SNOWLINE_ENV_FILE</key>
+        <string>/Users/CHANGEME/.config/snowline/env.roam</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/snowline-roam-pm.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/snowline-roam-pm.err.log</string>
+</dict>
+</plist>

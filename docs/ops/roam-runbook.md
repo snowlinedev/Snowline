@@ -9,6 +9,15 @@
 > Companion files live in `ops/roam/`: `env.roam.example` / `env.primary.example`
 > (environment), `tailscale-serve.sh` (tailnet exposure), `run-service.sh` +
 > `launchd/` (service supervision), `seed-config.example.json` (the seed input).
+>
+> **This manual drill has a packaged alternative as of macOS distribution
+> item b70b0359: `curl … | sh` (install.sh) then `snowline stack sync --role
+> spoke` builds every service's venv, renders this SAME env/plist posture
+> from packaged templates, and health-checks the gateway — one command
+> instead of §§0-3 below. This runbook stays the reference for what that
+> command automates, the pairing/seeding steps it deliberately does NOT do
+> (§4-6, still a separate `snowline stack bootstrap-spoke` step per
+> macOS-distribution.md §6), and the manual two-machine drill.**
 
 The load-bearing rule for the whole document: **§7's ordering is not advisory.**
 Prime → dump → scrub → inject → boot → reverse-pair exists in that order because
@@ -20,9 +29,13 @@ not hand-run the steps out of order.
 ## 0. Prerequisites
 
 - Both machines on the same tailnet, `tailscaled` up, each logged in.
-- Postgres on each machine with the three databases (`snowline_platform`,
-  `snowline_governance`, `snowline_memory`). The apps auto-migrate to head on
-  boot.
+- Postgres on each machine with the **four** databases (`snowline_platform`,
+  `snowline_governance`, `snowline_memory`, `snowline_pm` — pm joins the spoke
+  drill as of macOS distribution spec §7/§8, item b70b0359; this runbook
+  predates pm on the spoke). The apps auto-migrate to head on boot.
+- The `snowline-pm` checkout as a sibling of the platform checkout (the same
+  layout `release/components.json` assumes: `../snowline-pm`) — `run-service.sh
+  pm` runs from there, not the platform repo.
 - The `snowline` CLI available (it ships with the platform package —
   `uv run snowline ...` from the checkout, or `pip install -e .` puts `snowline`
   on the PATH).
@@ -67,7 +80,8 @@ ops/roam/tailscale-serve.sh
 ```
 
 This maps each service's loopback port **1:1 onto the same tailnet port**
-(`tailnet:8848→127.0.0.1:8848`, `:8801→:8801`, `:8802→:8802`). The port-preserving
+(`tailnet:8848→127.0.0.1:8848`, `:8801→:8801`, `:8802→:8802`, `:8803→:8803` for
+pm). The port-preserving
 1:1 mapping is the **fallback** the pairing CLI relies on when it rewrites a peer
 plugin's loopback `base_url` onto the peer's tailnet host (§4.1) — governance at
 loopback `:8801` is reachable at `<host>.tailnet:8801`. Under this stock posture
@@ -88,6 +102,7 @@ Start the services (per instance), using the launchd agents or by hand:
 SNOWLINE_ENV_FILE=~/.config/snowline/env.roam ops/roam/run-service.sh platform
 SNOWLINE_ENV_FILE=~/.config/snowline/env.roam ops/roam/run-service.sh governance
 SNOWLINE_ENV_FILE=~/.config/snowline/env.roam ops/roam/run-service.sh memory
+SNOWLINE_ENV_FILE=~/.config/snowline/env.roam ops/roam/run-service.sh pm
 # under launchd (survives crashes/reboots): install the ops/roam/launchd/*.plist
 ```
 
@@ -201,6 +216,30 @@ Both are required because **a park ACKs as delivered** (§8.1): an empty outbox
 does *not* imply the spoke's writes were applied on the primary. Re-seeding over
 an unresolved park would overwrite the spoke's only applied copy of that write.
 Resolve parks (fix the cause, re-apply from the parked view) before re-seeding.
+
+## 6a. Rolling back a packaged-channel update (macOS distribution spec §5)
+
+`snowline stack sync --train vPrev` is the rollback command for a spoke
+installed via the packaged channel (item b70b0359) — same code path as an
+ordinary sync, just naming an older train. Two cases:
+
+- **Code-only rollback (no schema migration in the delta being undone).**
+  The symlink swap IS the rollback: `current` repoints at `vPrev`'s venv,
+  changed services kickstart, done. `sync` also does this **automatically**
+  when a `--auto` upgrade's post-upgrade health check fails and no migration
+  crossed in the delta — see the work item body's auto-upgrade failure
+  posture.
+- **Rollback across a schema migration.** boot-migrate is **forward-only by
+  design** (§3) — the database does not roll back with the code. `sync`
+  refuses to auto-revert this case (leaving state as-is and reporting loudly)
+  precisely because rolling the code back against an already-migrated
+  database is broken, not because reverting is unsafe in the abstract. On a
+  spoke this is recoverable — but by the **re-seed protocol** (§6 above), not
+  a bare seed: drain the outbox, verify the primary's parked set is empty (a
+  park ACKs as delivered — reseeding over an unresolved park loses that
+  write), then `reseed-check` + `seed --reseed` under a fresh epoch. This is
+  the accepted cost of keeping migrations forward-only (macOS distribution
+  spec §5); there is no cheaper undo for a migration that already ran.
 
 ## 7. Acceptance — the §10 criteria and how to check each
 
