@@ -18,7 +18,7 @@ auto-upgrade requirements in the work item body (Sean, 2026-08-30).
 from __future__ import annotations
 
 from .model import RunReport, StackConfig, StackError, TrainManifest, exit_code
-from .sync import DEFAULT_HEALTH_URL, run_sync
+from .sync import DEFAULT_HEALTH_URL, run_sync, tty_prompt
 
 __all__ = [
     "DEFAULT_HEALTH_URL",
@@ -28,4 +28,5 @@ __all__ = [
     "TrainManifest",
     "exit_code",
     "run_sync",
+    "tty_prompt",
 ]

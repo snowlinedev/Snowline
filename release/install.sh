@@ -89,13 +89,15 @@ uv pip install --python "$venv_dir/bin/python" \
   -r "$work/requirements-platform.txt" \
   --find-links "$work"
 
-# -- 5. point venvs/platform/current at it, ATOMICALLY (spec §5 step 2: a
-# temp symlink + rename, never `ln -sfn`'s unlink-then-create window) -------
+# -- 5. point venvs/platform/current at it. NOT the sync-style atomic rename:
+# BSD `mv -f` onto an existing symlink-to-directory moves the temp INTO the
+# old venv instead of replacing the link (#210 review — a re-run silently
+# stayed on the old train). remove+ln has a momentary no-`current` window,
+# which is harmless here: nothing runs from this venv during bootstrap
+# (sync's os.replace handles the live case). -------------------------------
 
-tmp_link="$VENV_ROOT/current.tmp-new"
-rm -f "$tmp_link"
-ln -s "$venv_dir" "$tmp_link"
-mv -f "$tmp_link" "$VENV_ROOT/current"
+rm -f "$VENV_ROOT/current"
+ln -s "$venv_dir" "$VENV_ROOT/current"
 
 # -- 6. symlink ~/.local/bin/snowline THROUGH current (spec §5 — never at a
 # train-versioned path, or a later sync repoints `current` while PATH stays

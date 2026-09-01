@@ -291,10 +291,10 @@ def test_apply_env_file_dry_run_never_writes(tmp_path):
 
 def test_apply_plist_writes_and_is_idempotent_on_no_change(tmp_path):
     home = tmp_path / "home"
-    changed_1 = s.apply_plist(home, "governance", env_vars={"SNOWLINE_INSTANCE_ID": "roam"}, dry_run=False)
+    changed_1 = s.apply_plist(home, "governance", dry_run=False)
     assert changed_1 is True
     assert m.plist_path(home, "governance").exists()
-    changed_2 = s.apply_plist(home, "governance", env_vars={"SNOWLINE_INSTANCE_ID": "roam"}, dry_run=False)
+    changed_2 = s.apply_plist(home, "governance", dry_run=False)
     assert changed_2 is False
 
 
@@ -342,7 +342,7 @@ def test_check_health_true_on_success_false_on_failure():
 
     def failing(argv, cwd):
         return CommandError(argv, 7, "connection refused")
-    assert s.check_health(FakeRunner(failing)) is False
+    assert s.check_health(FakeRunner(failing), attempts=2, sleep=lambda _s: None) is False
 
 
 # -- migration-head probing --------------------------------------------------
@@ -410,7 +410,7 @@ def test_run_sync_fresh_install_builds_all_four_services_and_reports_ok(tmp_path
     _seed_train_assets(home)
     runner = FakeRunner(_full_fake_handler)
 
-    report = s.run_sync(home=home, train="v0.1.0", runner=runner, report=lambda _: None)
+    report = s.run_sync(home=home, train="v0.1.0", runner=runner, health_sleep=lambda _s: None, report=lambda _: None)
 
     assert report.outcome == "ok"
     assert report.train == "v0.1.0"
@@ -430,11 +430,11 @@ def test_run_sync_is_a_noop_when_already_on_the_resolved_train(tmp_path):
     _stack_config(home)
     _seed_train_assets(home)
     runner = FakeRunner(_full_fake_handler)
-    first = s.run_sync(home=home, train="v0.1.0", runner=runner, report=lambda _: None)
+    first = s.run_sync(home=home, train="v0.1.0", runner=runner, health_sleep=lambda _s: None, report=lambda _: None)
     assert first.outcome == "ok"
 
     runner2 = FakeRunner(_full_fake_handler)
-    second = s.run_sync(home=home, train="v0.1.0", runner=runner2, report=lambda _: None)
+    second = s.run_sync(home=home, train="v0.1.0", runner=runner2, health_sleep=lambda _s: None, report=lambda _: None)
     assert second.outcome == "noop"
     assert second.noop is True
     assert m.exit_code(second.outcome) == 0
@@ -447,7 +447,7 @@ def test_run_sync_dry_run_never_writes_or_downloads(tmp_path):
     home = tmp_path / "home"
     _stack_config(home)
     runner = FakeRunner(_ok_gh_auth, dry_run=True)
-    report = s.run_sync(home=home, train="v0.1.0", dry_run=True, runner=runner, report=lambda _: None)
+    report = s.run_sync(home=home, train="v0.1.0", dry_run=True, runner=runner, health_sleep=lambda _s: None, report=lambda _: None)
     assert report.dry_run is True
     assert report.outcome == "ok"
     assert len(report.services) == 4
@@ -460,7 +460,7 @@ def test_run_sync_dry_run_never_writes_or_downloads(tmp_path):
 def test_run_sync_refuses_when_role_is_not_spoke(tmp_path):
     home = tmp_path / "home"
     runner = FakeRunner(_ok_gh_auth)
-    report = s.run_sync(home=home, role="primary", runner=runner, report=lambda _: None)
+    report = s.run_sync(home=home, role="primary", runner=runner, health_sleep=lambda _s: None, report=lambda _: None)
     assert report.outcome == "failed"
     assert "spoke-only" in report.detail
     assert m.exit_code(report.outcome) == 1
@@ -472,7 +472,7 @@ def test_run_sync_refuses_against_a_hand_configured_primary_env(tmp_path):
     path.parent.mkdir(parents=True)
     path.write_text("export SNOWLINE_INSTANCE_ID=primary\n")
     runner = FakeRunner(_ok_gh_auth)
-    report = s.run_sync(home=home, runner=runner, report=lambda _: None)
+    report = s.run_sync(home=home, runner=runner, health_sleep=lambda _s: None, report=lambda _: None)
     assert report.outcome == "failed"
     assert "primary" in report.detail
 
@@ -485,7 +485,7 @@ def test_run_sync_auto_never_prompts_and_fails_loudly_when_config_missing(tmp_pa
         raise AssertionError("--auto must never prompt")
 
     report = s.run_sync(
-        home=home, train="v0.1.0", auto=True, runner=runner,
+        home=home, train="v0.1.0", auto=True, runner=runner, health_sleep=lambda _s: None,
         prompt=prompt_should_not_be_called, report=lambda _: None,
     )
     assert report.outcome == "failed"
@@ -500,7 +500,7 @@ def test_run_sync_interactive_prompts_once_and_persists_stack_json(tmp_path):
     runner = FakeRunner(_full_fake_handler)
     answers = iter(["roam", "mini.tailnet-name.ts.net"])
     report = s.run_sync(
-        home=home, train="v0.1.0", runner=runner,
+        home=home, train="v0.1.0", runner=runner, health_sleep=lambda _s: None,
         prompt=lambda _msg: next(answers), report=lambda _: None,
     )
     assert report.outcome == "ok"
@@ -518,7 +518,7 @@ def test_run_sync_gh_auth_failure_is_reported_before_any_symlink(tmp_path):
             return CommandError(argv, 1, "expired")
         return ""
     runner = FakeRunner(handler)
-    report = s.run_sync(home=home, train="v0.1.0", runner=runner, report=lambda _: None)
+    report = s.run_sync(home=home, train="v0.1.0", runner=runner, health_sleep=lambda _s: None, report=lambda _: None)
     assert report.outcome == "failed"
     assert "not authenticated" in report.detail
     assert not m.service_current_link(home, "platform").exists()
@@ -532,7 +532,7 @@ def test_run_sync_reverts_on_health_failure_with_no_migration_crossed(tmp_path):
     _stack_config(home)
     _seed_train_assets(home)
     runner = FakeRunner(_full_fake_handler)
-    first = s.run_sync(home=home, train="v0.1.0", runner=runner, report=lambda _: None)
+    first = s.run_sync(home=home, train="v0.1.0", runner=runner, health_sleep=lambda _s: None, report=lambda _: None)
     assert first.outcome == "ok"
 
     _seed_train_assets(home, "v0.2.0")
@@ -551,7 +551,7 @@ def test_run_sync_reverts_on_health_failure_with_no_migration_crossed(tmp_path):
         return '["headA"]\n'  # SAME heads before/after -> no migration crossed
 
     runner2 = FakeRunner(handler)
-    second = s.run_sync(home=home, train="v0.2.0", runner=runner2, report=lambda _: None)
+    second = s.run_sync(home=home, train="v0.2.0", runner=runner2, health_sleep=lambda _s: None, report=lambda _: None)
 
     assert second.outcome == "reverted"
     assert second.health_ok is False
@@ -566,7 +566,7 @@ def test_run_sync_never_auto_reverts_across_a_crossed_migration(tmp_path):
     _stack_config(home)
     _seed_train_assets(home)
     runner = FakeRunner(_full_fake_handler)
-    first = s.run_sync(home=home, train="v0.1.0", runner=runner, report=lambda _: None)
+    first = s.run_sync(home=home, train="v0.1.0", runner=runner, health_sleep=lambda _s: None, report=lambda _: None)
     assert first.outcome == "ok"
 
     _seed_train_assets(home, "v0.2.0")
@@ -591,7 +591,7 @@ def test_run_sync_never_auto_reverts_across_a_crossed_migration(tmp_path):
         return ""
 
     runner2 = FakeRunner(handler)
-    second = s.run_sync(home=home, train="v0.2.0", runner=runner2, report=lambda _: None)
+    second = s.run_sync(home=home, train="v0.2.0", runner=runner2, health_sleep=lambda _s: None, report=lambda _: None)
 
     assert second.outcome == "needs_attention"
     assert m.exit_code(second.outcome) == 1
@@ -599,3 +599,114 @@ def test_run_sync_never_auto_reverts_across_a_crossed_migration(tmp_path):
     # NEVER auto-reverted: `current` stays on the NEW (v0.2.0) train.
     for svc in s.SERVICE_ORDER:
         assert Path(os.readlink(m.service_current_link(home, svc))).name == "v0.2.0"
+
+
+def test_noop_run_still_health_checks_and_flags_a_dead_stack(tmp_path):
+    """An up-to-date spoke with a dead gateway must not exit 0 forever — the
+    --auto timer's exit code is the monitoring signal (#210 review)."""
+    home = tmp_path / "home"
+    _stack_config(home)
+    _seed_train_assets(home)
+    runner = FakeRunner(_full_fake_handler)
+    first = s.run_sync(home=home, train="v0.1.0", runner=runner, health_sleep=lambda _s: None, report=lambda _: None)
+    assert first.outcome == "ok"
+
+    def dead_gateway(argv, cwd):
+        if argv[:3] == ["gh", "auth", "status"]:
+            return "ok\n"
+        if argv and argv[0] == "curl":
+            return CommandError(argv, 7, "connection refused")
+        return ""
+
+    second = s.run_sync(
+        home=home, train="v0.1.0", runner=FakeRunner(dead_gateway),
+        health_sleep=lambda _s: None, report=lambda _: None,
+    )
+    assert second.noop is True
+    assert second.outcome == "needs_attention"
+    assert second.health_ok is False
+    assert m.exit_code(second.outcome) == 1
+    # and a HEALTHY noop still exits 0.
+    third = s.run_sync(
+        home=home, train="v0.1.0", runner=FakeRunner(_full_fake_handler),
+        health_sleep=lambda _s: None, report=lambda _: None,
+    )
+    assert third.outcome == "noop" and m.exit_code(third.outcome) == 0
+
+
+def test_sync_refuses_on_a_source_run_hub(tmp_path):
+    """dev.snowline.* plists present with NO stack.json = the source-run hub
+    posture — sync must refuse rather than stand up a second service set on
+    the hub's own ports (#210 review; decision 54447516)."""
+    home = tmp_path / "home"
+    agents = m.launch_agents_dir(home)
+    agents.mkdir(parents=True)
+    (agents / "dev.snowline.platform.plist").write_text("<plist/>")
+    rpt = s.run_sync(
+        home=home, runner=FakeRunner(_full_fake_handler),
+        health_sleep=lambda _s: None, report=lambda _: None,
+    )
+    assert rpt.outcome == "failed"
+    assert "SPOKE-ONLY" in (rpt.detail or "")
+    # a stack-managed spoke (stack.json present) is never tripped by its own plists
+    _stack_config(home)
+    s.check_not_source_hub(home)  # does not raise
+
+
+def test_unpack_dashboard_strips_the_tarballs_top_level_dist(tmp_path):
+    """The cutter packs a top-level `dist/` entry (the v0.1.0 shape);
+    unpacking must strip it so the dest itself holds index.html — without
+    --strip-components every packaged install's /ui 404'd (#210 review)."""
+    recorded = []
+
+    def handler(argv, cwd):
+        recorded.append(argv)
+        return ""
+
+    s.unpack_dashboard(FakeRunner(handler), tarball=tmp_path / "d.tar.gz", dest=tmp_path / "out")
+    tar = next(a for a in recorded if a and a[0] == "tar")
+    assert "--strip-components" in tar and tar[tar.index("--strip-components") + 1] == "1"
+
+
+def test_swap_dashboard_current_repoints_the_stable_path(tmp_path):
+    """The env files bake the STABLE dashboard/current path; the symlink is
+    the train-versioned part (#210 review: a versioned env value froze the UI
+    at the install-time train and read as perpetual drift)."""
+    home = tmp_path / "home"
+    m.dashboard_dir(home, "v0.1.0").mkdir(parents=True)
+    m.dashboard_dir(home, "v0.2.0").mkdir(parents=True)
+    s.swap_dashboard_current(home, "v0.1.0")
+    link = m.dashboard_root(home) / "current"
+    assert Path(os.readlink(link)).name == "v0.1.0"
+    s.swap_dashboard_current(home, "v0.2.0")
+    assert Path(os.readlink(link)).name == "v0.2.0"
+
+
+def test_fresh_install_health_failure_detail_never_claims_a_migration(tmp_path):
+    """needs_attention on a FRESH install (nothing to revert to) must say so —
+    the fabricated 'a migration crossed' diagnosis sent the operator down the
+    re-seed runbook for no reason (#210 review)."""
+    home = tmp_path / "home"
+    _stack_config(home)
+    _seed_train_assets(home)
+
+    def unhealthy_fresh(argv, cwd):
+        if argv[:3] == ["gh", "auth", "status"]:
+            return "ok\n"
+        if argv and argv[-1] == "--version":
+            return "Python 3.12.3\n"
+        if argv and argv[0] == "curl":
+            return CommandError(argv, 7, "connection refused")
+        if argv[:2] == ["psql", "-Atqc"]:
+            return "snowline_platform\nsnowline_governance\nsnowline_memory\nsnowline_pm\n"
+        if argv[:2] == ["launchctl", "bootstrap"]:
+            return ""
+        return '["headA"]\n'
+
+    rpt = s.run_sync(
+        home=home, train="v0.1.0", runner=FakeRunner(unhealthy_fresh),
+        health_sleep=lambda _s: None, report=lambda _: None,
+    )
+    assert rpt.outcome == "needs_attention"
+    assert "no previous train" in (rpt.detail or "")
+    assert "migration crossed" not in (rpt.detail or "").split("No migration crossed")[0]

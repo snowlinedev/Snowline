@@ -425,12 +425,14 @@ _EXPORT_LINE_RE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*
 
 
 def parse_env_exports(text: str) -> dict[str, str]:
-    """`export KEY=VALUE` (or bare `KEY=VALUE`) lines -> a dict. Used both to
-    read back an env file's `SNOWLINE_INSTANCE_ID` (the primary-posture
-    guard) and to bake its values into a launchd plist's
-    `EnvironmentVariables` (sync execs the venv's uvicorn directly — no
-    wrapper script sources the env file the way ops/roam/run-service.sh
-    did)."""
+    """`export KEY=VALUE` (or bare `KEY=VALUE`) lines -> a dict — a READ-ONLY
+    approximation used by the posture guards and the drift report; plists no
+    longer consume this (they SOURCE the env file at exec time, #210 review),
+    so shell-fidelity gaps here can't corrupt a running service. Unquoted
+    values have trailing ` # comment` text stripped (the guard-bypass bug:
+    `export SNOWLINE_INSTANCE_ID=primary # hub` must parse as 'primary');
+    `$VAR` expansion is deliberately NOT performed — callers compare literal
+    tokens, never resolved paths."""
     out: dict[str, str] = {}
     for line in text.splitlines():
         stripped = line.strip()
@@ -440,8 +442,14 @@ def parse_env_exports(text: str) -> dict[str, str]:
         if not m:
             continue
         key, value = m.group(1), m.group(2).strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
+        if value[:1] in "\"'":
+            # Quoted value: take the quoted content (anything after the
+            # closing quote — including a trailing comment — is dropped).
+            end = value.find(value[0], 1)
+            if end != -1:
+                value = value[1:end]
+        elif " #" in value:
+            value = value.split(" #", 1)[0].rstrip()
         out[key] = value
     return out
 
@@ -481,9 +489,16 @@ def render_plist(
     service: str,
     venv_current: Path,
     port: int,
-    env_vars: Mapping[str, str],
+    env_file: Path,
     logs: Path,
 ) -> str:
+    """The env file is SOURCED AT EXEC TIME (`/bin/sh -c 'set -a; . env;
+    exec uvicorn …'` — the live hub's own plist posture), never baked into
+    `EnvironmentVariables` (#210 review): baking froze operator env edits
+    until the next train, copied any credentials into a second
+    world-readable location (`launchctl print` included), and forced a
+    shell-semantics reimplementation in `parse_env_exports`. Sourcing keeps
+    the env file the single, live source of truth."""
     label = plist_label(service)
     app_target = SERVICE_ASGI_APP.get(service)
     if app_target is None:
@@ -491,9 +506,10 @@ def render_plist(
     uvicorn_bin = venv_current / "bin" / "uvicorn"
     out_log = logs / f"snowline-{service}.out.log"
     err_log = logs / f"snowline-{service}.err.log"
-    env_entries = "\n".join(
-        f"        <key>{_xml_escape(k)}</key>\n        <string>{_xml_escape(v)}</string>"
-        for k, v in sorted(env_vars.items())
+    launch = (
+        f"set -a; . {_sh_quote(str(env_file))}; set +a; "
+        f"exec {_sh_quote(str(uvicorn_bin))} {_sh_quote(app_target)} "
+        f"--host 127.0.0.1 --port {port}"
     )
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -501,8 +517,10 @@ def render_plist(
   launchd agent for the packaged spoke's {service} (macOS distribution spec
   §5 step 4). Rendered by `snowline stack sync` from a packaged template —
   regenerated every run, never hand-edited (contrast the *.env files, which
-  sync never clobbers). Execs {{venv}}/current/bin/uvicorn directly: no
-  WorkingDirectory, nothing runs from a checkout (spec §2/§5).
+  sync never clobbers and which this plist SOURCES at exec time, so operator
+  env edits take effect on the next service restart). Execs
+  {{venv}}/current/bin/uvicorn: no WorkingDirectory, nothing runs from a
+  checkout (spec §2/§5).
 -->
 <plist version="1.0">
 <dict>
@@ -510,17 +528,10 @@ def render_plist(
     <string>{label}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{_xml_escape(str(uvicorn_bin))}</string>
-        <string>{_xml_escape(app_target)}</string>
-        <string>--host</string>
-        <string>127.0.0.1</string>
-        <string>--port</string>
-        <string>{port}</string>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>{_xml_escape(launch)}</string>
     </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-{env_entries}
-    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -541,6 +552,11 @@ def _xml_escape(text: str) -> str:
         .replace(">", "&gt;")
         .replace('"', "&quot;")
     )
+
+
+def _sh_quote(text: str) -> str:
+    """Single-quote for the plist's `/bin/sh -c` line."""
+    return "'" + text.replace("'", "'\\''") + "'"
 
 
 def gui_target(label: str, uid: int) -> str:

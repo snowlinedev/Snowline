@@ -20,6 +20,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
+import time
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,6 +74,54 @@ def read_current_train(home: Path, service: str) -> str | None:
     except OSError:
         return None
     return Path(target).name
+
+
+def tty_prompt(message: str) -> str:
+    """A prompt that survives `curl … | sh` (#210 review): there, stdin is the
+    exhausted script pipe, so `input()` raises EOFError before the flagship
+    one-command install ever writes stack.json. Fall back to the controlling
+    terminal; refuse cleanly when there is none."""
+    if sys.stdin.isatty():
+        return input(message)
+    try:
+        with open("/dev/tty") as tty:
+            sys.stderr.write(message)
+            sys.stderr.flush()
+            line = tty.readline()
+    except OSError as exc:
+        raise m.StackError(
+            "stack.json setup needs an interactive terminal (stdin is not a "
+            "tty and /dev/tty is unavailable) — run `snowline stack sync` "
+            "from a terminal once"
+        ) from exc
+    if not line:
+        raise m.StackError("stack.json setup: no input received from the terminal")
+    return line.strip()
+
+
+def check_not_source_hub(home: Path) -> None:
+    """Refuse to install the packaged stack on a machine already running
+    Snowline services sync does not manage — i.e. the source-run hub, whose
+    posture lives in launchd plists, not in the `<service>.env` filenames the
+    env guard reads (#210 review: without this, `curl … | sh` on the mini
+    would bootstrap a SECOND service set onto the hub's own ports). A
+    stack-managed spoke always has stack.json, so its own plists don't trip
+    this."""
+    if m.stack_config_path(home).exists():
+        return
+    agents = m.launch_agents_dir(home)
+    existing = [
+        m.plist_label(svc)
+        for svc in SERVICE_ORDER
+        if (agents / f"{m.plist_label(svc)}.plist").exists()
+    ]
+    if existing:
+        raise m.StackError(
+            "this machine already runs Snowline services that stack sync does "
+            f"not manage ({', '.join(existing)}) with no stack.json — that is "
+            "the source-run hub posture, and sync is SPOKE-ONLY (decision "
+            "54447516); it will not stand up a second service set here"
+        )
 
 
 def ensure_stack_config(
@@ -225,8 +275,31 @@ def build_service_venv(
 
 
 def unpack_dashboard(runner: Runner, *, tarball: Path, dest: Path) -> None:
+    # The cutter packs `tar -czf … -C <dashboard> dist` — a TOP-LEVEL `dist/`
+    # entry (that is the shape v0.1.0 shipped with). Strip it so `dest` itself
+    # contains index.html; without this, SNOWLINE_DASHBOARD_DIST pointed one
+    # level too high and every packaged install's /ui 404'd (#210 review).
     dest.mkdir(parents=True, exist_ok=True)
-    runner.run(["tar", "-xzf", str(tarball), "-C", str(dest)])
+    runner.run(
+        ["tar", "-xzf", str(tarball), "-C", str(dest), "--strip-components", "1"]
+    )
+
+
+def swap_dashboard_current(home: Path, train: str) -> None:
+    """Repoint the STABLE dashboard path at this train's unpacked dist.
+
+    The env files bake `SNOWLINE_DASHBOARD_DIST=<…>/dashboard/current` — a
+    path that never changes — because env files are operator-owned and sync
+    never clobbers them: a train-versioned value would freeze the UI at the
+    install-time train forever and read as perpetual env drift (#210
+    review). The symlink is the train-versioned part, and sync owns it."""
+    link = m.dashboard_root(home) / "current"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    tmp = link.with_name(link.name + ".tmp-new")
+    if tmp.is_symlink() or tmp.exists():
+        tmp.unlink()
+    tmp.symlink_to(m.dashboard_dir(home, train))
+    os.replace(tmp, link)
 
 
 # --------------------------------------------------------------------------
@@ -300,17 +373,17 @@ def apply_env_file(
     return result
 
 
-def apply_plist(
-    home: Path, service: str, *, env_vars: Mapping[str, str], dry_run: bool
-) -> bool:
+def apply_plist(home: Path, service: str, *, dry_run: bool) -> bool:
     """Plists are entirely sync-owned (unlike env files) — regenerated every
-    run, written only when content actually changed. Returns whether it
+    run, written only when content actually changed. They SOURCE the env file
+    at exec time (never bake its values, #210 review), so their content no
+    longer depends on the env file's text at all. Returns whether it
     changed."""
     rendered = m.render_plist(
         service=service,
         venv_current=m.service_current_link(home, service),
         port=m.SERVICE_PORTS[service],
-        env_vars=env_vars,
+        env_file=m.env_file_path(home, service),
         logs=m.log_dir(home),
     )
     path = m.plist_path(home, service)
@@ -364,12 +437,26 @@ def kickstart_service(runner: Runner, home: Path, service: str) -> bool:
         return False
 
 
-def check_health(runner: Runner, url: str = DEFAULT_HEALTH_URL) -> bool:
-    try:
-        runner.read(["curl", "-fsS", "--max-time", "5", url])
-        return True
-    except CommandError:
-        return False
+def check_health(
+    runner: Runner,
+    url: str = DEFAULT_HEALTH_URL,
+    *,
+    attempts: int = 30,
+    delay: float = 1.0,
+    sleep: Callable[[float], None] = time.sleep,
+) -> bool:
+    """Poll until healthy or the budget runs out. A single immediate curl
+    right after `launchctl kickstart` races uvicorn's bind and boot-migrate —
+    it declared every healthy upgrade unhealthy, auto-reverting good trains
+    and paging on good fresh installs (#210 review)."""
+    for i in range(attempts):
+        try:
+            runner.read(["curl", "-fsS", "--max-time", "5", url])
+            return True
+        except CommandError:
+            if i + 1 < attempts:
+                sleep(delay)
+    return False
 
 
 # --------------------------------------------------------------------------
@@ -404,6 +491,7 @@ def run_sync(
     runner: Runner,
     prompt: PromptFn | None = None,
     health_url: str = DEFAULT_HEALTH_URL,
+    health_sleep: Callable[[float], None] = time.sleep,
     report: Report = print,
 ) -> m.RunReport:
     started_at = _now_iso()
@@ -413,6 +501,7 @@ def run_sync(
         existing_cfg = read_stack_config(home)
         m.check_spoke_posture(requested_role=role, existing=existing_cfg)
         m.check_no_primary_env(read_existing_env_texts(home))
+        check_not_source_hub(home)
         preflight_gh_auth(runner)
         cfg = ensure_stack_config(home, existing=existing_cfg, auto=auto, dry_run=dry_run, prompt=prompt)
         instance_id = cfg.instance_id
@@ -423,14 +512,33 @@ def run_sync(
         current_trains = {svc: read_current_train(home, svc) for svc in SERVICE_ORDER}
 
         if m.is_noop(resolved_train=resolved_train, current_trains=current_trains):
+            # A no-op still health-checks (#210 review): the --auto timer's
+            # exit code is the monitoring signal, and an up-to-date spoke with
+            # a dead gateway must not report success indefinitely. One attempt
+            # only — nothing was just kickstarted, so there is no boot race to
+            # wait out; a healthy stack answers immediately.
+            noop_health = None if dry_run else check_health(
+                runner, health_url, attempts=3, sleep=health_sleep
+            )
+            unhealthy = noop_health is False
             rpt = m.RunReport(
                 train=resolved_train, role=cfg.role, instance_id=cfg.instance_id,
                 started_at=started_at, finished_at=_now_iso(), auto=auto, dry_run=dry_run,
-                noop=True, services=(), health_ok=None, outcome="noop",
-                detail="already on the resolved train — nothing to do",
+                noop=True, services=(), health_ok=noop_health,
+                outcome="needs_attention" if unhealthy else "noop",
+                detail=(
+                    "already on the resolved train, but the gateway health "
+                    "check FAILED — services may be down; check launchctl "
+                    "and the service logs (nothing was changed by sync)"
+                    if unhealthy
+                    else "already on the resolved train — nothing to do"
+                ),
             )
             write_report(home, rpt, dry_run=dry_run)
-            report(f"stack sync: already on {resolved_train}, nothing to do")
+            report(
+                f"stack sync: already on {resolved_train}, "
+                + ("but the stack is UNHEALTHY" if unhealthy else "nothing to do")
+            )
             return rpt
 
         plans = {
@@ -484,6 +592,7 @@ def run_sync(
                 tarball=dashboard_tarball_path(home, resolved_train, platform_entry),
                 dest=m.dashboard_dir(home, resolved_train),
             )
+            swap_dashboard_current(home, resolved_train)
 
         # migration-head probe BEFORE any swap.
         old_heads: dict[str, list[str] | None] = {}
@@ -515,15 +624,19 @@ def run_sync(
             )
 
         # env + plist refresh — every service, every non-noop run (spec §5
-        # step 3/4).
-        variables = env_variables(cfg, dashboard_dist=str(m.dashboard_dir(home, resolved_train)))
+        # step 3/4). The dashboard env value is the STABLE `dashboard/current`
+        # symlink, never a train-versioned path (#210 review: env files are
+        # operator-owned and never clobbered, so a versioned value would pin
+        # the UI to the install-time train forever).
+        variables = env_variables(
+            cfg, dashboard_dist=str(m.dashboard_root(home) / "current")
+        )
         env_drift: list[str] = []
         for svc in SERVICE_ORDER:
             result = apply_env_file(home, svc, variables=variables, dry_run=False)
             if result.action == "drifted":
                 env_drift.append(svc)
-            final_text = _read_optional(result.path) or result.rendered
-            apply_plist(home, svc, env_vars=m.parse_env_exports(final_text), dry_run=False)
+            apply_plist(home, svc, dry_run=False)
 
         ensure_databases(runner, report)
 
@@ -536,7 +649,7 @@ def run_sync(
                     migration_crossed=change.migration_crossed, kickstarted=ok,
                 )
 
-        health_ok = check_health(runner, health_url)
+        health_ok = check_health(runner, health_url, sleep=health_sleep)
         any_crossed = any(c.migration_crossed for c in changes if c.changed)
         revertible = all(c.previous_train is not None for c in changes if c.changed)
 
@@ -553,7 +666,7 @@ def run_sync(
                 if c.changed and c.previous_train is not None:
                     swap_current(home, c.service, m.service_venv_dir(home, c.service, c.previous_train))
                     kickstart_service(runner, home, c.service)
-            health_ok = check_health(runner, health_url)
+            health_ok = check_health(runner, health_url, sleep=health_sleep)
 
         if outcome == "ok":
             for svc in SERVICE_ORDER:
@@ -565,13 +678,27 @@ def run_sync(
 
         detail = None
         if outcome == "needs_attention":
-            crossed_services = ", ".join(c.service for c in changes if c.migration_crossed)
-            detail = (
-                "post-upgrade health check failed AND a migration crossed for "
-                f"at least one service ({crossed_services}) — NOT auto-reverted "
-                "(boot-migrate is forward-only). State left as-is; this needs a "
-                "human (re-seed protocol, replication-continuity §7)."
-            )
+            # Two distinct causes, two distinct recovery paths — never claim a
+            # migration crossed when the real reason is "nothing to revert to"
+            # (#210 review: the fabricated re-seed pointer sent a fresh-install
+            # failure down entirely the wrong runbook).
+            crossed_services = [c.service for c in changes if c.migration_crossed]
+            if crossed_services:
+                detail = (
+                    "post-upgrade health check failed AND a migration crossed "
+                    f"for: {', '.join(crossed_services)} — NOT auto-reverted "
+                    "(boot-migrate is forward-only). State left as-is; this "
+                    "needs a human (re-seed protocol, replication-continuity "
+                    "§7)."
+                )
+            else:
+                detail = (
+                    "post-upgrade health check failed and there is no previous "
+                    "train to revert to (first install of at least one "
+                    "service). No migration crossed and nothing was reverted "
+                    "or re-seeded — check launchctl and the service logs, "
+                    "then re-run sync."
+                )
         elif outcome == "reverted":
             detail = (
                 "post-upgrade health check failed, no migration crossed — "

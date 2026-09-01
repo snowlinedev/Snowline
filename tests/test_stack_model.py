@@ -266,21 +266,24 @@ def test_render_plist_execs_current_bin_uvicorn_with_no_workingdirectory():
         service="governance",
         venv_current=Path("/home/x/Library/Application Support/Snowline/venvs/governance/current"),
         port=8801,
-        env_vars={"SNOWLINE_INSTANCE_ID": "roam"},
+        env_file=Path("/home/x/.config/snowline/governance.env"),
         logs=Path("/home/x/logs"),
     )
-    assert "<string>/home/x/Library/Application Support/Snowline/venvs/governance/current/bin/uvicorn</string>" in xml
-    assert "<string>snowline_governance.app:app</string>" in xml
-    assert "<string>8801</string>" in xml
+    # sources the env file at exec time (#210 review) — never bakes values
+    assert "<string>/bin/sh</string>" in xml
+    assert "set -a; . '/home/x/.config/snowline/governance.env'; set +a; exec" in xml
+    assert "venvs/governance/current/bin/uvicorn" in xml
+    assert "snowline_governance.app:app" in xml
+    assert "--port 8801" in xml
     assert "<key>WorkingDirectory</key>" not in xml
-    assert "SNOWLINE_INSTANCE_ID" in xml and "roam" in xml
+    assert "<key>EnvironmentVariables</key>" not in xml
     assert "dev.snowline.governance" in xml
 
 
 def test_render_plist_rejects_unknown_service():
     from pathlib import Path
     with pytest.raises(m.StackError, match="no ASGI target"):
-        m.render_plist(service="musher", venv_current=Path("/x"), port=1, env_vars={}, logs=Path("/l"))
+        m.render_plist(service="musher", venv_current=Path("/x"), port=1, env_file=Path("/e"), logs=Path("/l"))
 
 
 def test_gui_target_shape():
@@ -357,3 +360,17 @@ def test_run_report_round_trips_service_changes_through_json():
     assert data["auto"] is True
     assert data["services"][0]["kickstarted"] is True
     assert data["services"][0]["migration_crossed"] is False
+
+
+def test_parse_env_exports_strips_unquoted_inline_comments():
+    """`export SNOWLINE_INSTANCE_ID=primary # hub` must parse as 'primary' —
+    keeping the comment text let a commented primary declaration slip past
+    the spoke-only guard (#210 review). Quoted values keep their content."""
+    parsed = m.parse_env_exports(
+        "export SNOWLINE_INSTANCE_ID=primary # the hub\n"
+        'export SNOWLINE_PM_ROLE="spoke"  # quoted\n'
+        "export KEEP_HASH='a#b'\n"
+    )
+    assert parsed["SNOWLINE_INSTANCE_ID"] == "primary"
+    assert parsed["SNOWLINE_PM_ROLE"] == "spoke"
+    assert parsed["KEEP_HASH"] == "a#b"

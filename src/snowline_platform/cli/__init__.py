@@ -226,7 +226,9 @@ def _cmd_stack_sync(args) -> int:
         auto=args.auto,
         dry_run=args.dry_run,
         runner=runner,
-        prompt=(None if args.auto else input),
+        # tty_prompt, not input: the documented `curl … | sh` flow leaves
+        # stdin at EOF, so the first-run prompt must read /dev/tty (#210).
+        prompt=(None if args.auto else stack_lib.tty_prompt),
         health_url=args.health_url,
         report=print,
     )
