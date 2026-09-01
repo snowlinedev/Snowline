@@ -46,6 +46,16 @@
 #   ops/hub/tailscale-serve.sh --reset  # tear down ALL `tailscale serve` config
 set -euo pipefail
 
+# The macOS GUI app does not put `tailscale` on PATH; its CLI lives inside the
+# app bundle and MUST be invoked by its real path (a symlink trips the app's
+# bundle-identifier check and aborts). Honor an explicit override first.
+if command -v tailscale >/dev/null 2>&1; then
+  TAILSCALE="${TAILSCALE_BIN:-tailscale}"
+else
+  TAILSCALE="${TAILSCALE_BIN:-/Applications/Tailscale.app/Contents/MacOS/Tailscale}"
+fi
+tailscale() { "$TAILSCALE" "$@"; }
+
 BACKEND_HOST="${SNOWLINE_HUB_BACKEND_HOST:-$(tailscale ip -4)}"
 BACKEND_PORT="${SNOWLINE_HUB_PLATFORM_PORT:-8850}"
 BACKEND="http://${BACKEND_HOST}:${BACKEND_PORT}"
