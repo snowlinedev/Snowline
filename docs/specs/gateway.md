@@ -270,10 +270,17 @@ bind stays loopback/tailnet, and the gateway is the single gated front door.
 description}` sorted by prefix — answering "what does the gateway root serve,
 and who answers it".
 
-**Deploy order.** `PluginManifest` forbids unknown keys, so a manifest carrying
-`http` is a 422 against a platform that predates this revision: **the platform
-deploys first**, then the plugin declares its surface. Within a packaged release
-train the two ship together, and the ordering is the train's.
+**Deploy order.** `PluginManifest` TOLERATES unknown top-level keys (only its
+nested blocks are `extra="forbid"`), so a manifest carrying `http` registers
+fine against a platform that predates this revision — and is **silently
+unproxied**: registration succeeds, `GET /plugins/http-routes` is empty, and a
+consumer pointed at the gateway root gets the ordinary 404. That is the N−1
+posture (an older platform must not refuse a newer plugin), but it means the
+gate is operational, not fail-loud: **the platform deploys first**, and an
+operator wiring a consumer to the gateway checks `/plugins/http-routes` lists
+the prefix. The plugin's SDK pin must also be at or past this revision, or its
+heartbeat reads a collision 409 as success. Within a packaged release train
+the pieces ship together, and the ordering is the train's.
 
 ## 4. Health-aware routing
 
