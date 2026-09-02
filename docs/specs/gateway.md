@@ -138,6 +138,143 @@ plugin's route. The **shadow UI is a separately-mounted module** — UX isolatio
 mirrors the MCP isolation (a human can't act on live decisions from the shadow
 view).
 
+## 3a. Plugin HTTP surfaces (proxying beyond MCP + ui)
+
+A plugin may serve contracts that are neither MCP tools nor shell views — an
+ordinary HTTP API another program consumes. The motivating one: the PM plugin
+serves musher's **work-item provider contract** (`GET /provider/work-items`,
+`GET /provider/work-items/{id}`, `POST /provider/work-items/{id}/dispatched`).
+Without gateway support, musher's `MUSHER_PROVIDER_URL` must point at the pm
+process's own port — so the address breaks whenever pm moves port or host, and
+the contract sits outside the platform's trust gate. The `http` manifest block
+closes that gap: **the gateway proxies declared plain-HTTP prefixes at its own
+root**, so `MUSHER_PROVIDER_URL` is the gateway base URL and stays true across
+plugin redeploys.
+
+**Vocabulary.** A manifest may declare `http: [{prefix, methods, description}]`:
+
+```json
+{"name": "pm", "base_url": "http://127.0.0.1:8802",
+ "http": [{"prefix": "/provider", "methods": ["GET", "POST"],
+           "description": "musher work-item provider contract"}]}
+```
+
+- `prefix` — a **root-level** path prefix of one or more LITERAL segments. No
+  `{param}` segments (a prefix is matched, never templated), no `..`/`.`, no
+  trailing slash, no empty segment.
+- `methods` — the uppercase methods the gateway forwards under the prefix; one
+  of `GET`/`POST`/`PUT`/`PATCH`/`DELETE`. Defaults to `["GET"]`. Anything else
+  is a 422 at registration: the gateway would never forward it, so it is an
+  authoring error, not a fail-visible degradation.
+- Two prefixes in ONE manifest may not collide — equal, or one containing the
+  other (`/provider` + `/provider/x`). Longest-prefix *would* resolve the
+  nesting, but the two surfaces' `methods` then silently disagree about the
+  same request.
+
+**Root-level, verbatim.** Unlike `/ui-api/<plugin>/<path>` (§5), which
+namespaces by plugin and fixes the upstream prefix, the public path here **is**
+the plugin path: `GET /provider/work-items` on the gateway becomes `GET
+<base_url>/provider/work-items` upstream — the raw, still-percent-encoded path
+(so `%2F`/`%23`/`%25` in an identifier survive), a trailing slash if one was
+sent, and the query string as raw bytes (every value of a repeated key). A
+`base_url` with its own path keeps it; a `base_url` carrying a query or
+fragment is refused at registration (it would swallow the appended path).
+That is the point — an unmodified consumer talks to the gateway exactly as it
+would talk to the plugin. Matching is **segment-aligned**: `/providerx` does
+not match `/provider`. Nothing is normalized: a path with a `.`/`..` segment or
+an empty interior segment is simply not the proxy's (404) — the `/ui-api`
+lesson that a normalized path can match one prefix and land on another.
+
+**Reserved prefixes.** Because prefixes are root-level, they share a namespace
+with the platform's own routes. A prefix whose first segment is one the
+platform serves — the MCP surface mounts (`/mcp`, `/<surface>/mcp`,
+`/platform/mcp`), `/ui`, `/ui-api`, `/plugins`, `/scopes`, `/milestones`,
+`/surfaces`, `/replication`, `/replication-admin`, `/health`, `/whoami`,
+`/events`, and FastAPI's own docs routes — is refused. Two lines of defense:
+the STATIC set `manifest.RESERVED_HTTP_PREFIXES` refuses at validation (422)
+and is kept honest by a test that walks the built app's routes; and the
+registry holds the LIVE set — every top-level segment the built app actually
+routes, config-named surfaces included (`SNOWLINE_SURFACES=…,ops` mounts
+`/ops/mcp`) — handed over by `create_app` after the last mount, and refuses
+at upsert (409, holder `platform`). A surface that exists only in config can
+therefore never be half-shadowed by a plugin prefix.
+
+**Registration-time collision refusal — loud.** A prefix that collides with one
+held by a **different** registered plugin (equal, or either containing the
+other) is refused: `POST /plugins` answers **409** naming the prefix and the
+holding plugin, and the platform logs a WARNING. The registry owns this
+invariant, not the route — it is the only place the whole plugin set is visible
+under one lock. The refused plugin's registration heartbeat (issue #39) re-POSTs
+every beat, so the WARNING **repeating** is the operator-visible signal that two
+plugins contend for one prefix — the same loudness posture as the
+manifest-REPLACED warning. The SDK heartbeat treats the 409 as what it is — a
+REFUSAL, logged at WARNING every beat, never "already registered" (the
+register verb is an upsert; 409 has no other meaning) — so a refused plugin
+never reports itself confirmed. The same plugin re-registering is always fine:
+a heartbeat is `unchanged`, and a redeploy that re-shapes its OWN prefixes is
+`updated`.
+
+**Per-request proxying.** The proxy is wired as the router's **fallback**, not
+as a catch-all route: it is reached only after every platform route failed to
+match *and* after Starlette's redirect-slashes pass (so `GET /mcp` still 307s to
+its mount — a literal `/{path:path}` route would match `/mcp` and silently break
+every MCP client). A path no plugin claims falls through to the app's ordinary
+404.
+
+- **Headers are a denylist** (the reverse-proxy norm), in both directions.
+  Stripped on the way up: hop-by-hop headers, `host` (the upstream sees its
+  own; the gateway's rides in `X-Forwarded-Host`), request `content-length`
+  (recomputed from the buffered body), the caller's platform credentials and
+  cookies (`authorization`, `cookie`), and any forwarding headers a caller
+  invented — the gateway sets its own `X-Forwarded-For` (the direct peer),
+  `X-Forwarded-Host`, `X-Forwarded-Proto` and `X-Snowline-Gateway: 1`. A
+  caller that sends no `accept-encoding` gets `identity` upstream (httpx
+  would otherwise volunteer compression the caller never asked for).
+  Everything else passes — a whitelist would silently disable the
+  mechanisms a contract consumer relies on (`If-None-Match`/`If-Match`,
+  `Idempotency-Key`, `Retry-After`, `Vary`). Stripped on the way back:
+  hop-by-hop, `server`/`date` (uvicorn's), and `set-cookie` (a plugin session
+  must never be set on the gateway origin).
+- **Redirects stay behind the gateway**: an absolute `Location` /
+  `Content-Location` at the plugin's own `base_url` (Starlette's
+  redirect-slashes and `url_for` build those from the host the upstream saw)
+  is rewritten to the gateway origin; relative and external values pass.
+- **The response is streamed**, not buffered — relayed as raw bytes as it
+  arrives, so `content-encoding`/`content-length` stay truthful and a
+  long-poll or event stream neither pins gateway memory nor delays first
+  byte to EOF. The per-read upstream timeout is 60 s (a contract write that
+  takes longer than a widget read must not come back "unreachable" after it
+  applied); connect stays `/ui-api`'s 10 s.
+- The request body is buffered with the same 64 KiB cap `/ui-api` POSTs use
+  (413 past it, enforced on the actual bytes, never on a Content-Length that
+  can lie).
+- A method not in the surface's `methods` → **405** with `Allow`, without a
+  round-trip. A path that cannot be expressed as an upstream URL → **400**.
+- An `httpx.HTTPError` → **502**, with the same log shape `/ui-api` uses.
+- **No retry.** A connect failure is a straight 502, exactly as `/ui-api` does.
+  Connect-phase retry (`deploy-continuity.md` §3) is the MCP gateway's concern,
+  where a redeploy mid-tool-call is invisible to the agent; an HTTP consumer
+  sees the status code and owns its own retry policy.
+
+**Health route-around** (§4): a plugin whose registry status is `down`
+short-circuits to **503** without a network round-trip; `unknown`/`up` proceed —
+the same routability rule `/ui-api` and `discover_upstreams` apply.
+
+**Trust posture.** Proxied paths are **not** exempt from the trust middleware
+(only `/health` is): an untrusted peer gets the tailnet CIDR gate's 403 before
+the router runs. The gateway does not make a plugin public — the plugin's own
+bind stays loopback/tailnet, and the gateway is the single gated front door.
+
+**Introspection.** Each entry's `http` block rides `GET /plugins`; `GET
+/plugins/http-routes` is the flat operator view — `{prefix, methods, plugin,
+description}` sorted by prefix — answering "what does the gateway root serve,
+and who answers it".
+
+**Deploy order.** `PluginManifest` forbids unknown keys, so a manifest carrying
+`http` is a 422 against a platform that predates this revision: **the platform
+deploys first**, then the plugin declares its surface. Within a packaged release
+train the two ship together, and the ordering is the train's.
+
 ## 4. Health-aware routing
 
 The gateway consults registry **status** (set by the health checker): it does not
@@ -160,6 +297,9 @@ just a different URL.
 - A real-write tool a plugin maps only to `main` is provably **absent** from
   `shadow`.
 - Unknown/unregistered route → 404; a `down` plugin → route-around, not a hang.
+- A plugin's declared `http` prefix is served at the gateway root and reaches the
+  plugin unmodified; a second plugin claiming a colliding prefix is refused with
+  a 409; a platform route is never shadowed by a declared prefix.
 
 ## 7. Open / deferred
 

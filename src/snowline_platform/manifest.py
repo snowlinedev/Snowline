@@ -7,6 +7,8 @@ health-check it. The platform never imports plugin code; it routes to `base_url`
 
 from __future__ import annotations
 
+import httpx
+
 import re
 from typing import Literal
 from urllib.parse import urlsplit
@@ -472,6 +474,181 @@ class UIBlock(BaseModel):
         return v
 
 
+
+# --- HTTP surfaces (gateway.md §3a) ----------------------------------------
+#
+# A plugin's optional declaration that it serves a PLAIN-HTTP contract the
+# gateway should proxy at the platform root — the vocabulary beyond MCP and
+# `ui`. The motivating consumer is musher's work-item provider contract
+# (`/provider/work-items…`, served by the pm plugin): with a declared `http`
+# surface, `MUSHER_PROVIDER_URL` points at the GATEWAY, not at the plugin's
+# own port, so the address survives a plugin redeploy/move and rides the same
+# tailnet trust gate as every other platform route.
+#
+# Unlike `ui`'s `/ui-api/<plugin>/…` namespacing, an http surface's prefix is
+# ROOT-LEVEL and public: the path the client sends is the path the plugin
+# serves, byte for byte. That makes prefixes a SHARED namespace — hence the
+# reserved set below, the within-manifest overlap rules here, and the
+# cross-plugin collision refusal in `registry.upsert`.
+
+# The top-level path segments the platform app itself serves — a plugin may
+# not claim any of them, or its surface would be a route nobody can reach
+# (the catch-all proxy is registered LAST, so a platform route always wins)
+# and an operator would be left debugging a silent shadow.
+#
+# ONE constant, kept honest by a test that walks the BUILT app's routes and
+# asserts every top-level first segment appears here
+# (tests/test_http_proxy.py::test_reserved_prefixes_cover_every_app_route) —
+# so a future platform route can't be added without either reserving it or
+# consciously deciding not to.
+#
+# `shadow` is here because named MCP surfaces mount at `/<surface>/mcp` and
+# `config.DEFAULT_SURFACES` is "main,shadow" (the ROOT_SURFACE `main` mounts
+# at the bare `/mcp`). A non-default `SNOWLINE_SURFACES` name is NOT
+# statically reserved — an operator adding a surface should add it here too;
+# routing itself is safe regardless, since surface mounts precede the
+# catch-all.
+RESERVED_HTTP_PREFIXES: frozenset[str] = frozenset(
+    {
+        # MCP: the root surface, the default named surface, the platform's own
+        # tool app.
+        "mcp",
+        "shadow",
+        "platform",
+        # The dashboard shell and its data proxy (ui-shell.md §5–§6).
+        "ui",
+        "ui-api",
+        # Platform JSON routers.
+        "plugins",
+        "scopes",
+        "milestones",
+        "surfaces",
+        "replication",
+        "replication-admin",
+        # Bare app routes.
+        "health",
+        "whoami",
+        # FastAPI's own docs routes.
+        "docs",
+        "redoc",
+        "openapi.json",
+        # Reserved ahead of use: the event surface the platform would serve
+        # under its own name (today replication events live under
+        # `/replication/events/…`).
+        "events",
+    }
+)
+
+# The methods the gateway proxy is wired for. A declared method outside this
+# set is a manifest error, not a fail-visible degradation: the gateway would
+# never forward it, so the plugin's route would be dead on arrival.
+HTTP_SURFACE_METHODS: frozenset[str] = frozenset(
+    {"GET", "POST", "PUT", "PATCH", "DELETE"}
+)
+
+
+def http_prefix_matches(prefix: str, path: str) -> bool:
+    """Does `path` fall under `prefix`? Segment-aligned on purpose:
+    `/providerx` does NOT match `/provider`, only `/provider` itself and
+    anything under `/provider/`."""
+    return path == prefix or path.startswith(prefix + "/")
+
+
+def http_prefixes_collide(a: str, b: str) -> bool:
+    """Two prefixes collide when they are equal OR one contains the other
+    (`/provider` vs `/provider/x`) — in either case a request path could be
+    served by both declarations, and "both" has no defensible answer."""
+    return http_prefix_matches(a, b) or http_prefix_matches(b, a)
+
+
+def _valid_http_prefix(prefix: str) -> str:
+    if not prefix.startswith("/"):
+        raise ValueError(f"http prefix {prefix!r} must start with '/'")
+    if prefix == "/":
+        raise ValueError(
+            "http prefix '/' would claim the entire gateway root — declare at "
+            "least one path segment"
+        )
+    if prefix.endswith("/"):
+        raise ValueError(f"http prefix {prefix!r} must not end with a trailing '/'")
+    segments = prefix[1:].split("/")
+    for segment in segments:
+        if not segment:
+            raise ValueError(
+                f"http prefix {prefix!r} has an empty path segment (a stray '//')"
+            )
+        if "{" in segment or "}" in segment:
+            raise ValueError(
+                f"http prefix {prefix!r} has a '{{param}}' segment {segment!r} — a "
+                "prefix is LITERAL: it is matched against request paths, never "
+                "templated"
+            )
+        if segment in {".", ".."}:
+            raise ValueError(
+                f"http prefix {prefix!r} contains a '.'/'..' segment — the proxy "
+                "refuses dot-segment paths outright (they fall through to 404), "
+                "so this prefix could never be reached"
+            )
+        if not _ROUTE_LITERAL_RE.match(segment):
+            raise ValueError(
+                f"http prefix {prefix!r} has an invalid path segment {segment!r}"
+            )
+    if segments[0] in RESERVED_HTTP_PREFIXES:
+        raise ValueError(
+            f"http prefix {prefix!r} starts with reserved segment "
+            f"{segments[0]!r} — the platform serves that path itself "
+            f"(gateway.md §3a); reserved: {sorted(RESERVED_HTTP_PREFIXES)}"
+        )
+    return prefix
+
+
+class HttpSurface(BaseModel):
+    """One plain-HTTP contract this plugin serves, proxied by the gateway at
+    the platform ROOT (gateway.md §3a).
+
+    `extra="forbid"` — same fail-loud posture as `UIBlock`/`ReplicationBlock`:
+    a typo'd key rejects the manifest rather than silently registering a
+    surface that behaves differently than declared.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    prefix: str = Field(
+        description="root-level public path prefix, e.g. '/provider'. Literal "
+        "segments only; the public path IS the plugin path (no rewriting), so "
+        "the plugin must serve the SAME path it declares here"
+    )
+    methods: list[str] = Field(
+        default_factory=lambda: ["GET"],
+        description="the uppercase HTTP methods the gateway forwards under "
+        "this prefix; anything else 405s at the gateway without a round-trip",
+    )
+    description: str | None = Field(
+        default=None, description="human note — what contract this prefix serves"
+    )
+
+    _valid_prefix = field_validator("prefix")(_valid_http_prefix)
+
+    @field_validator("methods")
+    @classmethod
+    def _valid_methods(cls, v: list[str]) -> list[str]:
+        if not v:
+            raise ValueError(
+                "http surface declares no methods — an empty list is a surface "
+                "the gateway would never forward anything to"
+            )
+        unknown = [m for m in v if m not in HTTP_SURFACE_METHODS]
+        if unknown:
+            raise ValueError(
+                f"unsupported http method(s) {unknown!r} — the gateway proxy "
+                f"forwards {sorted(HTTP_SURFACE_METHODS)} (uppercase)"
+            )
+        dupes = sorted({m for m in v if v.count(m) > 1})
+        if dupes:
+            raise ValueError(f"duplicate http method(s): {dupes!r}")
+        return v
+
+
 # --- Replication block (replication-continuity.md §4/§9 item 2) -----------
 #
 # The registry stores this block; nothing else reads it. Gateway and health
@@ -588,6 +765,13 @@ class PluginManifest(BaseModel):
         description="optional declarative widget/page contributions (ui-shell.md "
         "§3); None for a headless plugin with no shell contributions",
     )
+    http: list[HttpSurface] = Field(
+        default_factory=list,
+        description="optional plain-HTTP contracts the gateway proxies at the "
+        "platform root (gateway.md §3a), e.g. [{'prefix': '/provider', "
+        "'methods': ['GET', 'POST']}]. Empty = the plugin serves nothing over "
+        "the gateway but MCP/ui",
+    )
     replication: ReplicationBlock | None = Field(
         default=None,
         description="optional replication contract declaration "
@@ -595,6 +779,27 @@ class PluginManifest(BaseModel):
         "gateway and health checker never read it. None if the plugin does "
         "not participate in replication",
     )
+
+    @field_validator("http")
+    @classmethod
+    def _no_overlapping_http_prefixes(cls, v: list[HttpSurface]) -> list[HttpSurface]:
+        """Within ONE manifest, no two prefixes may collide — equal, or one
+        containing the other. Nesting (`/provider` + `/provider/x`) is rejected
+        rather than resolved by longest-prefix: the resolver WOULD pick the
+        deeper one, but then the two surfaces' `methods` lists silently
+        disagree about the same request, which is an authoring mistake worth a
+        422. (Across plugins the same collision rule is enforced at
+        registration by `PluginRegistry.upsert` — there it's a 409, because
+        the manifest itself is fine and the CONFLICT is with someone else.)"""
+        for i, surface in enumerate(v):
+            for other in v[i + 1 :]:
+                if http_prefixes_collide(surface.prefix, other.prefix):
+                    raise ValueError(
+                        f"http prefixes {surface.prefix!r} and {other.prefix!r} "
+                        "overlap within this manifest — a request path could "
+                        "match both"
+                    )
+        return v
 
     @field_validator("surfaces")
     @classmethod
@@ -631,4 +836,18 @@ class PluginManifest(BaseModel):
     def _valid_base_url(cls, v: str) -> str:
         if not (v.startswith("http://") or v.startswith("https://")):
             raise ValueError(f"base_url {v!r} must start with http:// or https://")
+        # Every proxy appends a plugin path to base_url; a query or fragment
+        # would swallow that path (`?x=1/provider/…` lands on the plugin's
+        # root, `#f/provider/…` drops it entirely). Refuse at registration.
+        try:
+            parsed = httpx.URL(v)
+        except httpx.InvalidURL as exc:
+            raise ValueError(f"base_url {v!r} is not a valid URL: {exc}") from exc
+        if not parsed.host:
+            raise ValueError(f"base_url {v!r} has no host")
+        if parsed.query or parsed.fragment:
+            raise ValueError(
+                f"base_url {v!r} must not carry a query or fragment — the "
+                "gateway appends plugin paths to it"
+            )
         return v.rstrip("/")

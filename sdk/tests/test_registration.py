@@ -66,12 +66,17 @@ def test_register_posts_to_the_plugins_endpoint():
     assert captured["json"] == MANIFEST
 
 
-def test_register_idempotent_on_conflict():
-    # A legacy (pre-upsert) platform returns 409 — treated as success.
+def test_register_treats_conflict_as_refusal():
+    # 409 is a REFUSAL (an http prefix another plugin holds, gateway.md §3a),
+    # never "already registered" — the platform's register is an upsert. The
+    # heartbeat keeps retrying (loudly), and never reports itself confirmed.
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(409, json={"detail": "already registered"})
+        return httpx.Response(
+            409,
+            json={"detail": "http prefix '/provider' collides with '/provider', already held by plugin 'pm'"},
+        )
 
-    assert _register(handler) is True
+    assert _register(handler) is False
 
 
 def test_register_best_effort_when_platform_down():
