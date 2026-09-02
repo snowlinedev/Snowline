@@ -15,6 +15,7 @@ from fastapi import APIRouter, HTTPException, Request, Response, status
 
 from snowline_platform.manifest import PluginManifest
 from snowline_platform.registry import (
+    HttpPrefixConflict,
     PluginNotFound,
     PluginRegistry,
     RegisteredPlugin,
@@ -65,7 +66,25 @@ async def register_plugin(
     its health status; a changed manifest replaces it — a redeploy that moved or
     re-shaped a plugin takes effect without an unregister)."""
     _reject_reserved_name(manifest.name)
-    entry, outcome = _registry(request).upsert(manifest)
+    try:
+        entry, outcome = _registry(request).upsert(manifest)
+    except HttpPrefixConflict as conflict:
+        # Root-level http prefixes are a cross-plugin shared namespace
+        # (gateway.md §3a), so a collision is refused rather than resolved.
+        # Loud on purpose, exactly like the manifest-REPLACED warning below:
+        # the refusing plugin's registration heartbeat re-POSTs every beat, so
+        # this line REPEATING is the operator-visible signal that two plugins
+        # are contending for one prefix — a single 409 to a process that then
+        # keeps quietly running would be easy to miss.
+        log.warning(
+            "plugin %r registration REFUSED: http prefix %s collides with %s "
+            "held by plugin %r — one of the two manifests must change",
+            manifest.name,
+            conflict.prefix,
+            conflict.holder_prefix,
+            conflict.holder,
+        )
+        raise HTTPException(status.HTTP_409_CONFLICT, str(conflict)) from None
     if outcome == "created":
         log.info("plugin %r registered (base_url %s)", manifest.name, manifest.base_url)
     else:
@@ -87,6 +106,30 @@ async def register_plugin(
 @router.get("")
 async def list_plugins(request: Request) -> dict:
     return {"plugins": [_entry_dict(e) for e in _registry(request).list()]}
+
+
+@router.get("/http-routes")
+async def list_http_routes(request: Request) -> dict:
+    """The proxied plain-HTTP surface map (gateway.md §3a) — every declared
+    prefix, the methods the gateway forwards under it, and the plugin that
+    holds it, sorted by prefix.
+
+    The same facts are already in each entry's `manifest.http` from
+    `GET /plugins`; this is the FLAT operator view — "what does the gateway
+    root serve, and who answers it" — which is the question you actually have
+    when a proxied path 404s. Registered ahead of `DELETE /{name}` only for
+    reading order; the two never collide (different methods)."""
+    return {
+        "routes": [
+            {
+                "prefix": surface.prefix,
+                "methods": list(surface.methods),
+                "plugin": name,
+                "description": surface.description,
+            }
+            for name, surface in _registry(request).http_routes()
+        ]
+    }
 
 
 @router.delete("/{name}", status_code=status.HTTP_204_NO_CONTENT)

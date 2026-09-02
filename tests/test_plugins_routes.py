@@ -244,3 +244,88 @@ def test_replication_block_unknown_top_level_field_is_422():
         }
     }
     assert client.post("/plugins", json=bad).status_code == 422
+
+
+# --- the `http` block over the route (gateway.md §3a) ------------------------
+
+
+_PM = {
+    "name": "pm",
+    "base_url": "http://127.0.0.1:8802",
+    "http": [
+        {
+            "prefix": "/provider",
+            "methods": ["GET", "POST"],
+            "description": "musher work-item provider contract",
+        }
+    ],
+}
+
+
+def test_register_with_http_block_and_introspect_it():
+    client = _trusted_client()
+    r = client.post("/plugins", json=_PM)
+    assert r.status_code == 201, r.text
+    assert r.json()["manifest"]["http"] == [
+        {
+            "prefix": "/provider",
+            "methods": ["GET", "POST"],
+            "description": "musher work-item provider contract",
+        }
+    ]
+    # The block rides GET /plugins too...
+    listed = {p["name"]: p for p in client.get("/plugins").json()["plugins"]}
+    assert listed["pm"]["manifest"]["http"][0]["prefix"] == "/provider"
+    # ...and the flat operator view names the holder.
+    assert client.get("/plugins/http-routes").json() == {
+        "routes": [
+            {
+                "prefix": "/provider",
+                "methods": ["GET", "POST"],
+                "plugin": "pm",
+                "description": "musher work-item provider contract",
+            }
+        ]
+    }
+
+
+def test_http_prefix_collision_is_409_naming_the_holder():
+    client = _trusted_client()
+    assert client.post("/plugins", json=_PM).status_code == 201
+    impostor = {
+        "name": "impostor",
+        "base_url": "http://127.0.0.1:9999",
+        # Nested under pm's prefix — collision, not a distinct surface.
+        "http": [{"prefix": "/provider/work-items"}],
+    }
+    r = client.post("/plugins", json=impostor)
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert "/provider/work-items" in detail and "'pm'" in detail
+    # The refusal is total: the impostor never joined the registry.
+    assert "impostor" not in {
+        p["name"] for p in client.get("/plugins").json()["plugins"]
+    }
+
+
+def test_holder_heartbeat_is_unaffected_by_a_refused_collision():
+    client = _trusted_client()
+    assert client.post("/plugins", json=_PM).status_code == 201
+    other = {"name": "other", "base_url": "http://x:1", "http": [{"prefix": "/provider"}]}
+    assert client.post("/plugins", json=other).status_code == 409
+    # The holder keeps beating normally — a refused challenger must not
+    # disturb the incumbent's registration.
+    r = client.post("/plugins", json=_PM)
+    assert r.status_code == 200, r.text
+    assert r.json()["outcome"] == "unchanged"
+
+
+def test_reserved_http_prefix_is_422_at_the_route():
+    client = _trusted_client()
+    bad = _PM | {"name": "pm", "http": [{"prefix": "/plugins"}]}
+    assert client.post("/plugins", json=bad).status_code == 422
+
+
+def test_http_routes_is_empty_when_no_plugin_declares_one():
+    client = _trusted_client()
+    assert client.get("/plugins/http-routes").json() == {"routes": []}

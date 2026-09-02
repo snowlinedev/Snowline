@@ -16,7 +16,12 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Literal
 
-from snowline_platform.manifest import PluginManifest
+from snowline_platform.manifest import (
+    HttpSurface,
+    PluginManifest,
+    http_prefix_matches,
+    http_prefixes_collide,
+)
 
 UpsertOutcome = Literal["created", "unchanged", "updated"]
 
@@ -35,6 +40,27 @@ class RegisteredPlugin:
 
 class PluginNotFound(Exception):
     """No plugin is registered under this name."""
+
+
+class HttpPrefixConflict(Exception):
+    """A manifest declared an `http` prefix another plugin already holds
+    (gateway.md §3a).
+
+    Root-level http prefixes are a SHARED namespace across plugins, so the
+    registry owns the invariant: two plugins can never hold colliding
+    prefixes. Carries the offending `prefix` and the `holder` (and the
+    conflicting prefix the holder declared, when it is a containment rather
+    than an exact match) so the route can name both in its 409 and its
+    WARNING."""
+
+    def __init__(self, prefix: str, holder: str, holder_prefix: str) -> None:
+        self.prefix = prefix
+        self.holder = holder
+        self.holder_prefix = holder_prefix
+        super().__init__(
+            f"http prefix {prefix!r} collides with {holder_prefix!r}, already "
+            f"held by plugin {holder!r}"
+        )
 
 
 class PluginRegistry:
@@ -62,9 +88,66 @@ class PluginRegistry:
             existing = self._plugins.get(manifest.name)
             if existing is not None and existing.manifest == manifest:
                 return existing, "unchanged"
+            # The registry owns the http-prefix invariant (gateway.md §3a):
+            # a prefix is a ROOT-LEVEL, cross-plugin-shared namespace, so it
+            # is checked HERE — where the whole plugin set is visible and the
+            # write is serialized under the lock — not in the route. The
+            # plugin's OWN prefixes are excluded from the comparison, so a
+            # heartbeat re-POST and a redeploy that re-shapes its own
+            # prefixes both pass; only another plugin's claim refuses.
+            self._assert_http_prefixes_free(manifest)
             entry = RegisteredPlugin(manifest=manifest)
             self._plugins[manifest.name] = entry
             return entry, ("updated" if existing is not None else "created")
+
+    def _assert_http_prefixes_free(self, manifest: PluginManifest) -> None:
+        """Raise `HttpPrefixConflict` if any of `manifest`'s http prefixes
+        collides with one held by a DIFFERENT registered plugin. Callers hold
+        `self._lock`."""
+        for surface in manifest.http:
+            for name, entry in self._plugins.items():
+                if name == manifest.name:
+                    continue
+                for held in entry.manifest.http:
+                    if http_prefixes_collide(surface.prefix, held.prefix):
+                        raise HttpPrefixConflict(
+                            surface.prefix, name, held.prefix
+                        )
+
+    def http_route(self, path: str) -> tuple[RegisteredPlugin, HttpSurface] | None:
+        """Resolve a request path to the plugin + surface that serves it, by
+        LONGEST declared prefix.
+
+        Collisions are refused at registration, so in practice at most one
+        prefix ever matches a given path — longest-match is nonetheless the
+        stated rule, so resolution stays defined (and testable) rather than
+        dependent on registry iteration order. Matching is segment-aligned
+        (`http_prefix_matches`): `/providerx` does not match `/provider`.
+        `None` when no plugin declared a prefix covering `path`."""
+        best: tuple[RegisteredPlugin, HttpSurface] | None = None
+        best_len = -1
+        with self._lock:
+            for entry in self._plugins.values():
+                for surface in entry.manifest.http:
+                    if (
+                        http_prefix_matches(surface.prefix, path)
+                        and len(surface.prefix) > best_len
+                    ):
+                        best = (entry, surface)
+                        best_len = len(surface.prefix)
+        return best
+
+    def http_routes(self) -> list[tuple[str, HttpSurface]]:
+        """Every declared http prefix as `(plugin name, surface)`, sorted by
+        prefix — the operator's view of the proxied surface map
+        (`GET /plugins/http-routes`)."""
+        with self._lock:
+            pairs = [
+                (entry.manifest.name, surface)
+                for entry in self._plugins.values()
+                for surface in entry.manifest.http
+            ]
+        return sorted(pairs, key=lambda pair: pair[1].prefix)
 
     def unregister(self, name: str) -> None:
         with self._lock:

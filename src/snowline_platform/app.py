@@ -21,6 +21,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from snowline_platform import (
     config,
+    http_proxy,
     milestones_routes,
     platform_tools,
     plugins_routes,
@@ -330,6 +331,19 @@ def create_app(
                 headers=_NO_CACHE,
             )
         return FileResponse(index, headers=_NO_CACHE)
+
+    # The plain-HTTP plugin proxy (gateway.md §3a), wired as the router's
+    # FALLBACK rather than as a catch-all route. Starlette calls `default`
+    # only after every route failed to match AND after its redirect-slashes
+    # pass, so: platform routes always win (a plugin prefix can never shadow
+    # one — RESERVED_HTTP_PREFIXES refuses such a prefix at registration too,
+    # making that two independent lines of defense); `GET /mcp` still 307s to
+    # the `/mcp/` mount, which a literal `/{path:path}` route would have
+    # matched and silently broken for every MCP client; and a path no plugin
+    # claims falls through to the ORIGINAL default, keeping the app's existing
+    # 404 shape. Wrapped LAST in create_app so it composes over whatever the
+    # router's default is by then.
+    app.router.default = http_proxy.PluginHttpProxy(app.router.default)
 
     return app
 

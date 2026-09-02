@@ -472,3 +472,114 @@ def test_unknown_action_field_kind_registers_ok():
         {"pages": [_page(actions=[_action(fields=[{"name": "x", "kind": "wat"}])])]}
     )
     assert m.ui.pages[0].actions[0].fields[0].kind == "wat"
+
+
+# --- the `http` block (gateway.md §3a) --------------------------------------
+#
+# Unlike `ui`, an http surface's prefix is a ROOT-LEVEL, cross-plugin-shared
+# path claim, so validation is strict and fail-loud throughout: every reject
+# case below is a 422 at registration, none of them degrade at request time.
+
+
+def _http_manifest(*http) -> PluginManifest:
+    return PluginManifest(
+        name="pm", base_url="http://127.0.0.1:8802", http=list(http)
+    )
+
+
+def test_http_block_defaults_to_empty():
+    m = PluginManifest(name="pm", base_url="http://127.0.0.1:8802")
+    assert m.http == []
+
+
+def test_http_surface_accepts_a_literal_prefix_and_defaults_to_get():
+    m = _http_manifest({"prefix": "/provider"})
+    assert m.http[0].prefix == "/provider"
+    assert m.http[0].methods == ["GET"]
+    assert m.http[0].description is None
+
+
+def test_http_surface_accepts_a_nested_literal_prefix_and_methods():
+    m = _http_manifest(
+        {
+            "prefix": "/provider/work-items",
+            "methods": ["GET", "POST"],
+            "description": "musher work-item provider contract",
+        }
+    )
+    assert m.http[0].prefix == "/provider/work-items"
+    assert m.http[0].methods == ["GET", "POST"]
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "provider",  # no leading slash
+        "/",  # the whole gateway root
+        "/provider/",  # trailing slash
+        "/provider//work-items",  # empty segment
+        "/provider/{id}",  # a '{param}' segment — prefixes are LITERAL
+        "/provider/..",  # dot-segment: normalized away, could never match
+        "/provider/./x",
+        "/provi der",  # invalid segment token
+    ],
+)
+def test_http_surface_rejects_malformed_prefix(prefix):
+    with pytest.raises(ValidationError):
+        _http_manifest({"prefix": prefix})
+
+
+@pytest.mark.parametrize(
+    "prefix", ["/plugins", "/ui-api/x", "/mcp", "/health", "/ui", "/platform"]
+)
+def test_http_surface_rejects_reserved_prefix(prefix):
+    # The platform serves these itself; a plugin claiming one would declare a
+    # surface nothing can reach (the catch-all is registered last).
+    with pytest.raises(ValidationError):
+        _http_manifest({"prefix": prefix})
+
+
+@pytest.mark.parametrize("methods", [[], ["get"], ["GET", "OPTIONS"], ["GET", "GET"]])
+def test_http_surface_rejects_bad_methods(methods):
+    # Empty (a surface nothing forwards to), lowercase, an unsupported verb,
+    # and a duplicate all reject — the gateway would never forward them, so
+    # this is an authoring error, not a fail-visible degradation.
+    with pytest.raises(ValidationError):
+        _http_manifest({"prefix": "/provider", "methods": methods})
+
+
+def test_http_surface_rejects_unknown_field():
+    with pytest.raises(ValidationError):
+        _http_manifest({"prefix": "/provider", "rewrite": "/x"})
+
+
+def test_http_block_rejects_duplicate_prefixes():
+    with pytest.raises(ValidationError):
+        _http_manifest({"prefix": "/provider"}, {"prefix": "/provider"})
+
+
+@pytest.mark.parametrize(
+    "pair",
+    [
+        ("/provider", "/provider/work-items"),
+        ("/provider/work-items", "/provider"),
+    ],
+)
+def test_http_block_rejects_nested_prefixes_in_either_order(pair):
+    # Nesting within ONE manifest is ambiguous: longest-prefix WOULD resolve
+    # it, but the two surfaces' `methods` then silently disagree about the
+    # same request.
+    with pytest.raises(ValidationError):
+        _http_manifest({"prefix": pair[0]}, {"prefix": pair[1]})
+
+
+def test_http_block_allows_two_disjoint_prefixes():
+    m = _http_manifest({"prefix": "/provider"}, {"prefix": "/dispatch"})
+    assert [s.prefix for s in m.http] == ["/provider", "/dispatch"]
+
+
+def test_sibling_prefixes_sharing_a_string_prefix_are_not_nested():
+    # Segment alignment, at the manifest level: '/providerx' is not under
+    # '/provider', so declaring both is legal.
+    m = _http_manifest({"prefix": "/provider"}, {"prefix": "/providerx"})
+    assert len(m.http) == 2
