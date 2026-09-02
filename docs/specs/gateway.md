@@ -171,24 +171,33 @@ plugin redeploys.
   nesting, but the two surfaces' `methods` then silently disagree about the
   same request.
 
-**Root-level, not namespaced.** Unlike `/ui-api/<plugin>/<path>` (§5), which
+**Root-level, verbatim.** Unlike `/ui-api/<plugin>/<path>` (§5), which
 namespaces by plugin and fixes the upstream prefix, the public path here **is**
 the plugin path: `GET /provider/work-items` on the gateway becomes `GET
-<base_url>/provider/work-items` upstream, query string and all. That is the
-point — an unmodified consumer talks to the gateway exactly as it would talk to
-the plugin. Matching is **segment-aligned**: `/providerx` does not match
-`/provider`.
+<base_url>/provider/work-items` upstream — the raw, still-percent-encoded path
+(so `%2F`/`%23`/`%25` in an identifier survive), a trailing slash if one was
+sent, and the query string as raw bytes (every value of a repeated key). A
+`base_url` with its own path keeps it; a `base_url` carrying a query or
+fragment is refused at registration (it would swallow the appended path).
+That is the point — an unmodified consumer talks to the gateway exactly as it
+would talk to the plugin. Matching is **segment-aligned**: `/providerx` does
+not match `/provider`. Nothing is normalized: a path with a `.`/`..` segment or
+an empty interior segment is simply not the proxy's (404) — the `/ui-api`
+lesson that a normalized path can match one prefix and land on another.
 
 **Reserved prefixes.** Because prefixes are root-level, they share a namespace
 with the platform's own routes. A prefix whose first segment is one the
 platform serves — the MCP surface mounts (`/mcp`, `/<surface>/mcp`,
 `/platform/mcp`), `/ui`, `/ui-api`, `/plugins`, `/scopes`, `/milestones`,
 `/surfaces`, `/replication`, `/replication-admin`, `/health`, `/whoami`,
-`/events`, and FastAPI's own docs routes — is refused at registration (422).
-The set is ONE constant, `manifest.RESERVED_HTTP_PREFIXES`, kept honest by a
-test that walks the built app's routes and asserts every top-level segment
-appears in it, so a future platform route cannot be added into a prefix a
-plugin already holds.
+`/events`, and FastAPI's own docs routes — is refused. Two lines of defense:
+the STATIC set `manifest.RESERVED_HTTP_PREFIXES` refuses at validation (422)
+and is kept honest by a test that walks the built app's routes; and the
+registry holds the LIVE set — every top-level segment the built app actually
+routes, config-named surfaces included (`SNOWLINE_SURFACES=…,ops` mounts
+`/ops/mcp`) — handed over by `create_app` after the last mount, and refuses
+at upsert (409, holder `platform`). A surface that exists only in config can
+therefore never be half-shadowed by a plugin prefix.
 
 **Registration-time collision refusal — loud.** A prefix that collides with one
 held by a **different** registered plugin (equal, or either containing the
@@ -198,8 +207,11 @@ invariant, not the route — it is the only place the whole plugin set is visibl
 under one lock. The refused plugin's registration heartbeat (issue #39) re-POSTs
 every beat, so the WARNING **repeating** is the operator-visible signal that two
 plugins contend for one prefix — the same loudness posture as the
-manifest-REPLACED warning. The same plugin re-registering is always fine: a
-heartbeat is `unchanged`, and a redeploy that re-shapes its OWN prefixes is
+manifest-REPLACED warning. The SDK heartbeat treats the 409 as what it is — a
+REFUSAL, logged at WARNING every beat, never "already registered" (the
+register verb is an upsert; 409 has no other meaning) — so a refused plugin
+never reports itself confirmed. The same plugin re-registering is always fine:
+a heartbeat is `unchanged`, and a redeploy that re-shapes its OWN prefixes is
 `updated`.
 
 **Per-request proxying.** The proxy is wired as the router's **fallback**, not
@@ -209,19 +221,35 @@ its mount — a literal `/{path:path}` route would match `/mcp` and silently bre
 every MCP client). A path no plugin claims falls through to the app's ordinary
 404.
 
-- **Request headers are a whitelist**: `content-type` and `accept`, plus
-  `X-Forwarded-For` (the direct peer, not a caller-supplied chain) and
-  `X-Snowline-Gateway: 1`. `host`, `authorization`, cookies and hop-by-hop
-  headers are never forwarded — a plugin must not see the caller's platform
-  credentials, and a forwarded `host` would corrupt upstream absolute URLs.
-- **Response headers are a whitelist** too: `content-type`, `cache-control`,
-  `etag`, `location`. `content-length` is recomputed from the body actually
-  returned (httpx decompresses upstream bodies, so the upstream value can
-  describe bytes the caller never receives).
-- The request body is streamed with the same 64 KiB cap `/ui-api` POSTs use
+- **Headers are a denylist** (the reverse-proxy norm), in both directions.
+  Stripped on the way up: hop-by-hop headers, `host` (the upstream sees its
+  own; the gateway's rides in `X-Forwarded-Host`), request `content-length`
+  (recomputed from the buffered body), the caller's platform credentials and
+  cookies (`authorization`, `cookie`), and any forwarding headers a caller
+  invented — the gateway sets its own `X-Forwarded-For` (the direct peer),
+  `X-Forwarded-Host`, `X-Forwarded-Proto` and `X-Snowline-Gateway: 1`. A
+  caller that sends no `accept-encoding` gets `identity` upstream (httpx
+  would otherwise volunteer compression the caller never asked for).
+  Everything else passes — a whitelist would silently disable the
+  mechanisms a contract consumer relies on (`If-None-Match`/`If-Match`,
+  `Idempotency-Key`, `Retry-After`, `Vary`). Stripped on the way back:
+  hop-by-hop, `server`/`date` (uvicorn's), and `set-cookie` (a plugin session
+  must never be set on the gateway origin).
+- **Redirects stay behind the gateway**: an absolute `Location` /
+  `Content-Location` at the plugin's own `base_url` (Starlette's
+  redirect-slashes and `url_for` build those from the host the upstream saw)
+  is rewritten to the gateway origin; relative and external values pass.
+- **The response is streamed**, not buffered — relayed as raw bytes as it
+  arrives, so `content-encoding`/`content-length` stay truthful and a
+  long-poll or event stream neither pins gateway memory nor delays first
+  byte to EOF. The per-read upstream timeout is 60 s (a contract write that
+  takes longer than a widget read must not come back "unreachable" after it
+  applied); connect stays `/ui-api`'s 10 s.
+- The request body is buffered with the same 64 KiB cap `/ui-api` POSTs use
   (413 past it, enforced on the actual bytes, never on a Content-Length that
   can lie).
-- A method not in the surface's `methods` → **405**, without a round-trip.
+- A method not in the surface's `methods` → **405** with `Allow`, without a
+  round-trip. A path that cannot be expressed as an upstream URL → **400**.
 - An `httpx.HTTPError` → **502**, with the same log shape `/ui-api` uses.
 - **No retry.** A connect failure is a straight 502, exactly as `/ui-api` does.
   Connect-phase retry (`deploy-continuity.md` §3) is the MCP gateway's concern,

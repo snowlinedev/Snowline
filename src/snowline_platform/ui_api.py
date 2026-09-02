@@ -103,6 +103,21 @@ def _safe_upstream_suffix(path: str) -> str | None:
     return normalized[1:]
 
 
+async def read_capped_body(request: Request, limit: int) -> bytes | None:
+    """The request body, or `None` once it exceeds `limit`.
+
+    ONE enforcement path for every proxy: the cap is checked against the
+    actual streamed bytes (a Content-Length header can lie, be absent, or
+    chunk-encode) and BEFORE buffering each chunk, so an oversize body never
+    occupies memory past the limit."""
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > limit:
+            return None
+        body.extend(chunk)
+    return bytes(body)
+
+
 def _client(app: FastAPI) -> httpx.AsyncClient:
     """The shared proxy client, created lazily on first use and cached on
     `app.state` — never one client per request. Closed at shutdown by
@@ -214,7 +229,7 @@ async def proxy(plugin: str, path: str, request: Request) -> Response:
     client = _client(request.app)
     try:
         upstream_resp = await client.get(
-            upstream_url, params=request.query_params
+            upstream_url, params=request.query_params.multi_items()  # every value of a repeated key
         )
     except httpx.HTTPError as exc:
         log.warning(
@@ -300,16 +315,9 @@ async def proxy_post(plugin: str, path: str, request: Request) -> Response:
             status_code=status.HTTP_413_CONTENT_TOO_LARGE,
         )
 
-    # ONE enforcement path: the cap is checked against the actual streamed
-    # bytes (a Content-Length header can lie, be absent, or chunk-encode), and
-    # BEFORE buffering each chunk, so an oversize single-chunk body never
-    # occupies memory past the limit.
-    body = bytearray()
-    async for chunk in request.stream():
-        if len(body) + len(chunk) > POST_BODY_LIMIT:
-            return _too_large()
-        body.extend(chunk)
-    body_bytes = bytes(body)
+    body_bytes = await read_capped_body(request, POST_BODY_LIMIT)
+    if body_bytes is None:
+        return _too_large()
 
     upstream_url = f"{entry.manifest.base_url}/ui-api/{suffix}"
 
@@ -317,7 +325,7 @@ async def proxy_post(plugin: str, path: str, request: Request) -> Response:
     try:
         upstream_resp = await client.post(
             upstream_url,
-            params=request.query_params,
+            params=request.query_params.multi_items(),  # every value of a repeated key
             content=body_bytes,
             headers={"content-type": "application/json"},
         )

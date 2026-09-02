@@ -69,6 +69,17 @@ class PluginRegistry:
     def __init__(self) -> None:
         self._plugins: dict[str, RegisteredPlugin] = {}
         self._lock = threading.Lock()
+        # Top-level path segments the platform app ACTUALLY routes — handed
+        # over by `create_app` after every route and mount is in place, so a
+        # surface name that exists only in config (`SNOWLINE_SURFACES=…,ops`
+        # mounts `/ops/mcp`) is refused to plugins just like the static
+        # `manifest.RESERVED_HTTP_PREFIXES`. Two lines of defense: the manifest
+        # validator knows the static set, the registry knows the live one.
+        self.reserved_http_prefixes: frozenset[str] = frozenset()
+
+    def set_reserved_http_prefixes(self, segments: set[str] | frozenset[str]) -> None:
+        with self._lock:
+            self.reserved_http_prefixes = frozenset(segments)
 
     def upsert(self, manifest: PluginManifest) -> tuple[RegisteredPlugin, UpsertOutcome]:
         """Idempotent register — the ONE write verb, and the heartbeat's verb
@@ -105,6 +116,9 @@ class PluginRegistry:
         collides with one held by a DIFFERENT registered plugin. Callers hold
         `self._lock`."""
         for surface in manifest.http:
+            head = surface.prefix.split("/")[1]
+            if head in self.reserved_http_prefixes:
+                raise HttpPrefixConflict(surface.prefix, "platform", f"/{head}")
             for name, entry in self._plugins.items():
                 if name == manifest.name:
                     continue

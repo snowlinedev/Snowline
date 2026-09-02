@@ -583,3 +583,13 @@ def test_sibling_prefixes_sharing_a_string_prefix_are_not_nested():
     # '/provider', so declaring both is legal.
     m = _http_manifest({"prefix": "/provider"}, {"prefix": "/providerx"})
     assert len(m.http) == 2
+
+
+@pytest.mark.parametrize(
+    "bad", ["http://pm-host:8802?x=1", "http://pm-host:8802#frag", "http:///nohost"]
+)
+def test_base_url_with_query_fragment_or_no_host_is_refused(bad):
+    """Every proxy appends a plugin path to base_url — a query or fragment
+    would swallow it (`?x=1/provider/…` lands on the plugin root)."""
+    with pytest.raises(ValidationError):
+        PluginManifest(name="pm", base_url=bad)

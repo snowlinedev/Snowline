@@ -7,6 +7,8 @@ health-check it. The platform never imports plugin code; it routes to `base_url`
 
 from __future__ import annotations
 
+import httpx
+
 import re
 from typing import Literal
 from urllib.parse import urlsplit
@@ -584,8 +586,8 @@ def _valid_http_prefix(prefix: str) -> str:
         if segment in {".", ".."}:
             raise ValueError(
                 f"http prefix {prefix!r} contains a '.'/'..' segment — the proxy "
-                "normalizes dot-segments away before matching, so this prefix "
-                "could never be reached"
+                "refuses dot-segment paths outright (they fall through to 404), "
+                "so this prefix could never be reached"
             )
         if not _ROUTE_LITERAL_RE.match(segment):
             raise ValueError(
@@ -834,4 +836,18 @@ class PluginManifest(BaseModel):
     def _valid_base_url(cls, v: str) -> str:
         if not (v.startswith("http://") or v.startswith("https://")):
             raise ValueError(f"base_url {v!r} must start with http:// or https://")
+        # Every proxy appends a plugin path to base_url; a query or fragment
+        # would swallow that path (`?x=1/provider/…` lands on the plugin's
+        # root, `#f/provider/…` drops it entirely). Refuse at registration.
+        try:
+            parsed = httpx.URL(v)
+        except httpx.InvalidURL as exc:
+            raise ValueError(f"base_url {v!r} is not a valid URL: {exc}") from exc
+        if not parsed.host:
+            raise ValueError(f"base_url {v!r} has no host")
+        if parsed.query or parsed.fragment:
+            raise ValueError(
+                f"base_url {v!r} must not carry a query or fragment — the "
+                "gateway appends plugin paths to it"
+            )
         return v.rstrip("/")

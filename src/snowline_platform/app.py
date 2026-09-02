@@ -39,6 +39,8 @@ from snowline_platform.gateway_app import (
     mount_gateway,
 )
 from snowline_platform.health import health_poll_loop
+from starlette.routing import Mount, Route
+
 from snowline_platform.middleware import TrustMiddleware
 from snowline_platform.registry import PluginRegistry
 from snowline_platform.trust import CidrTrustProvider, TrustResolver
@@ -344,6 +346,18 @@ def create_app(
     # 404 shape. Wrapped LAST in create_app so it composes over whatever the
     # router's default is by then.
     app.router.default = http_proxy.PluginHttpProxy(app.router.default)
+    # The LIVE reserved set: every top-level segment this app routes (config-
+    # named surfaces included) — refused to plugin `http` prefixes at upsert,
+    # beside the static `manifest.RESERVED_HTTP_PREFIXES`. Computed after the
+    # last route/mount is added so it cannot lag what is actually served.
+    app.state.registry.set_reserved_http_prefixes(
+        {
+            r.path.lstrip("/").split("/")[0]
+            for r in app.routes
+            if isinstance(r, (Route, Mount))
+        }
+        - {""}
+    )
 
     return app
 

@@ -164,10 +164,22 @@ def register_with_platform(
         log.warning("plugin registration to %s failed (will retry): %s", url, exc)
         return False
     if resp.status_code == httpx.codes.CONFLICT:
-        # Only an OLDER (pre-upsert) platform returns 409 — but against one it
-        # is the heartbeat's per-beat steady state, so DEBUG like the 200 path.
-        log.debug("plugin %r already registered with the platform", plugin_name)
-        return True
+        # A REFUSAL: the platform's `POST /plugins` is an upsert (issue #39),
+        # so 409 never means "already registered" — it means the manifest
+        # collides with another plugin (an `http` prefix another plugin holds,
+        # gateway.md §3a). The plugin is NOT registered; returning True here
+        # would log "confirmed" and run unregistered forever. WARNING every
+        # beat is the intended loudness — the platform warns on its side too.
+        try:
+            detail = resp.json().get("detail", resp.text)
+        except ValueError:
+            detail = resp.text
+        log.warning(
+            "plugin %r registration REFUSED by the platform (409): %s",
+            plugin_name,
+            detail,
+        )
+        return False
     if resp.status_code == httpx.codes.CREATED:
         log.info(
             "registered plugin %r with the platform at %s", plugin_name, platform

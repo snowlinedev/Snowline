@@ -247,7 +247,7 @@ def test_body_at_the_cap_is_forwarded():
 # --- header hygiene ---------------------------------------------------------
 
 
-def test_request_headers_are_whitelisted_and_forwarding_headers_added():
+def test_request_headers_denylist_strips_credentials_and_adds_forwarding():
     app = _app()
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -256,11 +256,18 @@ def test_request_headers_are_whitelisted_and_forwarding_headers_added():
         assert "authorization" not in request.headers
         assert "cookie" not in request.headers
         assert request.headers["host"] == "pm-host:8802"
-        # Whitelisted through.
+        # Everything else rides through — the mechanisms a contract consumer
+        # relies on are not the gateway's to disable.
         assert request.headers["accept"] == "application/json"
-        # Added by the gateway.
+        assert request.headers["if-none-match"] == '"v1"'
+        assert request.headers["idempotency-key"] == "abc-123"
+        # Added by the gateway; the caller-invented chain is replaced.
         assert request.headers["x-forwarded-for"] == "testclient"
+        assert request.headers["x-forwarded-host"] == "testserver"
+        assert request.headers["x-forwarded-proto"] == "http"
         assert request.headers["x-snowline-gateway"] == "1"
+        # The caller's own encoding preference, not httpx's default.
+        assert request.headers["accept-encoding"] == "br"
         return httpx.Response(200, json={})
 
     _wire_mock_upstream(app, handler)
@@ -270,13 +277,29 @@ def test_request_headers_are_whitelisted_and_forwarding_headers_added():
             "authorization": "Bearer platform-secret",
             "cookie": "session=abc",
             "accept": "application/json",
+            "if-none-match": '"v1"',
+            "idempotency-key": "abc-123",
             "x-forwarded-for": "203.0.113.7",  # a caller-invented chain
+            "x-snowline-gateway": "0",
+            "accept-encoding": "br",
         },
     )
     assert r.status_code == 200
 
 
-def test_response_headers_are_whitelisted():
+def test_no_accept_encoding_from_the_caller_means_identity_upstream():
+    """httpx would otherwise volunteer `gzip, deflate`; the raw relay would then
+    hand a compressed body to a caller that never asked for one."""
+    from starlette.requests import Request
+
+    scope = {"type": "http", "method": "GET", "path": "/provider/x", "headers": [],
+             "query_string": b"", "scheme": "http", "client": ("1.2.3.4", 5)}
+    headers = dict(http_proxy._forward_headers(Request(scope)))
+    assert headers["accept-encoding"] == "identity"
+    assert headers["x-forwarded-for"] == "1.2.3.4"
+
+
+def test_response_headers_denylist_passes_contract_headers_and_strips_cookies():
     app = _app()
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -286,8 +309,10 @@ def test_response_headers_are_whitelisted():
             headers={
                 "etag": '"v1"',
                 "cache-control": "no-store",
+                "retry-after": "5",
+                "vary": "Accept",
                 "set-cookie": "plugin_session=abc",
-                "x-plugin-internal": "leak",
+                "x-plugin-internal": "fine-to-see",
             },
         )
 
@@ -295,11 +320,14 @@ def test_response_headers_are_whitelisted():
     r = TestClient(app).get("/provider/work-items")
     assert r.headers["etag"] == '"v1"'
     assert r.headers["cache-control"] == "no-store"
+    assert r.headers["retry-after"] == "5"
+    assert r.headers["vary"] == "Accept"
+    assert r.headers["x-plugin-internal"] == "fine-to-see"
     assert "set-cookie" not in r.headers
-    assert "x-plugin-internal" not in r.headers
+    assert r.json() == {}
 
 
-def test_redirect_location_is_passed_through_unfollowed():
+def test_relative_redirect_location_is_passed_through_unfollowed():
     app = _app()
     _wire_mock_upstream(
         app,
@@ -308,6 +336,146 @@ def test_redirect_location_is_passed_through_unfollowed():
     r = TestClient(app).get("/provider/work-items", follow_redirects=False)
     assert r.status_code == 303
     assert r.headers["location"] == "/provider/work-items/1"
+
+
+def test_absolute_redirect_at_the_plugin_origin_is_rewritten_to_the_gateway():
+    """Starlette's redirect-slashes / url_for build absolute Locations from the
+    Host the upstream saw (its own); a following consumer must stay behind the
+    gateway, never be sent to the plugin's private bind."""
+    app = _app()
+    _wire_mock_upstream(
+        app,
+        lambda r: httpx.Response(
+            307, headers={"location": "http://pm-host:8802/provider/work-items/"}
+        ),
+    )
+    r = TestClient(app).get("/provider/work-items", follow_redirects=False)
+    assert r.status_code == 307
+    assert r.headers["location"] == "http://testserver/provider/work-items/"
+
+
+def test_external_absolute_redirect_is_left_alone():
+    app = _app()
+    _wire_mock_upstream(
+        app, lambda r: httpx.Response(302, headers={"location": "https://example.org/x"})
+    )
+    r = TestClient(app).get("/provider/work-items", follow_redirects=False)
+    assert r.headers["location"] == "https://example.org/x"
+
+
+# --- verbatim forwarding ---------------------------------------------------
+
+
+def _capture(app):
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["raw"] = request.url.raw_path
+        return httpx.Response(200, json={})
+
+    _wire_mock_upstream(app, handler)
+    return seen
+
+
+def test_repeated_query_keys_all_reach_the_plugin():
+    app = _app()
+    seen = _capture(app)
+    assert TestClient(app).get("/provider/work-items?state=open&state=blocked&x=1").status_code == 200
+    assert seen["raw"] == b"/provider/work-items?state=open&state=blocked&x=1"
+
+
+def test_percent_encoded_path_segments_are_forwarded_verbatim():
+    app = _app()
+    seen = _capture(app)
+    assert TestClient(app).get("/provider/items/a%2Fb%23c%3Fd%2541").status_code == 200
+    # Not re-segmented, no fragment/query peeled off, no double-decode.
+    assert seen["raw"] == b"/provider/items/a%2Fb%23c%3Fd%2541"
+
+
+def test_trailing_slash_is_forwarded_not_stripped():
+    app = _app()
+    seen = _capture(app)
+    assert TestClient(app).get("/provider/work-items/").status_code == 200
+    assert seen["raw"] == b"/provider/work-items/"
+
+
+def test_plugin_base_url_sub_path_is_kept():
+    reg = PluginRegistry()
+    reg.upsert(
+        PluginManifest(
+            name="pm", base_url="http://pm-host:8802/pm",
+            http=[{"prefix": "/provider"}],
+        )
+    )
+    app = _app(reg)
+    seen = _capture(app)
+    assert TestClient(app).get("/provider/x").status_code == 200
+    assert seen["raw"] == b"/pm/provider/x"
+
+
+@pytest.mark.parametrize(
+    "path,ok",
+    [
+        ("/provider/x", True),
+        ("/provider/x/", True),        # trailing slash: a distinct, legitimate path
+        ("/provider/./x", False),
+        ("/provider/../provider/x", False),
+        ("/provider//x", False),       # empty INTERIOR segment
+    ],
+)
+def test_well_formed_refuses_dot_and_empty_interior_segments_only(path, ok):
+    # Nothing is normalized: a malformed path is simply not the proxy's (404),
+    # so what matched a prefix is always byte-identical to what is forwarded.
+    assert http_proxy._well_formed(path) is ok
+
+
+def test_unforwardable_raw_path_raises_proxy_path_error():
+    with pytest.raises(http_proxy.ProxyPathError):
+        http_proxy._raw_route_path(
+            {"type": "http", "path": "/provider/x",
+             "raw_path": "/provider/\xff".encode("latin-1"), "root_path": ""}
+        )
+
+
+def test_upstream_response_streams_chunks_intact():
+    app = _app()
+
+    async def chunks():
+        yield b'{"items": ['
+        yield b'{"id": 1}'
+        yield b"]}"
+
+    _wire_mock_upstream(
+        app,
+        lambda r: httpx.Response(
+            200, content=chunks(), headers={"content-type": "application/json"}
+        ),
+    )
+    r = TestClient(app).get("/provider/work-items")
+    assert r.status_code == 200
+    assert r.json() == {"items": [{"id": 1}]}
+
+
+def test_405_carries_allow():
+    app = _app(_registry(methods=["GET"]))
+    r = TestClient(app).post("/provider/work-items")
+    assert r.status_code == 405
+    assert r.headers["allow"] == "GET"
+
+
+def test_config_named_surface_segment_is_refused_to_plugins(monkeypatch):
+    """A surface that exists only in config (`SNOWLINE_SURFACES=…,ops` mounts
+    `/ops/mcp`) is not in the STATIC reserved set; the registry refuses it
+    from the LIVE route walk instead — no half-dead surface."""
+    from snowline_platform.registry import HttpPrefixConflict
+
+    monkeypatch.setenv("SNOWLINE_SURFACES", "main,shadow,ops")
+    reg = PluginRegistry()
+    _app(reg)
+    assert "ops" in reg.reserved_http_prefixes
+    with pytest.raises(HttpPrefixConflict) as exc:
+        reg.upsert(PluginManifest(name="x", base_url="http://x:1", http=[{"prefix": "/ops"}]))
+    assert exc.value.holder == "platform"
 
 
 # --- the catch-all cannot shadow the platform -------------------------------
@@ -351,22 +519,23 @@ def test_bare_mcp_still_redirects_to_the_mount():
 def test_traversal_cannot_reach_a_plugin_prefix_it_did_not_declare():
     app = _app()
 
+    calls = []
+
     def handler(request: httpx.Request) -> httpx.Response:
-        # Normalization happens BEFORE the prefix match, so what matched is
-        # exactly what is forwarded.
-        assert request.url.path == "/provider/work-items"
+        calls.append(request.url.raw_path)
         return httpx.Response(200, json={})
 
     _wire_mock_upstream(app, handler)
     client = TestClient(app)
-    # Percent-encoded dot-segments survive the client and reach the route.
-    assert client.get("/provider/x/%2e%2e/work-items").status_code == 200
-    # Climbing OUT of the declared prefix resolves to no plugin, rather than
-    # matching '/provider' and forwarding somewhere else — including when the
-    # climb lands on a platform path (normalization happens after routing, so
-    # this is a 404, never a proxied or re-routed request).
+    # Percent-encoded dot-segments survive the client and reach the route —
+    # and are REFUSED, never normalized: a path that could match one prefix
+    # after normalization and be forwarded as another is not forwarded at all.
+    assert client.get("/provider/x/%2e%2e/work-items").status_code == 404
+    # Climbing OUT of the declared prefix — including onto a platform path —
+    # is a plain 404, never a proxied or re-routed request.
     assert client.get("/provider/%2e%2e/plugins").json() == {"detail": "Not Found"}
     assert client.get("/provider/%2e%2e/nope").status_code == 404
+    assert calls == []
 
 
 def test_trust_gate_still_applies_to_a_proxied_path():
@@ -407,10 +576,3 @@ def test_reserved_prefixes_cover_every_app_route():
         f"platform routes whose top-level segment is unreserved: "
         f"{sorted(unreserved)} — add them to manifest.RESERVED_HTTP_PREFIXES"
     )
-
-
-def test_proxy_methods_match_the_manifest_vocabulary():
-    # The set a manifest may declare and the set the proxy forwards are the
-    # same set; they must never drift (a manifest-declarable method the proxy
-    # dropped would 405 at runtime with a valid manifest).
-    assert http_proxy.PROXY_METHODS == manifest_mod.HTTP_SURFACE_METHODS
