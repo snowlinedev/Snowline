@@ -28,6 +28,7 @@ so a plugin wiring its own transport can still reuse it.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from urllib.parse import unquote, urlsplit, urlunsplit
@@ -42,6 +43,40 @@ PG_DUMP_FLAGS = ("-Fc", "--no-owner", "--no-privileges")
 class SnapshotError(RuntimeError):
     """`pg_dump` failed. The caller must NOT serve or restore a partial
     archive — a partially-restored store is §7's silent-data-loss mode."""
+
+
+# Where Homebrew puts the Postgres CLI tools on macOS — probed ONLY when the
+# tool is not already on PATH. A launchd-run service does not inherit the
+# operator's shell PATH: the packaged spoke's plists (stack/model.py) set none,
+# so the service sees launchd's bare `/usr/bin:/bin:/usr/sbin:/sbin`, where
+# `pg_dump` does not live. (The source-run hub's hand-written plists happen to
+# add `/opt/homebrew/bin`; a packaged instance gets no such favour.)
+PG_BIN_ENV = "SNOWLINE_PG_BIN"
+_PG_BIN_CANDIDATES = (
+    "/opt/homebrew/opt/postgresql@16/bin",  # brew, Apple silicon, versioned keg
+    "/opt/homebrew/bin",                    # brew, Apple silicon, linked
+    "/usr/local/opt/postgresql@16/bin",     # brew, Intel, versioned keg
+    "/usr/local/bin",                       # brew, Intel, linked
+)
+
+
+def pg_tool(name: str) -> str:
+    """Resolve a Postgres CLI tool (`pg_dump`, `pg_restore`) to something
+    `subprocess` can exec. Order: an explicit `SNOWLINE_PG_BIN` directory (the
+    operator's override — set it in the service's env file); the bare name when
+    PATH already resolves it (so argv stays the conventional `["pg_dump", …]`);
+    then the known Homebrew locations. Falls through to the bare name when
+    nothing is found, so the resulting `FileNotFoundError` names the tool."""
+    override = os.environ.get(PG_BIN_ENV)
+    if override:
+        return str(Path(override) / name)
+    if shutil.which(name):
+        return name
+    for candidate in _PG_BIN_CANDIDATES:
+        path = Path(candidate) / name
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+    return name
 
 
 def libpq_url(url: str) -> str:
@@ -121,7 +156,7 @@ def database_url(session):
 def pg_dump_argv(url: str, dest: str | Path) -> list[str]:
     """The exact `pg_dump` argv. The URL here is already password-scrubbed
     (see `libpq_url_and_env`) — nothing secret is ever in this list."""
-    return ["pg_dump", *PG_DUMP_FLAGS, "-f", str(dest), url]
+    return [pg_tool("pg_dump"), *PG_DUMP_FLAGS, "-f", str(dest), url]
 
 
 def run_pg_dump(url, dest: str | Path) -> None:
@@ -129,12 +164,21 @@ def run_pg_dump(url, dest: str | Path) -> None:
     as a custom-format archive. ANY non-zero exit raises `SnapshotError` — a
     truncated archive must never be streamed to a seeding spoke."""
     scrubbed, env = libpq_url_and_env(url)
-    proc = subprocess.run(
-        pg_dump_argv(scrubbed, dest),
-        capture_output=True,
-        text=True,
-        env={**os.environ, **env} if env else None,
-    )
+    argv = pg_dump_argv(scrubbed, dest)
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            env={**os.environ, **env} if env else None,
+        )
+    except FileNotFoundError:
+        raise SnapshotError(
+            f"{argv[0]!r} not found — this service's PATH does not include the "
+            f"Postgres CLI tools (a launchd-run service does not inherit your "
+            f"shell PATH); set {PG_BIN_ENV}=<dir containing pg_dump> in its env "
+            f"file, or install postgresql@16 via Homebrew"
+        ) from None
     if proc.returncode != 0:
         # stderr can name the scrubbed URL; the password is only ever in env.
         raise SnapshotError(

@@ -317,3 +317,43 @@ def test_libpq_url_and_env_accepts_a_sqlalchemy_url():
         "postgresql:///db",
         {},
     )
+
+
+def test_pg_tool_resolution_order(monkeypatch, tmp_path):
+    """A launchd-run service does not inherit the operator's shell PATH (the
+    packaged spoke's plists set none), so `pg_dump` must be found without it:
+    `SNOWLINE_PG_BIN` wins outright; a PATH hit keeps the bare name (argv
+    stays conventional); otherwise the known Homebrew kegs are probed; and
+    when nothing matches the bare name falls through so the error names it."""
+    from snowline_plugin_sdk.replication import snapshot as snap
+
+    # 1. explicit override wins, even over PATH
+    monkeypatch.setenv(snap.PG_BIN_ENV, "/opt/pg/bin")
+    monkeypatch.setattr(snap.shutil, "which", lambda _n: "/usr/bin/pg_dump")
+    assert snap.pg_tool("pg_dump") == "/opt/pg/bin/pg_dump"
+
+    # 2. PATH hit -> bare name
+    monkeypatch.delenv(snap.PG_BIN_ENV)
+    assert snap.pg_tool("pg_dump") == "pg_dump"
+
+    # 3. not on PATH -> first executable Homebrew candidate
+    monkeypatch.setattr(snap.shutil, "which", lambda _n: None)
+    keg = tmp_path / "keg"
+    keg.mkdir()
+    tool = keg / "pg_dump"
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o755)
+    monkeypatch.setattr(snap, "_PG_BIN_CANDIDATES", (str(tmp_path / "missing"), str(keg)))
+    assert snap.pg_tool("pg_dump") == str(tool)
+
+    # 4. nothing anywhere -> bare name, and run_pg_dump turns the resulting
+    #    FileNotFoundError into a SnapshotError that names the fix
+    monkeypatch.setattr(snap, "_PG_BIN_CANDIDATES", ())
+    assert snap.pg_tool("pg_dump") == "pg_dump"
+
+    def missing(*_a, **_k):
+        raise FileNotFoundError("pg_dump")
+
+    monkeypatch.setattr(snap.subprocess, "run", missing)
+    with pytest.raises(snap.SnapshotError, match="SNOWLINE_PG_BIN"):
+        snap.run_pg_dump("postgresql:///x", tmp_path / "out.dump")

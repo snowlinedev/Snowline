@@ -118,6 +118,13 @@ Degradation is then strictly ordered: the local path (agent → loopback) cannot
 be taken down by the tailnet path; losing tailscaled costs only cross-instance
 delivery, and the outbox absorbs that.
 
+> **`pg_dump` under launchd.** The primary's snapshot route execs `pg_dump`
+> from the *service's* environment, and a launchd-run service does not
+> inherit your shell PATH. The hub's hand-written plists add
+> `/opt/homebrew/bin`; a packaged instance's plists set no PATH, so the SDK
+> falls back to the known Homebrew kegs and, failing that, to
+> `SNOWLINE_PG_BIN=<dir containing pg_dump>` from the service's env file.
+
 ## 3. Primary standing posture (§2.1) — do this once on the mini
 
 No topology survives an ops gap on the hub. On the primary:

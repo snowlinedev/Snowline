@@ -80,7 +80,7 @@ from snowline_plugin_sdk.replication.models import (
 # ONE implementation of the libpq-URL/PGPASSWORD hygiene, shared with the
 # service side that now produces the dump (`snapshot.run_pg_dump`) — the seed
 # only restores here, but both halves must scrub passwords off argv identically.
-from snowline_plugin_sdk.replication.snapshot import libpq_url_and_env
+from snowline_plugin_sdk.replication.snapshot import libpq_url_and_env, pg_tool
 
 Report = Callable[[str], None]
 
@@ -294,7 +294,7 @@ def dump_and_restore(
         report(f"[dump ] {sp.name}: received {size} byte archive -> {dump_file.name}")
         report(f"[restore] {sp.name}: pg_restore -> spoke")
         _run(
-            ["pg_restore", "--clean", "--if-exists", "--exit-on-error",
+            [pg_tool("pg_restore"), "--clean", "--if-exists", "--exit-on-error",
              "--no-owner", "--no-privileges", "-d", restore_url, str(dump_file)],
             what=f"pg_restore {sp.name}",
             env=restore_env,
