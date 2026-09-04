@@ -120,8 +120,11 @@ nonsense on a wheel install and must never be relied on.
 - **Homebrew `postgresql@16`**, managed by `brew services`. Same major
   version as the primary — seeding is a pg_dump/restore pipeline (§7 of
   replication-continuity), and holding the major equal keeps that path
-  boring. When the primary upgrades majors, the spoke follows in the same
-  train.
+  boring. (Since item 0ebe6a70 the dump is produced by the primary's own
+  service and fetched over HTTP rather than by a remote `pg_dump`, but it is
+  still a custom-format archive fed to `pg_restore`, so the equal-majors rule
+  stands unchanged.) When the primary upgrades majors, the spoke follows in
+  the same train.
 - *Postgres.app* rejected (GUI app lifecycle, not scriptable as a service
   target); *bundling* rejected (enormous artifact, security-update burden,
   and Homebrew is already a stated prerequisite).
@@ -259,6 +262,14 @@ into a guided `snowline stack bootstrap-spoke` that runs after the first
 sync. Software install and data topology are deliberately not fused: sync
 must stay safe to run at any time, and seeding is an operator-attended
 operation ordered by replication-continuity §7.
+
+`bootstrap-spoke` prompts for topology only — the primary's gateway URL and
+this machine's own tailnet address, both persisted into `stack.json` — and
+for **no credential**. It asked for the primary's Postgres user until item
+0ebe6a70; the primary now serves its own snapshot over its replication-admin
+surface, authorized by the stream secret the seed mints while priming, so
+`seed.json` carries no primary-side Postgres URL and no password anywhere
+(governance decision 1a83031c keeps the hub's Postgres loopback-only).
 
 ## 7. Decision D5 — v1 component set and each component's data story
 

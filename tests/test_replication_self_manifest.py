@@ -91,3 +91,22 @@ def test_manifest_payload_helper_matches_the_endpoint():
     assert replication.manifest_payload() == _request(
         _app(), "GET", replication.MANIFEST_PATH
     ).json()
+
+
+def test_the_snapshot_route_rides_along_with_no_platform_side_wiring():
+    """Item 0ebe6a70: `POST {ADMIN_PREFIX}/snapshot` comes from the SAME SDK
+    factory the platform already mounts, and reads its database URL off the
+    session's engine bind — so the platform (and governance, memory, pm, which
+    mount that identical factory) pick the route up with NO change at the mount
+    site. Pinned here because "nothing to do" is exactly the claim that rots."""
+    _, _, scope = make_store()
+    router = replication.build_router(scope)
+    assert f"{replication.ADMIN_PREFIX}/snapshot" in {r.path for r in router.routes}
+    # And it is really REACHABLE, gated like its siblings: an untrusted peer gets
+    # the trust gate's 403 — which an UNMOUNTED path could never produce (it
+    # would 404), so this is the mount proof as well as the posture check.
+    app = FastAPI()
+    app.include_router(router)
+    assert _request(
+        app, "POST", f"{replication.ADMIN_PREFIX}/snapshot", peer=HOTEL_LAN_PEER
+    ).status_code == 403

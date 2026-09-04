@@ -14,21 +14,18 @@
   },
 
   "participants": {
-    "__doc__": "One entry per opted-in participant that must be seeded — the platform's scope stream (name 'platform', §8) plus every replicating plugin. Each needs: spoke_ingest_url (where the PRIMARY delivers to this participant on the spoke, over the tailnet — the spoke's serve front); primary_dump_url + spoke_db_url (the Postgres endpoints pg_dump flows between). The primary-side admin surface + event vocabulary are discovered, not configured.",
+    "__doc__": "One entry per opted-in participant that must be seeded — the platform's scope stream (name 'platform', §8) plus every replicating plugin. Each needs just two keys: spoke_ingest_url (where the PRIMARY delivers to this participant on the spoke, over the tailnet — the spoke's serve front) and spoke_db_url (the LOCAL database pg_restore writes into). There is deliberately NO primary_dump_url: the primary dumps itself and serves the archive over its own replication-admin surface, signed with the secret the seed mints while priming (governance decision 1a83031c — the hub's Postgres is loopback-only and never reachable over the tailnet). An older seed.json that still carries primary_dump_url is accepted with a warning; the key is ignored. The primary-side admin surface + event vocabulary are discovered, not configured.",
 
     "platform": {
       "spoke_ingest_url": "http://roam.CHANGEME.ts.net:8848/replication/events/ingest",
-      "primary_dump_url": "postgresql://USER@mini.CHANGEME.ts.net:5432/snowline_platform",
       "spoke_db_url": "postgresql:///snowline_platform"
     },
     "governance": {
       "spoke_ingest_url": "http://roam.CHANGEME.ts.net:8801/events/ingest",
-      "primary_dump_url": "postgresql://USER@mini.CHANGEME.ts.net:5432/snowline_governance",
       "spoke_db_url": "postgresql:///snowline_governance"
     },
     "memory": {
       "spoke_ingest_url": "http://roam.CHANGEME.ts.net:8802/events/ingest",
-      "primary_dump_url": "postgresql://USER@mini.CHANGEME.ts.net:5432/snowline_memory",
       "spoke_db_url": "postgresql:///snowline_memory"
     }
   }

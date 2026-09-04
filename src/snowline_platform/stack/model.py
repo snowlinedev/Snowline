@@ -749,11 +749,6 @@ PARTICIPANT_INGEST_PATH: Mapping[str, str] = {
     "pm": SDK_INGEST_PATH,
 }
 
-# The primary's Postgres port — same default the runbook's
-# `seed-config.example.json` uses (`mini.CHANGEME.ts.net:5432`).
-PRIMARY_POSTGRES_PORT = 5432
-
-
 def default_primary_gateway_url(primary_tailnet_address: str) -> str:
     return f"http://{primary_tailnet_address}:{DEFAULT_PRIMARY_GATEWAY_PORT}"
 
@@ -828,20 +823,23 @@ def check_pm_role_is_spoke(pm_env_text: str | None) -> None:
         )
 
 
-def build_seed_config(cfg: StackConfig, *, local_platform_port: int, pg_user: str) -> dict:
+def build_seed_config(cfg: StackConfig, *, local_platform_port: int) -> dict:
     """The `snowline replicate seed --config <this>.json` input
     (docs/ops/roam-runbook.md §5, `ops/roam/seed-config.example.json`'s
-    shape) — built from stack.json plus the one thing seeding needs that
-    stack.json cannot carry: the Postgres user for the primary-side pg_dump
-    connection (a credential, re-prompted per bootstrap run rather than
-    persisted)."""
+    shape) — built entirely from stack.json, with NO credential prompt.
+
+    There is no primary-side Postgres user or dump URL to ask for any more:
+    the primary serves its own snapshot over its replication-admin surface,
+    authorized by the stream secret the seed mints while priming (item
+    0ebe6a70; governance decision 1a83031c keeps the hub's Postgres
+    loopback-only). The only Postgres URL left is the SPOKE's, which is local
+    (peer auth, no credential)."""
     if not cfg.primary_gateway_url or not cfg.local_tailnet_address:
         raise StackError(
             "stack.json is missing primary_gateway_url/local_tailnet_address "
             "— bootstrap-spoke must resolve these before building a seed "
             "config (internal error: ensure_bootstrap_config was skipped)"
         )
-    primary_host = _hostname(cfg.primary_gateway_url)
     participants = {}
     for svc in SEED_PARTICIPANTS:
         port = SERVICE_PORTS[svc]
@@ -849,7 +847,6 @@ def build_seed_config(cfg: StackConfig, *, local_platform_port: int, pg_user: st
         db = DB_NAME[svc]
         participants[svc] = {
             "spoke_ingest_url": f"http://{cfg.local_tailnet_address}:{port}{path}",
-            "primary_dump_url": f"postgresql://{pg_user}@{primary_host}:{PRIMARY_POSTGRES_PORT}/{db}",
             "spoke_db_url": f"postgresql:///{db}",
         }
     return {
@@ -860,15 +857,6 @@ def build_seed_config(cfg: StackConfig, *, local_platform_port: int, pg_user: st
         },
         "participants": participants,
     }
-
-
-def _hostname(url: str) -> str:
-    from urllib.parse import urlsplit
-
-    host = urlsplit(url).hostname
-    if not host:
-        raise StackError(f"{url!r} is not a valid URL (no host)")
-    return host
 
 
 def seed_config_path(home: Path) -> Path:

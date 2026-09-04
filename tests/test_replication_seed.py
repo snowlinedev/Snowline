@@ -1,15 +1,25 @@
 """`snowline replicate seed` (replication-continuity §7/§10, issue #82): the seed
 library exercised without a live Postgres. `pg_dump`/`pg_restore` (step 2) are
-covered by the real-Postgres drill; here the dump is SIMULATED by cloning the
-primary's store into the spoke (what a restore produces), so the load-bearing
+covered by the real-Postgres drill; here they are faked at the `subprocess` seam
+(and for the convergence tests the restore is SIMULATED by cloning the primary's
+store into the spoke, which is what a restore produces), so the load-bearing
 logic — the priming, the §7-step-3 scrub-then-inject, the gapless
 snapshot-to-stream handoff, and both re-seed preconditions — is unit-tested on
 SQLite.
+
+Step 2 now runs over HTTP (item 0ebe6a70 / #221, governance decision 1a83031c):
+the PRIMARY dumps its own database and serves the archive from its
+replication-admin surface, authorized by the secret step 1 minted. The tests
+below drive that end to end through the `RoutedClient` harness — the real SDK
+route on the primary's real app — with only `subprocess` faked.
 """
 
 from __future__ import annotations
 
 import json
+import subprocess
+from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
 from sqlalchemy import select
@@ -18,6 +28,7 @@ from sqlalchemy.orm import Session
 from snowline_platform import replication_seed as seed
 from snowline_platform.replication_pairing import Participant
 from snowline_plugin_sdk.replication import emit as emit_mod
+from snowline_plugin_sdk.replication.envelope import sign_body
 from snowline_plugin_sdk.replication.models import (
     ReplicationInboundStream,
     ReplicationOutboxRow,
@@ -66,7 +77,6 @@ def _seed_participant(tmp_path, name="governance"):
         ),
         spoke_source_id="roam.governance",
         spoke_ingest_url="http://roam-gov/events/ingest",
-        primary_dump_url="postgresql+psycopg:///unused_in_this_test",
         spoke_db_url=spoke_db,
     )
     client = RoutedClient({"prim-gov": primary.app, "roam-gov": spoke.app})
@@ -236,7 +246,6 @@ def test_load_seed_config_resolves_primary_from_discovery(tmp_path):
         "participants": {
             "governance": {
                 "spoke_ingest_url": "http://roam-gov/events/ingest",
-                "primary_dump_url": "postgresql:///gov_primary",
                 "spoke_db_url": "postgresql:///gov_roam",
             },
         },
@@ -263,7 +272,7 @@ def test_load_seed_config_rejects_non_opted_in_participant(tmp_path):
         "spoke": {"platform_url": "http://roam-platform", "instance": "roam"},
         "participants": {"governance": {
             "spoke_ingest_url": "http://roam-gov/events/ingest",
-            "primary_dump_url": "x", "spoke_db_url": "y",
+            "spoke_db_url": "y",
         }},
     }
     path = tmp_path / "seed.json"
@@ -272,22 +281,98 @@ def test_load_seed_config_rejects_non_opted_in_participant(tmp_path):
         seed.load_seed_config(client, path)
 
 
-def test_libpq_and_sqlalchemy_url_normalization():
-    assert seed._libpq_url("postgresql+psycopg:///db") == "postgresql:///db"
-    assert seed._libpq_url("postgresql:///db") == "postgresql:///db"
+def test_sqlalchemy_url_normalization():
     assert seed._sqlalchemy_url("postgresql:///db") == "postgresql+psycopg:///db"
     assert seed._sqlalchemy_url("sqlite:///x.db") == "sqlite:///x.db"
 
 
-def test_libpq_url_and_env_lifts_password_off_argv():
-    """Review finding: passwords must ride PGPASSWORD, not pg_dump/pg_restore
-    argv (visible in `ps`)."""
-    url, env = seed._libpq_url_and_env("postgresql+psycopg://user:sekret@host:5432/db")
-    assert env == {"PGPASSWORD": "sekret"}
-    assert "sekret" not in url
-    assert url == "postgresql://user@host:5432/db"
-    # No password (socket/peer auth) → empty overlay, url unchanged.
-    assert seed._libpq_url_and_env("postgresql:///db") == ("postgresql:///db", {})
+# --- §7 step 2 over HTTP (item 0ebe6a70, decision 1a83031c) -------------------
+
+
+def _fake_pg(
+    monkeypatch,
+    *,
+    archive: bytes = b"PGDMP-fake-archive",
+    restore_rc: int = 0,
+    restored: list[bytes] | None = None,
+):
+    """One fake for BOTH pg CLI tools — `pg_dump` (run by the primary's snapshot
+    route, which in this in-process harness shares our `subprocess` module) and
+    `pg_restore` (run by the seed). Returns the recorded argv list; `restored`
+    collects the bytes each pg_restore was handed."""
+    calls: list[list[str]] = []
+    restored = restored if restored is not None else []
+
+    class _Proc:
+        def __init__(self, rc: int):
+            self.returncode = rc
+            self.stdout = ""
+            self.stderr = "pg_restore: error: could not execute query" if rc else ""
+
+    def fake_run(argv, **kw):
+        calls.append(list(argv))
+        if argv[0] == "pg_dump":
+            Path(argv[argv.index("-f") + 1]).write_bytes(archive)
+            return _Proc(0)
+        # Read the archive back here: the seed deletes its temp dir on the way
+        # out, so this is the only moment the test can see what was restored.
+        restored.append(Path(argv[-1]).read_bytes())
+        return _Proc(restore_rc)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return calls
+
+
+def test_dump_and_restore_fetches_the_snapshot_over_http(tmp_path, monkeypatch):
+    """The primary dumps ITSELF and serves the archive over its own admin
+    surface; the seed fetches it over HTTP and only restores. Nothing dials the
+    primary's Postgres — decision 1a83031c."""
+    sp, _primary, _spoke, client = _seed_participant(tmp_path)
+    epoch, secret = seed.prime_forward(client, sp, report=lambda _m: None)
+    restored: list[bytes] = []
+    calls = _fake_pg(
+        monkeypatch, archive=b"PGDMP-primary-governance", restored=restored
+    )
+
+    seed.dump_and_restore(client, sp, epoch, secret, report=lambda _m: None)
+
+    # The dump ran on the PRIMARY's side of the wire (inside its snapshot
+    # route), the restore on the spoke's — and no URL of the primary's Postgres
+    # was ever passed to a client-side tool.
+    assert [c[0] for c in calls] == ["pg_dump", "pg_restore"]
+    dump_argv, restore_argv = calls
+    assert dump_argv[:4] == ["pg_dump", "-Fc", "--no-owner", "--no-privileges"]
+    assert "--exit-on-error" in restore_argv
+    assert "--clean" in restore_argv and "--if-exists" in restore_argv
+    # The bytes the primary streamed back are exactly what pg_restore was fed.
+    assert restore_argv[-1].endswith("governance.dump")
+    assert restored == [b"PGDMP-primary-governance"]
+
+
+def test_dump_and_restore_aborts_when_the_snapshot_is_refused(tmp_path, monkeypatch):
+    """A non-2xx from the snapshot route aborts the seed BEFORE step 3. Here the
+    stream was never primed, so the route 404s (non-enumeration) — and the seed
+    must not proceed to a restore."""
+    sp, _primary, _spoke, client = _seed_participant(tmp_path)
+    calls = _fake_pg(monkeypatch)
+
+    with pytest.raises(seed.SeedError, match="HTTP 404"):
+        seed.dump_and_restore(
+            client, sp, "never-primed-epoch", "wrong-secret", report=lambda _m: None
+        )
+    assert calls == []  # neither dumped nor restored
+
+
+def test_dump_and_restore_aborts_on_a_bad_signature(tmp_path, monkeypatch):
+    """The stream IS primed, but the request is signed with the wrong secret.
+    Same 404, same abort — the seed cannot tell (and neither can an attacker)."""
+    sp, _primary, _spoke, client = _seed_participant(tmp_path)
+    epoch, _secret = seed.prime_forward(client, sp, report=lambda _m: None)
+    calls = _fake_pg(monkeypatch)
+
+    with pytest.raises(seed.SeedError, match="HTTP 404"):
+        seed.dump_and_restore(client, sp, epoch, "not-the-secret", report=lambda _m: None)
+    assert calls == []
 
 
 def test_dump_and_restore_aborts_on_pg_restore_error(tmp_path, monkeypatch):
@@ -295,26 +380,125 @@ def test_dump_and_restore_aborts_on_pg_restore_error(tmp_path, monkeypatch):
     the seed BEFORE scrub/boot — a partially-restored store must never proceed
     (silent data loss). `--if-exists` already downgrades the only benign noise,
     so the old (0,1) window admitted genuine restore failures."""
-    sp, _p, _s, _c = _seed_participant(tmp_path)
-    calls: list[list[str]] = []
+    sp, _primary, _spoke, client = _seed_participant(tmp_path)
+    epoch, secret = seed.prime_forward(client, sp, report=lambda _m: None)
+    calls = _fake_pg(monkeypatch, restore_rc=1)
 
-    class _Proc:
-        def __init__(self, rc):
-            self.returncode = rc
-            self.stdout = ""
-            self.stderr = "pg_restore: error: could not execute query"
-
-    def fake_run(argv, **kw):
-        calls.append(argv)
-        return _Proc(1 if argv[0] == "pg_restore" else 0)  # restore fails
-
-    monkeypatch.setattr(seed.subprocess, "run", fake_run)
     with pytest.raises(seed.SeedError, match="pg_restore"):
-        seed.dump_and_restore(sp, report=lambda _m: None)
+        seed.dump_and_restore(client, sp, epoch, secret, report=lambda _m: None)
 
     restore_argv = next(c for c in calls if c[0] == "pg_restore")
     assert "--exit-on-error" in restore_argv
     assert "--clean" in restore_argv and "--if-exists" in restore_argv
+
+
+def test_dump_and_restore_refuses_an_empty_archive(tmp_path, monkeypatch):
+    """A `pg_dump -Fc` archive is never zero bytes; a 200 with an empty body is
+    a broken primary, not an empty database — refuse rather than wipe the spoke's
+    store with nothing."""
+    sp, _primary, _spoke, client = _seed_participant(tmp_path)
+    epoch, secret = seed.prime_forward(client, sp, report=lambda _m: None)
+    calls = _fake_pg(monkeypatch, archive=b"")
+
+    with pytest.raises(seed.SeedError, match="EMPTY"):
+        seed.dump_and_restore(client, sp, epoch, secret, report=lambda _m: None)
+    assert [c[0] for c in calls] == ["pg_dump"]  # never reached pg_restore
+
+
+def test_run_seed_end_to_end_over_the_http_snapshot(tmp_path, monkeypatch):
+    """§10's headline seeding criterion again, but driven by `run_seed` itself
+    and through the PRIMARY's REAL snapshot route: prime → signed snapshot
+    request → restore → scrub/inject, then a post-dump write converging by the
+    stream. The auth on the snapshot is what makes step 1's precedence
+    mechanical — if priming had not happened, this run could not have dumped."""
+    sp, primary, spoke, client = _seed_participant(tmp_path)
+
+    class _Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(argv, **kw):
+        if argv[0] == "pg_dump":
+            # The primary authors 3 writes AFTER priming, BEFORE the dump —
+            # they land in the snapshot AND in the primed stream's outbox.
+            _emit(primary, "primary.governance", 3, "decision.recorded")
+            Path(argv[argv.index("-f") + 1]).write_bytes(b"PGDMP-clone")
+            return _Proc()
+        # What a real `pg_restore` of that archive produces: a byte-clone of the
+        # primary's store, replication state and all (which step 3 then scrubs).
+        assert Path(argv[-1]).read_bytes() == b"PGDMP-clone"
+        _clone_store(primary.engine, spoke.engine)
+        return _Proc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    results = seed.run_seed(client, _cfg([sp]), report=lambda _m: None)
+    assert results["governance"]["watermark"] == 3
+
+    _emit(primary, "primary.governance", 1, "decision.recorded")  # post-dump: seq 4
+    with primary.scope() as s:
+        emit_mod.deliver_pending(s, client, reachability={})
+    assert [e["seq"] for e in spoke.applied] == [4]  # 1-3 were duplicates
+
+
+def test_snapshot_fetch_never_leaks_the_stream_secret(tmp_path, monkeypatch):
+    """The stream secret authorizes the snapshot — it must appear in the
+    signature header and NOWHERE else: not in the request body, not in a report
+    line, not in an error message."""
+    sp, _primary, _spoke, client = _seed_participant(tmp_path)
+    epoch, secret = seed.prime_forward(client, sp, report=lambda _m: None)
+    assert secret not in seed._snapshot_request_body(sp, epoch).decode()
+
+    _fake_pg(monkeypatch)
+    lines: list[str] = []
+    seed.dump_and_restore(client, sp, epoch, secret, report=lines.append)
+    assert lines and not any(secret in line for line in lines)
+
+    with pytest.raises(seed.SeedError) as exc:
+        seed.dump_and_restore(client, sp, epoch, "a-wrong-secret", report=lambda _m: None)
+    assert "a-wrong-secret" not in str(exc.value)
+
+
+def test_fetch_snapshot_uses_client_stream_when_offered(tmp_path):
+    """Production drives an `httpx.Client`, which streams — a multi-GB archive
+    must never be buffered whole. The buffered `.post` path is the fallback."""
+    sp, _primary, _spoke, _c = _seed_participant(tmp_path)
+    dest = tmp_path / "streamed.dump"
+    fake = _StreamingClient([b"PGD", b"MP-", b"chunks"])
+    size = seed._fetch_snapshot(fake, sp, "epoch-1", "s3cret", dest)
+    assert size == 12 and dest.read_bytes() == b"PGDMP-chunks"
+    assert fake.calls[0][0] == "POST"
+    assert fake.calls[0][1] == f"{sp.primary.admin_base}/snapshot"
+    headers = fake.calls[0][2]["headers"]
+    assert headers["X-Snowline-Signature"] == sign_body(
+        "s3cret", seed._snapshot_request_body(sp, "epoch-1")
+    )
+
+
+def test_load_seed_config_warns_but_ignores_a_legacy_primary_dump_url(tmp_path):
+    """Older seed.json files on operators' machines still carry the key. It is
+    ignored with a warning, never a hard failure."""
+    from ._replication_helpers import make_platform, plugin_entry
+
+    prim_platform = make_platform(plugins=[
+        plugin_entry("governance", "http://127.0.0.1:8801", events=["decision.recorded"]),
+    ])
+    client = RoutedClient({"prim-platform": prim_platform.app})
+    path = tmp_path / "seed.json"
+    path.write_text(json.dumps({
+        "primary": {"platform_url": "http://prim-platform", "instance": "primary"},
+        "spoke": {"platform_url": "http://roam-platform", "instance": "roam"},
+        "participants": {"governance": {
+            "spoke_ingest_url": "http://roam-gov/events/ingest",
+            "primary_dump_url": "postgresql://sean@mini.ts.net:5432/snowline_governance",
+            "spoke_db_url": "postgresql:///gov_roam",
+        }},
+    }))
+    lines: list[str] = []
+    cfg = seed.load_seed_config(client, path, report=lines.append)
+    (gov,) = cfg.participants
+    assert not hasattr(gov, "primary_dump_url")
+    assert any("primary_dump_url" in line and "IGNORED" in line for line in lines)
 
 
 def test_prime_forward_retires_orphan_on_rerun(tmp_path):
@@ -353,6 +537,35 @@ def test_run_reverse_pair_refuses_version_mismatch(tmp_path):
 
 
 # --- helpers ------------------------------------------------------------------
+
+
+class _StreamingClient:
+    """The minimum an `httpx.Client` offers the snapshot fetch: a `.stream`
+    context manager yielding a response with `.status_code` + `.iter_bytes()`."""
+
+    def __init__(self, chunks: list[bytes], status_code: int = 200):
+        self.chunks = chunks
+        self.status_code = status_code
+        self.calls: list[tuple] = []
+
+    def stream(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        chunks, status = self.chunks, self.status_code
+
+        class _Resp:
+            status_code = status
+
+            def read(self):
+                return b"".join(chunks)
+
+            def iter_bytes(self):
+                yield from chunks
+
+        @contextmanager
+        def _cm():
+            yield _Resp()
+
+        return _cm()
 
 
 def _emit(inst, source_id, n, event_type):

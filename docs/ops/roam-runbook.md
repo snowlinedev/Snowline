@@ -34,6 +34,13 @@ not hand-run the steps out of order.
   `snowline_governance`, `snowline_memory`, `snowline_pm` — pm joins the spoke
   drill as of macOS distribution spec §7/§8, item b70b0359; this runbook
   predates pm on the spoke). The apps auto-migrate to head on boot.
+- **Each Postgres stays loopback-only** — `listen_addresses = 'localhost'`, no
+  tailnet bind, no `pg_hba` entry for `100.64.0.0/10`, not even with password
+  auth (governance decision 1a83031c). Seeding needs no cross-machine Postgres
+  access: the primary dumps itself and serves the archive over its own
+  replication-admin surface (§5 step 2). `pg_dump`/`pg_restore` must be on the
+  PATH of the machine whose database they touch — the primary for the dump, the
+  spoke for the restore.
 - The `snowline-pm` checkout as a sibling of the platform checkout (the same
   layout `release/components.json` assumes: `../snowline-pm`) — `run-service.sh
   pm` runs from there, not the platform repo.
@@ -156,9 +163,9 @@ Fill `ops/roam/seed-config.example.json` → a private `seed.json`. Then, from t
 roam laptop, with the **primary up** and the **spoke NOT yet serving writes**:
 
 ```bash
-# Steps 1-3: prime the primary->spoke stream, pg_dump/restore each store,
-# scrub every cloned replication table (NOT the stream counters), inject the
-# spoke's inbound registration.
+# Steps 1-3: prime the primary->spoke stream, fetch each store's snapshot from
+# the primary and pg_restore it locally, scrub every cloned replication table
+# (NOT the stream counters), inject the spoke's inbound registration.
 uv run snowline replicate seed --config seed.json
 ```
 
@@ -177,9 +184,18 @@ The order the tool enforces, and why each step exists:
    the receiver, carries the secret (never logged), and injects it in step 3.
    From this instant every primary write emits into the stream, closing the gap
    where a write between dump and a later subscription would be lost.
-2. **Dump + restore.** `pg_dump -Fc` each store, `pg_restore --clean
-   --if-exists` into the spoke. The emit-time `seq` counter travels in the dump,
-   so the snapshot provably contains every event up to that counter.
+2. **Snapshot + restore.** The seed POSTs a signed request to each participant's
+   `…/replication-admin/snapshot` on the **primary**; the primary runs `pg_dump
+   -Fc` against its OWN database and streams the archive back, and the seed
+   `pg_restore --clean --if-exists`s it into the spoke. Nothing dials the
+   primary's Postgres over the tailnet — it is loopback-only (decision
+   1a83031c). The request is signed with the secret step 1 just minted, and the
+   route serves only a caller holding an **active** primed subscription's
+   secret, so step 1's precedence is mechanical: **no prime, no snapshot**. (A
+   404 from that route means either "no such stream" or "bad signature" — the
+   route deliberately cannot be probed to tell them apart.) The emit-time `seq`
+   counter travels in the dump, so the snapshot provably contains every event up
+   to that counter.
 3. **Scrub, then set watermarks.** Read the restored emit counter (keyed by the
    primary's `source_id` = the spoke's inbound stream) → initialize the spoke's
    inbound watermark/`applied_seq` to it; **truncate every cloned replication
@@ -258,7 +274,7 @@ Mapping the manual drill to the command:
 |---|---|
 | §0 prerequisites (both machines up, DBs exist) | Preconditions: refuses unless `~/.config/snowline/stack.json` exists, local services are installed (`snowline stack sync` already ran), and the local gateway is healthy. |
 | "with the primary up" (§5) | Precondition: curls the primary's gateway `/health` over the tailnet before touching anything; refuses loudly if unreachable (see "primary unreachable" below). |
-| Fill `seed-config.example.json` → `seed.json` by hand | Built automatically from `stack.json` (`primary_gateway_url`, `local_tailnet_address` — prompted once if missing, same posture as `sync`'s own prompts) plus one interactive prompt for the primary's Postgres user; written to `~/.config/snowline/seed.json`. |
+| Fill `seed-config.example.json` → `seed.json` by hand | Built automatically from `stack.json` (`primary_gateway_url`, `local_tailnet_address` — prompted once if missing, same posture as `sync`'s own prompts); written to `~/.config/snowline/seed.json`. No credential prompt: since item 0ebe6a70 the primary serves its own snapshot, so there is no primary-side Postgres user to ask for. |
 | `snowline replicate seed --config seed.json` (§5 steps 1-3) | Run as a subprocess through the same argv, unmodified. |
 | "boot the spoke" (§5, between steps 3 and 4) | Kickstarts all four services via `launchctl kickstart`, in the same order as §2's by-hand commands (platform, governance, memory, pm), then re-polls local health. |
 | `snowline replicate seed --config seed.json --reverse-pair` (§5 step 4) | Run as a subprocess through the same argv, unmodified. |
@@ -332,5 +348,6 @@ operator's to perform, verified by the criteria above:
 3. **Primary standing posture** (§3): `pmset`, the tailscaled system daemon, and
    the external dead-man's switch are host configuration.
 4. **Fill the CHANGEME values** in `env.*.example`, the launchd plists, and
-   `seed-config.example.json` with your tailnet hostnames/IPs and DB
-   credentials.
+   `seed-config.example.json` with your tailnet hostnames/IPs. (`seed.json`
+   carries no DB credentials any more — its only Postgres URL is the spoke's
+   own local one; decision 1a83031c.)

@@ -105,14 +105,6 @@ def _no_prompt(_message: str) -> str:
     raise AssertionError("prompt should not be called in this test")
 
 
-def _default_prompt(_message: str) -> str:
-    """Accepts whatever default is offered — used once bootstrap-spoke
-    reaches the (unconditional, harmless) Postgres-user prompt for the
-    seed config, in tests that are not specifically about stack.json
-    prompting."""
-    return ""
-
-
 # -- precondition refusals, each checked in order ---------------------------
 
 
@@ -221,7 +213,7 @@ def test_prompts_for_missing_primary_gateway_url_and_local_tailnet_address(tmp_p
 def test_fresh_bootstrap_wraps_seed_then_kickstarts_then_reverse_pairs(tmp_path):
     home = _fully_bootstrapped_home(tmp_path)
     runner = FakeRunner(_health_ok_handler)
-    report = b.run_bootstrap_spoke(home=home, runner=runner, prompt=_default_prompt, health_sleep=_noop_sleep)
+    report = b.run_bootstrap_spoke(home=home, runner=runner, prompt=_no_prompt, health_sleep=_noop_sleep)
 
     assert report.outcome == "ok", report.detail
     seed_path = m.seed_config_path(home)
@@ -245,6 +237,10 @@ def test_fresh_bootstrap_wraps_seed_then_kickstarts_then_reverse_pairs(tmp_path)
     written = json.loads(seed_path.read_text())
     assert written["primary"]["platform_url"] == "http://mini.ts.net:8850"
     assert written["spoke"]["instance"] == "roam"
+    # ...and carries no primary-side Postgres URL/credential at all: the
+    # primary serves its own snapshot now (item 0ebe6a70 / decision 1a83031c),
+    # which is also why `_no_prompt` above holds — nothing was asked for.
+    assert "primary_dump_url" not in seed_path.read_text()
 
     # pm role verified.
     assert report.pm_role_ok is True
@@ -255,7 +251,7 @@ def test_fresh_bootstrap_wraps_seed_then_kickstarts_then_reverse_pairs(tmp_path)
 def test_seed_argv_order_matches_seed_before_kickstart_before_reverse_pair(tmp_path):
     home = _fully_bootstrapped_home(tmp_path)
     runner = FakeRunner(_health_ok_handler)
-    b.run_bootstrap_spoke(home=home, runner=runner, prompt=_default_prompt, health_sleep=_noop_sleep)
+    b.run_bootstrap_spoke(home=home, runner=runner, prompt=_no_prompt, health_sleep=_noop_sleep)
     seed_path = m.seed_config_path(home)
     plain_seed = ["snowline", "replicate", "seed", "--config", str(seed_path)]
     reverse = plain_seed + ["--reverse-pair"]
@@ -272,7 +268,7 @@ def test_reseed_runs_reseed_check_before_seed_reseed(tmp_path):
     home = _fully_bootstrapped_home(tmp_path)
     runner = FakeRunner(_health_ok_handler)
     report = b.run_bootstrap_spoke(
-        home=home, runner=runner, prompt=_default_prompt, reseed=True, health_sleep=_noop_sleep
+        home=home, runner=runner, prompt=_no_prompt, reseed=True, health_sleep=_noop_sleep
     )
     assert report.outcome == "ok", report.detail
     seed_path = m.seed_config_path(home)
@@ -298,7 +294,7 @@ def test_reseed_check_failure_surfaces_the_parked_set_precondition(tmp_path):
 
     runner = FakeRunner(handler)
     report = b.run_bootstrap_spoke(
-        home=home, runner=runner, prompt=_default_prompt, reseed=True, health_sleep=_noop_sleep
+        home=home, runner=runner, prompt=_no_prompt, reseed=True, health_sleep=_noop_sleep
     )
     assert report.outcome == "failed"
     assert "parked event(s)" in report.detail
@@ -316,7 +312,7 @@ def test_reseed_check_failure_surfaces_the_parked_set_precondition(tmp_path):
 def test_refuses_loudly_when_pm_env_declares_a_non_spoke_role(tmp_path):
     home = _fully_bootstrapped_home(tmp_path, pm_env=PM_ENV_PRIMARY)
     runner = FakeRunner(_health_ok_handler)
-    report = b.run_bootstrap_spoke(home=home, runner=runner, prompt=_default_prompt, health_sleep=_noop_sleep)
+    report = b.run_bootstrap_spoke(home=home, runner=runner, prompt=_no_prompt, health_sleep=_noop_sleep)
     assert report.outcome == "failed"
     assert "SNOWLINE_PM_ROLE='primary'" in report.detail
     # the check now runs at PRECONDITION time (#212 review): the wrong
@@ -336,7 +332,7 @@ def test_refuses_when_pm_env_is_missing_entirely(tmp_path):
     )
     # no pm.env written.
     runner = FakeRunner(_health_ok_handler)
-    report = b.run_bootstrap_spoke(home=home, runner=runner, prompt=_default_prompt, health_sleep=_noop_sleep)
+    report = b.run_bootstrap_spoke(home=home, runner=runner, prompt=_no_prompt, health_sleep=_noop_sleep)
     assert report.outcome == "failed"
     assert "pm.env does not exist" in report.detail
 
@@ -347,11 +343,10 @@ def test_refuses_when_pm_env_is_missing_entirely(tmp_path):
 def test_dry_run_never_seeds_kickstarts_or_pairs(tmp_path):
     home = _fully_bootstrapped_home(tmp_path)
     runner = FakeRunner(_health_ok_handler, dry_run=True)
-    # stack.json already carries both additive fields, so the only prompt a
-    # dry run still issues is the seed config's (harmless, non-mutating)
-    # Postgres-user question — accept its default.
+    # stack.json already carries both additive fields, and since item 0ebe6a70
+    # there is no credential prompt at all — a dry run must ask nothing.
     report = b.run_bootstrap_spoke(
-        home=home, runner=runner, prompt=lambda _msg: "", dry_run=True, health_sleep=_noop_sleep
+        home=home, runner=runner, prompt=_no_prompt, dry_run=True, health_sleep=_noop_sleep
     )
     assert report.outcome == "ok", report.detail
     assert report.dry_run is True
