@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.snowline.backup</string>
+
+    <!-- Hourly pg_dump of every live Snowline store (platform, pm, governance,
+         memory). A one-shot wrapper — NOT KeepAlive: it dumps, prunes, and
+         exits. The timer fires it again on schedule, so a failed run is simply
+         a skipped run (no retry storm).
+         Install: cp to ~/Library/LaunchAgents/ then
+           launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.snowline.backup.plist -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/seanlynch/Projects/snowline-platform/ops/hub/snowline-backup.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/seanlynch/Projects/snowline-platform</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Where dumps land. Default in the script is iCloud Drive (off-machine
+             durability for free). Set this to redirect — e.g. a tailnet rsync
+             target or an external volume. Retention defaults to 30 days;
+             override with SNOWLINE_BACKUP_RETENTION_DAYS. The store list can
+             be overridden with SNOWLINE_BACKUP_DBS (space-separated). -->
+        <key>SNOWLINE_BACKUP_DIR</key>
+        <string>/Users/seanlynch/Library/Mobile Documents/com~apple~CloudDocs/Snowline/db-backups</string>
+    </dict>
+
+    <!-- Hourly (3600s). The stores change throughout the day (every work item /
+         decision / artifact / memory), so cap losable work at ~an hour.
+         StartInterval fires from load and catches up once after a sleep/wake
+         if an interval elapsed. Four dumps total ~5 MB, so a month of hourly
+         history is cheap. -->
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <!-- Take a backup immediately on install too, so loading the agent proves
+         it end-to-end (dump written, destination reachable). -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/seanlynch/Library/Logs/snowline-backup.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/seanlynch/Library/Logs/snowline-backup.log</string>
+</dict>
+</plist>
