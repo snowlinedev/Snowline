@@ -117,9 +117,13 @@ def build_router(
 ) -> APIRouter:
     """The platform's replication HTTP surface: POST `INGEST_PATH` plus the §5
     admin routes (create/list/retire inbound registrations + outbound
-    subscriptions, rotation, the parked-events read) — identical shape to what
+    subscriptions, rotation, the parked-events read, and the §7 step-2
+    `/snapshot` dump of the platform's OWN database) — identical shape to what
     any opted-in plugin mounts (§4/§5). `session_scope_fn` is injectable for
-    tests; production (`app.py`) uses the platform's own `session_scope`.
+    tests; production (`app.py`) uses the platform's own `session_scope`, whose
+    sessions are engine-bound, which is where `/snapshot` reads the database URL
+    it hands to `pg_dump` (item 0ebe6a70 / decision 1a83031c — nothing dials the
+    hub's Postgres across the tailnet).
 
     Also mounts the §8 replication self-manifest (`MANIFEST_PATH`, issue #95) —
     a plugin declares its contract in its `/plugins` manifest block, but the

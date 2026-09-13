@@ -21,6 +21,12 @@ LOOPBACK peer IP, so the loopback entries are what admit cross-instance
 traffic. The HMAC secret authenticates the *stream*; this gate authenticates
 the *network* — no new auth surface.
 
+`POST {admin_prefix}/snapshot` (item 0ebe6a70 / #221) is the one route where
+the trust gate is deliberately NOT sufficient on its own: it hands out the
+service's whole database, and trusted-CIDR grants owner to every tailnet peer.
+It additionally requires an HMAC signature under the secret of a LIVE OUTBOUND
+subscription toward the caller — see `_authorize_snapshot`.
+
 This module pulls `fastapi` and is deliberately NOT re-exported from the
 `replication` package root — import it explicitly.
 """
@@ -28,18 +34,26 @@ This module pulls `fastapi` and is deliberately NOT re-exported from the
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
+import secrets
+import shutil
+import tempfile
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 
-from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import JSONResponse, StreamingResponse
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from snowline_plugin_sdk.replication import emit as _emit
 from snowline_plugin_sdk.replication import ingest as _ingest
-from snowline_plugin_sdk.replication.envelope import REJECTION_REASONS
+from snowline_plugin_sdk.replication import snapshot as _snapshot
+from snowline_plugin_sdk.replication.envelope import REJECTION_REASONS, verify_signature
+from snowline_plugin_sdk.replication.models import ReplicationSubscription
 
 
 # §5.1's full trusted set: the tailnet CGNAT range + IPv4/IPv6 loopback.
@@ -92,6 +106,76 @@ def _required(data: dict, *fields: str) -> list:
             status_code=400, detail=f"missing required field(s): {', '.join(missing)}"
         )
     return [data[f] for f in fields]
+
+
+# The archive is streamed off disk in 1 MiB chunks — the service never holds a
+# whole database dump in memory.
+SNAPSHOT_CHUNK_BYTES = 1 << 20
+
+# A process-lifetime decoy key. When no subscription matches the snapshot
+# request we still burn one HMAC against this, so "no such stream" and "bad
+# signature" cost the same and answer the same (see `_authorize_snapshot`).
+_DECOY_SECRET = secrets.token_hex(32)
+
+
+def _not_found() -> JSONResponse:
+    """Byte-for-byte what an unmounted path answers, so an unauthenticated
+    caller cannot distinguish a missing route from a refused one."""
+    return JSONResponse({"detail": "Not Found"}, status_code=404)
+
+
+def _authorize_snapshot(
+    session: Session, body: bytes, signature: str | None
+) -> ReplicationSubscription | None:
+    """The snapshot route's authorization, and the reason it is safe to serve a
+    whole database over the admin surface at all.
+
+    The caller must present a body naming a stream —
+    `{"source_id", "epoch", "peer_source_id"}` — AND an `X-Snowline-Signature`
+    HMAC over the exact bytes of that body, under the secret of an ACTIVE
+    OUTBOUND subscription on THIS service matching all three. Returns the
+    subscription, or None (the route answers `_not_found()` either way — a
+    caller cannot tell "no such stream" from "bad signature").
+
+    This MECHANICALLY ENFORCES §7's prime-first/dump-second order on the
+    primary side: the only secret that opens the snapshot is the one the seed
+    minted while PRIMING the primary→spoke stream (§7 step 1), and priming is
+    what makes the primary emit into that stream. **No prime, no snapshot** —
+    an operator cannot take the dump before the stream exists and silently lose
+    every write in the gap. It also scopes the exposure: a tailnet peer with no
+    primed stream toward it gets nothing, which trusted-CIDR alone would not
+    give (governance decision 1a83031c — the hub's Postgres never listens
+    beyond loopback, so this surface is the ONLY path and it must not be
+    peer-ambient).
+
+    `active` is load-bearing for the `--reseed` path: a fresh-epoch re-seed
+    retires the old subscription before priming the new one, so only the NEW
+    epoch's secret opens the snapshot; a retired epoch's secret resolves
+    nothing."""
+    try:
+        data = json.loads(body or b"{}")
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        data = {}
+    source_id = data.get("source_id")
+    epoch = data.get("epoch")
+    peer_source_id = data.get("peer_source_id")
+    sub = None
+    if all(isinstance(v, str) for v in (source_id, epoch, peer_source_id)):
+        sub = session.scalars(
+            select(ReplicationSubscription).where(
+                ReplicationSubscription.source_id == source_id,
+                ReplicationSubscription.epoch == epoch,
+                ReplicationSubscription.peer_source_id == peer_source_id,
+                ReplicationSubscription.active.is_(True),
+            )
+        ).first()
+    # Constant-time compare either way, against the decoy when nothing matched.
+    ok = verify_signature(
+        sub.secret if sub is not None else _DECOY_SECRET, body, signature
+    )
+    return sub if (ok and sub is not None) else None
 
 
 def build_replication_router(
@@ -219,6 +303,61 @@ def build_replication_router(
                 return _emit.set_subscription_secret(session, subscription_id, secret)
             except ValueError as exc:
                 raise HTTPException(status_code=404, detail=str(exc)) from None
+
+    # --- snapshot: the §7 step-2 seed dump, served by its owner --------------
+
+    @router.post(f"{admin_prefix}/snapshot")
+    async def snapshot(request: Request) -> Response:
+        """Stream a `pg_dump -Fc` custom-format archive of THIS service's OWN
+        database — §7 step 2's seed snapshot, produced by the service that owns
+        the store instead of by a remote `pg_dump` over a tailnet Postgres port
+        (governance decision 1a83031c: the hub's Postgres stays loopback-only;
+        all cross-instance data movement goes through a service's own HTTP
+        surface behind the trust gate).
+
+        Request: `POST {admin_prefix}/snapshot` with a JSON body
+        `{"source_id", "epoch", "peer_source_id"}` naming the PRIMED
+        primary→spoke stream, and `X-Snowline-Signature` = HMAC-SHA256 of the
+        exact body bytes under that stream's secret. Response: `200` with
+        `application/octet-stream` (the archive), or `404` with a
+        nonexistent-route body for ANY authorization failure (see
+        `_authorize_snapshot` — this is the route that mechanically enforces
+        §7's prime-first/dump-second order: no prime, no snapshot).
+
+        `_require_trusted` still runs FIRST, unchanged — the network gate is
+        necessary, just not sufficient here."""
+        _require_trusted(request)
+        body = await request.body()
+        signature = request.headers.get("X-Snowline-Signature")
+        with session_scope() as session:
+            if _authorize_snapshot(session, body, signature) is None:
+                return _not_found()
+            db_url = _snapshot.database_url(session)
+
+        # A temp DIRECTORY, not NamedTemporaryFile: the archive must outlive
+        # this coroutine (the streaming generator below owns its cleanup), and
+        # pg_dump writes the file itself.
+        tmpdir = tempfile.mkdtemp(prefix="snowline-snapshot-")
+        dest = os.path.join(tmpdir, "snapshot.dump")
+        try:
+            # pg_dump is blocking and can run for a while — off the event loop.
+            await run_in_threadpool(_snapshot.run_pg_dump, db_url, dest)
+        except Exception as exc:  # noqa: BLE001 - reported to a verified peer
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            # The caller holds this stream's secret, so the pg_dump error text
+            # is safe to hand back — and a silent 500 would leave the seed
+            # guessing. No password can appear in it (PGPASSWORD, never argv).
+            raise HTTPException(status_code=500, detail=str(exc)) from None
+
+        def _chunks():
+            try:
+                with open(dest, "rb") as fh:
+                    while chunk := fh.read(SNAPSHOT_CHUNK_BYTES):
+                        yield chunk
+            finally:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+
+        return StreamingResponse(_chunks(), media_type="application/octet-stream")
 
     # --- parking: the loud read (§8.1) ---------------------------------------
 

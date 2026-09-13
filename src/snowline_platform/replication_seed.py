@@ -15,10 +15,17 @@ module implements it in exactly that order:
      primary write emits into the stream — so a write landing between the dump
      and a later-created subscription can be in neither the snapshot nor a
      delivery. Priming first closes that gap.
-  2. DUMP each opted-in store (and the platform DB for scopes) with pg_dump and
-     restore into the spoke. Because `seq` is emit-time in the write's
-     transaction (§3.2), the dumped store carries its own stream counter — the
-     snapshot provably contains every event up to that counter.
+  2. SNAPSHOT each opted-in store (and the platform DB for scopes) and restore
+     it into the spoke. The PRIMARY dumps ITSELF — the seed fetches the archive
+     from `{admin_base}/snapshot` on the primary's own replication-admin surface
+     (signed with step 1's secret) and restores it locally with `pg_restore`.
+     The primary's Postgres is NEVER dialled across the tailnet: governance
+     decision 1a83031c keeps it loopback-only, so every cross-instance byte
+     moves over a Snowline service's HTTP surface behind the trust gate. The
+     snapshot's auth is the primed subscription, which makes step 1's precedence
+     mechanical rather than merely documented. Because `seq` is emit-time in the
+     write's transaction (§3.2), the dumped store carries its own stream
+     counter — the snapshot provably contains every event up to that counter.
   3. SCRUB then set watermarks. The restored store is the PRIMARY's, replication
      state and all — booting on it would drain the primary's cloned outbox under
      the primary's identity (origin suppression guards the emit hook, not the
@@ -51,7 +58,6 @@ import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
 
 from sqlalchemy import create_engine, delete, select
 from sqlalchemy.orm import Session
@@ -62,6 +68,7 @@ from snowline_platform.replication_pairing import (
     handshake_direction,
     mint_epoch,
 )
+from snowline_plugin_sdk.replication.envelope import sign_body
 from snowline_plugin_sdk.replication.models import (
     ReplicationInboundStream,
     ReplicationOutboxRow,
@@ -69,6 +76,11 @@ from snowline_plugin_sdk.replication.models import (
     ReplicationStreamCounter,
     ReplicationSubscription,
 )
+
+# ONE implementation of the libpq-URL/PGPASSWORD hygiene, shared with the
+# service side that now produces the dump (`snapshot.run_pg_dump`) — the seed
+# only restores here, but both halves must scrub passwords off argv identically.
+from snowline_plugin_sdk.replication.snapshot import libpq_url_and_env, pg_tool
 
 Report = Callable[[str], None]
 
@@ -85,6 +97,13 @@ _SCRUB_MODELS = (
 )
 
 
+# The snapshot request OVERRIDES the CLI client's ordinary 30s timeout: the
+# primary runs `pg_dump` before the first response byte, so a large store's
+# think-time is minutes, not seconds. One hour is "an operator would have given
+# up long ago", not a real bound.
+SNAPSHOT_TIMEOUT = 3600.0
+
+
 class SeedError(RuntimeError):
     """A seed step failed hard, or a re-seed precondition was not met."""
 
@@ -94,14 +113,18 @@ class SeedParticipant:
     """One participant's seed coordinates: its live primary-side `Participant`
     (admin surface + event vocabulary, discovered from the primary), plus the
     static endpoints the seed needs that are NOT discoverable while the spoke is
-    down — the spoke's ingest URL (prime targets it before boot) and the two
-    Postgres URLs the dump flows between."""
+    down — the spoke's ingest URL (prime targets it before boot) and the spoke's
+    own Postgres URL (local to the machine running the seed).
+
+    There is deliberately NO primary-side Postgres URL: the primary's snapshot
+    comes from its OWN admin surface (`{primary.admin_base}/snapshot`), never
+    from a `pg_dump` dialled across the tailnet — governance decision
+    1a83031c."""
 
     name: str
     primary: Participant
     spoke_source_id: str
     spoke_ingest_url: str
-    primary_dump_url: str
     spoke_db_url: str
 
 
@@ -114,14 +137,19 @@ class SeedConfig:
     participants: tuple[SeedParticipant, ...]
 
 
-def load_seed_config(client, path: str | Path) -> SeedConfig:
+def load_seed_config(client, path: str | Path, *, report: Report = print) -> SeedConfig:
     """Load + resolve a seed config JSON. The primary is UP during seeding, so the
     primary-side `Participant` for each named participant (admin base, ingest URL,
     event vocabulary, source_id) is DISCOVERED from the primary's `/plugins` (plus
     the platform's own scope participant, §8). The config supplies only what
-    discovery can't reach: the spoke endpoints (down during prime) and the
-    Postgres URLs. A participant named in the config but not opted-in on the
-    primary is a hard error — you cannot seed a stream the primary won't emit."""
+    discovery can't reach: the spoke endpoints (down during prime) and the spoke's
+    Postgres URL. A participant named in the config but not opted-in on the
+    primary is a hard error — you cannot seed a stream the primary won't emit.
+
+    A `primary_dump_url` left over from an older seed.json is IGNORED with a
+    warning rather than a hard failure — the primary's snapshot now comes from
+    its own admin surface (decision 1a83031c), and existing seed.json files on
+    operators' machines still carry the key."""
     from urllib.parse import urlsplit
 
     data = json.loads(Path(path).read_text())
@@ -147,13 +175,19 @@ def load_seed_config(client, path: str | Path) -> SeedConfig:
                 f"(discovered: {sorted(discovered)}). Seed only opted-in "
                 f"participants."
             )
+        if "primary_dump_url" in pcfg:
+            report(
+                f"[warn] {name}: 'primary_dump_url' in {Path(path).name} is "
+                f"IGNORED — the primary now serves its own snapshot over "
+                f"{prim.admin_base}/snapshot and its Postgres is never reachable "
+                f"over the tailnet (decision 1a83031c). Drop the key."
+            )
         participants.append(
             SeedParticipant(
                 name=name,
                 primary=prim,
                 spoke_source_id=f"{spoke['instance']}.{name}",
                 spoke_ingest_url=pcfg["spoke_ingest_url"],
-                primary_dump_url=pcfg["primary_dump_url"],
                 spoke_db_url=pcfg["spoke_db_url"],
             )
         )
@@ -217,12 +251,30 @@ def prime_forward(
 # --- step 2: dump + restore ---------------------------------------------------
 
 
-def dump_and_restore(sp: SeedParticipant, *, report: Report = print) -> None:
-    """§7 step 2 for one participant: `pg_dump` the primary store and restore it
-    into the spoke's database. Custom-format dump + `pg_restore --clean
+def dump_and_restore(
+    client, sp: SeedParticipant, epoch: str, secret: str, *, report: Report = print
+) -> None:
+    """§7 step 2 for one participant: FETCH the primary's snapshot over the
+    primary's OWN admin surface, then restore it into the spoke's database.
+
+    The primary dumps itself (`POST {admin_base}/snapshot`, SDK
+    `admin.build_replication_router`) and streams a `pg_dump -Fc` archive back;
+    the seed never dials the primary's Postgres. **Governance decision
+    1a83031c**: the hub's Postgres stays loopback-only and is never exposed on
+    the tailnet, not even with password auth — all cross-instance data movement
+    goes through a Snowline service's HTTP surface behind the trust gate.
+
+    The request is signed with the secret `prime_forward` just minted for the
+    primary→spoke stream (§7 step 1), which is why step 1 MUST precede this
+    call: the snapshot route resolves the ACTIVE outbound subscription for
+    `(source_id, epoch, peer_source_id)` and verifies the HMAC against its
+    secret — no prime, no snapshot. Any non-2xx (a 404 covers both "no such
+    stream" and "bad signature", by design) aborts the seed BEFORE step 3.
+
+    The restore side is unchanged: custom-format archive + `pg_restore --clean
     --if-exists` so a spoke DB that already has the (alembic-created) schema is
-    dropped-and-replaced cleanly rather than colliding. `--no-owner
-    --no-privileges` keeps the restore host-role-agnostic (the two instances are
+    dropped-and-replaced cleanly rather than colliding; `--no-owner
+    --no-privileges` keeps it host-role-agnostic (the two instances are
     different owner Macs).
 
     `--exit-on-error` is LOAD-BEARING: `--if-exists` already downgrades the only
@@ -230,25 +282,97 @@ def dump_and_restore(sp: SeedParticipant, *, report: Report = print) -> None:
     `--exit-on-error` pg_restore would keep going past a GENUINE error and still
     exit non-zero — a partially-restored store would then flow into scrub + boot
     as silent data loss (§7's whole failure mode). So any non-zero exit aborts
-    the seed before step 3. Passwords ride PGPASSWORD, never argv (ps hygiene)."""
-    dump_url, dump_env = _libpq_url_and_env(sp.primary_dump_url)
-    restore_url, restore_env = _libpq_url_and_env(sp.spoke_db_url)
+    the seed before step 3. Passwords ride PGPASSWORD, never argv (ps hygiene),
+    and the stream secret rides the signature header — never argv, never a
+    report line, never an error body."""
+    restore_url, restore_env = libpq_url_and_env(sp.spoke_db_url)
+    snapshot_url = f"{sp.primary.admin_base}/snapshot"
     with tempfile.TemporaryDirectory() as tmp:
         dump_file = Path(tmp) / f"{sp.name}.dump"
-        report(f"[dump ] {sp.name}: pg_dump primary -> {dump_file.name}")
-        _run(
-            ["pg_dump", "-Fc", "--no-owner", "--no-privileges", "-f",
-             str(dump_file), dump_url],
-            what=f"pg_dump {sp.name}",
-            env=dump_env,
-        )
+        report(f"[dump ] {sp.name}: requesting snapshot from {snapshot_url}")
+        size = _fetch_snapshot(client, sp, epoch, secret, dump_file)
+        report(f"[dump ] {sp.name}: received {size} byte archive -> {dump_file.name}")
         report(f"[restore] {sp.name}: pg_restore -> spoke")
         _run(
-            ["pg_restore", "--clean", "--if-exists", "--exit-on-error",
+            [pg_tool("pg_restore"), "--clean", "--if-exists", "--exit-on-error",
              "--no-owner", "--no-privileges", "-d", restore_url, str(dump_file)],
             what=f"pg_restore {sp.name}",
             env=restore_env,
         )
+
+
+def _snapshot_request_body(sp: SeedParticipant, epoch: str) -> bytes:
+    """The exact bytes the snapshot request POSTs AND signs — built once so the
+    signature is computed over what actually goes on the wire (delivery-time
+    signing over exact bytes, §5). Names the primed stream unambiguously:
+    `(source_id, epoch)` is unique on the primary, and `peer_source_id` pins it
+    to THIS spoke."""
+    return json.dumps(
+        {
+            "source_id": sp.primary.source_id,
+            "epoch": epoch,
+            "peer_source_id": sp.spoke_source_id,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+
+
+def _fetch_snapshot(
+    client, sp: SeedParticipant, epoch: str, secret: str, dest: Path
+) -> int:
+    """POST the signed snapshot request and stream the archive to `dest`.
+    Returns the byte count. Streams via `client.stream` when the client offers
+    it (the production `httpx.Client` does, so a multi-GB archive never lands in
+    memory) and falls back to a buffered POST otherwise."""
+    body = _snapshot_request_body(sp, epoch)
+    headers = {
+        "X-Snowline-Signature": sign_body(secret, body),
+        "Content-Type": "application/json",
+    }
+    url = f"{sp.primary.admin_base}/snapshot"
+    total = 0
+    stream = getattr(client, "stream", None)
+    if stream is not None:
+        with stream(
+            "POST", url, content=body, headers=headers, timeout=SNAPSHOT_TIMEOUT
+        ) as resp:
+            if resp.status_code >= 300:
+                resp.read()  # a streamed error body is unread until asked for
+                _raise_snapshot_error(resp, sp, url)
+            with open(dest, "wb") as fh:
+                for chunk in resp.iter_bytes():
+                    fh.write(chunk)
+                    total += len(chunk)
+    else:
+        resp = client.post(url, content=body, headers=headers, timeout=SNAPSHOT_TIMEOUT)
+        if resp.status_code >= 300:
+            _raise_snapshot_error(resp, sp, url)
+        with open(dest, "wb") as fh:
+            fh.write(resp.content)
+            total = len(resp.content)
+    if total == 0:
+        # A `pg_dump -Fc` archive is never empty, even for an empty database.
+        raise SeedError(
+            f"snapshot for {sp.name!r} came back EMPTY from {url} — refusing to "
+            f"restore a zero-byte archive over the spoke's store"
+        )
+    return total
+
+
+def _raise_snapshot_error(resp, sp: SeedParticipant, url: str) -> None:
+    hint = ""
+    if resp.status_code == 404:
+        hint = (
+            " — the primary answers 404 for both 'no such stream' and 'bad "
+            "signature' (non-enumeration, by design). Check that step 1 primed "
+            "this participant against THIS primary, and that the primary runs a "
+            "build with the snapshot route (item 0ebe6a70)."
+        )
+    raise SeedError(
+        f"fetching the snapshot for {sp.name!r} failed: POST {url} -> "
+        f"HTTP {resp.status_code} {_safe_body(resp)}{hint}"
+    )
 
 
 # --- step 3: scrub + set watermarks -------------------------------------------
@@ -322,7 +446,7 @@ def run_seed(
     for sp in cfg.participants:
         report(f"=== seeding {sp.name} ({sp.primary.source_id} -> {sp.spoke_source_id}) ===")
         epoch, secret = prime_forward(client, sp, report=report)
-        dump_and_restore(sp, report=report)
+        dump_and_restore(client, sp, epoch, secret, report=report)
         watermark = scrub_and_inject(sp, epoch, secret, report=report)
         results[sp.name] = {"epoch": epoch, "watermark": watermark}
     report(
@@ -519,37 +643,6 @@ def _safe_body(resp) -> str:
         return str(resp.json())
     except Exception:  # noqa: BLE001 - non-JSON error body
         return getattr(resp, "text", "")[:200]
-
-
-def _libpq_url(url: str) -> str:
-    """A libpq-consumable URL for pg_dump/pg_restore: strip SQLAlchemy's
-    `+psycopg` (or any `+driver`) so the CLI tools see a plain
-    `postgresql://` scheme."""
-    if url.startswith("postgresql+"):
-        return "postgresql://" + url.split("://", 1)[1]
-    if url.startswith("postgres+"):
-        return "postgres://" + url.split("://", 1)[1]
-    return url
-
-
-def _libpq_url_and_env(url: str) -> tuple[str, dict[str, str]]:
-    """A libpq URL with the password LIFTED OUT of the URL and into a `PGPASSWORD`
-    env fragment, so it never rides pg_dump/pg_restore's argv (visible in `ps`).
-    Returns `(url_without_password, env_overlay)`; the overlay is empty when the
-    URL carries no password (peer/trust auth, or a socket connection)."""
-    plain = _libpq_url(url)
-    parts = urlsplit(plain)
-    if not parts.password:
-        return plain, {}
-    userinfo = parts.username or ""
-    host = parts.hostname or ""
-    if parts.port:
-        host = f"{host}:{parts.port}"
-    netloc = f"{userinfo}@{host}" if userinfo else host
-    scrubbed = urlunsplit(
-        (parts.scheme, netloc, parts.path, parts.query, parts.fragment)
-    )
-    return scrubbed, {"PGPASSWORD": parts.password}
 
 
 def _sqlalchemy_url(url: str) -> str:

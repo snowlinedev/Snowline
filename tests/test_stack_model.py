@@ -479,25 +479,39 @@ def test_build_seed_config_shapes_participants_from_stack_config():
         role="spoke", instance_id="roam", primary_tailnet_address="mini.ts.net",
         primary_gateway_url="http://mini.ts.net:8850", local_tailnet_address="roam.ts.net",
     )
-    config = m.build_seed_config(cfg, local_platform_port=8848, pg_user="sean")
+    config = m.build_seed_config(cfg, local_platform_port=8848)
     assert config["primary"] == {"platform_url": "http://mini.ts.net:8850", "instance": "primary"}
     assert config["spoke"] == {"platform_url": "http://127.0.0.1:8848", "instance": "roam"}
     assert set(config["participants"]) == {"platform", "governance", "memory", "pm"}
     platform_p = config["participants"]["platform"]
     assert platform_p["spoke_ingest_url"] == "http://roam.ts.net:8848/replication/events/ingest"
-    assert platform_p["primary_dump_url"] == "postgresql://sean@mini.ts.net:5432/snowline_platform"
     assert platform_p["spoke_db_url"] == "postgresql:///snowline_platform"
     pm_p = config["participants"]["pm"]
     assert pm_p["spoke_ingest_url"] == "http://roam.ts.net:8803/events/ingest"
-    assert pm_p["primary_dump_url"] == "postgresql://sean@mini.ts.net:5432/snowline_pm"
     governance_p = config["participants"]["governance"]
     assert governance_p["spoke_ingest_url"] == "http://roam.ts.net:8801/events/ingest"
+
+
+def test_build_seed_config_carries_no_primary_postgres_url_or_credential():
+    """Item 0ebe6a70 / decision 1a83031c: the hub's Postgres is loopback-only, so
+    the seed config names NO primary-side database and NO credential — the only
+    Postgres URL left is the spoke's own local one."""
+    cfg = m.StackConfig(
+        role="spoke", instance_id="roam", primary_tailnet_address="mini.ts.net",
+        primary_gateway_url="http://mini.ts.net:8850", local_tailnet_address="roam.ts.net",
+    )
+    config = m.build_seed_config(cfg, local_platform_port=8848)
+    for participant in config["participants"].values():
+        assert set(participant) == {"spoke_ingest_url", "spoke_db_url"}
+    blob = json.dumps(config)
+    assert "primary_dump_url" not in blob
+    assert ":5432" not in blob and "mini.ts.net:5432" not in blob
 
 
 def test_build_seed_config_refuses_without_the_additive_fields():
     cfg = m.StackConfig(role="spoke", instance_id="roam", primary_tailnet_address="mini.ts.net")
     with pytest.raises(m.StackError, match="missing primary_gateway_url"):
-        m.build_seed_config(cfg, local_platform_port=8848, pg_user="sean")
+        m.build_seed_config(cfg, local_platform_port=8848)
 
 
 # -- CLI argv builders (the fake-runner orchestration tests assert these

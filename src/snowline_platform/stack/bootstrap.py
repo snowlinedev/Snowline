@@ -9,8 +9,10 @@ never reimplements a byte of replication logic (`replication_seed.py`,
   assumes but never states as machine-checkable (§0, §5's "with the primary
   up"), refusing loudly and BEFORE touching anything;
 - builds the `seed.json` the runbook's §5 has the operator hand-edit from
-  `ops/roam/seed-config.example.json`, from `stack.json` plus one
-  interactively-prompted Postgres user;
+  `ops/roam/seed-config.example.json`, entirely from `stack.json` — no
+  credential prompt: since item 0ebe6a70 the primary serves its own snapshot
+  over its replication-admin surface (governance decision 1a83031c keeps the
+  hub's Postgres loopback-only), so there is no primary-side Postgres user;
 - drives `snowline replicate seed [--reverse-pair|--reseed]` and
   `snowline replicate reseed-check` as SUBPROCESSES through the SAME
   `release.runner.Runner` seam `stack.sync` uses — never by importing
@@ -29,7 +31,6 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import os
 import time
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -63,15 +64,6 @@ __all__ = [
     "write_bootstrap_report",
     "write_seed_config",
 ]
-
-
-def _prompt_pg_user(prompt: PromptFn) -> str:
-    default = os.environ.get("USER") or "postgres"
-    raw = prompt(
-        f"Postgres user on the PRIMARY for pg_dump over the tailnet "
-        f"(default: {default}): "
-    ).strip()
-    return raw or default
 
 
 def ensure_bootstrap_config(
@@ -136,8 +128,8 @@ def ensure_bootstrap_config(
 
 def write_seed_config(home: Path, seed_dict: dict, *, dry_run: bool) -> Path:
     """Regenerated every bootstrap-spoke run (unlike the operator-owned
-    `*.env` files) — it is derived wholly from `stack.json` plus a
-    freshly-prompted credential, never hand-edited."""
+    `*.env` files) — it is derived wholly from `stack.json`, carries no
+    credential at all (item 0ebe6a70), and is never hand-edited."""
     path = m.seed_config_path(home)
     if not dry_run:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -233,9 +225,11 @@ def run_bootstrap_spoke(
         ok("primary-gateway-healthy")
 
         # -- build + write the seed config -----------------------------------
-        pg_user = _prompt_pg_user(prompt)
+        # No credential prompt: the primary serves its own snapshot over its
+        # replication-admin surface (item 0ebe6a70 / decision 1a83031c), so
+        # there is no primary-side Postgres user to ask for.
         seed_dict = m.build_seed_config(
-            cfg, local_platform_port=m.SERVICE_PORTS["platform"], pg_user=pg_user
+            cfg, local_platform_port=m.SERVICE_PORTS["platform"]
         )
         seed_path = write_seed_config(home, seed_dict, dry_run=dry_run)
         if dry_run:

@@ -554,11 +554,26 @@ delivery — lost. The procedure:
    and the primary's dump can never supply the spoke's inbound secret (the
    primary is the sender on that stream and never holds it). From this
    instant every primary write emits into the stream.
-2. **Then snapshot**: `pg_dump`/restore each opted-in plugin's store (and
-   the platform DB for scopes, §8). Because `seq` is allocated at emit time
-   in the write's transaction (§3.2), the dumped store carries its own
-   stream counter — the snapshot provably contains every event up to that
-   counter's value.
+2. **Then snapshot**: each opted-in plugin's store (and the platform DB for
+   scopes, §8) is dumped **by the service that owns it** and served over
+   that service's own replication-admin surface — `POST
+   {admin_prefix}/snapshot` streams a `pg_dump -Fc` archive, which the seed
+   `pg_restore`s into the spoke. Postgres never listens beyond loopback on
+   either instance, not even with password auth, and no `pg_dump` is dialled
+   across the tailnet: **governance decision 1a83031c** — all cross-instance
+   data movement goes through a Snowline service's own HTTP surface behind
+   the trust gate. The trust gate alone does not guard that route (it grants
+   owner to every tailnet peer, which is exactly the exposure the decision
+   rejects): the request must ALSO be HMAC-signed with the secret of an
+   *active* outbound subscription toward the caller, i.e. the one step 1
+   just minted. That makes this step's dependency on step 1 mechanical
+   rather than merely documented — **no prime, no snapshot** — and it is why
+   a fresh-epoch re-seed (step 5) must retire the old stream before priming
+   the new one. Authorization failures answer `404` with a
+   nonexistent-route body, so the surface cannot be probed for which streams
+   exist. Because `seq` is allocated at emit time in the write's transaction
+   (§3.2), the dumped store carries its own stream counter — the snapshot
+   provably contains every event up to that counter's value.
 3. **Scrub, then set watermarks** — the restored store is the PRIMARY's
    store, replication state and all: its outbound subscription rows
    (spoke-targeted, live secrets included — step 1 *guarantees* they're in
