@@ -37,7 +37,9 @@ from snowline_memory.mcp_surface import build_main_surface
 # The manifest ingest path §4 declares (matched by the pairing CLI); memory's
 # replication routes mount under this + the admin prefix, as plain FastAPI routes
 # registered BEFORE the catch-all `/` MCP mount so Starlette matches them first.
-REPLICATION_INGEST_PATH = "/events/ingest"
+# The ingest path is declared next to the manifest's replication block
+# (registration.py) so the advertised and served paths cannot drift.
+REPLICATION_INGEST_PATH = registration.INGEST_PATH
 
 
 def _migrate_to_head() -> None:
