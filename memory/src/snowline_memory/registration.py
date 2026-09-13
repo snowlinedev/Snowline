@@ -28,12 +28,23 @@ from __future__ import annotations
 import logging
 
 from snowline_plugin_sdk import registration as sdk_registration
+from snowline_plugin_sdk.contract import (
+    CONTRACT_VERSION,
+    EVENT_MEMORY_FORGOTTEN,
+    EVENT_MEMORY_SET,
+)
 
 from snowline_memory import config
 
 log = logging.getLogger("snowline_memory.registration")
 
 PLUGIN_NAME = "memory"
+
+# Where memory's signed-event ingest route mounts (replication-continuity §5,
+# #80) — declared here (the manifest is the contract's source of truth) and
+# imported by `app.py` when mounting `build_replication_router`, so the
+# advertised path and the served path cannot drift.
+INGEST_PATH = "/events/ingest"
 
 
 def build_manifest(base_url: str | None = None) -> dict:
@@ -47,6 +58,17 @@ def build_manifest(base_url: str | None = None) -> dict:
         # Plugin-path -> platform named-surface (gateway.md §2): memory's one
         # surface composes onto `main`. No isolated surface.
         "surfaces": {"/mcp": "main"},
+        # Replication opt-in (replication-continuity §4, #80): ADVISORY metadata
+        # the §5 pairing step reads — without this block, `discover_participants`
+        # skips memory and it is silently left out of the pair even though the
+        # ingest/admin surface is mounted. The vocabulary is memory's OWN
+        # emitted subset (the platform self-manifest pattern, §8), not the full
+        # pinned registry.
+        "replication": {
+            "contract_version": CONTRACT_VERSION,
+            "ingest_path": INGEST_PATH,
+            "events": sorted((EVENT_MEMORY_SET, EVENT_MEMORY_FORGOTTEN)),
+        },
     }
 
 

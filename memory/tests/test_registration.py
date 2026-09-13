@@ -42,6 +42,14 @@ def test_register_posts_the_right_manifest():
     assert m["health_path"] == "/health"
     # One surface, mapped onto the platform's `main` — no isolated surface.
     assert m["surfaces"] == {"/mcp": "main"}
+    # Replication opt-in (replication-continuity §4, #80): pairing discovery
+    # keys on this block — without it memory is silently left out of the pair.
+    # The vocabulary is memory's OWN emitted subset, sorted.
+    assert m["replication"] == {
+        "contract_version": 2,
+        "ingest_path": "/events/ingest",
+        "events": ["memory.forgotten", "memory.set"],
+    }
 
 
 def test_heartbeat_reasserts_memory_manifest_every_beat():
