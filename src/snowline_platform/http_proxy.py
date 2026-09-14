@@ -102,6 +102,7 @@ from snowline_platform.registry import (
     RegisteredPlugin,
 )
 from snowline_platform.replication import ADMIN_PREFIX as REPLICATION_ADMIN_PREFIX
+from snowline_platform.replication import VIA_PREFIX
 
 # The shared proxy client, the body cap and the capped-body reader are
 # `/ui-api`'s (ui_api.py) — deliberately imported rather than re-derived: one
@@ -124,14 +125,19 @@ log = logging.getLogger("snowline_platform.http_proxy")
 UPSTREAM_READ_TIMEOUT = 60.0
 
 # --- replication via the gateway (`/via/<plugin>/…`, decision 0b8390f7) -----
-# A delivery batch is a JSON array of signed envelopes — far larger than a
-# contract write; 8 MiB is "no realistic batch, every runaway one" (the SDK
-# delivery loop drains in bounded batches).
+# The SDK delivers ONE signed envelope per POST (emit.py builds the body from a
+# single outbox row; the ingest route rejects a JSON array), but an envelope
+# carries a row's full state, including unbounded free-text fields (a PM item
+# body, a memory note). 8 MiB is "no realistic envelope, every runaway one".
 VIA_BODY_LIMIT = 8 * 1024 * 1024
 # The §7 snapshot route runs `pg_dump` BEFORE its first response byte, so a
 # large store's think-time is minutes; mirror the seed client's own bound
-# (`replication_seed.SNAPSHOT_TIMEOUT`) rather than the contract-write one.
+# (`replication_seed.SNAPSHOT_TIMEOUT`). Applied to the snapshot path ONLY —
+# every other /via forward (a per-envelope ingest, an admin call) keeps the
+# contract read timeout, so a stalled plugin cannot pin a pooled connection
+# for an hour per delivery attempt.
 VIA_READ_TIMEOUT = 3600.0
+VIA_SNAPSHOT_PATH = f"{REPLICATION_ADMIN_PREFIX}/snapshot"
 
 HOP_BY_HOP_HEADERS: frozenset[str] = frozenset({
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -209,7 +215,7 @@ def upstream_url(base_url: str, raw_path: bytes, query_string: bytes) -> httpx.U
         raise ProxyPathError(str(exc)) from exc
 
 
-def _forward_headers(request: Request) -> list[tuple[str, str]]:
+def _forward_headers(request: Request, *, forward_peer: bool = True) -> list[tuple[str, str]]:
     out = [
         (name, value)
         for name, value in request.headers.items()
@@ -223,7 +229,14 @@ def _forward_headers(request: Request) -> list[tuple[str, str]]:
         out.append(("accept-encoding", "identity"))
     # The DIRECT peer's IP (the same value the trust gate resolved on) — a
     # caller-supplied chain is stripped above so an upstream can't be fed one.
-    if request.client is not None:
+    # NOT sent on the replication `/via` path (`forward_peer=False`): plugins
+    # run stock uvicorn with proxy-header trust for loopback, so an
+    # X-Forwarded-For from the platform would REPLACE the plugin's view of its
+    # peer with the tailnet address — and the SDK's `_require_trusted` would
+    # then gate on that instead of on the platform's loopback client, which is
+    # the documented posture (§4.1/§5.1: cross-instance traffic reaches a
+    # plugin from loopback).
+    if forward_peer and request.client is not None:
         out.append(("x-forwarded-for", request.client.host))
     if "host" in request.headers:
         out.append(("x-forwarded-host", request.headers["host"]))
@@ -350,10 +363,17 @@ class PluginHttpProxy:
                 headers={"allow": allowed},
             )
 
+        try:
+            raw_path = _raw_route_path(request.scope)
+        except ProxyPathError as exc:
+            return JSONResponse(
+                {"detail": f"request path cannot be forwarded: {exc}"},
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
         return await forward_to_plugin(
             request,
             entry,
-            _raw_route_path(request.scope),
+            raw_path,
             body_limit=POST_BODY_LIMIT,
             read_timeout=UPSTREAM_READ_TIMEOUT,
         )
@@ -366,6 +386,8 @@ async def forward_to_plugin(
     *,
     body_limit: int,
     read_timeout: float,
+    public_base: str | None = None,
+    forward_peer: bool = True,
 ) -> Response:
     """Forward `request` to `entry`'s `base_url` + `raw_path` (verbatim, plus
     the raw query string) and relay the response as it streams back. The ONE
@@ -373,7 +395,15 @@ async def forward_to_plugin(
     (`PluginHttpProxy`) and the replication `/via` surface
     (`ReplicationViaProxy`) — so header policy, body capping, error shapes
     and streaming are identical; the callers differ only in what they let
-    through and how large/slow it may be."""
+    through and how large/slow it may be.
+
+    `public_base` is the gateway-side address that corresponds to the plugin's
+    `base_url` for THIS forward — the origin a plugin-absolute redirect is
+    rewritten onto. The root-level `http` surfaces use the bare gateway origin
+    (a plugin path IS the public path); `/via` passes `<origin>/via/<name>`, so
+    a plugin's `307 …/replication-admin/outbound` comes back as
+    `/via/<name>/replication-admin/outbound` rather than landing on the
+    platform's OWN admin surface at the gateway root."""
     name = entry.manifest.name
     try:
         target = upstream_url(
@@ -402,7 +432,7 @@ async def forward_to_plugin(
         request.method,
         target,
         content=body,
-        headers=_forward_headers(request),
+        headers=_forward_headers(request, forward_peer=forward_peer),
         timeout=httpx.Timeout(PROXY_TIMEOUT, read=read_timeout),
     )
     try:
@@ -424,7 +454,7 @@ async def forward_to_plugin(
             status_code=status.HTTP_502_BAD_GATEWAY,
         )
 
-    gateway_origin = str(request.base_url).rstrip("/")
+    gateway_origin = public_base or str(request.base_url).rstrip("/")
     return StreamingResponse(
         _raw_body(upstream_resp),
         status_code=upstream_resp.status_code,
@@ -465,13 +495,18 @@ class ReplicationViaProxy:
     Trust is the gateway's: this mount rides `TrustMiddleware` like every
     other path, so only a trusted (tailnet/loopback) peer reaches it — and the
     plugin then sees the PLATFORM's own client as its peer (loopback), which
-    the SDK's `_require_trusted` already admits with no forwarded-header trust
-    anywhere. The per-stream HMAC on ingest and snapshot is unchanged. Net
-    effect: the only tailnet-reachable port per instance is the platform's.
+    the SDK's `_require_trusted` already admits. That holds because this path
+    deliberately sends NO `X-Forwarded-For` (`forward_peer=False`): plugins
+    run stock uvicorn with proxy-header trust for loopback, so a forwarded
+    tailnet address would otherwise become the plugin's `request.client` and
+    its gate would resolve the peer instead. The per-stream HMAC on ingest and
+    snapshot is unchanged. Net effect: the only tailnet-reachable port per
+    instance is the platform's.
 
-    Sized for the traffic it carries, unlike the contract proxy: an ingest
-    batch may be large (`VIA_BODY_LIMIT`) and the snapshot route may think
-    for minutes before its first byte (`VIA_READ_TIMEOUT`)."""
+    Sized for the traffic it carries, unlike the contract proxy: a single
+    envelope may be large (`VIA_BODY_LIMIT`), and the snapshot route — and
+    ONLY it — may think for minutes before its first byte
+    (`VIA_READ_TIMEOUT`)."""
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -527,12 +562,20 @@ class ReplicationViaProxy:
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
         else:
+            # `request.base_url` is the app's root, not the Mount's — compose the
+            # public base for this plugin ourselves so a plugin-absolute
+            # redirect is rewritten back UNDER `/via/<name>`.
+            gateway_root = str(request.base_url).rstrip("/")
             response = await forward_to_plugin(
                 request,
                 entry,
                 raw_rest,
                 body_limit=VIA_BODY_LIMIT,
-                read_timeout=VIA_READ_TIMEOUT,
+                read_timeout=(
+                    VIA_READ_TIMEOUT if rest == VIA_SNAPSHOT_PATH else UPSTREAM_READ_TIMEOUT
+                ),
+                public_base=f"{gateway_root}{VIA_PREFIX}/{name}",
+                forward_peer=False,
             )
         await response(scope, receive, send)
 

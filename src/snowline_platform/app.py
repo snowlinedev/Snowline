@@ -212,14 +212,15 @@ def create_app(
     # decision 0503fff0); a gateway surface named after any of them would mount
     # /<name>/mcp on top of those and silently interleave MCP transports or SPA
     # assets — fail loud at boot like every other surface-config error.
-    reserved = {"ui", "ui-api", platform_tools.PLATFORM_PLUGIN_NAME} & set(
-        config.surfaces()
-    )
+    reserved = {
+        "ui", "ui-api", platform_tools.PLATFORM_PLUGIN_NAME, "via",
+    } & set(config.surfaces())
     if reserved:
         raise config.ConfigError(
             f"SNOWLINE_SURFACES uses reserved name(s) {sorted(reserved)!r} — "
-            f"'ui'/'ui-api' are the dashboard's route namespaces and 'platform' "
-            f"is the platform's own tool-app route (/platform/mcp)"
+            f"'ui'/'ui-api' are the dashboard's route namespaces, 'platform' "
+            f"is the platform's own tool-app route (/platform/mcp), and 'via' "
+            f"is the replication proxy (/via/<plugin>/…, decision 0b8390f7)"
         )
 
     # The gateway: aggregate registered plugins' MCP surfaces onto the platform's

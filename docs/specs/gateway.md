@@ -303,15 +303,22 @@ plugin whose status is `down` short-circuits to 503 (§4). A real `Mount`,
 not a router fallback: `via` is in `RESERVED_HTTP_PREFIXES`, so no plugin
 can claim it and nothing can shadow it.
 
-**Sizing differs from §3a**: a delivery batch may be large (`VIA_BODY_LIMIT`,
-8 MiB) and the snapshot route runs `pg_dump` before its first byte
-(`VIA_READ_TIMEOUT`, one hour — the seed client's own bound).
+**Sizing differs from §3a**: the SDK delivers ONE signed envelope per POST,
+but an envelope carries a row's full state including unbounded free text, so
+the body cap is 8 MiB (`VIA_BODY_LIMIT`); and the snapshot route — and only
+it — runs `pg_dump` before its first byte, so that path alone gets a one-hour
+read timeout (`VIA_READ_TIMEOUT`, the seed client's own bound) while every
+other `/via` forward keeps the §3a contract timeout, so a stalled plugin
+cannot pin a pooled connection for an hour per delivery attempt.
 
 **Trust.** The mount rides `TrustMiddleware` like every gateway path, so only
 a trusted (tailnet/loopback) peer reaches it; the plugin then sees the
 platform's own client as its peer — loopback — which the SDK's
-`_require_trusted` already admits. No forwarded-header trust exists anywhere
-on this path (the §3a `X-Forwarded-For` is informational). Net effect: the
+`_require_trusted` already admits. This holds because `/via` deliberately
+sends NO `X-Forwarded-For` (unlike §3a): plugins run stock uvicorn with
+proxy-header trust for loopback, so a forwarded tailnet address would
+otherwise become the plugin's `request.client` and its gate would resolve the
+peer instead of the platform. Net effect: the
 only tailnet-reachable port per instance is the platform's; plugins keep
 binding loopback and change nothing. Pairing addresses a peer's plugins as
 `<peer platform_url>/via/<name>` by default (replication-continuity.md §4.1);

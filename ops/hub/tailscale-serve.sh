@@ -57,7 +57,10 @@ if command -v tailscale >/dev/null 2>&1; then
 else
   TAILSCALE="${TAILSCALE_BIN:-/Applications/Tailscale.app/Contents/MacOS/Tailscale}"
 fi
-tailscale() { "$TAILSCALE" "$@"; }
+# `command` so the function never re-enters ITSELF when TAILSCALE is the bare
+# name `tailscale` (bash resolves functions before PATH — without it the
+# on-PATH case recursed until the shell segfaulted).
+tailscale() { command "$TAILSCALE" "$@"; }
 
 BACKEND_HOST="${SNOWLINE_HUB_BACKEND_HOST:-$(tailscale ip -4)}"
 BACKEND_PORT="${SNOWLINE_HUB_PLATFORM_PORT:-8850}"

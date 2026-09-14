@@ -323,7 +323,9 @@ platform's — the one bootstrap already requires healthy over the tailnet and
 the one `tailscale serve` (or a direct tailnet bind, on the hub) already
 fronts. Plugins change nothing: they keep binding loopback, keep advertising
 loopback, and see the platform's own client as their peer (loopback), which
-the SDK's `_require_trusted` admits with no forwarded-header trust anywhere.
+the SDK's `_require_trusted` admits — the `/via` proxy sends no
+`X-Forwarded-For`, precisely so a plugin's stock uvicorn proxy-header
+handling cannot swap the tailnet address in as its peer (gateway.md §3b).
 Trust on the tailnet side is the gateway's `TrustMiddleware` CIDR gate, and
 the per-stream HMAC on ingest and snapshot is unchanged. The cost accepted:
 the platform is now on the cross-instance delivery path, so a platform

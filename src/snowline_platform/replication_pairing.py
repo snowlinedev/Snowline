@@ -35,14 +35,13 @@ an event type one side doesn't know simply never arrives from it.
 
 from __future__ import annotations
 
-import ipaddress
 import logging
 import secrets
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from snowline_platform.replication import VIA_PREFIX
+from snowline_platform.replication import via_base
 
 log = logging.getLogger("snowline_platform.replication_pairing")
 
@@ -121,6 +120,7 @@ def discover_participants(
     admin_prefix: str = DEFAULT_ADMIN_PREFIX,
     include_platform: bool = True,
     peer: bool = False,
+    public_url: str | None = None,
 ) -> dict[str, Participant]:
     """Every replicating participant on the instance at `platform_url`, keyed by
     name. Plugins come from `GET /plugins` (a plugin replicates iff its manifest
@@ -142,7 +142,15 @@ def discover_participants(
     plugin's loopback surfaces (`http_proxy.ReplicationViaProxy`) — unless the
     plugin declares an explicit `advertised_base_url`, which wins verbatim.
     The platform participant is addressed at `platform_url` in both cases
-    (already the reachable address)."""
+    (already the reachable address).
+
+    `public_url` (LOCAL discovery only) is the address a PEER reaches THIS
+    instance's gateway at. When given, each participant's `ingest_url` — the
+    target a peer's outbound subscription will dial — is built against it
+    (`<public_url>/via/<name><ingest_path>`, or `<public_url><ingest_path>` for
+    the platform) while `admin_base` stays on the loopback `platform_url` the
+    local handshake drives. Without it a local participant's ingest_url is
+    loopback, which only a same-box peer can reach."""
     platform_url = platform_url.rstrip("/")
     resp = client.get(f"{platform_url}/plugins")
     _raise_for_status(resp, f"GET {platform_url}/plugins")
@@ -154,20 +162,34 @@ def discover_participants(
             continue  # not opted in — degrades alone (§4)
         name = manifest["name"]
         base = _resolve_base(block, name, manifest["base_url"], platform_url, peer=peer)
-        participants[name] = _participant(name, base, block, instance_id, admin_prefix)
+        ingest_base = (
+            _resolve_base(block, name, manifest["base_url"], public_url, peer=True)
+            if public_url
+            else base
+        )
+        participants[name] = _participant(
+            name, base, block, instance_id, admin_prefix, ingest_base=ingest_base
+        )
     if include_platform:
         block = _platform_manifest(client, platform_url)
         # The platform is discovered AT platform_url (already the reachable
         # address), so its base is platform_url verbatim — `/via` is a plugin
         # concern (§8).
         participants[PLATFORM_PARTICIPANT] = _participant(
-            PLATFORM_PARTICIPANT, platform_url, block, instance_id, admin_prefix
+            PLATFORM_PARTICIPANT, platform_url, block, instance_id, admin_prefix,
+            ingest_base=public_url or platform_url,
         )
     return participants
 
 
 def _participant(
-    name: str, base: str, block: dict, instance_id: str, admin_prefix: str
+    name: str,
+    base: str,
+    block: dict,
+    instance_id: str,
+    admin_prefix: str,
+    *,
+    ingest_base: str | None = None,
 ) -> Participant:
     """Build a Participant from a `replication`-block-shaped dict — the ONE
     construction path for both a plugin (block from `/plugins`, §4) and the
@@ -175,10 +197,11 @@ def _participant(
     declared `contract_version`/vocabulary and are refused/warned identically at
     pairing."""
     base = base.rstrip("/")
+    ingest_base = (ingest_base or base).rstrip("/")
     return Participant(
         name=name,
         admin_base=f"{base}{admin_prefix}",
-        ingest_url=f"{base}{block['ingest_path']}",
+        ingest_url=f"{ingest_base}{block['ingest_path']}",
         source_id=f"{instance_id}.{name}",
         events=tuple(block.get("events", [])),
         contract_version=block.get("contract_version"),
@@ -207,7 +230,7 @@ def _resolve_base(
     advertised = block.get("advertised_base_url")
     if advertised:
         return advertised
-    return f"{platform_url.rstrip('/')}{VIA_PREFIX}/{name}"
+    return via_base(platform_url, name)
 
 
 def _platform_manifest(client, platform_url: str) -> dict:
@@ -479,17 +502,6 @@ def pair(
         f"{len(plan.one_sided)} one-sided, {len(plan.refused)} refused"
     )
     return plan
-
-
-def _is_loopback(hostname: str | None) -> bool:
-    if not hostname:
-        return False
-    if hostname == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(hostname).is_loopback
-    except ValueError:
-        return False
 
 
 def _raise_for_status(resp, what: str) -> None:

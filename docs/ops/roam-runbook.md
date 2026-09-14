@@ -96,6 +96,12 @@ seed address peers that way automatically; you declare nothing. (On the hub the
 platform binds its tailnet address directly — `ops/hub/tailscale-serve.sh` adds
 the HTTPS front on top — so the hub needs no TCP mirror at all.)
 
+> **Upgrading an instance paired under the OLD posture** (streams whose
+> `target_url` dials `<peer>:8801/8802/8803`): there is no admin verb to
+> repoint a live stream, so re-seed the spoke under a fresh epoch (§6) — or
+> re-pair after retiring the old streams — BEFORE switching the old per-port
+> mirror off. Off first wedges every old stream in backoff.
+
 > **If a plugin is fronted some other way** (a distinct host, a non-gateway
 > front): the plugin declares its peer-reachable address as
 > `advertised_base_url` on its manifest `replication` block (spec §4.1), which
@@ -144,10 +150,16 @@ No topology survives an ops gap on the hub. On the primary:
 From the roam laptop:
 
 ```bash
-uv run snowline replicate pair http://mini.CHANGEME.ts.net:8848 \
+uv run snowline replicate pair http://mini.CHANGEME.ts.net:8850 \
     --local-url http://127.0.0.1:8848 \
+    --local-peer-url http://roam.CHANGEME.ts.net:8848 \
     --local-instance roam --peer-instance primary
 ```
+
+`--local-peer-url` is THIS instance's gateway as the PEER reaches it: the
+reverse (primary→roam) streams are pointed at `<that>/via/<plugin>/…`
+(decision 0b8390f7). Leave it out only for a same-box drill — the command
+warns, and the reverse streams then target this instance's loopback.
 
 What it does (§5): for every participant opted into replication on **both**
 instances (each replicating plugin, plus the platform's own scope stream), it

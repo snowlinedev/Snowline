@@ -77,6 +77,15 @@ def _build_replicate(p: argparse.ArgumentParser) -> None:
         help="the peer instance's SNOWLINE_INSTANCE_ID (e.g. 'primary')",
     )
     pair.add_argument(
+        "--local-peer-url",
+        default=os.environ.get("SNOWLINE_LOCAL_PEER_URL"),
+        help="THIS instance's gateway as the PEER reaches it over the tailnet "
+        "(e.g. http://roam.tailnet:8848) — the reverse (peer->local) streams "
+        "are pointed at <this>/via/<plugin>/… (decision 0b8390f7). Without it "
+        "they target this instance's LOOPBACK, which only a same-box peer can "
+        "reach; the command warns loudly",
+    )
+    pair.add_argument(
         "--dry-run", action="store_true",
         help="discover + plan (warnings, refusals) without driving the handshake",
     )
@@ -390,8 +399,21 @@ def _cmd_pair(args) -> int:
             file=sys.stderr,
         )
         return 1
+    if not args.local_peer_url:
+        print(
+            "WARN --local-peer-url not given: the peer->local streams will target "
+            f"this instance's loopback gateway ({args.local_url}), which only a "
+            "peer on THIS machine can reach. Pass this instance's tailnet gateway "
+            "address for a two-box pairing.",
+            file=sys.stderr,
+        )
     with _client() as client:
-        local = pairing.discover_participants(client, args.local_url, args.local_instance)
+        # Local participants: admin surfaces on the loopback gateway (the
+        # handshake drives them from here); ingest targets on the address the
+        # PEER reaches this gateway at (`<local-peer-url>/via/<name>`).
+        local = pairing.discover_participants(
+            client, args.local_url, args.local_instance, public_url=args.local_peer_url
+        )
         # The peer's plugins are addressed through ITS gateway (`/via/<name>`,
         # §4.1 / decision 0b8390f7) — peer_url is the only peer address needed.
         peer = pairing.discover_participants(

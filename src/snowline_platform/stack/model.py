@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from snowline_platform.replication import INGEST_PATH as _PLATFORM_INGEST_PATH
-from snowline_platform.replication import VIA_PREFIX as _VIA_PREFIX
+from snowline_platform.replication import via_base as _via_base
 
 _VERSION_RE = re.compile(r"^v0\.(\d+)\.(\d+)$")
 
@@ -850,11 +850,10 @@ def build_seed_config(cfg: StackConfig, *, local_platform_port: int) -> dict:
         # participants reached through the gateway's `/via/<plugin>` proxy
         # (decision 0b8390f7). The platform's own scope stream lives at the
         # gateway root. No plugin port is ever dialled across the tailnet.
-        via = "" if svc == "platform" else f"{_VIA_PREFIX}/{svc}"
+        gateway = f"http://{cfg.local_tailnet_address}:{local_platform_port}"
+        base = gateway if svc == "platform" else _via_base(gateway, svc)
         participants[svc] = {
-            "spoke_ingest_url": (
-                f"http://{cfg.local_tailnet_address}:{local_platform_port}{via}{path}"
-            ),
+            "spoke_ingest_url": f"{base}{path}",
             "spoke_db_url": f"postgresql:///{db}",
         }
     return {

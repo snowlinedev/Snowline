@@ -254,6 +254,31 @@ def test_advertised_base_url_preferred_over_the_gateway_route():
     assert gov.ingest_url == "http://primary.tailnet:9901/events/ingest"
 
 
+def test_local_discovery_with_public_url_points_ingest_at_this_gateway():
+    """`public_url` (the address the PEER reaches THIS gateway at) shapes the
+    ingest targets a peer's outbound subscriptions will dial —
+    `<public_url>/via/<name><ingest_path>`, or `<public_url><ingest_path>` for
+    the platform — while the admin surfaces stay on the loopback gateway the
+    local handshake drives. Without it a two-box `pair` would hand the peer a
+    loopback target."""
+    apps = {
+        "roam-platform": make_platform(plugins=[
+            plugin_entry("governance", "http://127.0.0.1:8801",
+                         events=["decision.recorded"]),
+        ]),
+    }
+    client = RoutedClient({h: inst.app for h, inst in apps.items()})
+    local = pairing.discover_participants(
+        client, "http://roam-platform", "roam", public_url="http://roam.tailnet:8848"
+    )
+    gov = local["governance"]
+    assert gov.admin_base == "http://127.0.0.1:8801/replication-admin"
+    assert gov.ingest_url == "http://roam.tailnet:8848/via/governance/events/ingest"
+    plat = local["platform"]
+    assert plat.admin_base == "http://roam-platform/replication-admin"
+    assert plat.ingest_url == "http://roam.tailnet:8848/replication/events/ingest"
+
+
 def test_local_discovery_uses_loopback_base_url_even_with_advertised():
     """LOCAL discovery (`peer=False`) addresses a plugin at its loopback
     base_url as-is — `advertised_base_url` is a PEER-reachability concern (§4.1),

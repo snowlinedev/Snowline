@@ -23,8 +23,12 @@
 # instead, the tailnet range in the CIDR list is what carries the trust; keep
 # both listed.
 #
-# A mirror left over from the pre-0b8390f7 posture (tailnet:8801/8802/8803) is
-# harmless but pointless; remove it with `tailscale serve --tcp=<port> off`.
+# A mirror left over from the pre-0b8390f7 posture (tailnet:8801/8802/8803):
+# an instance paired BEFORE that decision still holds outbound subscriptions
+# whose target_url dials those ports, and there is no admin verb to repoint a
+# live stream — so RE-SEED (or re-pair under a fresh epoch, runbook §6) FIRST,
+# then remove the mirror with `tailscale serve --tcp=<port> off`. Removing it
+# first wedges every old-posture stream in backoff.
 set -euo pipefail
 PLATFORM_PORT="${SNOWLINE_PLATFORM_PORT:-8848}"
 
@@ -36,7 +40,10 @@ if command -v tailscale >/dev/null 2>&1; then
 else
   TAILSCALE="${TAILSCALE_BIN:-/Applications/Tailscale.app/Contents/MacOS/Tailscale}"
 fi
-tailscale() { "$TAILSCALE" "$@"; }
+# `command` so the function never re-enters ITSELF when TAILSCALE is the bare
+# name `tailscale` (bash resolves functions before PATH — without it the
+# on-PATH case recursed until the shell segfaulted).
+tailscale() { command "$TAILSCALE" "$@"; }
 
 echo "Configuring tailscale serve (TCP, platform port only) -> loopback..."
 echo "  tailnet:${PLATFORM_PORT} -> 127.0.0.1:${PLATFORM_PORT}"

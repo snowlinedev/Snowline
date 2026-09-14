@@ -62,7 +62,7 @@ from pathlib import Path
 from sqlalchemy import create_engine, delete, select
 from sqlalchemy.orm import Session
 
-from snowline_platform.replication import VIA_PREFIX
+from snowline_platform.replication import via_base
 from snowline_platform.replication_pairing import (
     Participant,
     discover_participants,
@@ -160,8 +160,9 @@ def load_seed_config(client, path: str | Path, *, report: Report = print) -> See
     if primary.get("host"):
         report(
             f"[warn] primary.host in {Path(path).name} is IGNORED — peers are "
-            f"addressed through the primary's gateway at {primary['platform_url']}"
-            f"{VIA_PREFIX}/<plugin> (decision 0b8390f7); drop the key."
+            f"addressed through the primary's gateway at "
+            f"{via_base(primary['platform_url'], '<plugin>')} (decision 0b8390f7); "
+            f"drop the key."
         )
     discovered = discover_participants(
         client, primary["platform_url"], primary["instance"],

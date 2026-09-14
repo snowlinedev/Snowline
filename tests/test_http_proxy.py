@@ -715,10 +715,11 @@ def test_via_unreachable_plugin_is_502():
     assert r.status_code == 502
 
 
-def test_via_body_cap_is_sized_for_delivery_batches():
-    """An ingest batch is far larger than a contract write: a body over the
-    contract proxy's 64 KiB cap is forwarded under /via, and one over the
-    via cap is 413 without a round-trip."""
+def test_via_body_cap_is_sized_for_a_large_envelope():
+    """A single signed envelope carries a row's full state (unbounded free
+    text), far larger than a contract write: a body over the contract proxy's
+    64 KiB cap is forwarded under /via, and one over the via cap is 413
+    without a round-trip."""
     app = _app(_replicating_registry())
     sizes = []
 
@@ -769,3 +770,111 @@ def test_via_is_trust_gated_like_every_gateway_path():
     r = TestClient(app).post("/via/pm/events/ingest", content=b"[]")
     assert r.status_code == 403
     assert calls == []
+
+
+def test_via_rewrites_a_plugin_absolute_redirect_back_under_via():
+    """A plugin's redirect-slashes 307 is absolute at ITS origin (the proxy
+    strips Host). It must come back under `/via/<name>/…`, not at the gateway
+    root — where `/replication-admin/…` is the PLATFORM's own admin surface
+    and a redirect-following peer would register its stream on the wrong
+    participant."""
+    app = _app(_replicating_registry())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            307, headers={"location": "http://pm-host:8802/replication-admin/outbound"}
+        )
+
+    _wire_mock_upstream(app, handler)
+    r = TestClient(app).post(
+        "/via/pm/replication-admin/outbound/", content=b"{}", follow_redirects=False
+    )
+    assert r.status_code == 307
+    assert r.headers["location"] == "http://testserver/via/pm/replication-admin/outbound"
+
+
+def test_via_long_read_timeout_applies_to_the_snapshot_path_only():
+    """The one-hour read budget is for `pg_dump`'s think-time on the snapshot
+    route alone; a per-envelope ingest or an admin call keeps the contract
+    timeout, so a stalled plugin cannot pin a pooled connection for an hour
+    per delivery attempt."""
+    app = _app(_replicating_registry())
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen[request.url.path] = request.extensions["timeout"]["read"]
+        return httpx.Response(200, content=b"")
+
+    _wire_mock_upstream(app, handler)
+    c = TestClient(app)
+    c.post("/via/pm/events/ingest", content=b"{}")
+    c.get("/via/pm/replication-admin/outbound")
+    c.post("/via/pm/replication-admin/snapshot", content=b"{}")
+    assert seen == {
+        "/events/ingest": http_proxy.UPSTREAM_READ_TIMEOUT,
+        "/replication-admin/outbound": http_proxy.UPSTREAM_READ_TIMEOUT,
+        "/replication-admin/snapshot": http_proxy.VIA_READ_TIMEOUT,
+    }
+
+
+def test_via_sends_no_forwarded_for_so_the_plugin_sees_loopback():
+    """Plugins run stock uvicorn with proxy-header trust for loopback: an
+    X-Forwarded-For from the platform would REPLACE the plugin's peer with the
+    tailnet address and its SDK gate would resolve that. `/via` sends none;
+    the §3a contract proxy still does (a different contract)."""
+    app = _app(_replicating_registry())
+    headers = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        headers[request.url.path] = dict(request.headers)
+        return httpx.Response(200, content=b"")
+
+    _wire_mock_upstream(app, handler)
+    TestClient(app).post("/via/pm/events/ingest", content=b"{}")
+    h = headers["/events/ingest"]
+    assert "x-forwarded-for" not in h
+    assert h["x-snowline-gateway"] == "1"
+    assert h["x-forwarded-proto"] == "http"
+
+
+def test_http_surface_unforwardable_raw_path_is_still_400_not_500():
+    """Refactor pin: `_raw_route_path` raising ProxyPathError inside
+    `PluginHttpProxy._proxy` must still be a 400 (it was, before the
+    forwarding half moved into `forward_to_plugin`)."""
+    import anyio
+
+    app = _app()
+    _wire_mock_upstream(app, lambda request: httpx.Response(200))
+    scope = {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+        "method": "GET", "scheme": "http", "path": "/provider/x",
+        "raw_path": b"/provider/\xff", "query_string": b"", "root_path": "",
+        "headers": [(b"host", b"testserver")],
+        "client": ("127.0.0.1", 1234), "server": ("testserver", 80),
+    }
+    sent = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    async def run():
+        async with app.router.lifespan_context(app):
+            await app(scope, receive, send)
+
+    anyio.run(run)
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    assert start["status"] == 400, sent
+
+
+def test_via_is_refused_as_a_surface_name(monkeypatch):
+    """`via` is reserved as a gateway SURFACE name too, not only as a plugin
+    `http` prefix — otherwise SNOWLINE_SURFACES=…,via would mount /via/mcp
+    ahead of the replication proxy and split the prefix between two owners."""
+    from snowline_platform import config
+
+    monkeypatch.setenv("SNOWLINE_SURFACES", "main,via")
+    with pytest.raises(config.ConfigError, match="via"):
+        _app(PluginRegistry())
