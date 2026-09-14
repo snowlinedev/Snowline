@@ -77,14 +77,6 @@ def _build_replicate(p: argparse.ArgumentParser) -> None:
         help="the peer instance's SNOWLINE_INSTANCE_ID (e.g. 'primary')",
     )
     pair.add_argument(
-        "--peer-host",
-        default=None,
-        help="the peer's tailnet host to reach its plugins on (§4.1); defaults "
-        "to the peer URL's host. Plugin loopback base_urls in the peer registry "
-        "are rewritten onto this host, port preserved (the runbook's serve "
-        "posture maps each service's port 1:1 tailnet->loopback)",
-    )
-    pair.add_argument(
         "--dry-run", action="store_true",
         help="discover + plan (warnings, refusals) without driving the handshake",
     )
@@ -398,13 +390,12 @@ def _cmd_pair(args) -> int:
             file=sys.stderr,
         )
         return 1
-    from urllib.parse import urlsplit
-
-    peer_host = args.peer_host or urlsplit(args.peer_url).hostname
     with _client() as client:
         local = pairing.discover_participants(client, args.local_url, args.local_instance)
+        # The peer's plugins are addressed through ITS gateway (`/via/<name>`,
+        # §4.1 / decision 0b8390f7) — peer_url is the only peer address needed.
         peer = pairing.discover_participants(
-            client, args.peer_url, args.peer_instance, reachable_host=peer_host
+            client, args.peer_url, args.peer_instance, peer=True
         )
         print(
             f"discovered {sorted(local)} on local ({args.local_instance}), "

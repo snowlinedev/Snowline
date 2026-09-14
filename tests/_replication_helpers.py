@@ -24,7 +24,10 @@ from sqlalchemy.pool import StaticPool
 from snowline_plugin_sdk.contract import CONTRACT_VERSION
 from snowline_plugin_sdk.replication.admin import build_replication_router
 from snowline_plugin_sdk.replication.models import ReplicationBase
-from snowline_platform.replication import SCOPE_EVENTS
+from snowline_platform.http_proxy import ReplicationViaProxy
+from snowline_platform.manifest import PluginManifest
+from snowline_platform.registry import PluginRegistry
+from snowline_platform.replication import SCOPE_EVENTS, VIA_PREFIX
 
 # A loopback peer so the SDK admin surface's tailnet gate admits every routed
 # request (§5.1: behind the serve→loopback front, cross-instance traffic arrives
@@ -99,6 +102,19 @@ def make_platform(*, plugins: list[dict], db_url: str | None = None,
     async def list_plugins() -> dict:  # noqa: D401 - test fixture route
         return {"plugins": plugins}
 
+    # The REAL `/via/<plugin>/…` gateway proxy (decision 0b8390f7), over a
+    # registry built from the same entries `/plugins` lists — so a PEER's
+    # pairing/seed reaches this instance's plugin apps exactly the way a real
+    # gateway forwards: by the plugin's registered base_url, whose host the
+    # RoutedClient resolves to the in-process app (`state.via_mounts`, injected
+    # by RoutedClient at construction).
+    registry = PluginRegistry()
+    for entry in plugins:
+        registry.upsert(PluginManifest(**entry["manifest"]))
+    inst.app.state.registry = registry
+    inst.app.state.ui_api_client = httpx.AsyncClient(transport=_ViaTransport(inst.app))
+    inst.app.mount(VIA_PREFIX, ReplicationViaProxy())
+
     @inst.app.get("/replication/manifest")
     async def replication_manifest() -> dict:  # noqa: D401 - test fixture route
         return {
@@ -135,6 +151,24 @@ def plugin_entry(name: str, base_url: str, *, ingest_path: str = "/events/ingest
     }
 
 
+class _ViaTransport(httpx.AsyncBaseTransport):
+    """The fake platform's upstream transport for its `/via` proxy: dispatch
+    by URL host to the app the enclosing RoutedClient mounted under that host
+    (looked up lazily on `app.state.via_mounts`), with the loopback peer the
+    SDK gate expects — the platform's own client IS a loopback peer."""
+
+    def __init__(self, platform_app: FastAPI) -> None:
+        self._platform_app = platform_app
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        mounts = getattr(self._platform_app.state, "via_mounts", {})
+        target = mounts.get(request.url.netloc.decode())
+        if target is None:
+            raise httpx.ConnectError(f"no mounted app for host {request.url.netloc!r}")
+        transport = httpx.ASGITransport(app=target, client=_PEER)
+        return await transport.handle_async_request(request)
+
+
 class RoutedClient:
     """A synchronous httpx-shaped client that dispatches by URL host to an ASGI
     app. `.get`/`.post` take absolute URLs (as the pairing/seed libraries emit);
@@ -144,6 +178,12 @@ class RoutedClient:
 
     def __init__(self, mounts: dict[str, FastAPI]):
         self._mounts = mounts
+        # Let every fake platform's `/via` proxy resolve plugin hosts through
+        # the same table this client dispatches on.
+        for app in mounts.values():
+            state = getattr(app, "state", None)
+            if state is not None:
+                state.via_mounts = mounts
 
     def __enter__(self) -> "RoutedClient":
         return self

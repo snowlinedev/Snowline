@@ -198,10 +198,11 @@ def test_mint_epoch_is_unique_and_sortable():
     assert len(set(epochs)) == 50
 
 
-def test_reachable_host_rewrites_peer_plugin_loopback_urls():
-    """§4.1: a peer plugin advertises a LOOPBACK base_url to its own registry;
-    discovering it over the tailnet rewrites the host onto the peer's tailnet
-    host, PRESERVING the port (the serve posture maps port 1:1)."""
+def test_peer_discovery_addresses_plugins_through_the_peers_gateway():
+    """§4.1 (decision 0b8390f7): a peer plugin advertises a LOOPBACK base_url to
+    its own registry; discovering it as a PEER addresses it THROUGH THE PEER'S
+    PLATFORM at `<platform_url>/via/<name>` — the plugin's own port is never
+    dialled across the tailnet, so no per-port serve mirror is assumed."""
     apps = {
         "prim-platform": make_platform(plugins=[
             plugin_entry("governance", "http://127.0.0.1:8801",
@@ -210,19 +211,33 @@ def test_reachable_host_rewrites_peer_plugin_loopback_urls():
     }
     client = RoutedClient({h: inst.app for h, inst in apps.items()})
     peer = pairing.discover_participants(
-        client, "http://prim-platform", "primary", reachable_host="primary.tailnet"
+        client, "http://prim-platform", "primary", peer=True
     )
-    assert peer["governance"].admin_base == "http://primary.tailnet:8801/replication-admin"
-    assert peer["governance"].ingest_url == "http://primary.tailnet:8801/events/ingest"
-    # The platform participant is addressed via platform_url, never rewritten.
+    gov = peer["governance"]
+    assert gov.admin_base == "http://prim-platform/via/governance/replication-admin"
+    assert gov.ingest_url == "http://prim-platform/via/governance/events/ingest"
+    # The platform participant is addressed via platform_url, never through /via.
     assert peer["platform"].admin_base == "http://prim-platform/replication-admin"
 
 
-def test_advertised_base_url_preferred_over_port_rewrite():
+def test_peer_discovery_keeps_a_custom_ingest_path_under_via():
+    """`/via/<name>` is a PREFIX: whatever ingest_path the plugin declares is
+    appended verbatim, so a plugin with a non-default path is still reached."""
+    apps = {
+        "prim-platform": make_platform(plugins=[
+            plugin_entry("memory", "http://127.0.0.1:8802",
+                         ingest_path="/rep/in", events=["memory.set"]),
+        ]),
+    }
+    client = RoutedClient({h: inst.app for h, inst in apps.items()})
+    peer = pairing.discover_participants(client, "http://prim-platform/", "primary", peer=True)
+    assert peer["memory"].ingest_url == "http://prim-platform/via/memory/rep/in"
+
+
+def test_advertised_base_url_preferred_over_the_gateway_route():
     """§4.1 (#96): a plugin that DECLARES `advertised_base_url` is addressed
-    there verbatim — pairing does NOT port-rewrite its loopback base_url onto
-    the peer host. This is the principled answer when the serve posture is not a
-    1:1 port mirror (a different port, a path front, a distinct host)."""
+    there verbatim — the explicit override for a deployment that fronts a
+    plugin some other way. Pairing does NOT route it through `/via`."""
     apps = {
         "prim-platform": make_platform(plugins=[
             plugin_entry("governance", "http://127.0.0.1:8801",
@@ -232,37 +247,15 @@ def test_advertised_base_url_preferred_over_port_rewrite():
     }
     client = RoutedClient({h: inst.app for h, inst in apps.items()})
     peer = pairing.discover_participants(
-        client, "http://prim-platform", "primary", reachable_host="primary.tailnet"
+        client, "http://prim-platform", "primary", peer=True
     )
     gov = peer["governance"]
-    # The declared address wins outright — note the port is 9901, NOT the 8801
-    # the fallback rewrite would have preserved.
     assert gov.admin_base == "http://primary.tailnet:9901/replication-admin"
     assert gov.ingest_url == "http://primary.tailnet:9901/events/ingest"
 
 
-def test_absent_advertised_base_url_is_byte_identical_to_the_old_rewrite():
-    """DO-NOT-BREAK-EXISTING-PAIRS pin: with NO `advertised_base_url`, a peer
-    plugin is addressed by the exact same port-preserving rewrite as before #96
-    — byte-identical to `_rehost(base_url, host)`, so an existing pair that has
-    never declared the field behaves identically."""
-    base = "http://127.0.0.1:8801"
-    apps = {
-        "prim-platform": make_platform(plugins=[
-            plugin_entry("governance", base, events=["decision.recorded"]),
-        ]),
-    }
-    client = RoutedClient({h: inst.app for h, inst in apps.items()})
-    peer = pairing.discover_participants(
-        client, "http://prim-platform", "primary", reachable_host="primary.tailnet"
-    )
-    rewritten = pairing._rehost(base, "primary.tailnet")
-    assert peer["governance"].admin_base == f"{rewritten}/replication-admin"
-    assert peer["governance"].ingest_url == f"{rewritten}/events/ingest"
-
-
 def test_local_discovery_uses_loopback_base_url_even_with_advertised():
-    """LOCAL discovery (`reachable_host` None) addresses a plugin at its loopback
+    """LOCAL discovery (`peer=False`) addresses a plugin at its loopback
     base_url as-is — `advertised_base_url` is a PEER-reachability concern (§4.1),
     so a locally-discovered plugin is never redirected to it."""
     apps = {
@@ -349,7 +342,7 @@ def test_platform_self_manifest_404_falls_back_and_pairing_proceeds(caplog):
     })
     with caplog.at_level(logging.WARNING, logger="snowline_platform.replication_pairing"):
         peer = pairing.discover_participants(
-            client, "http://prim-platform", "primary", reachable_host="prim-platform"
+            client, "http://prim-platform", "primary", peer=True
         )
     # The 404 platform is synthesized, NOT a blocker — the plugin came through too.
     assert set(peer) == {"governance", "platform"}
@@ -385,29 +378,6 @@ def test_platform_self_manifest_missing_field_raises_labeled_error():
     client = RoutedClient({"prim-platform": _peer_platform_app(self_manifest=body)})
     with pytest.raises(pairing.PairingError, match="incomplete replication self-manifest.*ingest_path"):
         pairing.discover_participants(client, "http://prim-platform", "primary")
-
-
-def test_rehost_preserves_port_and_path():
-    assert pairing._rehost("http://127.0.0.1:8801/x", "h.tailnet") == "http://h.tailnet:8801/x"
-    assert pairing._rehost("http://127.0.0.1:8801", "h.tailnet") == "http://h.tailnet:8801"
-    assert pairing._rehost("http://127.0.0.1:8801", None) == "http://127.0.0.1:8801"
-
-
-def test_rehost_warns_only_when_original_is_not_loopback(caplog):
-    """Review finding: rewriting a NON-loopback base_url may not honor the §4.1
-    serve→loopback assumption, so it warns; a loopback base_url (the expected
-    case) rewrites silently."""
-    import logging
-
-    with caplog.at_level(logging.WARNING, logger="snowline_platform.replication_pairing"):
-        assert pairing._rehost("http://10.0.0.5:8801/x", "peer.tailnet") == "http://peer.tailnet:8801/x"
-    assert any("non-loopback" in r.message for r in caplog.records)
-
-    caplog.clear()
-    with caplog.at_level(logging.WARNING, logger="snowline_platform.replication_pairing"):
-        pairing._rehost("http://127.0.0.1:8801/x", "peer.tailnet")
-        pairing._rehost("http://localhost:8801/x", "peer.tailnet")
-    assert caplog.records == []
 
 
 def test_handshake_direction_refuses_version_mismatch_before_touching_wire():

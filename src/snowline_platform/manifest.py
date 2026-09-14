@@ -525,6 +525,10 @@ RESERVED_HTTP_PREFIXES: frozenset[str] = frozenset(
         "surfaces",
         "replication",
         "replication-admin",
+        # Replication via the gateway: `/via/<plugin>/…` proxies a PEER's
+        # replication traffic to a plugin's loopback surfaces (decision
+        # 0b8390f7, `http_proxy.ReplicationViaProxy`).
+        "via",
         # Bare app routes.
         "health",
         "whoami",
@@ -691,12 +695,11 @@ class ReplicationBlock(BaseModel):
     )
     advertised_base_url: str | None = Field(
         default=None,
-        description="optional peer-reachable address for this plugin's "
-        "replication surfaces over the tailnet, when it differs from the "
-        "loopback base_url advertised to this plugin's own registry (§4.1). "
-        "Pairing (§5) prefers it; absent, pairing falls back to the "
-        "port-preserving rewrite of base_url. None = no override (the "
-        "fallback applies)",
+        description="optional EXPLICIT peer-reachable address for this "
+        "plugin's replication surfaces, for a deployment that fronts the "
+        "plugin some way of its own (§4.1). Pairing (§5) prefers it verbatim; "
+        "absent, a peer addresses the plugin through this instance's gateway "
+        "at <platform_url>/via/<name> (decision 0b8390f7). None = no override",
     )
 
     @field_validator("advertised_base_url")

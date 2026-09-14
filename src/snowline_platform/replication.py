@@ -46,6 +46,17 @@ from snowline_plugin_sdk.replication.admin import _require_trusted, build_replic
 INGEST_PATH = "/replication/events/ingest"
 ADMIN_PREFIX = "/replication-admin"
 
+# Replication VIA the gateway (governance decision 0b8390f7, item 6754a127):
+# a PEER instance reaches this instance's plugins' replication surfaces at
+# `<platform_url>/via/<plugin><ingest_path | admin path>` — the gateway proxies
+# to the plugin's loopback `base_url` (`http_proxy.ReplicationViaProxy`). The
+# platform's OWN scope stream needs no `/via`: it is served at `platform_url`
+# directly (INGEST_PATH / ADMIN_PREFIX above). The only tailnet-reachable port
+# per instance is therefore the platform's; plugins keep binding loopback and
+# never need a per-port `tailscale serve` mirror. Shared by the proxy (serves
+# it), pairing (addresses peers with it) and the stack model (seeds with it).
+VIA_PREFIX = "/via"
+
 # The platform's replication SELF-MANIFEST (§8, issue #95). The platform has no
 # `/plugins` registry entry of its own, so its scope-stream contract is not
 # manifest-discoverable the way a plugin's is — pairing could not read the

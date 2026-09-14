@@ -576,3 +576,196 @@ def test_reserved_prefixes_cover_every_app_route():
         f"platform routes whose top-level segment is unreserved: "
         f"{sorted(unreserved)} — add them to manifest.RESERVED_HTTP_PREFIXES"
     )
+
+
+# --- replication via the gateway: /via/<plugin>/… (decision 0b8390f7) -------
+
+
+def _replicating_registry(status: PluginStatus | None = None) -> PluginRegistry:
+    reg = PluginRegistry()
+    reg.upsert(
+        PluginManifest(
+            name="pm",
+            base_url="http://pm-host:8802",
+            replication={
+                "contract_version": 2,
+                "ingest_path": "/events/ingest",
+                "events": ["pm.item.created"],
+            },
+        )
+    )
+    # A registered plugin that does NOT replicate — nothing of it is reachable
+    # through /via.
+    reg.upsert(PluginManifest(name="walkthrough", base_url="http://wt-host:3417"))
+    if status is not None:
+        reg.set_status("pm", status)
+    return reg
+
+
+def test_via_forwards_ingest_post_verbatim_to_the_plugins_ingest_path():
+    """The load-bearing property: `POST /via/pm/events/ingest` reaches pm as
+    `POST <base_url>/events/ingest` with the body bytes and signature header
+    untouched — the SDK's HMAC is over the exact body, so any rewrite would
+    dead-letter every delivery."""
+    app = _app(_replicating_registry())
+    body = b'[{"seq": 1, "type": "pm.item.created", "payload": {"x": "\xc3\xa9"}}]'
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url == httpx.URL("http://pm-host:8802/events/ingest?epoch=abc")
+        assert request.content == body
+        assert request.headers["x-snowline-signature"] == "sha256=deadbeef"
+        assert request.headers["x-snowline-gateway"] == "1"
+        return httpx.Response(202, json={"accepted": 1})
+
+    _wire_mock_upstream(app, handler)
+    r = TestClient(app).post(
+        "/via/pm/events/ingest?epoch=abc",
+        content=body,
+        headers={"content-type": "application/json", "x-snowline-signature": "sha256=deadbeef"},
+    )
+    assert r.status_code == 202
+    assert r.json() == {"accepted": 1}
+
+
+def test_via_serves_the_replication_admin_surface():
+    """The §5 handshake and the §7 snapshot live under `/replication-admin`
+    on the plugin; a peer drives them through the gateway."""
+    app = _app(_replicating_registry())
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, str(request.url)))
+        if request.url.path.endswith("/snapshot"):
+            return httpx.Response(200, content=b"PGDMP\x00\x01", headers={"content-type": "application/octet-stream"})
+        return httpx.Response(200, json=[])
+
+    _wire_mock_upstream(app, handler)
+    c = TestClient(app)
+    assert c.get("/via/pm/replication-admin/outbound").json() == []
+    snap = c.post("/via/pm/replication-admin/snapshot", content=b'{"source_id":"x"}')
+    assert snap.status_code == 200 and snap.content == b"PGDMP\x00\x01"
+    assert snap.headers["content-type"] == "application/octet-stream"
+    assert seen == [
+        ("GET", "http://pm-host:8802/replication-admin/outbound"),
+        ("POST", "http://pm-host:8802/replication-admin/snapshot"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/via/pm/mcp",                    # the plugin's MCP surface
+        "/via/pm/health",                 # its health route
+        "/via/pm/ui-api/widgets/x",       # its dashboard data plane
+        "/via/pm/provider/work-items",    # an `http` contract surface
+        "/via/pm/events",                 # a prefix of the ingest path
+        "/via/pm/events/ingest/extra",    # a path UNDER the ingest path
+        "/via/pm/replication-adminx",     # a lookalike of the admin prefix
+        "/via/pm",                        # no path at all
+        "/via/pm/",
+        "/via/walkthrough/events/ingest", # a plugin with no replication block
+        "/via/nope/events/ingest",        # an unknown plugin
+        "/via/pm/../governance/events/ingest",
+        "/via/pm//events/ingest",
+        "/via",
+        "/via/",
+    ],
+)
+def test_via_exposes_only_the_two_replication_surfaces(path):
+    """Everything that is not the named plugin's declared ingest_path or its
+    `/replication-admin/…` surface is a plain 404 — the app's own shape — with
+    NO upstream round-trip. `/via` widens a plugin's tailnet exposure to
+    exactly its replication surfaces and nothing else."""
+    app = _app(_replicating_registry())
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(200)
+
+    _wire_mock_upstream(app, handler)
+    r = TestClient(app).post(path, content=b"{}")
+    assert r.status_code == 404, path
+    assert r.json() == {"detail": "Not Found"}
+    assert calls == []
+
+
+def test_via_down_plugin_is_503_without_a_round_trip():
+    app = _app(_replicating_registry(status=PluginStatus.DOWN))
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(200)
+
+    _wire_mock_upstream(app, handler)
+    r = TestClient(app).post("/via/pm/events/ingest", content=b"[]")
+    assert r.status_code == 503
+    assert calls == []
+
+
+def test_via_unreachable_plugin_is_502():
+    app = _app(_replicating_registry())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    _wire_mock_upstream(app, handler)
+    r = TestClient(app).post("/via/pm/events/ingest", content=b"[]")
+    assert r.status_code == 502
+
+
+def test_via_body_cap_is_sized_for_delivery_batches():
+    """An ingest batch is far larger than a contract write: a body over the
+    contract proxy's 64 KiB cap is forwarded under /via, and one over the
+    via cap is 413 without a round-trip."""
+    app = _app(_replicating_registry())
+    sizes = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sizes.append(len(request.content))
+        return httpx.Response(202)
+
+    _wire_mock_upstream(app, handler)
+    c = TestClient(app)
+    big = b"x" * (POST_BODY_LIMIT * 4)
+    assert c.post("/via/pm/events/ingest", content=big).status_code == 202
+    assert sizes == [len(big)]
+    too_big = b"x" * (http_proxy.VIA_BODY_LIMIT + 1)
+    assert c.post("/via/pm/events/ingest", content=too_big).status_code == 413
+    assert sizes == [len(big)]
+
+
+def test_via_prefix_is_reserved_to_plugins():
+    """`via` is the platform's — a plugin cannot claim it as an `http` prefix
+    (the static reserved set refuses at validation) and the built app's live
+    route walk lists it too, so the two lines of defense agree."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="reserved"):
+        PluginManifest(name="x", base_url="http://x:1", http=[{"prefix": "/via"}])
+    reg = PluginRegistry()
+    _app(reg)
+    assert "via" in reg.reserved_http_prefixes
+
+
+def test_via_is_trust_gated_like_every_gateway_path():
+    """The mount rides TrustMiddleware: an untrusted peer gets the gate's 403
+    before the proxy (and the plugin) is ever reached."""
+    from snowline_platform.trust import TrustResolver as _TR
+
+    class _NeverTrust:
+        def resolve(self, peer_ip, headers):
+            return None
+
+    app = _app(_replicating_registry(), resolver=_TR([_NeverTrust()]))
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(202)
+
+    _wire_mock_upstream(app, handler)
+    r = TestClient(app).post("/via/pm/events/ingest", content=b"[]")
+    assert r.status_code == 403
+    assert calls == []

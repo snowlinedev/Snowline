@@ -486,10 +486,18 @@ def test_build_seed_config_shapes_participants_from_stack_config():
     platform_p = config["participants"]["platform"]
     assert platform_p["spoke_ingest_url"] == "http://roam.ts.net:8848/replication/events/ingest"
     assert platform_p["spoke_db_url"] == "postgresql:///snowline_platform"
+    # Plugin participants are delivered to THROUGH the spoke's gateway
+    # (`/via/<plugin>`, decision 0b8390f7): the spoke's platform port is the only
+    # one the primary ever dials — no per-plugin tailnet port, no serve mirror.
     pm_p = config["participants"]["pm"]
-    assert pm_p["spoke_ingest_url"] == "http://roam.ts.net:8803/events/ingest"
+    assert pm_p["spoke_ingest_url"] == "http://roam.ts.net:8848/via/pm/events/ingest"
     governance_p = config["participants"]["governance"]
-    assert governance_p["spoke_ingest_url"] == "http://roam.ts.net:8801/events/ingest"
+    assert governance_p["spoke_ingest_url"] == "http://roam.ts.net:8848/via/governance/events/ingest"
+    memory_p = config["participants"]["memory"]
+    assert memory_p["spoke_ingest_url"] == "http://roam.ts.net:8848/via/memory/events/ingest"
+    blob = json.dumps(config)
+    for port in (":8801", ":8802", ":8803"):
+        assert port not in blob, f"a plugin port {port} leaked into the seed config"
 
 
 def test_build_seed_config_carries_no_primary_postgres_url_or_credential():

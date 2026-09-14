@@ -282,6 +282,41 @@ the prefix. The plugin's SDK pin must also be at or past this revision, or its
 heartbeat reads a collision 409 as success. Within a packaged release train
 the pieces ship together, and the ordering is the train's.
 
+## 3b. Replication via the gateway (`/via/<plugin>/…`)
+
+A **peer instance's** replication traffic — the §5 admin handshake, event
+ingest deliveries and the §7 seed snapshot (replication-continuity.md) —
+reaches this instance's plugins **through this gateway**, never at a plugin's
+own port (governance decision 0b8390f7, item 6754a127). The gateway mounts
+`/via` (`http_proxy.ReplicationViaProxy`): `/via/<plugin>/<path>` forwards
+`<path>` VERBATIM — raw path, raw query, the §3a header denylist, a streamed
+relay — to the named plugin's loopback `base_url`, so the peer's HMAC over the
+exact body bytes survives the hop.
+
+**Only two surfaces are served**, both read off the plugin's manifest
+`replication` block: its declared `ingest_path`, and anything under the SDK
+admin prefix `/replication-admin`. Everything else — the plugin's MCP mount,
+`/health`, `/ui-api`, an `http` contract, a path under or beside the ingest
+path — is the app's plain 404, as are an unknown plugin name, a plugin with no
+`replication` block, and a malformed path (the §3a dot-segment rule). A
+plugin whose status is `down` short-circuits to 503 (§4). A real `Mount`,
+not a router fallback: `via` is in `RESERVED_HTTP_PREFIXES`, so no plugin
+can claim it and nothing can shadow it.
+
+**Sizing differs from §3a**: a delivery batch may be large (`VIA_BODY_LIMIT`,
+8 MiB) and the snapshot route runs `pg_dump` before its first byte
+(`VIA_READ_TIMEOUT`, one hour — the seed client's own bound).
+
+**Trust.** The mount rides `TrustMiddleware` like every gateway path, so only
+a trusted (tailnet/loopback) peer reaches it; the plugin then sees the
+platform's own client as its peer — loopback — which the SDK's
+`_require_trusted` already admits. No forwarded-header trust exists anywhere
+on this path (the §3a `X-Forwarded-For` is informational). Net effect: the
+only tailnet-reachable port per instance is the platform's; plugins keep
+binding loopback and change nothing. Pairing addresses a peer's plugins as
+`<peer platform_url>/via/<name>` by default (replication-continuity.md §4.1);
+`advertised_base_url` remains the explicit override.
+
 ## 4. Health-aware routing
 
 The gateway consults registry **status** (set by the health checker): it does not
@@ -293,7 +328,8 @@ clear error rather than hanging on a dead upstream. "Crashed" (local) and
 
 Plugins are addressed by `base_url`, so **local or cross-tailnet** — the gateway
 proxies over HTTP regardless of where a plugin runs. A cross-tailnet plugin is
-just a different URL.
+just a different URL. The reverse direction — a PEER instance reaching one of
+THIS instance's loopback plugins — goes through `/via/<plugin>/…` (§3b).
 
 ## 6. Acceptance criteria
 

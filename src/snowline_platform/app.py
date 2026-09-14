@@ -237,6 +237,15 @@ def create_app(
     app.state.gateway_mounts = mounts
     mount_gateway(app, mounts)
 
+    # Replication VIA the gateway (decision 0b8390f7): `/via/<plugin>/…`
+    # proxies a PEER instance's replication traffic (admin handshake, ingest
+    # deliveries, the seed snapshot) to the named plugin's loopback
+    # replication surfaces. A real Mount, not a router-fallback like the
+    # `http` proxy below: its prefix is the platform's own (reserved to
+    # plugins), so nothing can shadow it and it needs no "no route matched"
+    # ordering. Rides TrustMiddleware like every other gateway path.
+    app.mount(replication.VIA_PREFIX, http_proxy.ReplicationViaProxy(), name="via")
+
     # Freeze the surface config the moment the mounts are built: GET /surfaces
     # reports THIS, not a per-request env re-parse — the view can't drift from
     # what the gateway actually mounted, and a malformed env mutated after

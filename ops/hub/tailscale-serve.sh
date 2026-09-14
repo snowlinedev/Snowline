@@ -3,9 +3,12 @@
 # spec §1 — "the primary stays source-run"): a stable tailnet HTTPS URL for
 # the composed gateway + dashboard, via `tailscale serve` (issue 39c092c9).
 #
-# ONE mapping covers everything. Unlike the roam spoke's port-preserving 1:1
-# mirror (ops/roam/tailscale-serve.sh, one tailnet port per service), the hub
-# needs only https:443 -> the platform's own port: the dashboard is served BY
+# ONE mapping covers everything: the hub needs only https:443 -> the
+# platform's own port. (Plugins are never exposed on their own ports — a peer
+# reaches their replication surfaces through this same gateway at
+# /via/<plugin>/…, replication-continuity §4.1 / decision 0b8390f7; the roam
+# spoke's ops/roam/tailscale-serve.sh likewise mirrors only its platform port.)
+# The dashboard is served BY
 # the platform itself, at /ui (+ /ui-api) on the SAME port as the gateway
 # (src/snowline_platform/app.py — the composed surface, /ui, and /ui-api all
 # live on one ASGI app). So gateway + dashboard + /ui-api ride a single

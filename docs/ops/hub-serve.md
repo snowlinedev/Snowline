@@ -37,13 +37,12 @@ https://<hub>.<tailnet>.ts.net/health   -> health check
 
 is ONE `tailscale serve --https=443 <backend>` rule, not one per surface.
 
-This is unrelated to (and does not replace) the roaming spoke's own
-`ops/roam/tailscale-serve.sh`, which port-preserving-mirrors FOUR separate
-service ports (`8848/8801/8802/8803`) for the pairing/replication admin
-surfaces (replication-continuity §5.1/§4.1). The hub's public-facing surface
-is just the one composed gateway+dashboard port; its replication admin
-surfaces are reached the same tailnet way they always have been (this item
-does not change that).
+This is the hub's ONLY tailnet exposure. Its plugins bind loopback and are
+reached by a peer (the spoke's seed, pairing and deliveries) through the
+gateway's `/via/<plugin>/…` proxy on this same port (replication-continuity
+§4.1, decision 0b8390f7) — no per-service port mirror exists on the hub, and
+none is needed. The roaming spoke's `ops/roam/tailscale-serve.sh` likewise
+mirrors only the spoke's platform port.
 
 ## 2. The URL shape
 

@@ -256,9 +256,11 @@ def test_load_seed_config_resolves_primary_from_discovery(tmp_path):
     assert cfg.primary_instance == "primary" and cfg.spoke_instance == "roam"
     (gov,) = cfg.participants
     assert gov.primary.source_id == "primary.governance"
-    # The primary plugin's loopback base_url is rewritten onto the primary's
-    # tailnet host (derived from platform_url), port preserved (§4.1).
-    assert gov.primary.admin_base == "http://prim-platform:8801/replication-admin"
+    # The primary's plugin is addressed THROUGH THE PRIMARY'S GATEWAY
+    # (`<platform_url>/via/<name>`, §4.1 / decision 0b8390f7) — never at its
+    # own loopback port across the tailnet.
+    assert gov.primary.admin_base == "http://prim-platform/via/governance/replication-admin"
+    assert gov.primary.ingest_url == "http://prim-platform/via/governance/events/ingest"
     assert gov.spoke_source_id == "roam.governance"
 
 
@@ -588,3 +590,85 @@ def _cfg(participants):
         spoke_instance="roam",
         participants=tuple(participants),
     )
+
+
+def test_seed_end_to_end_through_both_gateways_via_proxy(tmp_path, monkeypatch):
+    """Decision 0b8390f7: the whole §7 seed — discovery, prime, the SIGNED
+    snapshot request and its streamed archive, and the post-dump delivery —
+    crosses instances ONLY through each side's platform gateway (`/via/<name>`).
+    Neither plugin's own host is ever dialled by the peer: the primary's
+    governance is reached at `prim-platform/via/governance/…` and the spoke's
+    at `roam-platform/via/governance/…`. The HMAC over the exact body must
+    survive the proxy hop in both directions, or the snapshot is refused and
+    the delivery dead-letters."""
+    import json
+
+    from ._replication_helpers import make_platform, plugin_entry
+
+    primary = make_participant()
+    spoke_db = f"sqlite:///{tmp_path}/gov-spoke.db"
+    spoke = make_participant(db_url=spoke_db)
+    prim_platform = make_platform(plugins=[
+        plugin_entry("governance", "http://prim-gov", events=["decision.recorded"]),
+    ])
+    roam_platform = make_platform(plugins=[
+        plugin_entry("governance", "http://roam-gov", events=["decision.recorded"]),
+    ])
+    client = RoutedClient({
+        "prim-platform": prim_platform.app, "prim-gov": primary.app,
+        "roam-platform": roam_platform.app, "roam-gov": spoke.app,
+    })
+    dialled: list[str] = []
+    real_request = client._request
+
+    def spy(method, url, **kw):
+        dialled.append(url)
+        return real_request(method, url, **kw)
+
+    monkeypatch.setattr(client, "_request", spy)
+
+    config = {
+        "primary": {"platform_url": "http://prim-platform", "instance": "primary"},
+        "spoke": {"platform_url": "http://roam-platform", "instance": "roam"},
+        "participants": {"governance": {
+            "spoke_ingest_url": "http://roam-platform/via/governance/events/ingest",
+            "spoke_db_url": spoke_db,
+        }},
+    }
+    path = tmp_path / "seed.json"
+    path.write_text(json.dumps(config))
+    cfg = seed.load_seed_config(client, path, report=lambda _m: None)
+    (sp,) = [p for p in cfg.participants if p.name == "governance"]
+    assert sp.primary.admin_base == "http://prim-platform/via/governance/replication-admin"
+
+    class _Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(argv, **kw):
+        if argv[0] == "pg_dump":
+            _emit(primary, "primary.governance", 3, "decision.recorded")
+            Path(argv[argv.index("-f") + 1]).write_bytes(b"PGDMP-clone")
+            return _Proc()
+        assert Path(argv[-1]).read_bytes() == b"PGDMP-clone"
+        _clone_store(primary.engine, spoke.engine)
+        return _Proc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    results = seed.run_seed(client, cfg, report=lambda _m: None)
+    assert results["governance"]["watermark"] == 3
+
+    # Post-dump write converges through the SPOKE's gateway.
+    _emit(primary, "primary.governance", 1, "decision.recorded")  # seq 4
+    with primary.scope() as s:
+        emit_mod.deliver_pending(s, client, reachability={})
+    assert [e["seq"] for e in spoke.applied] == [4]
+
+    # Every cross-instance URL the seed and the delivery loop dialled went to a
+    # PLATFORM host; the plugin hosts were reached only by the gateways.
+    cross = [u for u in dialled if "/via/" in u or "/replication" in u]
+    assert cross, dialled
+    assert all(u.startswith(("http://prim-platform", "http://roam-platform")) for u in dialled), dialled
+    assert any(u == "http://prim-platform/via/governance/replication-admin/snapshot" for u in dialled)
+    assert any(u == "http://roam-platform/via/governance/events/ingest" for u in dialled)

@@ -62,6 +62,7 @@ from pathlib import Path
 from sqlalchemy import create_engine, delete, select
 from sqlalchemy.orm import Session
 
+from snowline_platform.replication import VIA_PREFIX
 from snowline_platform.replication_pairing import (
     Participant,
     discover_participants,
@@ -150,18 +151,21 @@ def load_seed_config(client, path: str | Path, *, report: Report = print) -> See
     warning rather than a hard failure — the primary's snapshot now comes from
     its own admin surface (decision 1a83031c), and existing seed.json files on
     operators' machines still carry the key."""
-    from urllib.parse import urlsplit
-
     data = json.loads(Path(path).read_text())
     primary = data["primary"]
     spoke = data["spoke"]
-    # The seed runs on the spoke box; the primary is reached over the tailnet, so
-    # its plugins' loopback base_urls are rewritten onto the primary's tailnet
-    # host (§4.1), same posture as the pairing CLI's --peer-host.
-    primary_host = data["primary"].get("host") or urlsplit(primary["platform_url"]).hostname
+    # The seed runs on the spoke box; the primary is a PEER, so its plugins are
+    # addressed through the primary's gateway (`<platform_url>/via/<name>`,
+    # §4.1 / decision 0b8390f7) — the only primary port the spoke ever dials.
+    if primary.get("host"):
+        report(
+            f"[warn] primary.host in {Path(path).name} is IGNORED — peers are "
+            f"addressed through the primary's gateway at {primary['platform_url']}"
+            f"{VIA_PREFIX}/<plugin> (decision 0b8390f7); drop the key."
+        )
     discovered = discover_participants(
         client, primary["platform_url"], primary["instance"],
-        include_platform=True, reachable_host=primary_host,
+        include_platform=True, peer=True,
     )
     participants: list[SeedParticipant] = []
     for name, pcfg in data["participants"].items():
