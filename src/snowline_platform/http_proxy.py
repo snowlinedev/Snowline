@@ -95,7 +95,14 @@ from starlette.routing import get_route_path
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from snowline_platform.manifest import HttpSurface
-from snowline_platform.registry import PluginRegistry, PluginStatus, RegisteredPlugin
+from snowline_platform.registry import (
+    PluginNotFound,
+    PluginRegistry,
+    PluginStatus,
+    RegisteredPlugin,
+)
+from snowline_platform.replication import ADMIN_PREFIX as REPLICATION_ADMIN_PREFIX
+from snowline_platform.replication import VIA_PREFIX
 
 # The shared proxy client, the body cap and the capped-body reader are
 # `/ui-api`'s (ui_api.py) — deliberately imported rather than re-derived: one
@@ -116,6 +123,21 @@ log = logging.getLogger("snowline_platform.http_proxy")
 # duplicate on retry). Connect still uses PROXY_TIMEOUT — a dead upstream is
 # found just as fast.
 UPSTREAM_READ_TIMEOUT = 60.0
+
+# --- replication via the gateway (`/via/<plugin>/…`, decision 0b8390f7) -----
+# The SDK delivers ONE signed envelope per POST (emit.py builds the body from a
+# single outbox row; the ingest route rejects a JSON array), but an envelope
+# carries a row's full state, including unbounded free-text fields (a PM item
+# body, a memory note). 8 MiB is "no realistic envelope, every runaway one".
+VIA_BODY_LIMIT = 8 * 1024 * 1024
+# The §7 snapshot route runs `pg_dump` BEFORE its first response byte, so a
+# large store's think-time is minutes; mirror the seed client's own bound
+# (`replication_seed.SNAPSHOT_TIMEOUT`). Applied to the snapshot path ONLY —
+# every other /via forward (a per-envelope ingest, an admin call) keeps the
+# contract read timeout, so a stalled plugin cannot pin a pooled connection
+# for an hour per delivery attempt.
+VIA_READ_TIMEOUT = 3600.0
+VIA_SNAPSHOT_PATH = f"{REPLICATION_ADMIN_PREFIX}/snapshot"
 
 HOP_BY_HOP_HEADERS: frozenset[str] = frozenset({
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -193,7 +215,7 @@ def upstream_url(base_url: str, raw_path: bytes, query_string: bytes) -> httpx.U
         raise ProxyPathError(str(exc)) from exc
 
 
-def _forward_headers(request: Request) -> list[tuple[str, str]]:
+def _forward_headers(request: Request, *, forward_peer: bool = True) -> list[tuple[str, str]]:
     out = [
         (name, value)
         for name, value in request.headers.items()
@@ -207,7 +229,14 @@ def _forward_headers(request: Request) -> list[tuple[str, str]]:
         out.append(("accept-encoding", "identity"))
     # The DIRECT peer's IP (the same value the trust gate resolved on) — a
     # caller-supplied chain is stripped above so an upstream can't be fed one.
-    if request.client is not None:
+    # NOT sent on the replication `/via` path (`forward_peer=False`): plugins
+    # run stock uvicorn with proxy-header trust for loopback, so an
+    # X-Forwarded-For from the platform would REPLACE the plugin's view of its
+    # peer with the tailnet address — and the SDK's `_require_trusted` would
+    # then gate on that instead of on the platform's loopback client, which is
+    # the documented posture (§4.1/§5.1: cross-instance traffic reaches a
+    # plugin from loopback).
+    if forward_peer and request.client is not None:
         out.append(("x-forwarded-for", request.client.host))
     if "host" in request.headers:
         out.append(("x-forwarded-host", request.headers["host"]))
@@ -335,60 +364,224 @@ class PluginHttpProxy:
             )
 
         try:
-            target = upstream_url(
-                entry.manifest.base_url,
-                _raw_route_path(request.scope),
-                request.scope.get("query_string", b""),
-            )
+            raw_path = _raw_route_path(request.scope)
         except ProxyPathError as exc:
             return JSONResponse(
                 {"detail": f"request path cannot be forwarded: {exc}"},
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
-
-        body = await read_capped_body(request, POST_BODY_LIMIT)
-        if body is None:
-            return JSONResponse(
-                {
-                    "detail": f"request body exceeds the {POST_BODY_LIMIT}-byte "
-                    "gateway proxy limit"
-                },
-                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
-            )
-
-        client = _client(request.app)
-        upstream_req = client.build_request(
-            request.method,
-            target,
-            content=body,
-            headers=_forward_headers(request),
-            timeout=httpx.Timeout(PROXY_TIMEOUT, read=UPSTREAM_READ_TIMEOUT),
+        return await forward_to_plugin(
+            request,
+            entry,
+            raw_path,
+            body_limit=POST_BODY_LIMIT,
+            read_timeout=UPSTREAM_READ_TIMEOUT,
         )
+
+
+async def forward_to_plugin(
+    request: Request,
+    entry: RegisteredPlugin,
+    raw_path: bytes,
+    *,
+    body_limit: int,
+    read_timeout: float,
+    public_base: str | None = None,
+    forward_peer: bool = True,
+) -> Response:
+    """Forward `request` to `entry`'s `base_url` + `raw_path` (verbatim, plus
+    the raw query string) and relay the response as it streams back. The ONE
+    forwarding path for both gateway proxies — the root-level `http` surfaces
+    (`PluginHttpProxy`) and the replication `/via` surface
+    (`ReplicationViaProxy`) — so header policy, body capping, error shapes
+    and streaming are identical; the callers differ only in what they let
+    through and how large/slow it may be.
+
+    `public_base` is the gateway-side address that corresponds to the plugin's
+    `base_url` for THIS forward — the origin a plugin-absolute redirect is
+    rewritten onto. The root-level `http` surfaces use the bare gateway origin
+    (a plugin path IS the public path); `/via` passes `<origin>/via/<name>`, so
+    a plugin's `307 …/replication-admin/outbound` comes back as
+    `/via/<name>/replication-admin/outbound` rather than landing on the
+    platform's OWN admin surface at the gateway root."""
+    name = entry.manifest.name
+    try:
+        target = upstream_url(
+            entry.manifest.base_url,
+            raw_path,
+            request.scope.get("query_string", b""),
+        )
+    except ProxyPathError as exc:
+        return JSONResponse(
+            {"detail": f"request path cannot be forwarded: {exc}"},
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    body = await read_capped_body(request, body_limit)
+    if body is None:
+        return JSONResponse(
+            {
+                "detail": f"request body exceeds the {body_limit}-byte "
+                "gateway proxy limit"
+            },
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+        )
+
+    client = _client(request.app)
+    upstream_req = client.build_request(
+        request.method,
+        target,
+        content=body,
+        headers=_forward_headers(request, forward_peer=forward_peer),
+        timeout=httpx.Timeout(PROXY_TIMEOUT, read=read_timeout),
+    )
+    try:
+        upstream_resp = await client.send(upstream_req, stream=True)
+    except httpx.InvalidURL as exc:
+        return JSONResponse(
+            {"detail": f"request path cannot be forwarded: {exc}"},
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+    except httpx.HTTPError as exc:
+        log.warning(
+            "http-proxy: plugin %r upstream %s unreachable: %s",
+            name,
+            target,
+            exc,
+        )
+        return JSONResponse(
+            {"detail": f"plugin {name!r} upstream unreachable: {exc}"},
+            status_code=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    gateway_origin = public_base or str(request.base_url).rstrip("/")
+    return StreamingResponse(
+        _raw_body(upstream_resp),
+        status_code=upstream_resp.status_code,
+        headers=_response_headers(
+            upstream_resp, entry.manifest.base_url, gateway_origin
+        ),
+        background=BackgroundTask(upstream_resp.aclose),
+    )
+
+
+def is_replication_path(path: str, ingest_path: str) -> bool:
+    """Whether `path` (decoded, query-less) is one of the two replication
+    surfaces a plugin serves — its declared `ingest_path`, or anything under
+    the SDK admin prefix. Nothing else of a plugin (its MCP mount, `/ui-api`,
+    `/health`, an `http` contract) is reachable through `/via`."""
+    if path == ingest_path:
+        return True
+    return path == REPLICATION_ADMIN_PREFIX or path.startswith(
+        REPLICATION_ADMIN_PREFIX + "/"
+    )
+
+
+class ReplicationViaProxy:
+    """`/via/<plugin>/<path>` — a PEER instance's route to this instance's
+    plugins' replication surfaces (governance decision 0b8390f7).
+
+    Mounted at `VIA_PREFIX` (`app.py`). `<path>` is forwarded VERBATIM (raw
+    path + raw query, the same header denylist and streamed relay as the
+    `http` surfaces) to the named plugin's loopback `base_url`, so
+    `POST /via/pm/events/ingest` on the gateway is exactly
+    `POST <pm base_url>/events/ingest` at pm, signature header and body bytes
+    untouched (the SDK's HMAC is over the exact body). Only a REPLICATING
+    plugin's `ingest_path` and its `/replication-admin/…` surface are served;
+    everything else is a plain 404, as are an unknown plugin name, a plugin
+    with no `replication` block, and a malformed path. A plugin whose registry
+    status is DOWN short-circuits to 503 (gateway.md §4).
+
+    Trust is the gateway's: this mount rides `TrustMiddleware` like every
+    other path, so only a trusted (tailnet/loopback) peer reaches it — and the
+    plugin then sees the PLATFORM's own client as its peer (loopback), which
+    the SDK's `_require_trusted` already admits. That holds because this path
+    deliberately sends NO `X-Forwarded-For` (`forward_peer=False`): plugins
+    run stock uvicorn with proxy-header trust for loopback, so a forwarded
+    tailnet address would otherwise become the plugin's `request.client` and
+    its gate would resolve the peer instead. The per-stream HMAC on ingest and
+    snapshot is unchanged. Net effect: the only tailnet-reachable port per
+    instance is the platform's.
+
+    Sized for the traffic it carries, unlike the contract proxy: a single
+    envelope may be large (`VIA_BODY_LIMIT`), and the snapshot route — and
+    ONLY it — may think for minutes before its first byte
+    (`VIA_READ_TIMEOUT`)."""
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await _not_found_asgi(scope, receive, send)
+            return
+        request = Request(scope, receive)
+        registry: PluginRegistry = request.app.state.registry
+
+        # Under the mount, the route path is the remainder after `/via`:
+        # `/<plugin>/<path>`. Matched decoded, forwarded raw — nothing is
+        # normalized in between (the `_well_formed` rule of the http proxy).
+        route_path = get_route_path(scope)
+        if not _well_formed(route_path):
+            await _not_found_asgi(scope, receive, send)
+            return
+        segments = route_path.split("/")
+        if len(segments) < 3 or not segments[1]:
+            await _not_found_asgi(scope, receive, send)
+            return
+        name = segments[1]
+        rest = "/" + "/".join(segments[2:])
+
         try:
-            upstream_resp = await client.send(upstream_req, stream=True)
-        except httpx.InvalidURL as exc:
-            return JSONResponse(
+            entry = registry.get(name)
+        except PluginNotFound:
+            await _not_found_asgi(scope, receive, send)
+            return
+        block = entry.manifest.replication
+        if block is None or not is_replication_path(rest, block.ingest_path):
+            await _not_found_asgi(scope, receive, send)
+            return
+
+        # The raw path carries the plugin segment too; strip exactly that. A
+        # plugin name is a plain identifier, so its raw form is itself.
+        try:
+            raw = _raw_route_path(scope)
+        except ProxyPathError as exc:
+            response = JSONResponse(
                 {"detail": f"request path cannot be forwarded: {exc}"},
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
-        except httpx.HTTPError as exc:
-            log.warning(
-                "http-proxy: plugin %r upstream %s unreachable: %s",
-                name,
-                target,
-                exc,
-            )
-            return JSONResponse(
-                {"detail": f"plugin {name!r} upstream unreachable: {exc}"},
-                status_code=status.HTTP_502_BAD_GATEWAY,
-            )
+            await response(scope, receive, send)
+            return
+        head = f"/{name}".encode("ascii")
+        if not raw.startswith(head):
+            await _not_found_asgi(scope, receive, send)
+            return
+        raw_rest = raw[len(head):]
 
-        gateway_origin = str(request.base_url).rstrip("/")
-        return StreamingResponse(
-            _raw_body(upstream_resp),
-            status_code=upstream_resp.status_code,
-            headers=_response_headers(
-                upstream_resp, entry.manifest.base_url, gateway_origin
-            ),
-            background=BackgroundTask(upstream_resp.aclose),
-        )
+        if entry.status is PluginStatus.DOWN:
+            response = JSONResponse(
+                {"detail": f"plugin {name!r} is down"},
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        else:
+            # `request.base_url` is the app's root, not the Mount's — compose the
+            # public base for this plugin ourselves so a plugin-absolute
+            # redirect is rewritten back UNDER `/via/<name>`.
+            gateway_root = str(request.base_url).rstrip("/")
+            response = await forward_to_plugin(
+                request,
+                entry,
+                raw_rest,
+                body_limit=VIA_BODY_LIMIT,
+                read_timeout=(
+                    VIA_READ_TIMEOUT if rest == VIA_SNAPSHOT_PATH else UPSTREAM_READ_TIMEOUT
+                ),
+                public_base=f"{gateway_root}{VIA_PREFIX}/{name}",
+                forward_peer=False,
+            )
+        await response(scope, receive, send)
+
+
+async def _not_found_asgi(scope: Scope, receive: Receive, send: Send) -> None:
+    """The app's own 404 shape, so an unclaimed `/via` path is
+    indistinguishable from any other unknown gateway path."""
+    response = JSONResponse({"detail": "Not Found"}, status_code=status.HTTP_404_NOT_FOUND)
+    await response(scope, receive, send)

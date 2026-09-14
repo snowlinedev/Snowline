@@ -35,13 +35,13 @@ an event type one side doesn't know simply never arrives from it.
 
 from __future__ import annotations
 
-import ipaddress
 import logging
 import secrets
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from urllib.parse import urlsplit, urlunsplit
+
+from snowline_platform.replication import via_base
 
 log = logging.getLogger("snowline_platform.replication_pairing")
 
@@ -119,7 +119,8 @@ def discover_participants(
     *,
     admin_prefix: str = DEFAULT_ADMIN_PREFIX,
     include_platform: bool = True,
-    reachable_host: str | None = None,
+    peer: bool = False,
+    public_url: str | None = None,
 ) -> dict[str, Participant]:
     """Every replicating participant on the instance at `platform_url`, keyed by
     name. Plugins come from `GET /plugins` (a plugin replicates iff its manifest
@@ -132,16 +133,24 @@ def discover_participants(
     `client` is any object with `.get(url) -> response` (an `httpx.Client` in
     production). `platform_url` is the instance's platform base.
 
-    CROSS-TAILNET ADDRESSING (§4.1/§5.1): a plugin advertises a LOOPBACK
-    `base_url` to its own platform's registry (it binds loopback; the tailnet
-    path is tailscaled's). That loopback base_url is directly usable when
-    discovering the LOCAL instance, but NOT when discovering a PEER over the
-    tailnet. `reachable_host` (the peer's tailnet host) is how a peer's plugin
-    gets a reachable address, by the §4.1 advertised-address rule
-    (`_resolve_base`): the plugin's declared `advertised_base_url` if present,
-    else a port-preserving rewrite of its loopback `base_url` onto
-    `reachable_host`. The platform participant is addressed via `platform_url`
-    (already the reachable address), so it is never advertised-rewritten."""
+    CROSS-INSTANCE ADDRESSING (§4.1, decision 0b8390f7): a plugin advertises a
+    LOOPBACK `base_url` to its own platform's registry (it binds loopback and
+    is never reachable across the tailnet itself). That loopback base_url is
+    directly usable when discovering the LOCAL instance (`peer=False`). When
+    discovering a PEER (`peer=True`) the plugin is addressed THROUGH THE PEER'S
+    GATEWAY at `<platform_url>/via/<name>` — the gateway proxies to the
+    plugin's loopback surfaces (`http_proxy.ReplicationViaProxy`) — unless the
+    plugin declares an explicit `advertised_base_url`, which wins verbatim.
+    The platform participant is addressed at `platform_url` in both cases
+    (already the reachable address).
+
+    `public_url` (LOCAL discovery only) is the address a PEER reaches THIS
+    instance's gateway at. When given, each participant's `ingest_url` — the
+    target a peer's outbound subscription will dial — is built against it
+    (`<public_url>/via/<name><ingest_path>`, or `<public_url><ingest_path>` for
+    the platform) while `admin_base` stays on the loopback `platform_url` the
+    local handshake drives. Without it a local participant's ingest_url is
+    loopback, which only a same-box peer can reach."""
     platform_url = platform_url.rstrip("/")
     resp = client.get(f"{platform_url}/plugins")
     _raise_for_status(resp, f"GET {platform_url}/plugins")
@@ -152,21 +161,35 @@ def discover_participants(
         if not block:
             continue  # not opted in — degrades alone (§4)
         name = manifest["name"]
-        base = _resolve_base(block, manifest["base_url"], reachable_host)
-        participants[name] = _participant(name, base, block, instance_id, admin_prefix)
+        base = _resolve_base(block, name, manifest["base_url"], platform_url, peer=peer)
+        ingest_base = (
+            _resolve_base(block, name, manifest["base_url"], public_url, peer=True)
+            if public_url
+            else base
+        )
+        participants[name] = _participant(
+            name, base, block, instance_id, admin_prefix, ingest_base=ingest_base
+        )
     if include_platform:
         block = _platform_manifest(client, platform_url)
         # The platform is discovered AT platform_url (already the reachable
-        # address), so its base is platform_url verbatim — the §4.1 rewrite is a
-        # plugin concern (§8).
+        # address), so its base is platform_url verbatim — `/via` is a plugin
+        # concern (§8).
         participants[PLATFORM_PARTICIPANT] = _participant(
-            PLATFORM_PARTICIPANT, platform_url, block, instance_id, admin_prefix
+            PLATFORM_PARTICIPANT, platform_url, block, instance_id, admin_prefix,
+            ingest_base=public_url or platform_url,
         )
     return participants
 
 
 def _participant(
-    name: str, base: str, block: dict, instance_id: str, admin_prefix: str
+    name: str,
+    base: str,
+    block: dict,
+    instance_id: str,
+    admin_prefix: str,
+    *,
+    ingest_base: str | None = None,
 ) -> Participant:
     """Build a Participant from a `replication`-block-shaped dict — the ONE
     construction path for both a plugin (block from `/plugins`, §4) and the
@@ -174,10 +197,11 @@ def _participant(
     declared `contract_version`/vocabulary and are refused/warned identically at
     pairing."""
     base = base.rstrip("/")
+    ingest_base = (ingest_base or base).rstrip("/")
     return Participant(
         name=name,
         admin_base=f"{base}{admin_prefix}",
-        ingest_url=f"{base}{block['ingest_path']}",
+        ingest_url=f"{ingest_base}{block['ingest_path']}",
         source_id=f"{instance_id}.{name}",
         events=tuple(block.get("events", [])),
         contract_version=block.get("contract_version"),
@@ -185,22 +209,28 @@ def _participant(
 
 
 def _resolve_base(
-    block: dict, registry_base_url: str, reachable_host: str | None
+    block: dict,
+    name: str,
+    registry_base_url: str,
+    platform_url: str,
+    *,
+    peer: bool,
 ) -> str:
-    """The §4.1 advertised-address rule for a plugin discovered on an instance.
+    """The §4.1 addressing rule for a plugin discovered on an instance.
 
-    LOCAL discovery (`reachable_host` None) uses the registry `base_url` as-is —
-    the loopback address is directly reachable. CROSS-TAILNET discovery prefers
-    the plugin's declared `advertised_base_url` (the peer-reachable address it
-    states for itself), and with none falls back to the port-preserving host
-    rewrite. The fallback is BYTE-IDENTICAL to pre-#96 behavior, so a plugin
-    that never declares the field pairs exactly as it does today."""
-    if reachable_host is None:
+    LOCAL discovery (`peer=False`) uses the registry `base_url` as-is — the
+    loopback address is directly reachable. PEER discovery prefers the plugin's
+    declared `advertised_base_url` (an explicit peer-reachable address it
+    states for itself) and otherwise addresses the plugin THROUGH THE PEER'S
+    GATEWAY: `<platform_url>/via/<name>` (decision 0b8390f7). There is no
+    port-preserving host rewrite any more — a peer's plugin ports are not
+    exposed on the tailnet, only its platform's."""
+    if not peer:
         return registry_base_url
     advertised = block.get("advertised_base_url")
     if advertised:
         return advertised
-    return _rehost(registry_base_url.rstrip("/"), reachable_host)
+    return via_base(platform_url, name)
 
 
 def _platform_manifest(client, platform_url: str) -> dict:
@@ -472,42 +502,6 @@ def pair(
         f"{len(plan.one_sided)} one-sided, {len(plan.refused)} refused"
     )
     return plan
-
-
-def _rehost(url: str, host: str | None) -> str:
-    """Rewrite `url`'s host to `host`, preserving scheme, PORT, path (§4.1
-    cross-tailnet addressing). `host` None returns the url unchanged (local
-    discovery uses the loopback base_url as-is).
-
-    The rewrite ASSUMES the peer advertised a LOOPBACK base_url (§4.1) that the
-    serve posture re-exposes on the tailnet at the SAME port. If the original
-    host is NOT loopback, that assumption may not hold — the plugin may have
-    advertised a real address on purpose — so we WARN rather than silently
-    redirect it to a port that maps to something else on the peer."""
-    if not host:
-        return url
-    parts = urlsplit(url)
-    if not _is_loopback(parts.hostname):
-        log.warning(
-            "rehosting non-loopback base_url %r onto peer host %r (port %s "
-            "preserved) — §4.1 assumes plugins advertise LOOPBACK base_urls that "
-            "tailscale serve re-exposes 1:1; verify this port maps to this "
-            "plugin on the peer",
-            url, host, parts.port,
-        )
-    port = f":{parts.port}" if parts.port else ""
-    return urlunsplit((parts.scheme, f"{host}{port}", parts.path, parts.query, parts.fragment))
-
-
-def _is_loopback(hostname: str | None) -> bool:
-    if not hostname:
-        return False
-    if hostname == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(hostname).is_loopback
-    except ValueError:
-        return False
 
 
 def _raise_for_status(resp, what: str) -> None:

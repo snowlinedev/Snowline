@@ -87,21 +87,26 @@ pre-auth listener on every hotel LAN it joins. The tailnet path is tailscaled's:
 ops/roam/tailscale-serve.sh
 ```
 
-This maps each service's loopback port **1:1 onto the same tailnet port**
-(`tailnet:8848→127.0.0.1:8848`, `:8801→:8801`, `:8802→:8802`, `:8803→:8803` for
-pm). The port-preserving
-1:1 mapping is the **fallback** the pairing CLI relies on when it rewrites a peer
-plugin's loopback `base_url` onto the peer's tailnet host (§4.1) — governance at
-loopback `:8801` is reachable at `<host>.tailnet:8801`. Under this stock posture
-you declare nothing and pairing works as written; the `pair`/`seed` steps below
-are unchanged.
+This exposes **only the platform's port** on the tailnet
+(`tailnet:8848→127.0.0.1:8848`). Plugin ports (`8801/8802/8803`) are NOT
+mirrored and must not be: a peer reaches a plugin's replication surfaces
+**through this instance's gateway** at `/via/<plugin>/…`, which proxies to the
+plugin's loopback bind (spec §4.1, decision 0b8390f7). The pairing CLI and the
+seed address peers that way automatically; you declare nothing. (On the hub the
+platform binds its tailnet address directly — `ops/hub/tailscale-serve.sh` adds
+the HTTPS front on top — so the hub needs no TCP mirror at all.)
 
-> **Only if you diverge from the 1:1 mirror** (a non-matching port, a path-based
-> serve front, a distinct tailnet host): the silent-rewrite assumption no longer
-> holds, and the fix is not a CLI flag — the plugin declares its peer-reachable
-> address as `advertised_base_url` on its manifest `replication` block (spec
-> §4.1), which pairing then prefers verbatim. The platform's own scope stream
-> needs nothing here: a peer discovers it AT its base URL.
+> **Upgrading an instance paired under the OLD posture** (streams whose
+> `target_url` dials `<peer>:8801/8802/8803`): there is no admin verb to
+> repoint a live stream, so re-seed the spoke under a fresh epoch (§6) — or
+> re-pair after retiring the old streams — BEFORE switching the old per-port
+> mirror off. Off first wedges every old stream in backoff.
+
+> **If a plugin is fronted some other way** (a distinct host, a non-gateway
+> front): the plugin declares its peer-reachable address as
+> `advertised_base_url` on its manifest `replication` block (spec §4.1), which
+> pairing then prefers verbatim. The platform's own scope stream needs nothing
+> here: a peer discovers it AT its base URL.
 
 Start the services (per instance), using the launchd agents or by hand:
 
@@ -145,10 +150,16 @@ No topology survives an ops gap on the hub. On the primary:
 From the roam laptop:
 
 ```bash
-uv run snowline replicate pair http://mini.CHANGEME.ts.net:8848 \
+uv run snowline replicate pair http://mini.CHANGEME.ts.net:8850 \
     --local-url http://127.0.0.1:8848 \
+    --local-peer-url http://roam.CHANGEME.ts.net:8848 \
     --local-instance roam --peer-instance primary
 ```
+
+`--local-peer-url` is THIS instance's gateway as the PEER reaches it: the
+reverse (primary→roam) streams are pointed at `<that>/via/<plugin>/…`
+(decision 0b8390f7). Leave it out only for a same-box drill — the command
+warns, and the reverse streams then target this instance's loopback.
 
 What it does (§5): for every participant opted into replication on **both**
 instances (each replicating plugin, plus the platform's own scope stream), it

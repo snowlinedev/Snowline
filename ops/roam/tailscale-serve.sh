@@ -1,42 +1,58 @@
 #!/usr/bin/env bash
-# Expose the loopback-bound Snowline services on the tailnet via tailscaled
+# Expose the loopback-bound Snowline PLATFORM on the tailnet via tailscaled
 # (replication-continuity §5.1). The apps NEVER bind the tailnet address
 # themselves — losing tailscaled must not take down the local agent's loopback
 # access (that is half the spoke's job), and a wildcard bind would park a
 # pre-auth listener on every untrusted LAN the laptop joins.
 #
-# The mapping is PORT-PRESERVING and 1:1 (tailnet:PORT -> 127.0.0.1:PORT) for
-# every service. That is the posture the pairing CLI assumes when it rewrites a
-# peer plugin's loopback base_url onto the peer's tailnet host (§4.1,
-# replication_pairing._rehost): the peer's governance at loopback :8801 is
-# reachable at <this-host>.tailnet:8801, memory :8802 at :8802, and the platform
-# :8848 at :8848.
+# ONLY THE PLATFORM PORT is mirrored (tailnet:8848 -> 127.0.0.1:8848). Plugin
+# ports (8801/8802/8803) are deliberately NOT exposed: a peer instance reaches a
+# plugin's replication surfaces THROUGH THIS GATEWAY at `/via/<plugin>/…`, which
+# proxies to the plugin's loopback bind (§4.1, governance decision 0b8390f7).
+# The pairing CLI and the seed address peers that way automatically.
 #
-# Run once per instance (primary AND roam). `tailscale serve` config persists
-# across reboots. Requires tailscaled up and this node logged in.
+# Run once per SPOKE instance. (The hub's platform binds its tailnet address
+# directly and fronts it with ops/hub/tailscale-serve.sh instead.) `tailscale
+# serve` config persists across reboots. Requires tailscaled up and this node
+# logged in.
 #
 # NOTE: `tailscale serve` terminates the tailnet connection and forwards to
-# loopback, so EVERY forwarded request reaches the app with a 127.0.0.1 peer IP
-# — which is exactly why SNOWLINE_TRUSTED_CIDRS must include the loopback
-# entries (§5.1). If you switch to a source-IP-preserving front instead, the
-# tailnet range in the CIDR list is what carries the trust; keep both listed.
+# loopback, so EVERY forwarded request reaches the platform with a 127.0.0.1
+# peer IP — which is exactly why SNOWLINE_TRUSTED_CIDRS must include the
+# loopback entries (§5.1). If you switch to a source-IP-preserving front
+# instead, the tailnet range in the CIDR list is what carries the trust; keep
+# both listed.
+#
+# A mirror left over from the pre-0b8390f7 posture (tailnet:8801/8802/8803):
+# an instance paired BEFORE that decision still holds outbound subscriptions
+# whose target_url dials those ports, and there is no admin verb to repoint a
+# live stream — so RE-SEED (or re-pair under a fresh epoch, runbook §6) FIRST,
+# then remove the mirror with `tailscale serve --tcp=<port> off`. Removing it
+# first wedges every old-posture stream in backoff.
 set -euo pipefail
-
 PLATFORM_PORT="${SNOWLINE_PLATFORM_PORT:-8848}"
-GOV_PORT="${SNOWLINE_GOVERNANCE_PORT:-8801}"
-MEM_PORT="${SNOWLINE_MEMORY_PORT:-8802}"
-PM_PORT="${SNOWLINE_PM_PORT:-8803}"
 
-echo "Configuring tailscale serve (TCP, port-preserving) -> loopback..."
-for port in "$PLATFORM_PORT" "$GOV_PORT" "$MEM_PORT" "$PM_PORT"; do
-  echo "  tailnet:${port} -> 127.0.0.1:${port}"
-  tailscale serve --bg --tcp "${port}" "tcp://127.0.0.1:${port}"
-done
+# The macOS GUI app does not put `tailscale` on PATH; its CLI lives inside the
+# app bundle and MUST be invoked by its real path (a symlink trips the app's
+# bundle-identifier check and aborts). Honor an explicit override first.
+if command -v tailscale >/dev/null 2>&1; then
+  TAILSCALE="${TAILSCALE_BIN:-tailscale}"
+else
+  TAILSCALE="${TAILSCALE_BIN:-/Applications/Tailscale.app/Contents/MacOS/Tailscale}"
+fi
+# `command` so the function never re-enters ITSELF when TAILSCALE is the bare
+# name `tailscale` (bash resolves functions before PATH — without it the
+# on-PATH case recursed until the shell segfaulted).
+tailscale() { command "$TAILSCALE" "$@"; }
 
+echo "Configuring tailscale serve (TCP, platform port only) -> loopback..."
+echo "  tailnet:${PLATFORM_PORT} -> 127.0.0.1:${PLATFORM_PORT}"
+tailscale serve --bg --tcp "${PLATFORM_PORT}" "tcp://127.0.0.1:${PLATFORM_PORT}"
 echo
 echo "Current serve config:"
 tailscale serve status
 echo
-echo "Done. This host's services are now reachable on the tailnet at"
-echo "  http://\$(tailscale ip -4):{${PLATFORM_PORT},${GOV_PORT},${MEM_PORT},${PM_PORT}}"
+echo "Done. This host's gateway is reachable on the tailnet at"
+echo "  http://$(tailscale ip -4):${PLATFORM_PORT}"
+echo "Plugins are reached by peers through it at /via/<plugin>/… — no plugin port is exposed."
 echo "Reset with: tailscale serve reset"

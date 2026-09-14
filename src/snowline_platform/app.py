@@ -212,14 +212,15 @@ def create_app(
     # decision 0503fff0); a gateway surface named after any of them would mount
     # /<name>/mcp on top of those and silently interleave MCP transports or SPA
     # assets — fail loud at boot like every other surface-config error.
-    reserved = {"ui", "ui-api", platform_tools.PLATFORM_PLUGIN_NAME} & set(
-        config.surfaces()
-    )
+    reserved = {
+        "ui", "ui-api", platform_tools.PLATFORM_PLUGIN_NAME, "via",
+    } & set(config.surfaces())
     if reserved:
         raise config.ConfigError(
             f"SNOWLINE_SURFACES uses reserved name(s) {sorted(reserved)!r} — "
-            f"'ui'/'ui-api' are the dashboard's route namespaces and 'platform' "
-            f"is the platform's own tool-app route (/platform/mcp)"
+            f"'ui'/'ui-api' are the dashboard's route namespaces, 'platform' "
+            f"is the platform's own tool-app route (/platform/mcp), and 'via' "
+            f"is the replication proxy (/via/<plugin>/…, decision 0b8390f7)"
         )
 
     # The gateway: aggregate registered plugins' MCP surfaces onto the platform's
@@ -236,6 +237,15 @@ def create_app(
     mounts.append(build_platform_tools_mount())
     app.state.gateway_mounts = mounts
     mount_gateway(app, mounts)
+
+    # Replication VIA the gateway (decision 0b8390f7): `/via/<plugin>/…`
+    # proxies a PEER instance's replication traffic (admin handshake, ingest
+    # deliveries, the seed snapshot) to the named plugin's loopback
+    # replication surfaces. A real Mount, not a router-fallback like the
+    # `http` proxy below: its prefix is the platform's own (reserved to
+    # plugins), so nothing can shadow it and it needs no "no route matched"
+    # ordering. Rides TrustMiddleware like every other gateway path.
+    app.mount(replication.VIA_PREFIX, http_proxy.ReplicationViaProxy(), name="via")
 
     # Freeze the surface config the moment the mounts are built: GET /surfaces
     # reports THIS, not a per-request env re-parse — the view can't drift from

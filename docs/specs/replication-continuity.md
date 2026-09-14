@@ -221,15 +221,16 @@ pairing**. This keeps the server thin and makes participation strictly opt-in:
   `base_url` (SDK-provided handler).
 - `events` — the event vocabulary this plugin emits, declared so pairing can
   warn on version/vocabulary skew between the two instances' copies.
-- `advertised_base_url` (optional) — the absolute address a **peer** instance
-  reaches this plugin's replication surfaces at over the tailnet, when that
-  differs from the loopback `base_url` the plugin advertises to its own
-  registry (§4.1). Pairing (§5) prefers it; absent, pairing falls back to the
-  port-preserving host rewrite (the addressing rule in §4.1). "advertised"
-  is the §4.1 verb for a per-target `base_url`; the name says what it is — the
-  address this plugin advertises for cross-tailnet reach — without baking the
-  transport (`tailnet`) into the field, since the reachable front is a serve
-  detail, not a contract one.
+- `advertised_base_url` (optional) — an EXPLICIT absolute address a **peer**
+  instance reaches this plugin's replication surfaces at, for a deployment
+  that fronts the plugin some way of its own. Pairing (§5) prefers it
+  verbatim; absent — the stock posture — a peer addresses the plugin
+  **through this instance's platform gateway** at `<platform_url>/via/<name>`
+  (the addressing rule in §4.1, decision 0b8390f7). "advertised" is the §4.1
+  verb for a per-target `base_url`; the name says what it is — the address
+  this plugin advertises for cross-instance reach — without baking the
+  transport into the field, since the reachable front is a serve detail, not
+  a contract one.
 - Absent block = plugin does not replicate. **Gateway and health never read
   the block**; registration changes only by *storing* it — the manifest
   model and registry gain the field (§9 item 2; today's manifest model would
@@ -295,35 +296,48 @@ hub machine's simulators" is the first; "drive the simulators wherever I am"
 is the second — decided in the plugin's repo, not here. Both compose without
 platform changes.
 
-**Cross-tailnet replication addressing — the advertised-address rule.** A
+**Cross-instance replication addressing — through the peer's gateway.** A
 replicating plugin advertises a **loopback** `base_url` to the platform it
-shares a machine with (§5.1): it binds loopback and lets tailscaled own the
-tailnet path. That loopback address is exactly right for the *local*
+shares a machine with (§5.1): it binds loopback and is never itself reachable
+across the tailnet. That loopback address is exactly right for the *local*
 instance's own surfaces, but a **peer** discovering the plugin at pairing time
-(§5) cannot reach a loopback address across the tailnet. Pairing resolves the
-peer-reachable replication address in one of two ways, **in preference
-order**:
+(§5) cannot reach a loopback address. Pairing resolves the peer-reachable
+replication address in one of two ways, **in preference order** (decision
+0b8390f7, item 6754a127):
 
 1. **The plugin's declared `advertised_base_url`** (manifest `replication`
-   block, §4) — the address a peer reaches this plugin's replication surfaces
-   at, stated by the plugin itself. Pairing uses it verbatim. This is the
-   principled answer whenever the serve posture is *not* a 1:1 port mirror — a
-   non-1:1 port map, a path-based serve front, a distinct tailnet host —
-   because only the plugin knows where it actually lands over the tailnet.
-2. **Fallback: the port-preserving host rewrite.** With no
-   `advertised_base_url`, pairing rewrites the loopback `base_url`'s host onto
-   the peer's tailnet host and **preserves the port** — correct **only** under
-   the runbook's `tailscale serve` posture that maps each loopback port 1:1
-   onto the same tailnet port (`ops/roam/tailscale-serve.sh`). This keeps every
-   existing pair working untouched: a deployment that has never needed
-   `advertised_base_url` behaves exactly as it does today.
+   block, §4) — an explicit address a peer reaches this plugin's replication
+   surfaces at, stated by the plugin itself. Pairing uses it verbatim. This is
+   the override for a deployment that fronts a plugin some way of its own.
+2. **Default: the peer's platform gateway.** With no `advertised_base_url`,
+   pairing addresses the plugin at **`<platform_url>/via/<name>`** — the
+   gateway of the instance the plugin lives on, which proxies
+   `/via/<plugin>/<path>` to the plugin's loopback `base_url` for exactly two
+   surfaces: the plugin's declared `ingest_path` and its `/replication-admin/…`
+   admin surface (`http_proxy.ReplicationViaProxy`; gateway.md §3b). Nothing
+   else of a plugin is reachable through `/via`. The platform's own scope
+   stream (§8) is served at `platform_url` directly and needs no `/via`.
 
-**Config trap:** the fallback's 1:1 assumption is silent. A deploy that fronts
-services on non-matching ports, or behind a shared path prefix, will have
-pairing rewrite onto a port that maps to the *wrong* service — or to nothing —
-on the peer, and nothing at the CLI says so. The remedy is not a CLI flag; it
-is the plugin declaring `advertised_base_url`. Declare it whenever the serve
-posture is anything other than the documented 1:1 port mirror.
+**What this buys.** The only tailnet-reachable port per instance is the
+platform's — the one bootstrap already requires healthy over the tailnet and
+the one `tailscale serve` (or a direct tailnet bind, on the hub) already
+fronts. Plugins change nothing: they keep binding loopback, keep advertising
+loopback, and see the platform's own client as their peer (loopback), which
+the SDK's `_require_trusted` admits — the `/via` proxy sends no
+`X-Forwarded-For`, precisely so a plugin's stock uvicorn proxy-header
+handling cannot swap the tailnet address in as its peer (gateway.md §3b).
+Trust on the tailnet side is the gateway's `TrustMiddleware` CIDR gate, and
+the per-stream HMAC on ingest and snapshot is unchanged. The cost accepted:
+the platform is now on the cross-instance delivery path, so a platform
+restart pauses deliveries for its duration — which the outbox absorbs exactly
+as a tailnet blip does (§3).
+
+**History.** Before this rule, pairing rewrote a peer plugin's loopback
+`base_url` onto the peer's tailnet host **port-for-port**, which assumed a
+per-service 1:1 `tailscale serve` mirror on every instance. That assumption
+was silent and operator-maintained per service; it failed twice in one day on
+the first packaged-spoke bootstrap (a hub that had never mirrored its plugin
+ports; a spoke whose mirror predated pm). The rewrite is gone.
 
 **Event coverage is the real per-plugin work.** The bus today emits only
 `decision.recorded` / `decision.superseded`. Full-store convergence means
@@ -381,9 +395,9 @@ each opted-in plugin covers its write surface with events:
   pre-check is a courtesy on top, not the guarantee. The
   CLI warns on any plugin opted in on one side only or with mismatched
   `contract_version`/vocabulary. It addresses each peer participant's
-  replication surfaces by the §4.1 advertised-address rule: the participant's
-  declared `advertised_base_url` if present, else the port-preserving rewrite
-  of its loopback `base_url`.
+  replication surfaces by the §4.1 rule: the participant's declared
+  `advertised_base_url` if present, else through the peer's gateway at
+  `<platform_url>/via/<name>` (decision 0b8390f7).
 - **Secrets, concretely.** A secret authenticates one stream for one epoch.
   Storage is a row in each plugin's own store, same posture as the bus today
   (both stores live on owner boxes; at-rest encryption is the host's
@@ -434,8 +448,11 @@ exposure delegated to tailscaled. Rationale:
 - **Never bind `0.0.0.0` on the roaming spoke.** The CIDR gate fails closed,
   but a wildcard bind parks a pre-auth listener on every hotel LAN the
   laptop joins. Loopback-only binds keep the untrusted-network surface at
-  zero; the tailnet path is tailscaled's (`tailscale serve` TCP-forwarding
-  to loopback, or a tiny front proxy — decide at implementation).
+  zero; the tailnet path is tailscaled's — and only the **platform's** port
+  needs it (`tailscale serve --tcp <platform port>` to loopback on a spoke;
+  the hub's platform binds its tailnet address directly). Plugin ports are
+  never exposed: a peer reaches a plugin's replication surfaces through the
+  gateway's `/via/<plugin>` proxy (§4.1, decision 0b8390f7).
 - **Layer-3 synergy.** "App on localhost, a flipper in front owning the
   tailnet address" is exactly the shape deploy-continuity.md §4 sketched
   for platform socket continuity — this posture is a step toward that

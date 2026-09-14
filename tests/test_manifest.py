@@ -530,7 +530,7 @@ def test_http_surface_rejects_malformed_prefix(prefix):
 
 
 @pytest.mark.parametrize(
-    "prefix", ["/plugins", "/ui-api/x", "/mcp", "/health", "/ui", "/platform"]
+    "prefix", ["/plugins", "/ui-api/x", "/mcp", "/health", "/ui", "/platform", "/via", "/via/pm"]
 )
 def test_http_surface_rejects_reserved_prefix(prefix):
     # The platform serves these itself; a plugin claiming one would declare a

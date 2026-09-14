@@ -1,32 +1,32 @@
 {
-  "__doc__": "Config for `snowline replicate seed --config this.json` (replication-continuity §7). Run it FROM the roam laptop: the primary is discovered + reached over the tailnet; the spoke DBs are local. Fill every CHANGEME. Delete this __doc__ key or leave it — the loader ignores unknown keys under participants but reads primary/spoke/participants.",
-
+  "__doc__": "Config for `snowline replicate seed --config this.json` (replication-continuity \u00a77). Run it FROM the roam laptop: the primary is discovered + reached over the tailnet; the spoke DBs are local. Fill every CHANGEME. Delete this __doc__ key or leave it \u2014 the loader ignores unknown keys under participants but reads primary/spoke/participants.",
   "primary": {
-    "__doc__": "The hub, reached over the tailnet. platform_url is the mini's tailnet address; plugin admin surfaces are found by discovery and rewritten onto this host (port-preserving, §4.1). `host` optionally overrides the rewrite host (defaults to platform_url's host).",
-    "platform_url": "http://mini.CHANGEME.ts.net:8848",
+    "__doc__": "The hub, reached over the tailnet. platform_url is the hub's gateway address; its plugins' admin surfaces are found by discovery and addressed THROUGH that gateway at /via/<plugin>/\u2026 (\u00a74.1, decision 0b8390f7) \u2014 no hub plugin port is ever dialled. A legacy `host` key is ignored with a warning.",
+    "platform_url": "http://mini.CHANGEME.ts.net:8850",
     "instance": "primary"
   },
-
   "spoke": {
     "__doc__": "This laptop. platform_url is loopback (the seed reaches the spoke locally, and after boot pairs the reverse direction against it).",
     "platform_url": "http://127.0.0.1:8848",
     "instance": "roam"
   },
-
   "participants": {
-    "__doc__": "One entry per opted-in participant that must be seeded — the platform's scope stream (name 'platform', §8) plus every replicating plugin. Each needs just two keys: spoke_ingest_url (where the PRIMARY delivers to this participant on the spoke, over the tailnet — the spoke's serve front) and spoke_db_url (the LOCAL database pg_restore writes into). There is deliberately NO primary_dump_url: the primary dumps itself and serves the archive over its own replication-admin surface, signed with the secret the seed mints while priming (governance decision 1a83031c — the hub's Postgres is loopback-only and never reachable over the tailnet). An older seed.json that still carries primary_dump_url is accepted with a warning; the key is ignored. The primary-side admin surface + event vocabulary are discovered, not configured.",
-
+    "__doc__": "One entry per opted-in participant that must be seeded \u2014 the platform's scope stream (name 'platform', \u00a78) plus every replicating plugin. Each needs just two keys: spoke_ingest_url (where the PRIMARY delivers to this participant on the spoke, over the tailnet \u2014 the spoke's GATEWAY port, with plugin participants under /via/<plugin>/\u2026; decision 0b8390f7) and spoke_db_url (the LOCAL database pg_restore writes into). There is deliberately NO primary_dump_url: the primary dumps itself and serves the archive over its own replication-admin surface, signed with the secret the seed mints while priming (governance decision 1a83031c \u2014 the hub's Postgres is loopback-only and never reachable over the tailnet). An older seed.json that still carries primary_dump_url is accepted with a warning; the key is ignored. The primary-side admin surface + event vocabulary are discovered, not configured.",
     "platform": {
       "spoke_ingest_url": "http://roam.CHANGEME.ts.net:8848/replication/events/ingest",
       "spoke_db_url": "postgresql:///snowline_platform"
     },
     "governance": {
-      "spoke_ingest_url": "http://roam.CHANGEME.ts.net:8801/events/ingest",
+      "spoke_ingest_url": "http://roam.CHANGEME.ts.net:8848/via/governance/events/ingest",
       "spoke_db_url": "postgresql:///snowline_governance"
     },
     "memory": {
-      "spoke_ingest_url": "http://roam.CHANGEME.ts.net:8802/events/ingest",
+      "spoke_ingest_url": "http://roam.CHANGEME.ts.net:8848/via/memory/events/ingest",
       "spoke_db_url": "postgresql:///snowline_memory"
+    },
+    "pm": {
+      "spoke_ingest_url": "http://roam.CHANGEME.ts.net:8848/via/pm/events/ingest",
+      "spoke_db_url": "postgresql:///snowline_pm"
     }
   }
 }
