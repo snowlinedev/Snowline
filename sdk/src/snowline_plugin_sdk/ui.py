@@ -263,6 +263,24 @@ FACET_SHAPE: dict[str, str] = {
     "filtering nodes where node.facets[key] === true OUT of view",
 }
 
+# The optional dockable side list (§4.2a "The drawer"): work that legitimately
+# sits OUTSIDE the hierarchy — the pm roadmap's placement queue — shown BESIDE
+# the tree rather than as a section of it, which would misrepresent unplaced
+# work as placed (snowlinedev/snowline-pm decision b9116311). Same BoardNode
+# shape, same shell renderer; flat and unnumbered, because drawer order is not
+# roadmap order. The declared `facets[]` toggles filter drawer nodes exactly as
+# they filter tree nodes; `group_by` does not apply inside it.
+DRAWER_SHAPE: dict[str, str] = {
+    "title": "required — the toggle's visible label and the panel's heading "
+    "(e.g. 'Placement queue')",
+    "nodes": "required — list of BOARD_NODE_SHAPE, same shape as the tree and "
+    "typically leaves",
+    "empty": "optional — copy shown inside the panel when no drawer node is "
+    "visible (the shell falls back to neutral copy when omitted)",
+    "count_label": "optional — a word rendered after the count on the toggle, "
+    "e.g. 'waiting' -> 'Placement queue · 7 waiting'",
+}
+
 BOARD_SHAPE: dict[str, str] = {
     "nodes": f"required — list of {BOARD_NODE_SHAPE!r}, already in the "
     "plugin's intended default order",
@@ -270,6 +288,8 @@ BOARD_SHAPE: dict[str, str] = {
     "toggle",
     "facets": f"optional — list of {FACET_SHAPE!r}; omit to offer no filter "
     "toggles",
+    "drawer": f"optional — {DRAWER_SHAPE!r}; omit to offer no drawer (a board "
+    "without one renders exactly as it did before the drawer existed)",
     "empty": "optional — placeholder text/state when nodes is []",
 }
 

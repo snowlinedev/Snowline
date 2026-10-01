@@ -11,6 +11,7 @@
  * node's `.hidden` property, the state the collapse control toggles. */
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import axe from "axe-core";
 import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { describe, expect, it } from "vitest";
 
@@ -44,6 +45,24 @@ function renderRoadmap(entry = "/governance/roadmap") {
       <LocationProbe />
     </MemoryRouter>,
   );
+}
+
+/* The drawer (§4.2a): the board root carries the docked-vs-overlay LAYOUT class
+ * and the panel is a `hidden`-toggled region, so — as with the collapse control
+ * — the DOM node's own `.hidden`/`className` is the state under test, not a
+ * visibility heuristic. Everything a USER can reach is queried by role instead,
+ * which excludes the `hidden` panel from the a11y tree for free. */
+function boardRoot(): HTMLElement {
+  return document.querySelector(".board") as HTMLElement;
+}
+function drawerPanel(): HTMLElement {
+  return document.querySelector(".board-drawer") as HTMLElement;
+}
+/** The drawer toggle, by its composed label: title + visible count (+ the
+ * plugin's `count_label`). `stale` is hidden_by_default, so 2 of the fixture's
+ * 3 queue nodes are visible on arrival. */
+function drawerToggle(count = 2): HTMLElement {
+  return screen.getByRole("button", { name: `Placement queue · ${count} waiting` });
 }
 
 describe("board kind: rendering", () => {
@@ -329,4 +348,249 @@ describe("board kind: registered nav omission", () => {
         .map((a) => a.getAttribute("href")),
     ).not.toContain("/governance/roadmap");
   });
+});
+
+/** ui-shell.md §4.2a "The drawer": UNPLACED work (the pm placement queue) is a
+ * dockable fly-out BESIDE the board, not a section of the tree
+ * (snowlinedev/snowline-pm decision b9116311). The shell half: the toggle, the
+ * overlay/docked panel, the shared node renderer, and the `?drawer=` view
+ * state. */
+describe("board kind: drawer", () => {
+  it("renders exactly as before, with no toggle, when the payload declares none", async () => {
+    renderRoadmap("/governance/roadmap-no-drawer");
+    await screen.findByText("Placed node");
+    // The facet toggle still renders — only the drawer affordance is absent.
+    expect(screen.getByRole("button", { name: "Hide stale scopes" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Placement queue/ })).toBeNull();
+    // Not even a closed panel in the DOM, and no two-column wrapper.
+    expect(document.querySelector(".board-drawer")).toBeNull();
+    expect(document.querySelector(".board-body")).toBeNull();
+  });
+
+  it("shows the title, the visible-node count and the plugin's count_label", async () => {
+    renderRoadmap();
+    await screen.findByText("Replication continuity");
+    const toggle = drawerToggle();
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    // aria-controls stays a VALID idref even closed: the panel is mounted and
+    // `hidden`, the same way a collapsed subtree is.
+    const panel = drawerPanel();
+    expect(toggle.getAttribute("aria-controls")).toBe(panel.getAttribute("id"));
+    expect(panel.hidden).toBe(true);
+    // Closed means closed to AT too — no heading, no controls in the a11y tree.
+    expect(screen.queryByRole("heading", { name: "Placement queue" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Dock" })).toBeNull();
+  });
+
+  it("opens as an overlay on click and closes again, restoring focus to the toggle", async () => {
+    const user = userEvent.setup();
+    renderRoadmap();
+    await screen.findByText("Replication continuity");
+    const toggle = drawerToggle();
+
+    await user.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    const panel = drawerPanel();
+    expect(panel.hidden).toBe(false);
+    // Overlay, not docked: the panel's own class and the board root's.
+    expect(panel.className).toContain("board-drawer-overlay");
+    expect(boardRoot().className).not.toContain("board-docked");
+    // A labelled region named by its own heading, and focus moved INTO it.
+    expect(screen.getByRole("heading", { name: "Placement queue" })).toBeTruthy();
+    expect(screen.getByRole("region", { name: "Placement queue" })).toBe(panel);
+    expect(document.activeElement).toBe(panel);
+
+    await user.click(screen.getByRole("button", { name: "Close" }));
+    expect(panel.hidden).toBe(true);
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    // Focus returns to the control that opened it, never to the document.
+    expect(document.activeElement).toBe(toggle);
+  });
+
+  it("Escape closes the overlay", async () => {
+    const user = userEvent.setup();
+    renderRoadmap();
+    await screen.findByText("Replication continuity");
+    await user.click(drawerToggle());
+    expect(drawerPanel().hidden).toBe(false);
+    await user.keyboard("{Escape}");
+    expect(drawerPanel().hidden).toBe(true);
+    expect(currentUrl()).toBe("/governance/roadmap");
+  });
+
+  it("Escape leaves the DOCKED panel alone — docked is a chosen layout, not an overlay", async () => {
+    const user = userEvent.setup();
+    renderRoadmap("/governance/roadmap?drawer=docked");
+    await screen.findByText("Replication continuity");
+    expect(drawerPanel().hidden).toBe(false);
+    await user.keyboard("{Escape}");
+    expect(drawerPanel().hidden).toBe(false);
+    expect(currentUrl()).toBe("/governance/roadmap?drawer=docked");
+  });
+
+  it("dock/undock flips the layout class and the button's own label", async () => {
+    const user = userEvent.setup();
+    renderRoadmap();
+    await screen.findByText("Replication continuity");
+    await user.click(drawerToggle());
+    expect(boardRoot().className).not.toContain("board-docked");
+
+    await user.click(screen.getByRole("button", { name: "Dock" }));
+    expect(boardRoot().className).toContain("board-docked");
+    expect(drawerPanel().className).toContain("board-drawer-docked");
+    // The STATE is in visible text, never color or position alone.
+    expect(screen.queryByRole("button", { name: "Dock" })).toBeNull();
+    const undock = screen.getByRole("button", { name: "Undock" });
+    // Still expanded, and the docked layout is serialized.
+    expect(drawerToggle().getAttribute("aria-expanded")).toBe("true");
+    expect(currentUrl()).toBe("/governance/roadmap?drawer=docked");
+
+    await user.click(undock);
+    expect(boardRoot().className).not.toContain("board-docked");
+    expect(drawerPanel().className).toContain("board-drawer-overlay");
+    expect(screen.getByRole("button", { name: "Dock" })).toBeTruthy();
+    expect(currentUrl()).toBe("/governance/roadmap?drawer=open");
+  });
+
+  it("renders drawer nodes with the tree's node renderer, unnumbered", async () => {
+    const user = userEvent.setup();
+    renderRoadmap();
+    await screen.findByText("Replication continuity");
+    await user.click(drawerToggle());
+    const panel = drawerPanel();
+
+    // Chip, badge and a plugin-relative href all go through BoardNodeRow, so
+    // the href is re-namespaced under the plugin exactly as the tree's is.
+    expect(within(panel).getByText("Triage inbound")).toBeTruthy();
+    expect(within(panel).getByText("NEW")).toBeTruthy();
+    expect(within(panel).getByText("snowlinedev/snowline-pm")).toBeTruthy();
+    expect(
+      within(panel)
+        .getByRole("link", { name: "Queued with a link" })
+        .getAttribute("href"),
+    ).toBe("/governance/roadmap/item-queued");
+    // Flat and UNNUMBERED: drawer order is not roadmap order, so a 1-based
+    // index would assert an ordering the payload never claimed.
+    const list = panel.querySelector(".board-drawer-nodes") as HTMLElement;
+    expect(list.tagName).toBe("UL");
+    expect(list.querySelector(".board-index")).toBeNull();
+    // group_by does not reach inside the drawer.
+    expect(panel.querySelector(".board-group-heading")).toBeNull();
+  });
+
+  it("facet toggles filter drawer nodes and move the count with them", async () => {
+    const user = userEvent.setup();
+    renderRoadmap();
+    await screen.findByText("Replication continuity");
+    await user.click(drawerToggle(2));
+    const panel = drawerPanel();
+    // `stale` is hidden_by_default, so the stale queue node starts filtered OUT
+    // of the drawer exactly as it is out of the tree.
+    expect(within(panel).queryByText("Dusty idea")).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "Hide stale scopes" }));
+    // The count on the toggle is the count of VISIBLE drawer nodes.
+    expect(drawerToggle(3)).toBeTruthy();
+    expect(within(panel).getByText("Dusty idea")).toBeTruthy();
+    // The facet toggle keeps the drawer's own view state, and the drawer keeps
+    // the facet's — both are params the board owns. (Param ORDER is whatever
+    // the surviving URLSearchParams gives: the shell rewrites values, never
+    // re-sorts a query string it only partly owns.)
+    expect(currentUrl()).toBe("/governance/roadmap?drawer=open&show=stale");
+
+    await user.click(screen.getByRole("button", { name: "Hide stale scopes" }));
+    expect(drawerToggle(2)).toBeTruthy();
+    expect(within(panel).queryByText("Dusty idea")).toBeNull();
+    expect(currentUrl()).toBe("/governance/roadmap?drawer=open");
+  });
+
+  it("?drawer=docked renders docked on load and closing takes the URL back to bare", async () => {
+    const user = userEvent.setup();
+    renderRoadmap("/governance/roadmap?drawer=docked");
+    await screen.findByText("Replication continuity");
+    expect(boardRoot().className).toContain("board-docked");
+    expect(drawerPanel().hidden).toBe(false);
+    expect(screen.getByRole("button", { name: "Undock" })).toBeTruthy();
+    expect(drawerToggle().getAttribute("aria-expanded")).toBe("true");
+    // A deep link must not STEAL focus on first paint — it isn't an "open".
+    expect(document.activeElement).not.toBe(drawerPanel());
+
+    await user.click(screen.getByRole("button", { name: "Close" }));
+    // Closed is the default, so it writes nothing at all.
+    expect(currentUrl()).toBe("/governance/roadmap");
+    expect(drawerPanel().hidden).toBe(true);
+  });
+
+  it("?drawer=open opens the overlay on load, and the toggle closes it", async () => {
+    const user = userEvent.setup();
+    renderRoadmap("/governance/roadmap?drawer=open");
+    await screen.findByText("Replication continuity");
+    expect(drawerPanel().hidden).toBe(false);
+    expect(boardRoot().className).not.toContain("board-docked");
+    await user.click(drawerToggle());
+    expect(drawerPanel().hidden).toBe(true);
+    expect(currentUrl()).toBe("/governance/roadmap");
+  });
+
+  it("an unreadable ?drawer= value degrades to closed and the next toggle drops it", async () => {
+    const user = userEvent.setup();
+    renderRoadmap("/governance/roadmap?drawer=sideways");
+    await screen.findByText("Replication continuity");
+    expect(drawerPanel().hidden).toBe(true);
+    // `drawer` is a param the shell OWNS, so the first toggle normalizes it.
+    await user.click(screen.getByRole("button", { name: "Hide stale scopes" }));
+    expect(currentUrl()).toBe("/governance/roadmap?show=stale");
+  });
+
+  it("a drained queue still gets its toggle, and the panel says so", async () => {
+    const user = userEvent.setup();
+    renderRoadmap("/governance/roadmap-drawer-empty");
+    await screen.findByText("Placed node");
+    // Count 0, and no count_label declared — just the number.
+    const toggle = screen.getByRole("button", { name: "Placement queue · 0" });
+    await user.click(toggle);
+    expect(screen.getByText("Nothing waiting for placement.")).toBeTruthy();
+  });
+
+  it("fails the WHOLE board visible on a malformed drawer", async () => {
+    render(
+      <MemoryRouter initialEntries={["/governance/roadmap-bad-drawer"]}>
+        <App />
+      </MemoryRouter>,
+    );
+    const error = await screen.findByRole("alert");
+    expect(error.textContent).toContain("/ui-api/pages/roadmap-bad-drawer");
+    // Not the tree beside a silently-dropped queue — the whole card fails.
+    expect(screen.queryByText("Placed node")).toBeNull();
+  });
+});
+
+/** axe over the drawer in BOTH of its states (ACCESSIBILITY.md: semantics,
+ * roles, names, structure). a11y.test.tsx audits the board with the drawer
+ * CLOSED as part of its per-page sweep; the open and docked states are
+ * conditional DOM this board test owns, so they are audited here rather than
+ * leaving two thirds of the feature unaudited. */
+describe("board kind: drawer accessibility", () => {
+  for (const [state, entry] of [
+    ["open (overlay)", "/governance/roadmap?drawer=open"],
+    ["docked", "/governance/roadmap?drawer=docked"],
+  ] as const) {
+    it(`has no axe violations with the drawer ${state}`, async () => {
+      const { container } = render(
+        <MemoryRouter initialEntries={[entry]}>
+          <App />
+        </MemoryRouter>,
+      );
+      await screen.findByRole("heading", { name: "Placement queue" });
+      await waitFor(() => {
+        expect(screen.queryAllByText(/Loading…/)).toHaveLength(0);
+        expect(screen.queryAllByText(/Failed to load/)).toHaveLength(0);
+      });
+      // Contrast is the token validator's job (jsdom applies no styling).
+      const results = await axe.run(container, {
+        rules: { "color-contrast": { enabled: false } },
+      });
+      expect(results.violations.map((v) => `${v.id}: ${v.nodes[0]?.html}`)).toEqual([]);
+    });
+  }
 });

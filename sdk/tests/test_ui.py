@@ -56,6 +56,30 @@ def test_action_shape_is_specified():
     assert set(ui.ACTION_RESPONSE_SHAPE) == {"navigate"}
 
 
+def test_board_drawer_shape_is_documented():
+    # §4.2a "The drawer": the board payload's optional dockable side list for
+    # work that sits OUTSIDE the hierarchy (snowlinedev/snowline-pm decision
+    # b9116311). OPTIONAL and additive — a board payload without it renders as
+    # it always did — so the shape doc must say "optional" and must not grow a
+    # second required field beside `nodes`. Documentation, not an SDK-side
+    # schema: the shell's board validator is the enforcement surface (it fails
+    # the whole board visible on a malformed drawer, §4.4).
+    assert set(ui.DRAWER_SHAPE) == {"title", "nodes", "empty", "count_label"}
+    assert ui.DRAWER_SHAPE["title"].startswith("required")
+    assert ui.DRAWER_SHAPE["nodes"].startswith("required")
+    assert ui.DRAWER_SHAPE["empty"].startswith("optional")
+    assert ui.DRAWER_SHAPE["count_label"].startswith("optional")
+    # Reachable from the kind a plugin author actually looks up, and optional
+    # there too.
+    assert "drawer" in ui.BOARD_SHAPE
+    assert ui.BOARD_SHAPE["drawer"].startswith("optional")
+    assert ui.UI_KIND_SHAPES[ui.PAGE_KIND_BOARD] is ui.BOARD_SHAPE
+    # The drawer is a BOARD field only — no other kind grew one.
+    assert [k for k, v in ui.UI_KIND_SHAPES.items() if "drawer" in v] == [
+        ui.PAGE_KIND_BOARD
+    ]
+
+
 def test_package_reexports_ui_constants():
     import snowline_plugin_sdk as sdk
 

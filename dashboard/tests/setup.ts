@@ -163,6 +163,39 @@ export const FIXTURES: Record<string, unknown> = {
                 kind: "board",
                 data: "/ui-api/pages/roadmap-all-filtered",
               },
+              // No `drawer` field at all — the pre-drawer payload every
+              // plugin ships until it opts in: renders exactly as before,
+              // with no toggle (§4.2a).
+              {
+                id: "roadmap-no-drawer",
+                route: "/roadmap-no-drawer",
+                title: "Roadmap without a drawer",
+                nav: false,
+                kind: "board",
+                data: "/ui-api/pages/roadmap-no-drawer",
+              },
+              // ui-shell.md §4.2a "The drawer": a declared drawer whose
+              // `nodes` is EMPTY — the toggle still renders (count 0) and the
+              // panel shows the plugin's `empty` copy.
+              {
+                id: "roadmap-drawer-empty",
+                route: "/roadmap-drawer-empty",
+                title: "Roadmap, drained queue",
+                nav: false,
+                kind: "board",
+                data: "/ui-api/pages/roadmap-drawer-empty",
+              },
+              // A malformed drawer (a drawer node missing `id`) — the SAME
+              // board validator must fail the WHOLE board visible (§4.4),
+              // never render the tree beside a silently-dropped queue.
+              {
+                id: "roadmap-bad-drawer",
+                route: "/roadmap-bad-drawer",
+                title: "Roadmap with a bad drawer",
+                nav: false,
+                kind: "board",
+                data: "/ui-api/pages/roadmap-bad-drawer",
+              },
             ],
           },
         },
@@ -288,6 +321,41 @@ export const FIXTURES: Record<string, unknown> = {
       { key: "stale", label: "Hide stale scopes", hidden_by_default: true },
       { key: "initiative_only", label: "Initiative work only", hidden_by_default: false },
     ],
+    // ui-shell.md §4.2a "The drawer": the placement queue — work with no place
+    // in the hierarchy yet. Three nodes, one of them carrying the
+    // hidden_by_default `stale` facet, so the drawer's facet filtering (and
+    // the toggle's count moving with it) has something observable; one carries
+    // an `href` so the drill-down goes through the same node renderer as the
+    // tree's.
+    drawer: {
+      title: "Placement queue",
+      count_label: "waiting",
+      nodes: [
+        {
+          id: "q-triage",
+          label: "Triage inbound",
+          kind: "item",
+          // A DIFFERENT chip slug from the tree's: the suite queries chips by
+          // exact text and a hidden drawer node still answers getByText.
+          chip: "snowlinedev/snowline-pm",
+          badges: [{ text: "NEW", intent: "neutral" }],
+          facets: { stale: false },
+        },
+        {
+          id: "q-dusty",
+          label: "Dusty idea",
+          kind: "item",
+          facets: { stale: true },
+        },
+        {
+          id: "q-linked",
+          label: "Queued with a link",
+          kind: "item",
+          href: "/roadmap/item-queued",
+        },
+      ],
+      empty: "Nothing waiting for placement.",
+    },
     empty: "Nothing on the roadmap.",
   },
   // A node missing required `id`/`label` — malformed, fails visible (§4.4).
@@ -311,6 +379,27 @@ export const FIXTURES: Record<string, unknown> = {
     nodes: [{ id: "n1", label: "Filtered node", facets: { stale: true } }],
     facets: [{ key: "stale", label: "Hide stale scopes", hidden_by_default: true }],
     empty: "Nothing on the roadmap.",
+  },
+  // No drawer declared — the board renders exactly as it did before §4.2a's
+  // drawer existed.
+  "/ui-api/governance/pages/roadmap-no-drawer": {
+    nodes: [{ id: "n1", label: "Placed node" }],
+    facets: [{ key: "stale", label: "Hide stale scopes", hidden_by_default: true }],
+  },
+  // A drained queue: the toggle still renders (count 0) and the panel carries
+  // the plugin's `empty` copy — a queue that has drained is information.
+  "/ui-api/governance/pages/roadmap-drawer-empty": {
+    nodes: [{ id: "n1", label: "Placed node" }],
+    drawer: {
+      title: "Placement queue",
+      nodes: [],
+      empty: "Nothing waiting for placement.",
+    },
+  },
+  // A drawer node missing `id` — malformed, so the WHOLE board fails visible.
+  "/ui-api/governance/pages/roadmap-bad-drawer": {
+    nodes: [{ id: "n1", label: "Placed node" }],
+    drawer: { title: "Placement queue", nodes: [{ label: "no id here" }] },
   },
   "/surfaces": {
     surfaces: [
