@@ -641,6 +641,17 @@ export type BoardNode = {
 };
 export type BoardGroupBy = { key: string; label: string; flat_label: string };
 export type BoardFacet = { key: string; label: string; hidden_by_default?: boolean };
+/** The optional dockable side list beside the tree (§4.2a "The drawer"):
+ * work that legitimately sits OUTSIDE the hierarchy (the pm roadmap's
+ * placement queue), which a tree section would misrepresent as placed.
+ * Same `BoardNode` shape, same renderer — just flat, unnumbered, and
+ * elsewhere on screen. */
+export type BoardDrawer = {
+  title: string;
+  nodes: BoardNode[];
+  empty?: string;
+  count_label?: string;
+};
 
 // The known progress-segment states; anything else renders in `upcoming`'s
 // neutral style rather than erroring (§4.2a: an OPEN string set).
@@ -831,6 +842,25 @@ function groupNodes(
 const BOARD_SHOW_PARAM = "show";
 const BOARD_HIDE_PARAM = "hide";
 const BOARD_GROUP_PARAM = "group";
+/* The drawer rides the same scheme: `?drawer=open` (overlay) /
+ * `?drawer=docked` (side column), and CLOSED — the default — writes nothing,
+ * so a bare URL is a closed drawer and a deep link can hand someone the
+ * docked layout. Any other value (or a `?drawer=` on a board whose payload
+ * declares no drawer) degrades to closed, the same silently-degrade posture
+ * an undeclared facet key gets, and the next toggle normalizes it away
+ * because `drawer` is a param the shell owns. */
+const BOARD_DRAWER_PARAM = "drawer";
+
+/** Closed (default) / overlay / pinned side column. Overlay and docked are
+ * both "expanded" as far as the toggle's `aria-expanded` is concerned; they
+ * differ only in layout, and the difference is spelled out in the dock
+ * button's own visible label (never color or position alone). */
+type DrawerState = "closed" | "open" | "docked";
+
+function readDrawerState(params: URLSearchParams): DrawerState {
+  const raw = params.get(BOARD_DRAWER_PARAM);
+  return raw === "docked" ? "docked" : raw === "open" ? "open" : "closed";
+}
 
 function readKeys(params: URLSearchParams, name: string): Set<string> {
   return new Set(params.getAll(name).filter((v) => v !== ""));
@@ -851,12 +881,20 @@ function writeKeys(params: URLSearchParams, name: string, keys: string[]) {
  * a back/forward, a shared link) reproduces exactly the same view. Flat is
  * selected by default; a facet whose `hidden_by_default` is true starts
  * filtering. This is view state in a shareable, stateless URL — NOT a stored
- * per-user preference, which §9 still excludes. */
+ * per-user preference, which §9 still excludes.
+ *
+ * The optional `drawer` (§4.2a) rides the same scheme: unplaced work shows
+ * BESIDE the tree, as an overlay (`?drawer=open`) or a pinned side column
+ * (`?drawer=docked`), closed being the default that writes nothing. */
 export function Board(props: {
   plugin: string;
   nodes: BoardNode[];
   groupBy?: BoardGroupBy;
   facets?: BoardFacet[];
+  /** §4.2a's optional dockable side list. Absent (the pre-drawer payload every
+   * plugin ships until it opts in) renders the board exactly as before, with
+   * no toggle and no extra wrapper. */
+  drawer?: BoardDrawer;
   empty?: string;
 }) {
   // A malformed `facets` (present but not an array — validateBoardData only
@@ -878,11 +916,21 @@ export function Board(props: {
       .map((f) => f.key),
   );
   const grouped = searchParams.get(BOARD_GROUP_PARAM) === "1";
+  // A `?drawer=` on a board that declares none names nothing, so it reads as
+  // closed (and the next toggle drops the stray param).
+  const drawer = props.drawer;
+  const drawerState: DrawerState = drawer ? readDrawerState(searchParams) : "closed";
+  const drawerOpen = drawerState !== "closed";
+  const drawerDocked = drawerState === "docked";
 
   /** Serialize a whole next view onto the current route, keeping every param
    * we don't own. `replace` (never push): a filter toggle is a view change on
    * the page you're already on, not a place to come back to. */
-  const writeView = (nextHidden: Set<string>, nextGrouped: boolean) => {
+  const writeView = (
+    nextHidden: Set<string>,
+    nextGrouped: boolean,
+    nextDrawer: DrawerState,
+  ) => {
     const next = new URLSearchParams(searchParams);
     writeKeys(
       next,
@@ -896,16 +944,71 @@ export function Board(props: {
     );
     if (nextGrouped) next.set(BOARD_GROUP_PARAM, "1");
     else next.delete(BOARD_GROUP_PARAM);
+    // Closed is the default, so it writes NOTHING — the same non-defaults-only
+    // rule that keeps a default view's URL bare.
+    if (nextDrawer === "closed") next.delete(BOARD_DRAWER_PARAM);
+    else next.set(BOARD_DRAWER_PARAM, nextDrawer);
     setSearchParams(next, { replace: true });
   };
   const toggleFacet = (key: string) => {
     const next = new Set(hidden);
     if (next.has(key)) next.delete(key);
     else next.add(key);
-    writeView(next, grouped);
+    writeView(next, grouped, drawerState);
   };
-  const setGrouped = (g: boolean) => writeView(hidden, g);
+  const setGrouped = (g: boolean) => writeView(hidden, g, drawerState);
+  const setDrawerState = (s: DrawerState) => writeView(hidden, grouped, s);
   const visible = facetFilter(props.nodes, hidden);
+
+  /* The drawer's own nodes run through the SAME facet filter as the tree
+   * (§4.2a: "the declared facets[] toggles apply to drawer nodes EXACTLY as to
+   * tree nodes"), so `?hide=…` filters both and the toggle's count moves with
+   * the toggles. `group_by` deliberately does NOT apply: the drawer is flat by
+   * construction — it is the list of things that have no place in the
+   * hierarchy yet. `nodes` is Array.isArray-guarded even though
+   * validateBoardData already rejects a non-array, because `Board` is exported
+   * and a platform-native caller doesn't go through that validator. */
+  const drawerNodes = Array.isArray(drawer?.nodes) ? drawer!.nodes : [];
+  const visibleDrawerNodes = facetFilter(drawerNodes, hidden);
+
+  const panelRef = useRef<HTMLElement | null>(null);
+  const toggleRef = useRef<HTMLButtonElement | null>(null);
+  const panelId = useId();
+  const drawerHeadingId = useId();
+
+  /* Focus follows the OPEN⇄CLOSED transition and nothing else: into the panel
+   * when it opens, back to the toggle when it closes. Initialized to the
+   * CURRENT state so a deep-linked `?drawer=docked` renders docked WITHOUT
+   * stealing focus on first paint (focus on load is a defect, not a feature),
+   * and dock/undock moves no focus — it is already on the button whose label
+   * just flipped, which must stay put so the change is the only thing that
+   * happened. */
+  const wasOpen = useRef(drawerOpen);
+  useEffect(() => {
+    if (wasOpen.current === drawerOpen) return;
+    wasOpen.current = drawerOpen;
+    if (drawerOpen) panelRef.current?.focus();
+    else toggleRef.current?.focus();
+  }, [drawerOpen]);
+
+  /* Escape closes the OVERLAY only — docked is a layout the user chose, not a
+   * transient thing covering their content, so dismissing it on a stray
+   * Escape would be surprising. A document-level listener (rather than the
+   * panel's own onKeyDown) so Escape still works after tabbing out of the
+   * panel into the tree the overlay sits over. The handler goes through a ref
+   * so the listener is registered once per open/closed transition instead of
+   * on every render that rebuilds the closure. */
+  const closeDrawer = () => setDrawerState("closed");
+  const closeRef = useRef(closeDrawer);
+  closeRef.current = closeDrawer;
+  useEffect(() => {
+    if (drawerState !== "open") return;
+    const onKeyDown = (e: DocumentEventMap["keydown"]) => {
+      if (e.key === "Escape") closeRef.current();
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [drawerState]);
 
   const tree =
     props.groupBy && grouped ? (
@@ -931,9 +1034,79 @@ export function Board(props: {
       </ol>
     );
 
+  const content =
+    props.nodes.length === 0 ? (
+      <p className="state-note">{props.empty ?? "Nothing here."}</p>
+    ) : visible.length === 0 ? (
+      // Distinct from the true-empty case above: nodes exist, but the
+      // active facet toggles filtered every one of them out — a blank
+      // render here (checking props.nodes.length alone) would be
+      // indistinguishable from a broken page.
+      <p className="state-note">Nothing matches the current filters.</p>
+    ) : (
+      tree
+    );
+
+  /* The drawer panel stays MOUNTED and is toggled with the `hidden` attribute,
+   * exactly as a collapsed subtree is: that keeps the toggle's `aria-controls`
+   * idref pointing at a real element in every state, and `hidden` drops the
+   * closed panel out of layout AND the a11y tree. A `<section>` with
+   * `aria-labelledby` its own heading is the labelled region §4.2a asks for;
+   * `tabIndex={-1}` makes it a programmatic focus target without putting it in
+   * the tab order. Deliberately NOT a modal dialog — the board behind it stays
+   * readable and operable, which is the whole point of a dockable side list. */
+  const panel = drawer && (
+    <section
+      id={panelId}
+      ref={panelRef}
+      className={`board-drawer board-drawer-${drawerDocked ? "docked" : "overlay"}`}
+      aria-labelledby={drawerHeadingId}
+      tabIndex={-1}
+      hidden={!drawerOpen}
+    >
+      <div className="board-drawer-head">
+        {/* h2: same level as a group heading — the first level below Layout's
+         * page h1, so no level is skipped (axe heading-order). */}
+        <h2 id={drawerHeadingId} className="board-drawer-title">
+          {drawer.title}
+        </h2>
+        <div className="board-drawer-head-controls">
+          {/* Dock/undock: the LABEL carries the state (never color or position
+           * alone), so pressing it says what will happen and reading it says
+           * where you are. */}
+          <button
+            type="button"
+            className="board-drawer-btn"
+            onClick={() => setDrawerState(drawerDocked ? "open" : "docked")}
+          >
+            {drawerDocked ? "Undock" : "Dock"}
+          </button>
+          <button type="button" className="board-drawer-btn" onClick={closeDrawer}>
+            Close
+          </button>
+        </div>
+      </div>
+      {drawerNodes.length === 0 ? (
+        <p className="state-note">{drawer.empty ?? "Nothing here."}</p>
+      ) : visibleDrawerNodes.length === 0 ? (
+        <p className="state-note">Nothing matches the current filters.</p>
+      ) : (
+        // A plain <ul>, NOT the tree's numbered <ol>: the tree's 1-based index
+        // means "the plugin's roadmap order" and drawer order is not roadmap
+        // order, so numbering here would assert an ordering the payload never
+        // claimed (§4.2a).
+        <ul className="board-drawer-nodes">
+          {visibleDrawerNodes.map((n) => (
+            <BoardNodeRow key={n.id} plugin={props.plugin} node={n} />
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+
   return (
-    <div className="board">
-      {(props.groupBy || facets.length > 0) && (
+    <div className={drawerDocked ? "board board-docked" : "board"}>
+      {(props.groupBy || facets.length > 0 || drawer) && (
         <div className="board-controls">
           {props.groupBy && (
             <div className="board-control-group" role="group" aria-label="Grouping">
@@ -972,18 +1145,39 @@ export function Board(props: {
               ))}
             </div>
           )}
+          {drawer && (
+            /* The drawer toggle sits in the SAME control row as group-by and
+             * the facets (§4.2a: "beside the group-by/facet controls"). Its
+             * whole label is ONE template-literal text child — title, count,
+             * and the plugin's `count_label` — so the accessible name is
+             * exactly the visible text with no JSX whitespace surprises
+             * between sibling spans (the same reason UnsupportedKindCard
+             * builds its copy that way). The count is of VISIBLE drawer nodes,
+             * so it tracks the facet toggles. */
+            <button
+              type="button"
+              ref={toggleRef}
+              className="board-drawer-toggle"
+              aria-expanded={drawerOpen}
+              aria-controls={panelId}
+              onClick={() => setDrawerState(drawerOpen ? "closed" : "open")}
+            >
+              {`${drawer.title} · ${visibleDrawerNodes.length}${
+                drawer.count_label ? ` ${drawer.count_label}` : ""
+              }`}
+            </button>
+          )}
         </div>
       )}
-      {props.nodes.length === 0 ? (
-        <p className="state-note">{props.empty ?? "Nothing here."}</p>
-      ) : visible.length === 0 ? (
-        // Distinct from the true-empty case above: nodes exist, but the
-        // active facet toggles filtered every one of them out — a blank
-        // render here (checking props.nodes.length alone) would be
-        // indistinguishable from a broken page.
-        <p className="state-note">Nothing matches the current filters.</p>
+      {drawer ? (
+        <div className="board-body">
+          <div className="board-tree">{content}</div>
+          {panel}
+        </div>
       ) : (
-        tree
+        // No drawer declared: no wrapper, no toggle — byte-for-byte the
+        // pre-drawer render.
+        content
       )}
     </div>
   );
@@ -1134,10 +1328,29 @@ function validateBoardData(d: unknown) {
   ) {
     return null;
   }
+  /* The drawer (§4.2a) is held to the SAME bar as the tree by the SAME
+   * validator — deliberately extended here rather than given a validator of
+   * its own, so a drawer can never be checked by a looser second rule. A
+   * malformed drawer fails the WHOLE board visible (§4.4): a board rendered
+   * beside a silently-dropped placement queue is precisely the invisible
+   * failure the fail-visible posture exists to prevent, and the queue is the
+   * half a reader would never know was missing. `title` is required because it
+   * is the toggle's only label; `empty`/`count_label` are rejected rather than
+   * coerced when present-but-wrong-shaped, the same rule `badges`/`facets`
+   * follow. */
+  if (d.drawer !== undefined) {
+    if (!isRecord(d.drawer)) return null;
+    const dr = d.drawer;
+    if (typeof dr.title !== "string") return null;
+    if (!validateBoardNodes(dr.nodes)) return null;
+    if (dr.empty !== undefined && typeof dr.empty !== "string") return null;
+    if (dr.count_label !== undefined && typeof dr.count_label !== "string") return null;
+  }
   return d as {
     nodes: BoardNode[];
     group_by?: BoardGroupBy;
     facets?: BoardFacet[];
+    drawer?: BoardDrawer;
     empty?: string;
   };
 }
@@ -1276,6 +1489,7 @@ export function RegisteredKind(props: {
           nodes={v.nodes}
           groupBy={v.group_by}
           facets={v.facets}
+          drawer={v.drawer}
           empty={v.empty}
         />
       );

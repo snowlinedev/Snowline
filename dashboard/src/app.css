@@ -652,7 +652,8 @@ textarea.page-action-input {
 
 /* nested numbered/unnumbered lists — the shell draws numbers/markers itself */
 .board-top,
-.board-children {
+.board-children,
+.board-drawer-nodes {
   list-style: none;
   margin: 0;
   padding: 0;
@@ -793,6 +794,130 @@ textarea.page-action-input {
 
 .board-progress-text {
   font-variant-numeric: tabular-nums;
+}
+
+/* the drawer (ui-shell.md §4.2a) — work that sits OUTSIDE the hierarchy, shown
+ * BESIDE the tree rather than in it: an overlay over the board's right edge by
+ * default, a pinned side column when docked. Every color/space/layer here is a
+ * token, same as the rest of the kind. */
+.board-body {
+  /* the overlay's positioning context: the panel covers the BOARD's right
+   * edge, never the shell chrome around it */
+  position: relative;
+}
+
+.board-tree {
+  /* a grid/flex child defaults to min-width:auto, so a long node label would
+   * otherwise widen the tree column instead of wrapping inside it */
+  min-width: 0;
+}
+
+/* Docked: two columns, the drawer pinned beside the tree instead of over it. */
+.board.board-docked .board-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 280px);
+  gap: var(--space-4);
+  align-items: start;
+}
+
+/* the toggle lives in the same control row as group-by/facets and reuses their
+ * pressed treatment — aria-expanded carries the state for AT, the label's own
+ * count carries it visually; the accent fill is never the only signal */
+.board-drawer-toggle {
+  min-height: var(--control-h);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  background: var(--surface-card);
+  color: var(--ink-secondary);
+  font-size: var(--font-small);
+  cursor: pointer;
+}
+
+.board-drawer-toggle[aria-expanded="true"] {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+.board-drawer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  background: var(--surface-card);
+}
+
+/* The panel stays MOUNTED and closed-by-`hidden` (so the toggle's
+ * aria-controls idref is valid in every state), so the attribute has to beat
+ * the display rule above. */
+.board-drawer[hidden] {
+  display: none;
+}
+
+.board-drawer-overlay {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: min(280px, 100%);
+  max-height: 100%;
+  overflow-y: auto;
+  z-index: var(--z-overlay);
+  box-shadow: 0 2px 8px var(--border-ring);
+  /* the slide-out. An animation rather than a transition so it plays on the
+   * panel's first paint out of `hidden`; the global prefers-reduced-motion
+   * rule in tokens.css turns it off outright (2.3.3). */
+  animation: board-drawer-in 120ms ease-out;
+}
+
+@keyframes board-drawer-in {
+  from {
+    transform: translateX(var(--space-5));
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+.board-drawer-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.board-drawer-title {
+  margin: 0;
+  font-size: var(--font-body);
+  color: var(--ink-secondary);
+}
+
+.board-drawer-head-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+/* dock/undock + close: real buttons, >= 24px target in comfortable, and their
+ * LABELS carry the state (Dock / Undock) — never color or position */
+.board-drawer-btn {
+  min-height: var(--control-h);
+  padding: 0 var(--space-2);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  background: var(--surface-page);
+  color: var(--ink-secondary);
+  font-size: var(--font-small);
+  cursor: pointer;
+}
+
+.board-drawer-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 /* status chip: dot + text label, never color alone */
@@ -990,6 +1115,22 @@ textarea.page-action-input {
   /* shallower nesting indent so deep trees keep usable width at 320px */
   .board-children {
     padding-left: var(--space-3);
+  }
+
+  /* Reflow (1.4.10): there is no room BESIDE a board at 320px, so the drawer
+   * stops being a column or an overlay and becomes a block in flow under the
+   * tree — in both states, so a docked deep link and an opened overlay reflow
+   * the same way and neither can cover the content it sits over. */
+  .board.board-docked .board-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .board-drawer-overlay {
+    position: static;
+    width: auto;
+    max-height: none;
+    box-shadow: none;
+    animation: none;
   }
 
   .tree ul {

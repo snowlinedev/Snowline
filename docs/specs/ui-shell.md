@@ -137,7 +137,7 @@ internally — the platform eats its own vocabulary.
 | `table` | `{ columns: [{ key, label, kind? }], rows: [{ cells, href? }], empty? }` | column `kind` hints (text/chip/time/actor); row `href` targets shell routes |
 | `thread` | `{ title, meta, nodes: [{ author, kind, markdown, at, citations: [...] }] }` | the shadow discussion view: ordered authored markdown nodes with metadata |
 | `document` | `{ title, markdown, meta? }` | rendered markdown (e.g. branch narrative notes) |
-| `board` | `{ nodes: [BoardNode...], group_by?, facets?, empty? }` (§4.2a) | hierarchical, collapsible, read-only tree — specified for the pm roadmap (`roadmap-board.md`, snowline-pm repo) |
+| `board` | `{ nodes: [BoardNode...], group_by?, facets?, drawer?, empty? }` (§4.2a) | hierarchical, collapsible, read-only tree — specified for the pm roadmap (`roadmap-board.md`, snowline-pm repo) |
 
 Any page kind's response may additionally carry a top-level `page_title`
 string. When present, the shell uses it as the page header (and document
@@ -200,6 +200,12 @@ hierarchies would need a different contract.
     { "key": "stale", "label": "Hide stale scopes", "hidden_by_default": true },
     { "key": "initiative_only", "label": "Initiative work only", "hidden_by_default": false }
   ],
+  "drawer": {                        // optional — omit to offer no drawer (§ below)
+    "title": "Placement queue",      // the toggle's visible label
+    "nodes": [ /* BoardNode[] — same shape as the tree, typically leaves */ ],
+    "empty": "Nothing waiting for placement.",
+    "count_label": "waiting"         // rendered after the count, e.g. "Placement queue · 7 waiting"
+  },
   "empty": "Nothing here."
 }
 ```
@@ -224,6 +230,48 @@ refetches, and a parent whose every child is filtered out still renders
 (collapsed to show 0 visible children, not hidden itself) so the tree's shape
 stays legible.
 
+**The drawer — a dockable side list (optional `drawer`).** Some of a board's
+work legitimately sits OUTSIDE the tree: the pm roadmap's placement queue is
+work that has no place in the hierarchy YET, and giving it a tree section
+would be a lie about the hierarchy (snowlinedev/snowline-pm decision
+`b9116311`). `drawer` is that escape hatch — a flat, dockable fly-out list
+BESIDE the board, not a branch of it:
+
+| field | req? | meaning |
+|---|---|---|
+| `title` | yes | the toggle's visible label and the panel's heading (e.g. `"Placement queue"`) |
+| `nodes` | yes | `BoardNode[]` — the same shape as the tree, typically leaves; rendered by the SAME node renderer (chip, badges, meta, annotation, progress, `href` drill-down, and `children` if any) |
+| `empty` | no | copy shown inside the panel when no drawer node is visible; a neutral default when absent |
+| `count_label` | no | a word rendered after the count on the toggle (e.g. `"waiting"` → `"Placement queue · 7 waiting"`) |
+
+A toggle button sits BESIDE the group-by/facet controls showing `title` and the
+count of currently-VISIBLE drawer nodes (post-facet-filtering), with
+`count_label` after the number when given. Clicking it slides the panel out
+over the board's right edge — an OVERLAY, so the tree keeps its full width. A
+**dock** control inside the panel pins it: docked, the panel is a side column
+alongside the tree (two columns, stacking BELOW the tree at narrow widths, the
+same reflow rule §7 holds everywhere) rather than an overlay; an **undock**
+control returns it to the overlay. A **close** control, and `Escape` while the
+OVERLAY is open, closes it (docked is a chosen layout, not a transient
+overlay, so `Escape` leaves it alone). Drawer nodes are NOT numbered: the
+1-based index the tree carries means "the plugin's roadmap order", and drawer
+order is not roadmap order — numbering it would assert an ordering the payload
+doesn't claim. The declared `facets[]` toggles apply to drawer nodes EXACTLY as
+to tree nodes (same hide-where-true filter, so `?hide=not_in_flight` filters
+both and the toggle's count moves with it); `group_by` does NOT apply inside
+the drawer, which is flat by construction. A board with no `drawer` field
+renders exactly as it does today, with no toggle; a `drawer` whose `nodes` is
+empty still renders its toggle (count 0) and shows `empty` in the panel — a
+queue that has drained is information, not an absence.
+
+Accessibility (§7, and so non-negotiable rather than a nicety): the panel is a
+labelled region named by its own heading; the toggle carries `aria-expanded` +
+`aria-controls`; opening moves focus into the panel and closing returns it to
+the toggle; every control — toggle, dock/undock, close — is a real `<button>`,
+so keyboard and AT get the whole feature; and docked-vs-overlay is conveyed in
+VISIBLE TEXT (the dock button's own label flips `Dock` ⇄ `Undock`), never by
+position or color alone.
+
 **View state lives in the URL.** The group-by and facet toggles serialize onto
 the board page's own route as query params, so the filters survive a refresh, a
 board URL deep-links a particular view, and back/forward stay sane (each toggle
@@ -235,7 +283,10 @@ default can never silently re-read an old link as something else.
 `?show=<key>` names a facet forced VISIBLE, `?hide=<key>` a facet forced HIDDEN
 (both repeat for several keys — `?show=a&show=b`, which stays readable where a
 delimited list would come back percent-encoded), and `?group=1` selects the
-grouped view (`Flat` being the default is never written). A key naming a facet
+grouped view (`Flat` being the default is never written). `?drawer=open` opens
+the drawer as an overlay and `?drawer=docked` renders it docked — CLOSED is the
+default and writes nothing, so reading `?drawer=docked` on load comes up docked
+and closing the panel again takes the URL back to bare. A key naming a facet
 the payload never declared matches no toggle and filters nothing (the same
 degrade-silently rule an undeclared `group_by.key` gets above) and is LEFT in
 the URL untouched — the shell rewrites only the params it owns, so the next
@@ -248,7 +299,13 @@ renders the plugin's declared defaults.
 
 **Validation** (fail-visible, §4.4, same posture as every other kind): a
 response missing `nodes` (or `nodes` not an array), or any node missing
-`id`/`label`, renders the malformed-data card. `group_by`/`facets`/per-node
+`id`/`label`, renders the malformed-data card. `drawer`, when present, is held
+to the SAME bar by the SAME validator (one board validator, not a second one
+beside it): a `drawer` whose `nodes` isn't an array, whose `title` isn't a
+string, whose optional `empty`/`count_label` are present but not strings, or
+any of whose nodes is missing `id`/`label`, renders the malformed-data card for
+the WHOLE board — a half-rendered board beside a silently-dropped queue is
+exactly the invisible failure §4.4 exists to prevent. `group_by`/`facets`/per-node
 optional fields are never validated beyond their own type — a facet key with
 no `facets[]` declaration still renders (just with no toggle to hide it), and
 an undeclared `group_by.key` degrades every node into the "Ungrouped" bucket

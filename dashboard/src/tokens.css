@@ -84,6 +84,15 @@
   --font-stat: 22px;
 }
 
+/* Layering — neither a color nor a size, so its own axis and swapped by
+ * nothing: one named stacking level for the things that sit OVER page content
+ * (the board drawer's overlay, ui-shell.md §4.2a). A token rather than
+ * scattered magic numbers, for the same reason colors are tokens: the next
+ * overlay has somewhere to belong instead of guessing a bigger number. */
+:root {
+  --z-overlay: 10;
+}
+
 * {
   box-sizing: border-box;
 }
