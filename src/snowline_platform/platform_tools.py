@@ -70,8 +70,9 @@ cross-plugin release-correlation keys, addressed `<anchor>/<name>`: \
 `create_milestone` (the only mint path — born `planned`), `resolve_milestone` \
 (shorthand is legitimate input, storage is canonical, unknown hard-fails with \
 suggestions and NEVER mints), `list_milestones`, the lifecycle verbs \
-`activate_milestone`/`achieve_milestone`/`cancel_milestone` (explicit, never \
-automatic), `get_milestone` (audit read — returns a merge tombstone as itself), \
+`activate_milestone`/`deactivate_milestone`/`achieve_milestone`/\
+`cancel_milestone` (explicit, never automatic; activate a release when work on it \
+STARTS — an active milestone is its scope's current release), `get_milestone` (audit read — returns a merge tombstone as itself), \
 `update_milestone` (outcome/target_date only, `""` clears), and \
 `milestone_transitions` (the append-only lifecycle log). Drift reconciliation: \
 `merge_milestone` aliases one milestone into another (state-compatible only; the \
@@ -371,18 +372,36 @@ def build_platform_tools_surface() -> FastMCP:
 
     @mcp.tool()
     async def activate_milestone(address: str, reason: str | None = None) -> dict:
-        """Move a milestone planned→active (§4). Rejects any other source status —
-        never auto-activates. `reason` is recorded on the transition. Returns the
-        updated row."""
+        """Move a milestone planned→active (§4): this release is now CURRENT for
+        its scope. Activate when work on it STARTS, not at ship time (decision
+        68f4ed4b) — PM's whats_next/briefing focus on active releases, and several
+        may be active per anchor (parallel release lines). Side effect: governance
+        spec versions stamped with this milestone become canonical (§6.1).
+        `deactivate_milestone` undoes a mistaken activation. Rejects any source
+        status but `planned` — never auto-activates. `reason` is recorded on the
+        transition. Returns the updated row."""
         return await anyio.to_thread.run_sync(
             _lifecycle_sync, milestones.activate, address, reason
         )
 
     @mcp.tool()
+    async def deactivate_milestone(address: str, reason: str) -> dict:
+        """Undo a mistaken activation: move a milestone active→planned (§4,
+        decision 68f4ed4b). Only an `active` milestone deactivates; anything else
+        is rejected. `reason` is REQUIRED and recorded on the transition.
+        `activated_at` is cleared, the release stops being current in PM, and
+        governance versions stamped with it revert to pending (§6.1). Returns the
+        updated row."""
+        return await anyio.to_thread.run_sync(
+            _lifecycle_sync, milestones.deactivate, address, reason
+        )
+
+    @mcp.tool()
     async def achieve_milestone(address: str, reason: str | None = None) -> dict:
-        """Move a milestone active→achieved (§4). Achieving a still-`planned`
-        milestone is REJECTED — activate first; achievement is never automatic and
-        no member-item state ever implies it. `reason` is recorded. Returns the
+        """Move a milestone active→achieved (§4) — the SHIP step for a release
+        activated when work on it began. Achieving a still-`planned` milestone is
+        REJECTED — activate first; achievement is never automatic and no
+        member-item state ever implies it. `reason` is recorded. Returns the
         updated row."""
         return await anyio.to_thread.run_sync(
             _lifecycle_sync, milestones.achieve, address, reason

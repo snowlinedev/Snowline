@@ -47,7 +47,8 @@ target one but must never require one.
   (the #134/#139 convention, composing with scope-slug folding in addresses);
   unique within its anchor scope, **including merge tombstones** (§7).
   **Reserved names** (amendment, PR #149 review): `transitions`, `aliases`,
-  `dependencies`, `activate`, `achieve`, `cancel` can never be milestone names —
+  `dependencies`, `activate`, `deactivate`, `achieve`, `cancel` can never be
+  milestone names (`deactivate` added with the verb, decision `68f4ed4b`) —
   they collide with the HTTP surface's address-suffix route grammar, and a
   milestone so named would make requests to its own address misroute to the
   suffix handler with a shorter address. (The fixed single-segment paths —
@@ -64,7 +65,15 @@ target one but must never require one.
   **Transitions are explicit verbs; nothing is automatic** — all tagged items
   going terminal does not achieve a milestone, and achieving one cancels no
   work. **Concurrent active milestones on one anchor are legal and intended**
-  (the i18n scenario runs several release lines at once).
+  (the i18n scenario runs several release lines at once; parallel iOS and
+  Android release lines).
+- **`active` = the scope's current release** (decision `68f4ed4b`). There is
+  no separate current-milestone field: a release milestone is **activated when
+  work on it STARTS**, not as a closing step at ship time, and `achieve` is the
+  ship step. PM's `whats_next` / `briefing` focus on a scope's active
+  milestones (§6.2). Activation is also the governance promotion (§6.1.6) —
+  versions stamped with the milestone become canonical — and that coupling is
+  accepted. `deactivate` (active→planned) undoes a mistaken activation.
 - **Transition log** — an append-only record per transition: from/to status,
   authored-at timestamp (the replication LWW clock, §9), and optional
   free-text `reason`. This is where the lifecycle verbs' `reason` lands.
@@ -112,9 +121,23 @@ and agents relay it — so the tools resolve it; **storage is always canonical**
   enforces slash-free name, 1-or-2-segment anchor, and uniqueness **against
   live rows and tombstones alike** (a tombstoned name is reserved forever; the
   error names the alias target).
-- `activate` / `achieve` / `cancel` — explicit lifecycle verbs (optional
-  `reason`, recorded on the transition log). Legal moves:
-  planned→active→achieved; planned|active→cancelled. `achieve` on a *planned*
+- `activate` / `deactivate` / `achieve` / `cancel` — explicit lifecycle verbs
+  (`reason` recorded on the transition log; optional except on `deactivate`,
+  where it is required). Legal moves: planned→active→achieved;
+  planned|active→cancelled; active→planned (`deactivate`, decision `68f4ed4b`
+  — the undo of a mistaken activation; only an *active* milestone deactivates).
+  `deactivate` **clears `activated_at`** — a planned-again row reads as
+  never-activated (the log keeps the history), so `activated_at` stays an
+  honest was-active witness for the cancel-from-active warning and PM's
+  current-release ordering; it replicates as an ordinary full-row
+  `milestone.transitioned` (§9). Governance needs no write for the stamped
+  versions: they bucket `pending` again on the next read (§6.1.2). It is not a
+  full rewind — an unstamped child revised onto a stamped version while the
+  milestone was active stays an eligible leaf, and `resolve_artifact`
+  supersessions made in that window stand — so deactivate early, and check the
+  affected artifacts. A peer older than `deactivate` flags active→planned as
+  unreconciled; the flag is dropped once that peer upgrades, so upgrade every
+  peer before relying on the verb. `achieve` on a *planned*
   milestone is **rejected** ("activate first" — never auto-activates). No
   transition is ever implied by member-item state. **Dependencies never gate
   transitions**: activating or achieving with unachieved (or cancelled)
@@ -146,7 +169,8 @@ and agents relay it — so the tools resolve it; **storage is always canonical**
 - **MCP tools on the platform `main` surface**: `create_milestone`,
   `resolve_milestone`, `list_milestones` (registry rows — distinct from PM's
   work roll-up read of the same name; prefixes disambiguate),
-  `activate_milestone`, `achieve_milestone`, `cancel_milestone`,
+  `activate_milestone`, `deactivate_milestone`, `achieve_milestone`,
+  `cancel_milestone`,
   `get_milestone`, `milestone_transitions`, `merge_milestone`, dependency verbs.
   These reach `main` by the platform **registering itself as an upstream**
   (decision `0503fff0`; `gateway.md` §2): thin FastMCP wrappers over this

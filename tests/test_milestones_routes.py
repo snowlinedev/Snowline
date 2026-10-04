@@ -153,6 +153,28 @@ def test_lifecycle_over_http(clean_db):
     ]
 
 
+def test_deactivate_over_http(clean_db):
+    """Decision 68f4ed4b: POST /deactivate moves active→planned (reason
+    required → 422 without one; non-active → 409), clearing activated_at."""
+    _seed()
+    client = _trusted_client()
+    addr = "turtlesedge/turtletracks/spanish-beta"
+    # Planned → 409 (only an active milestone deactivates).
+    r = client.post(f"/milestones/{addr}/deactivate", json={"reason": "x"})
+    assert r.status_code == 409 and "only an active" in r.json()["detail"]
+    assert client.post(f"/milestones/{addr}/activate").status_code == 200
+    # Missing reason → 422.
+    assert client.post(f"/milestones/{addr}/deactivate").status_code == 422
+    r = client.post(f"/milestones/{addr}/deactivate", json={"reason": "wrong line"})
+    assert r.status_code == 200
+    assert r.json()["status"] == "planned" and r.json()["activated_at"] is None
+    log = client.get(f"/milestones/{addr}/transitions").json()["transitions"]
+    assert [(t["from_status"], t["to_status"]) for t in log] == [
+        ("planned", "active"),
+        ("active", "planned"),
+    ]
+
+
 def test_list_and_filters_over_http(clean_db):
     _seed()
     client = _trusted_client()

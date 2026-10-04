@@ -14,7 +14,8 @@ Out-of-process plugins (governance, PM) cannot import the platform, so they read
   POST /milestones/{address}/dependencies   {dependency} add an edge
   DELETE /milestones/{address}/dependencies?dependency=  remove an edge
   POST /milestones                          create (the only mint path)
-  POST /milestones/{address}/activate|achieve|cancel   lifecycle verbs
+  POST /milestones/{address}/activate|deactivate|achieve|cancel   lifecycle
+                                            verbs (deactivate requires reason)
   PATCH /milestones/{address}               update outcome / target_date
 
 These ride behind the platform trust middleware automatically — only a trusted
@@ -204,6 +205,10 @@ def _lifecycle(verb):
             raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from None
         except milestones.IllegalTransitionError as exc:
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from None
+        except milestones.InvalidMilestoneFieldError as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)
+            ) from None
         row = milestones.to_row(milestone)
         # §4 warnings (unmet dependencies on activate/achieve; the
         # cancel-from-active governance-demotion note) — attached only when
@@ -219,6 +224,11 @@ def _lifecycle(verb):
 router.add_api_route(
     "/{address:path}/activate",
     _lifecycle(milestones.activate),
+    methods=["POST"],
+)
+router.add_api_route(
+    "/{address:path}/deactivate",
+    _lifecycle(milestones.deactivate),
     methods=["POST"],
 )
 router.add_api_route(

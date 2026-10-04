@@ -308,6 +308,77 @@ def test_transition_log_records_each_move(db_session):
     assert log[1]["reason"] == "shipped"
 
 
+def test_deactivate_undoes_activation(db_session):
+    """Decision 68f4ed4b: `deactivate` (active→planned) undoes a mistaken
+    activation — `activated_at` CLEARS (the row reads as never-activated), the
+    reason lands on the log, and a later `activate` re-stamps it."""
+    _anchors(db_session)
+    addr = "turtlesedge/turtletracks/spanish-beta"
+    milestones.create(db_session, anchor="turtlesedge/turtletracks", name="spanish-beta")
+    db_session.flush()
+    milestones.activate(db_session, addr, reason="kickoff")
+    milestones.deactivate(db_session, addr, reason="activated the wrong line")
+    m = milestones.get(db_session, addr)
+    assert m.status == "planned" and m.activated_at is None
+    log = milestones.transitions(db_session, addr)
+    assert [(t["from_status"], t["to_status"]) for t in log] == [
+        ("planned", "active"),
+        ("active", "planned"),
+    ]
+    assert log[1]["reason"] == "activated the wrong line"
+    # Re-activation is legal and re-stamps activated_at.
+    milestones.activate(db_session, addr, reason="for real")
+    m = milestones.get(db_session, addr)
+    assert m.status == "active" and m.activated_at is not None
+
+
+def test_deactivate_only_from_active(db_session):
+    _anchors(db_session)
+    t = "turtlesedge/turtletracks"
+    for name in ("planned", "done", "dead"):
+        milestones.create(db_session, anchor=t, name=name)
+    db_session.flush()
+    milestones.activate(db_session, f"{t}/done")
+    milestones.achieve(db_session, f"{t}/done")
+    milestones.cancel(db_session, f"{t}/dead")
+    for name, status in (("planned", "planned"), ("done", "achieved"), ("dead", "cancelled")):
+        with pytest.raises(milestones.IllegalTransitionError, match="only an active"):
+            milestones.deactivate(db_session, f"{t}/{name}", reason="oops")
+        assert milestones.get(db_session, f"{t}/{name}").status == status
+
+
+def test_deactivate_requires_reason(db_session):
+    _anchors(db_session)
+    addr = "turtlesedge/turtletracks/x"
+    milestones.create(db_session, anchor="turtlesedge/turtletracks", name="x")
+    db_session.flush()
+    milestones.activate(db_session, addr)
+    for reason in (None, "", "   "):
+        with pytest.raises(milestones.InvalidMilestoneFieldError, match="reason"):
+            milestones.deactivate(db_session, addr, reason=reason)
+    assert milestones.get(db_session, addr).status == "active"
+
+
+def test_cancel_after_deactivate_does_not_warn_demotion(db_session):
+    """Clearing `activated_at` keeps it an honest was-active witness: cancelling
+    a deactivated (planned-again) milestone strands only pending drafts, so it
+    carries NO cancel-from-active demotion warning."""
+    _anchors(db_session)
+    addr = "turtlesedge/turtletracks/x"
+    milestones.create(db_session, anchor="turtlesedge/turtletracks", name="x")
+    db_session.flush()
+    milestones.activate(db_session, addr)
+    milestones.deactivate(db_session, addr, reason="mistake")
+    m = milestones.cancel(db_session, addr)
+    assert milestones.transition_warnings(db_session, m) == []
+
+
+def test_deactivate_is_reserved_name(db_session):
+    _anchors(db_session)
+    with pytest.raises(milestones.InvalidMilestoneNameError):
+        milestones.create(db_session, anchor="turtlesedge/turtletracks", name="deactivate")
+
+
 # --- update -----------------------------------------------------------------
 
 
