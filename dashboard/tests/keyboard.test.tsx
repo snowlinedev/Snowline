@@ -65,7 +65,11 @@ describe("keyboard operability", () => {
     const menu = screen.getByRole("button", { name: "Menu" });
     expect(menu).toHaveProperty("type", "button");
     expect(menu.getAttribute("aria-expanded")).toBe("false");
-    expect(menu.getAttribute("aria-controls")).toBe("shell-nav-links");
+    // the disclosure reveals the links AND the display preferences
+    expect(menu.getAttribute("aria-controls")).toBe("shell-nav-links shell-prefs");
+    for (const id of ["shell-nav-links", "shell-prefs"]) {
+      expect(document.getElementById(id)).not.toBeNull();
+    }
 
     menu.focus();
     await user.keyboard("{Enter}");

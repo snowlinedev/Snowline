@@ -8,6 +8,7 @@
  * Pairs and minimums:
  *   text tokens on surfaces ................ 4.5:1  (1.4.3)
  *   text on accent fills ................... 4.5:1  (1.4.3)
+ *   text on sunken fills, ink fills, badges  4.5:1  (1.4.3)
  *   status + focus indicators on surfaces .. 3:1    (1.4.11 non-text; status
  *                                                    always ships icon+label)
  */
@@ -70,6 +71,18 @@ const PAIRS = [
   ["accent", "surface-page", 4.5], // accent is link/interactive TEXT
   ["accent", "surface-card", 4.5],
   ["accent-ink", "accent", 4.5],
+  // quiet fills (chips, code) carry secondary/primary text
+  ["ink-primary", "surface-sunken", 4.5],
+  ["ink-secondary", "surface-sunken", 4.5],
+  // pressed/selected controls are an ink fill with card-surface text
+  ["surface-card", "ink-primary", 4.5],
+  // tinted status badges: each ink on its own fill
+  ["badge-good-ink", "badge-good-bg", 4.5],
+  ["badge-bad-ink", "badge-bad-bg", 4.5],
+  ["badge-neutral-ink", "badge-neutral-bg", 4.5],
+  // …and the good/bad inks double as intent TEXT on a card (stat deltas)
+  ["badge-good-ink", "surface-card", 4.5],
+  ["badge-bad-ink", "surface-card", 4.5],
   ["status-up", "surface-card", 3],
   ["status-down", "surface-card", 3],
   ["status-unknown", "surface-card", 3],

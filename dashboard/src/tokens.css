@@ -17,42 +17,62 @@
  *
  * Palette lineage: the validated reference instance from the dataviz method
  * (surfaces, ink, status roles), with --ink-muted darkened past the reference
- * chart-muted so it holds 4.5:1 as body text on both surfaces. Status colors
- * are reserved for state, never series/decoration, and never appear without
- * an icon/dot + text label.
+ * chart-muted so it holds 4.5:1 as body text on every surface, and the card
+ * surface lifted to pure white over a slightly deeper page so cards read as
+ * raised without a shadow. Status colors are reserved for state, never
+ * series/decoration, and never appear without an icon/dot + text label.
+ * There is deliberately no brand hue: "selected" and "pressed" are drawn in
+ * ink (--ink-primary fill, --surface-card text), and --accent stays the one
+ * interactive color.
  */
 
 :root,
 :root[data-theme="light"] {
-  --surface-page: #f9f9f7;
-  --surface-card: #fcfcfb;
-  --ink-primary: #0b0b0b;
-  --ink-secondary: #52514e;
-  --ink-muted: #676660;
-  --hairline: #e1e0d9;
-  --border-ring: rgba(11, 11, 11, 0.1);
-  --accent: #256abf;        /* interactive: links, active nav, focus */
+  --surface-page: #f5f5f2;
+  --surface-card: #ffffff;
+  --surface-sunken: #ecebe6; /* quiet fills: chips, progress tracks, code */
+  --ink-primary: #161614;
+  --ink-secondary: #4b4a45;
+  --ink-muted: #63625c;
+  --hairline: #e0dfd8;
+  --border-ring: rgba(22, 22, 20, 0.1);
+  --accent: #2362b3;        /* interactive: links, primary actions, focus */
   --accent-ink: #ffffff;    /* text on accent fills */
   --status-up: #0ca30c;
   --status-down: #d03b3b;
-  --status-unknown: #676660;
-  --focus-ring: #256abf;
+  --status-unknown: #63625c;
+  --focus-ring: #2362b3;
+  /* Badge pairs: a tinted fill with its own ink, so a status badge reads as a
+   * pill rather than colored text. The badge's TEXT is still the signal. */
+  --badge-good-bg: #e3f0da;
+  --badge-good-ink: #2f5a1c;
+  --badge-bad-bg: #fbe6e3;
+  --badge-bad-ink: #94281a;
+  --badge-neutral-bg: #ecebe6;
+  --badge-neutral-ink: #4b4a45;
 }
 
 :root[data-theme="dark"] {
-  --surface-page: #0d0d0d;
-  --surface-card: #1a1a19;
-  --ink-primary: #ffffff;
+  --surface-page: #0e0e0d;
+  --surface-card: #191918;
+  --surface-sunken: #262624;
+  --ink-primary: #f4f4f1;
   --ink-secondary: #c3c2b7;
-  --ink-muted: #98968f;
-  --hairline: #2c2c2a;
+  --ink-muted: #9a9890;
+  --hairline: #2e2e2b;
   --border-ring: rgba(255, 255, 255, 0.1);
   --accent: #6da7ec;
   --accent-ink: #0b0b0b;
   --status-up: #0ca30c;
   --status-down: #e66767;
-  --status-unknown: #98968f;
+  --status-unknown: #9a9890;
   --focus-ring: #6da7ec;
+  --badge-good-bg: #1d3320;
+  --badge-good-ink: #a8dba0;
+  --badge-bad-bg: #42201c;
+  --badge-bad-ink: #f3aca3;
+  --badge-neutral-bg: #262624;
+  --badge-neutral-ink: #c3c2b7;
 }
 
 :root,
@@ -62,11 +82,19 @@
   --space-3: 12px;
   --space-4: 16px;
   --space-5: 24px;
+  --space-6: 36px;        /* between page blocks: header, bands */
   --control-h: 32px;      /* interactive controls: >= 24px target (2.5.8) */
   --row-h: 40px;          /* table/list rows */
-  --font-body: 14px;
-  --font-small: 12.5px;
-  --font-stat: 28px;
+  --font-body: 15px;
+  --font-small: 13px;
+  --font-eyebrow: 12px;   /* uppercase, letter-spaced labels */
+  --font-card-title: 16px;
+  --font-heading: 20px;   /* band / section headings */
+  --font-title: 34px;     /* the page h1 */
+  --font-stat: 34px;
+  --gutter: clamp(20px, 4vw, 56px);  /* page side margin */
+  --masthead-h: 64px;
+  --subnav-h: 48px;
 }
 
 :root[data-density="compact"] {
@@ -77,20 +105,32 @@
   --space-3: 8px;
   --space-4: 10px;
   --space-5: 16px;
+  --space-6: 20px;
   --control-h: 22px;
   --row-h: 26px;
-  --font-body: 12.5px;
-  --font-small: 11.5px;
+  --font-body: 13px;
+  --font-small: 12px;
+  --font-eyebrow: 11px;
+  --font-card-title: 13.5px;
+  --font-heading: 15px;
+  --font-title: 20px;
   --font-stat: 22px;
+  --gutter: clamp(12px, 2vw, 24px);
+  --masthead-h: 44px;
+  --subnav-h: 34px;
 }
 
-/* Layering — neither a color nor a size, so its own axis and swapped by
- * nothing: one named stacking level for the things that sit OVER page content
- * (the board drawer's overlay, ui-shell.md §4.2a). A token rather than
+/* Layering and shape — neither a color nor a density size, so their own axis
+ * and swapped by nothing: one named stacking level for the things that sit
+ * OVER page content (the board drawer's overlay, ui-shell.md §4.2a), the two
+ * corner radii, and the content column's maximum width. Tokens rather than
  * scattered magic numbers, for the same reason colors are tokens: the next
- * overlay has somewhere to belong instead of guessing a bigger number. */
+ * overlay or card has somewhere to belong instead of guessing a number. */
 :root {
   --z-overlay: 10;
+  --radius-card: 12px;
+  --radius-control: 8px;
+  --content-max: 1320px;
 }
 
 * {
@@ -108,11 +148,14 @@ body {
   color: var(--ink-primary);
   font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
   font-size: var(--font-body);
-  line-height: 1.45;
+  line-height: 1.5;
+  font-synthesis: none;
 }
 
 a {
   color: var(--accent);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
 }
 
 :focus-visible {
