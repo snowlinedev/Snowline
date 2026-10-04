@@ -9,10 +9,11 @@
  * checks rather than `toBeInTheDocument()`. */
 import { render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import { App } from "../src/App";
 import { Document, Markdown, Thread } from "../src/kinds/kinds";
+import { FIXTURES } from "./setup";
 
 describe("registered nav + pages", () => {
   it("groups a registered nav page under its plugin's name", async () => {
@@ -89,6 +90,42 @@ describe("registered nav + pages", () => {
     expect(container.querySelector(".thread-title")?.textContent).toBe("main-plan-x");
     expect(screen.getByText("comment")).toBeTruthy();
     expect(screen.getByText("decision-abc")).toBeTruthy();
+  });
+});
+
+describe("page_subtitle (ui-shell.md §4.2)", () => {
+  const PATH = "/ui-api/governance/pages/branches/main-plan-x";
+  const original = FIXTURES[PATH] as Record<string, unknown>;
+  afterEach(() => {
+    FIXTURES[PATH] = original;
+  });
+  const renderWith = async (extra: Record<string, unknown>) => {
+    FIXTURES[PATH] = { ...original, ...extra };
+    const view = render(
+      <MemoryRouter initialEntries={["/governance/shadow/main-plan-x"]}>
+        <App />
+      </MemoryRouter>,
+    );
+    await screen.findByRole("heading", { level: 1, name: "Branch main-plan-x" });
+    return view;
+  };
+
+  it("renders a payload page_subtitle as a plain paragraph under the title", async () => {
+    const { container } = await renderWith({ page_subtitle: "3 of 5 items done" });
+    const sub = screen.getByText("3 of 5 items done");
+    expect(sub.tagName).toBe("P");
+    expect(sub.className).toBe("shell-subtitle");
+    expect(screen.queryByRole("heading", { name: "3 of 5 items done" })).toBeNull();
+    // Directly follows the h1 within the header.
+    expect(container.querySelector("h1 + p.shell-subtitle")).toBe(sub);
+  });
+
+  it("renders nothing when page_subtitle is absent, blank or non-string", async () => {
+    for (const extra of [{}, { page_subtitle: "   " }, { page_subtitle: 42 }, { page_subtitle: { a: 1 } }]) {
+      const { container, unmount } = await renderWith(extra);
+      expect(container.querySelector(".shell-subtitle")).toBeNull();
+      unmount();
+    }
   });
 });
 

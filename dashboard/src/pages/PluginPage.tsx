@@ -44,17 +44,26 @@ export function PluginPage(props: { plugin: PluginEntry; page: UIPage }) {
   // knows a human name. Manifest title stays the pre-load and fallback
   // header.
   const payload = loadable.state === "ready" ? loadable.data : undefined;
+  const pagePayload =
+    typeof payload === "object" && payload !== null && !Array.isArray(payload)
+      ? (payload as { page_title?: unknown; page_subtitle?: unknown })
+      : undefined;
   const payloadTitle =
-    typeof payload === "object" &&
-    payload !== null &&
-    !Array.isArray(payload) &&
-    typeof (payload as { page_title?: unknown }).page_title === "string" &&
-    (payload as { page_title: string }).page_title.trim() !== ""
-      ? (payload as { page_title: string }).page_title
+    typeof pagePayload?.page_title === "string" && pagePayload.page_title.trim() !== ""
+      ? pagePayload.page_title
+      : undefined;
+  // Additive `page_subtitle` (ui-shell.md §4.2): one plain-text line under
+  // the title. Same validation shape as page_title; blank/non-string = none.
+  const payloadSubtitle =
+    typeof pagePayload?.page_subtitle === "string" && pagePayload.page_subtitle.trim() !== ""
+      ? pagePayload.page_subtitle
       : undefined;
 
   return (
-    <Layout title={payloadTitle ?? props.page.title ?? props.page.id}>
+    <Layout
+      title={payloadTitle ?? props.page.title ?? props.page.id}
+      subtitle={payloadSubtitle}
+    >
       <Card>
         <PageActions plugin={props.plugin.name} actions={actions} />
         <RegisteredKind
