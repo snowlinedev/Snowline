@@ -130,8 +130,14 @@ and agents relay it — so the tools resolve it; **storage is always canonical**
   never-activated (the log keeps the history), so `activated_at` stays an
   honest was-active witness for the cancel-from-active warning and PM's
   current-release ordering; it replicates as an ordinary full-row
-  `milestone.transitioned` (§9). Governance needs no write: stamped versions
-  bucket `pending` again on the next read (§6.1.2). `achieve` on a *planned*
+  `milestone.transitioned` (§9). Governance needs no write for the stamped
+  versions: they bucket `pending` again on the next read (§6.1.2). It is not a
+  full rewind — an unstamped child revised onto a stamped version while the
+  milestone was active stays an eligible leaf, and `resolve_artifact`
+  supersessions made in that window stand — so deactivate early, and check the
+  affected artifacts. A peer older than `deactivate` flags active→planned as
+  unreconciled; the flag is dropped once that peer upgrades, so upgrade every
+  peer before relying on the verb. `achieve` on a *planned*
   milestone is **rejected** ("activate first" — never auto-activates). No
   transition is ever implied by member-item state. **Dependencies never gate
   transitions**: activating or achieving with unachieved (or cancelled)

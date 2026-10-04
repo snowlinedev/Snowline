@@ -29,7 +29,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import select
 
 from snowline_platform import milestones, replication, scopes
-from snowline_platform.models import MilestoneDependency
+from snowline_platform.models import MilestoneDependency, MilestoneUnreconciled
 from snowline_plugin_sdk.contract import (
     EVENT_MILESTONE_CREATED,
     EVENT_MILESTONE_DEPENDENCY_CHANGED,
@@ -351,6 +351,38 @@ def test_deactivate_apply_converges_back_to_planned(db_session):
         ("planned", "active"), ("active", "planned"), ("planned", "active"),
     ]
     assert milestones.list_unreconciled(db_session) == []
+
+
+def test_stale_active_to_planned_flag_from_older_peer_is_dropped(db_session):
+    """A peer that predates `deactivate` flags active→planned as unreconciled.
+    Once upgraded, that move is legal: `list_unreconciled` omits the stale flag
+    and the next applied transition on the milestone deletes it, while a
+    genuinely illegal flag on the same milestone survives."""
+    _anchor(db_session)
+    secret = _register(db_session)["secret"]
+    _deliver(db_session, secret, EVENT_MILESTONE_CREATED,
+             _m_payload("acme/repo", "v1", authored_at=T0), 1)
+    m = milestones.get(db_session, "acme/repo/v1")
+    db_session.add_all([
+        MilestoneUnreconciled(milestone_id=m.id, reason="old build",
+                              detail={"illegal_move": ["active", "planned"]}),
+        MilestoneUnreconciled(milestone_id=m.id, reason="real conflict",
+                              detail={"illegal_move": ["cancelled", "active"]}),
+    ])
+    db_session.flush()
+
+    assert [f["detail"]["illegal_move"]
+            for f in milestones.list_unreconciled(db_session)] == [
+        ["cancelled", "active"]]
+
+    _deliver(db_session, secret, EVENT_MILESTONE_TRANSITIONED,
+             _transitioned("acme/repo", "v1", from_status="planned",
+                           to_status="active", authored_at=T0 + timedelta(minutes=1),
+                           activated_at=T0 + timedelta(minutes=1)), 2)
+    stored = db_session.scalars(
+        select(MilestoneUnreconciled).where(MilestoneUnreconciled.milestone_id == m.id)
+    ).all()
+    assert [u.detail["illegal_move"] for u in stored] == [["cancelled", "active"]]
 
 
 def test_deactivate_loses_lww_to_later_achieve(db_session):

@@ -619,8 +619,17 @@ def deactivate(
     `transition_warnings` reads it to tell a cancel-from-active, and PM orders
     current releases by it — and it replicates for free, since the transition
     event carries full row state and apply writes `activated_at` verbatim under
-    LWW (§9). A later `activate` re-stamps it. Governance needs no write: stamped
-    versions simply bucket `pending` again on the next read (§6.1.2/§6.1.6)."""
+    LWW (§9). A later `activate` re-stamps it. Governance needs no write for the
+    stamped versions themselves: they bucket `pending` again on the next read
+    (§6.1.2/§6.1.6). It is NOT a full rewind, though: an unstamped child revised
+    onto a stamped version during the active window stays an eligible leaf, and
+    a `resolve_artifact` run in that window keeps its supersessions, so check
+    the affected artifacts after deactivating.
+
+    Version skew: a peer that predates this verb still converges the row but
+    flags active→planned as unreconciled; `list_unreconciled` drops such flags
+    once the peer upgrades (a move legal under the current table is not a
+    contradiction). Upgrade every peer before relying on deactivate."""
     if not reason or not reason.strip():
         raise InvalidMilestoneFieldError(
             f"deactivate {address!r} requires a reason — it undoes an "
@@ -1336,11 +1345,33 @@ def _check_illegal_history(session: Session, m: Milestone) -> None:
             )
         )
     )
+    _prune_now_legal_flags(session, m)
     for prev, cur in zip(rows, rows[1:]):
         move = (prev.to_status, cur.to_status)
         if move[0] == move[1] or move in LEGAL_TRANSITIONS:
             continue
         _flag_unreconciled(session, m, prev, cur)
+
+
+def _flag_now_legal(u: MilestoneUnreconciled) -> bool:
+    """True when a stored flag's illegal move is LEGAL under the current table —
+    written by an older build that predates the move (e.g. active→planned before
+    `deactivate` existed), so it is no longer a contradiction."""
+    move = (u.detail or {}).get("illegal_move")
+    return bool(move) and len(move) == 2 and tuple(move) in LEGAL_TRANSITIONS
+
+
+def _prune_now_legal_flags(session: Session, m: Milestone) -> None:
+    """Delete `m`'s flags whose move the current table now allows, so an upgraded
+    peer stops carrying stale contradictions (and the dedupe in
+    `_flag_unreconciled` can't be blocked by one)."""
+    for u in session.scalars(
+        select(MilestoneUnreconciled).where(
+            MilestoneUnreconciled.milestone_id == m.id
+        )
+    ):
+        if _flag_now_legal(u):
+            session.delete(u)
 
 
 def _flag_unreconciled(
@@ -1521,7 +1552,8 @@ def list_unreconciled(session: Session) -> list[dict]:
     """Every first-class unreconciled milestone row, oldest first (§9) — the
     agent-triage read (the milestone analogue of governance's unreconciled
     decisions, and of the replication parked-events read). An empty list is the
-    standing invariant to watch."""
+    standing invariant to watch. Flags whose move the current legality table
+    allows (written by an older build) are omitted — see `_flag_now_legal`."""
     rows = session.scalars(
         select(MilestoneUnreconciled).order_by(
             MilestoneUnreconciled.created_at, MilestoneUnreconciled.id
@@ -1535,4 +1567,5 @@ def list_unreconciled(session: Session) -> list[dict]:
             "created_at": _iso(u.created_at),
         }
         for u in rows
+        if not _flag_now_legal(u)
     ]
