@@ -45,24 +45,40 @@ export function Layout(props: {
   );
   const navGroups = useMemo(() => pluginNavGroups(registry ?? []), [registry]);
 
-  // Exactly one current tenant link. Tenant links match by PREFIX, so a detail
-  // page keeps its parent view marked (/pm/roadmap/item/… → Roadmap) — but two
-  // tenants can share a prefix (/pm/roadmap and /pm/roadmap/scopes), and both
-  // would then announce aria-current="page" and both draw the current-tab
-  // underline. The longest route matching the location wins; every other
-  // tenant link is held to exact matching (`end`), which by construction it
-  // then fails.
+  // Where the reader is, in nav terms. Tenant links match by PREFIX, so a
+  // detail page keeps its parent view marked (/pm/roadmap/item/… → Roadmap) —
+  // but two tenants can share a prefix (/pm/roadmap and /pm/roadmap/scopes),
+  // and both would then announce aria-current="page". So: the longest tenant
+  // route matching the location is THE current one (`currentTo`), and every
+  // other tenant link is held to exact matching (`end`), which by
+  // construction it then fails. Compared the way NavLink compares — case-
+  // insensitively, on a segment boundary — so the two can never disagree.
   const { pathname } = useLocation();
+  const here = pathname.toLowerCase().replace(/\/+$/, "") || "/";
   const currentTo = useMemo(() => {
     const routes = [
       ...[...sectionEntries.values()].flat().map((e) => e.to),
       ...navGroups.flatMap((g) => g.pages.map((p) => p.to)),
     ];
     return routes
-      .filter((to) => pathname === to || pathname.startsWith(`${to}/`))
+      .filter((to) => {
+        const t = to.toLowerCase();
+        return here === t || here.startsWith(`${t}/`);
+      })
       .sort((a, b) => b.length - a.length)[0];
-  }, [pathname, sectionEntries, navGroups]);
+  }, [here, sectionEntries, navGroups]);
   const yieldsTo = (to: string) => currentTo !== undefined && currentTo !== to;
+  // The current SECTION: the one whose own page this is, or whose tenant is
+  // current. app.css shows that section's tenants as the masthead's second
+  // row, so the layout follows the same fact aria-current announces.
+  const currentSection = SECTIONS.find(
+    (s) =>
+      here === s.to.toLowerCase() ||
+      (sectionEntries.get(s.id) ?? []).some((e) => e.to === currentTo),
+  );
+  const hasSubnav =
+    currentSection !== undefined &&
+    (sectionEntries.get(currentSection.id) ?? []).length > 0;
 
   // Page titled (WCAG 2.4.2): SPA route changes must retitle the document —
   // tabs, history, and screen readers all read this, not the <h1>.
@@ -84,8 +100,17 @@ export function Layout(props: {
        * preferences, across the top of every page. The nav's DOM is the same
        * tree dashboard-ia.md §3 describes (sections, each with its tenant
        * group, then the fallback plugin groups) — app.css lays it out as a
-       * tab row and shows the CURRENT section's tenants as a second row. */}
-      <header className={navOpen ? "masthead nav-open" : "masthead"}>
+       * tab row and shows the CURRENT section's tenants as a second row
+       * (`nav-section-current` / `masthead-subnav`, set below). */}
+      <header
+        className={[
+          "masthead",
+          navOpen && "nav-open",
+          hasSubnav && "masthead-subnav",
+        ]
+          .filter(Boolean)
+          .join(" ")}
+      >
         <div className="masthead-inner">
           <nav className="shell-nav" aria-label="Main">
             <div className="shell-nav-top">
@@ -103,7 +128,7 @@ export function Layout(props: {
                 type="button"
                 className="nav-toggle"
                 aria-expanded={navOpen}
-                aria-controls="shell-nav-links"
+                aria-controls="shell-nav-links shell-prefs"
                 onClick={() => setNavOpen(!navOpen)}
               >
                 Menu
@@ -113,7 +138,14 @@ export function Layout(props: {
               {SECTIONS.map((section) => {
                 const entries = sectionEntries.get(section.id) ?? [];
                 return (
-                  <div className="nav-section" key={section.id}>
+                  <div
+                    className={
+                      section === currentSection
+                        ? "nav-section nav-section-current"
+                        : "nav-section"
+                    }
+                    key={section.id}
+                  >
                     {/* `end` on every section link: sections have no legitimate
                      * child routes, so a deeper URL (a stale citation, or a
                      * plugin route) must not leave the section marked
@@ -163,7 +195,10 @@ export function Layout(props: {
               ))}
             </div>
           </nav>
-          <div className="toggles">
+          {/* The display preferences. Below 640px they sit in the opened menu
+           * with the links — hence the id the Menu button's aria-controls
+           * names alongside the link list. */}
+          <div className="toggles" id="shell-prefs">
             <button
               type="button"
               aria-pressed={theme === "dark"}

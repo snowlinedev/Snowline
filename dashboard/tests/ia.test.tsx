@@ -403,6 +403,85 @@ describe("nav link hygiene", () => {
       await within(mainNav()).findByRole("link", { name: "Board" });
       expect(currentLinks()).toEqual(["Board"]);
     });
+
+    // NavLink matches case-insensitively and ignores a trailing slash; the
+    // longest-match rule has to agree with it, or the one-current rule quietly
+    // reverts for those URLs.
+    for (const path of ["/Acme/Board/Scopes", "/acme/board/scopes/"]) {
+      it(`agrees with NavLink's own matching at ${path}`, async () => {
+        stubRegistry([acme([boardPage, scopesPage])], {
+          "/ui-api/acme/pages/scopes": LIST_PAYLOAD,
+        });
+        renderAt(path);
+        await screen.findByRole("link", { name: "By scope" });
+        expect(currentLinks()).toEqual(["By scope"]);
+      });
+    }
+
+    it("applies to fallback-group pages too", async () => {
+      // No intent: both land in the plugin's fallback group, same prefix shape.
+      const plain = (page: UIPage): UIPage => ({ ...page, intent: undefined });
+      stubRegistry([acme([plain(boardPage), plain(scopesPage)])], {
+        "/ui-api/acme/pages/scopes": LIST_PAYLOAD,
+      });
+      renderAt("/acme/board/scopes");
+      await screen.findByRole("link", { name: "By scope" });
+      expect(currentLinks()).toEqual(["By scope"]);
+    });
+
+    it("resolves a prefix shared across a fallback page and a section tenant", async () => {
+      // The shorter route is a fallback page, the longer a Roadmap tenant: the
+      // rule is about routes, not about which group lists them.
+      stubRegistry([acme([{ ...boardPage, intent: undefined }, scopesPage])], {
+        "/ui-api/acme/pages/scopes": LIST_PAYLOAD,
+      });
+      renderAt("/acme/board/scopes");
+      await screen.findByRole("link", { name: "By scope" });
+      expect(currentLinks()).toEqual(["By scope"]);
+    });
+  });
+
+  describe("the current section (masthead layout hooks)", () => {
+    // app.css shows the current section's tenants as the masthead's second
+    // row off these two classes; jsdom applies no stylesheet, so the classes
+    // are what there is to pin.
+    const tenant: UIPage = {
+      id: "board",
+      route: "/board",
+      title: "Board",
+      nav: true,
+      kind: "list",
+      data: "/ui-api/pages/board",
+      intent: "roadmap",
+    };
+    const currentSections = () =>
+      [...mainNav().querySelectorAll(".nav-section-current > a")].map((a) => a.textContent);
+    const reservesSubnav = () =>
+      mainNav().closest("header")!.classList.contains("masthead-subnav");
+
+    it("marks a tenant's section current and reserves the tenant row", async () => {
+      stubRegistry([acme([tenant])], { "/ui-api/acme/pages/board": LIST_PAYLOAD });
+      renderAt("/acme/board");
+      await screen.findByRole("link", { name: "Board" });
+      expect(currentSections()).toEqual(["Roadmap"]);
+      expect(reservesSubnav()).toBe(true);
+    });
+
+    it("marks a section page's own section, with no row to reserve when it has no tenants", async () => {
+      stubRegistry([]);
+      renderAt("/features");
+      await within(mainNav()).findByRole("link", { name: "Features" });
+      expect(currentSections()).toEqual(["Features"]);
+      expect(reservesSubnav()).toBe(false);
+    });
+
+    it("marks no section on a page outside every section", async () => {
+      stubRegistry([]);
+      renderAt("/nowhere");
+      await screen.findByText("No such page.");
+      expect(currentSections()).toEqual([]);
+      expect(reservesSubnav()).toBe(false);
+    });
   });
 
   it("lists a today-intent page under Today in nav AND on the Today page itself", async () => {

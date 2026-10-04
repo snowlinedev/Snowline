@@ -80,6 +80,9 @@ const PAIRS = [
   ["badge-good-ink", "badge-good-bg", 4.5],
   ["badge-bad-ink", "badge-bad-bg", 4.5],
   ["badge-neutral-ink", "badge-neutral-bg", 4.5],
+  // …and the good/bad inks double as intent TEXT on a card (stat deltas)
+  ["badge-good-ink", "surface-card", 4.5],
+  ["badge-bad-ink", "surface-card", 4.5],
   ["status-up", "surface-card", 3],
   ["status-down", "surface-card", 3],
   ["status-unknown", "surface-card", 3],

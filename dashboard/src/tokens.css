@@ -90,7 +90,7 @@
   --font-eyebrow: 12px;   /* uppercase, letter-spaced labels */
   --font-card-title: 16px;
   --font-heading: 20px;   /* band / section headings */
-  --font-title: clamp(26px, 2.6vw, 36px); /* the page h1 */
+  --font-title: 34px;     /* the page h1 */
   --font-stat: 34px;
   --gutter: clamp(20px, 4vw, 56px);  /* page side margin */
   --masthead-h: 64px;
