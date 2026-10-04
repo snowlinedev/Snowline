@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { NavLink } from "react-router-dom";
+import { NavLink, useLocation } from "react-router-dom";
 
 import {
   applyPrefs,
@@ -45,6 +45,25 @@ export function Layout(props: {
   );
   const navGroups = useMemo(() => pluginNavGroups(registry ?? []), [registry]);
 
+  // Exactly one current tenant link. Tenant links match by PREFIX, so a detail
+  // page keeps its parent view marked (/pm/roadmap/item/… → Roadmap) — but two
+  // tenants can share a prefix (/pm/roadmap and /pm/roadmap/scopes), and both
+  // would then announce aria-current="page" and both draw the current-tab
+  // underline. The longest route matching the location wins; every other
+  // tenant link is held to exact matching (`end`), which by construction it
+  // then fails.
+  const { pathname } = useLocation();
+  const currentTo = useMemo(() => {
+    const routes = [
+      ...[...sectionEntries.values()].flat().map((e) => e.to),
+      ...navGroups.flatMap((g) => g.pages.map((p) => p.to)),
+    ];
+    return routes
+      .filter((to) => pathname === to || pathname.startsWith(`${to}/`))
+      .sort((a, b) => b.length - a.length)[0];
+  }, [pathname, sectionEntries, navGroups]);
+  const yieldsTo = (to: string) => currentTo !== undefined && currentTo !== to;
+
   // Page titled (WCAG 2.4.2): SPA route changes must retitle the document —
   // tabs, history, and screen readers all read this, not the <h1>.
   useEffect(() => {
@@ -61,82 +80,89 @@ export function Layout(props: {
 
   return (
     <div className="shell">
-      <nav
-        className={navOpen ? "shell-nav nav-open" : "shell-nav"}
-        aria-label="Main"
-      >
-        <div className="shell-nav-top">
-          <div className="brand">Snowline</div>
-          <button
-            type="button"
-            className="nav-toggle"
-            aria-expanded={navOpen}
-            aria-controls="shell-nav-links"
-            onClick={() => setNavOpen(!navOpen)}
-          >
-            Menu
-          </button>
-        </div>
-        <div className="shell-nav-links" id="shell-nav-links">
-          {SECTIONS.map((section) => {
-            const entries = sectionEntries.get(section.id) ?? [];
-            return (
-              <div className="nav-section" key={section.id}>
-                {/* `end` on every section link: sections have no legitimate
-                 * child routes, so a deeper URL (a stale citation, or a
-                 * plugin route) must not leave the section marked
-                 * aria-current="page" by prefix match. */}
-                <NavLink to={section.to} end onClick={closeNav}>
-                  {section.label}
-                </NavLink>
-                {entries.length > 0 && (
-                  /* role="group" + label: the tenant/section association is
-                   * otherwise only CSS indentation, which assistive tech
-                   * flattens into one run of links (WCAG 1.3.1). */
-                  <div
-                    className="nav-section-pages"
-                    role="group"
-                    aria-label={`${section.label} views`}
-                  >
-                    {entries.map((e) => (
-                      <NavLink key={e.key} to={e.to} onClick={closeNav}>
-                        {e.label}
-                      </NavLink>
-                    ))}
-                  </div>
-                )}
+      {/* The masthead: brand, the five sections as tabs, and the display
+       * preferences, across the top of every page. The nav's DOM is the same
+       * tree dashboard-ia.md §3 describes (sections, each with its tenant
+       * group, then the fallback plugin groups) — app.css lays it out as a
+       * tab row and shows the CURRENT section's tenants as a second row. */}
+      <header className={navOpen ? "masthead nav-open" : "masthead"}>
+        <div className="masthead-inner">
+          <nav className="shell-nav" aria-label="Main">
+            <div className="shell-nav-top">
+              <div className="brand">
+                <span className="brand-mark" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" focusable="false">
+                    {/* two peaks; everything above the snow line is solid */}
+                    <path d="M1.5 20 9.5 5l5 9.4 2-3.4 6 9Z" fill="currentColor" opacity="0.4" />
+                    <path d="m9.5 5-3.4 6.4 2.2 1.5 1.5-1.9 1.6 1.7 1.4-1.5Z" fill="currentColor" />
+                  </svg>
+                </span>
+                Snowline
               </div>
-            );
-          })}
-          {navGroups.map((group) => (
-            /* Same 1.3.1 association as the section groups, but the fallback
-             * groups already have a visible heading — point the group at it
-             * rather than duplicating the text in an aria-label. Plugin names
-             * are unique, so the id is too. */
-            <div
-              className="nav-group"
-              key={group.plugin}
-              role="group"
-              aria-labelledby={`nav-group-${group.plugin}`}
-            >
-              <p className="nav-group-heading" id={`nav-group-${group.plugin}`}>
-                {group.plugin}
-              </p>
-              {group.pages.map((p) => (
-                <NavLink key={p.key} to={p.to} onClick={closeNav}>
-                  {p.label}
-                </NavLink>
+              <button
+                type="button"
+                className="nav-toggle"
+                aria-expanded={navOpen}
+                aria-controls="shell-nav-links"
+                onClick={() => setNavOpen(!navOpen)}
+              >
+                Menu
+              </button>
+            </div>
+            <div className="shell-nav-links" id="shell-nav-links">
+              {SECTIONS.map((section) => {
+                const entries = sectionEntries.get(section.id) ?? [];
+                return (
+                  <div className="nav-section" key={section.id}>
+                    {/* `end` on every section link: sections have no legitimate
+                     * child routes, so a deeper URL (a stale citation, or a
+                     * plugin route) must not leave the section marked
+                     * aria-current="page" by prefix match. */}
+                    <NavLink to={section.to} end onClick={closeNav}>
+                      {section.label}
+                    </NavLink>
+                    {entries.length > 0 && (
+                      /* role="group" + label: the tenant/section association is
+                       * otherwise only CSS indentation, which assistive tech
+                       * flattens into one run of links (WCAG 1.3.1). */
+                      <div
+                        className="nav-section-pages"
+                        role="group"
+                        aria-label={`${section.label} views`}
+                      >
+                        {entries.map((e) => (
+                          <NavLink key={e.key} to={e.to} end={yieldsTo(e.to)} onClick={closeNav}>
+                            {e.label}
+                          </NavLink>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+              {navGroups.map((group) => (
+                /* Same 1.3.1 association as the section groups, but the fallback
+                 * groups already have a visible heading — point the group at it
+                 * rather than duplicating the text in an aria-label. Plugin names
+                 * are unique, so the id is too. */
+                <div
+                  className="nav-group"
+                  key={group.plugin}
+                  role="group"
+                  aria-labelledby={`nav-group-${group.plugin}`}
+                >
+                  <p className="nav-group-heading" id={`nav-group-${group.plugin}`}>
+                    {group.plugin}
+                  </p>
+                  {group.pages.map((p) => (
+                    <NavLink key={p.key} to={p.to} end={yieldsTo(p.to)} onClick={closeNav}>
+                      {p.label}
+                    </NavLink>
+                  ))}
+                </div>
               ))}
             </div>
-          ))}
-        </div>
-      </nav>
-      <main className="shell-main">
-        <div className="shell-header">
-          <div className="shell-heading">
-            <h1>{props.title}</h1>
-            {props.subtitle && <p className="shell-subtitle">{props.subtitle}</p>}
-          </div>
+          </nav>
           <div className="toggles">
             <button
               type="button"
@@ -160,6 +186,12 @@ export function Layout(props: {
               Compact
             </button>
           </div>
+        </div>
+      </header>
+      <main className="shell-main">
+        <div className="shell-header">
+          <h1>{props.title}</h1>
+          {props.subtitle && <p className="shell-subtitle">{props.subtitle}</p>}
         </div>
         {props.children}
       </main>

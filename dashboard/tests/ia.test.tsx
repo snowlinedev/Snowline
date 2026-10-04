@@ -356,6 +356,55 @@ describe("nav link hygiene", () => {
     expect(link.getAttribute("aria-current")).toBeNull();
   });
 
+  describe("tenants that share a route prefix", () => {
+    // pm's real shape: /roadmap (the board) and /roadmap/scopes (the directory)
+    // are both Roadmap tenants, and the first is a prefix of the second.
+    const boardPage: UIPage = {
+      id: "board",
+      route: "/board",
+      title: "Board",
+      nav: true,
+      kind: "list",
+      data: "/ui-api/pages/board",
+      intent: "roadmap",
+    };
+    const scopesPage: UIPage = {
+      id: "scopes",
+      route: "/board/scopes",
+      title: "By scope",
+      nav: true,
+      kind: "list",
+      data: "/ui-api/pages/scopes",
+      intent: "roadmap",
+    };
+    const currentLinks = () =>
+      within(mainNav())
+        .getAllByRole("link")
+        .filter((a) => a.getAttribute("aria-current") === "page")
+        .map((a) => a.textContent);
+
+    it("marks only the longest match current, not every prefix of it", async () => {
+      stubRegistry([acme([boardPage, scopesPage])], {
+        "/ui-api/acme/pages/scopes": LIST_PAYLOAD,
+      });
+      renderAt("/acme/board/scopes");
+      // screen, not a held nav: the route resolves once plugins load, which
+      // remounts the shell — currentLinks() then reads the live nav.
+      await screen.findByRole("link", { name: "By scope" });
+      expect(currentLinks()).toEqual(["By scope"]);
+    });
+
+    it("still marks a tenant current on its own detail pages", async () => {
+      // A deeper URL under the board that is NOT the sibling tenant keeps the
+      // board marked — prefix matching is what tells a detail page's reader
+      // which view they are in.
+      stubRegistry([acme([boardPage, scopesPage])]);
+      renderAt("/acme/board/item/123");
+      await within(mainNav()).findByRole("link", { name: "Board" });
+      expect(currentLinks()).toEqual(["Board"]);
+    });
+  });
+
   it("lists a today-intent page under Today in nav AND on the Today page itself", async () => {
     // The §3 nav↔page invariant holds for Today like any section: an
     // attention/digest/activity page nav-lists under Today, so `/` must

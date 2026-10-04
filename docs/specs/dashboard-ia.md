@@ -79,6 +79,19 @@ Rules:
   recognized intent appear grouped under their plugin name after the five
   sections — exactly today's behavior, demoted from being the whole IA to
   being the escape hatch.
+- **Presentation: a masthead of tabs.** The nav is one tree — the five
+  section links in order, each followed by its tenants, then the fallback
+  groups — and that tree is what the nav landmark always contains. At desktop
+  widths it is laid out as a masthead: the sections are a tab row across the
+  top of every page, and the *current* section's tenants are a second tab row
+  under it. Other sections' tenants are not shown there; each is one click
+  away on its section page, which lists the same entries nav derives (the
+  nav↔page invariant is what makes hiding them safe). Below 640px the whole
+  tree stacks behind the Menu disclosure with every tenant visible (§7).
+- **One current tenant.** Tenant links match by prefix, so a detail page
+  keeps its parent view marked (`/pm/roadmap/item/…` marks Roadmap). When two
+  tenants share a prefix (`/pm/roadmap` and `/pm/roadmap/scopes`), only the
+  longest match is marked `aria-current="page"` — a location is one place.
 
 ## 4. The placement-intent contract
 
@@ -178,7 +191,8 @@ every link, so a renamed route just means older citations go stale.
 - Band headings on Today are real headings (landmark/heading structure, not
   styled divs), so the page outline mirrors the visual bands.
 - The <640px nav disclosure pattern is unchanged; five sections + fallback
-  groups must remain operable inside it.
+  groups must remain operable inside it. The display preferences (theme,
+  density) sit in the opened menu at that width, after the links.
 
 ## 8. Build order
 

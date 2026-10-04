@@ -3,32 +3,80 @@
  * anything density-relevant (that is what makes compact uniform by
  * construction, ui-shell.md §7). */
 
+/* ---- shell ----------------------------------------------------------------
+ * A full-width masthead over one centred content column. The nav's DOM is the
+ * tree dashboard-ia.md §3 describes — five sections, each followed by its
+ * tenant group, then the fallback plugin groups — and that tree is laid out
+ * here as a tab row: the sections are the tabs, and the CURRENT section's
+ * tenants are a second row under the masthead. Other sections' tenants are
+ * not shown at desktop widths; each stays one click away on its section page,
+ * which lists them. Below 640px the whole tree stacks behind the Menu
+ * disclosure instead (issue #161), every link visible. */
+
 .shell {
   display: flex;
+  flex-direction: column;
   min-height: 100vh;
   min-height: 100dvh; /* mobile browsers: exclude the collapsing toolbar */
 }
 
-.shell-nav {
-  width: 200px;
-  flex-shrink: 0;
-  border-right: 1px solid var(--hairline);
-  padding: var(--space-4);
+.masthead {
+  /* the positioning context for the current section's tenant row */
+  position: relative;
+  background: var(--surface-card);
+  border-bottom: 1px solid var(--hairline);
+}
+
+.masthead-inner {
   display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
+  align-items: stretch;
+  gap: var(--space-5);
+  max-width: var(--content-max);
+  min-height: var(--masthead-h);
+  margin: 0 auto;
+  padding: 0 var(--gutter);
+}
+
+.shell-nav {
+  display: flex;
+  align-items: stretch;
+  gap: var(--space-6);
+  flex: 1;
+  min-width: 0;
 }
 
 .shell-nav-top {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: var(--space-4);
+  gap: var(--space-3);
 }
 
 .shell-nav .brand {
-  font-weight: 700;
-  font-size: var(--font-body);
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  font-weight: 650;
+  font-size: calc(var(--font-body) + 3px);
+  letter-spacing: -0.02em;
+  white-space: nowrap;
+}
+
+/* the mark: an ink tile, so it follows the theme with no color of its own */
+.brand-mark {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: calc(var(--masthead-h) * 0.6);
+  height: calc(var(--masthead-h) * 0.6);
+  border-radius: var(--radius-control);
+  background: var(--ink-primary);
+  color: var(--surface-card);
+}
+
+.brand-mark svg {
+  width: 72%;
+  height: 72%;
 }
 
 /* nav disclosure button (issue #161): a real button so keyboard + AT get it
@@ -39,139 +87,241 @@
   min-height: var(--control-h);
   padding: 0 var(--space-3);
   border: 1px solid var(--hairline);
-  border-radius: 6px;
+  border-radius: var(--radius-control);
   background: var(--surface-card);
   color: var(--ink-secondary);
+  font: inherit;
   font-size: var(--font-small);
   cursor: pointer;
 }
 
 .nav-toggle[aria-expanded="true"] {
-  color: var(--accent);
-  border-color: var(--accent);
+  border-color: var(--ink-primary);
+  color: var(--ink-primary);
   font-weight: 600;
 }
 
 .shell-nav-links {
   display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
+  align-items: stretch;
+  gap: var(--space-5);
+  min-width: 0;
 }
 
 .shell-nav a {
   display: flex;
   align-items: center;
   min-height: var(--control-h);
-  padding: 0 var(--space-3);
-  border-radius: 6px;
   color: var(--ink-secondary);
   text-decoration: none;
+  white-space: nowrap;
 }
 
 .shell-nav a:hover {
-  background: var(--surface-card);
   color: var(--ink-primary);
 }
 
 .shell-nav a[aria-current="page"] {
-  background: var(--surface-card);
-  color: var(--accent);
+  color: var(--ink-primary);
   font-weight: 600;
 }
 
 /* the five demand-side sections (dashboard-ia.md §3): a section link, with
- * its composed tenants indented under it. */
-.nav-section,
-.nav-section-pages {
+ * its composed tenants in the group after it. */
+.nav-section {
   display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
+  align-items: stretch;
 }
 
 .nav-section-pages {
-  padding-left: var(--space-3);
+  display: flex;
+  gap: var(--space-5);
 }
 
 /* fallback nav groups (dashboard-ia.md §3 / ui-shell.md §6): after the
  * sections, one small heading per plugin whose pages declared no intent. */
 .nav-group {
   display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  margin-top: var(--space-3);
+  align-items: center;
+  gap: var(--space-4);
 }
 
 .nav-group-heading {
   margin: 0;
-  padding: 0 var(--space-3);
   color: var(--ink-muted);
-  font-size: var(--font-small);
+  font-size: var(--font-eyebrow);
+  font-weight: 650;
   text-transform: uppercase;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.08em;
+}
+
+@media (min-width: 641px) {
+  /* A tab: the full height of its row, the current one underlined in ink.
+   * The underline is drawn inside the link's own box, so it sits exactly on
+   * the row's bottom hairline. */
+  .nav-section > a,
+  .nav-section-pages a {
+    padding: 0 var(--space-1);
+    box-shadow: inset 0 -2px 0 transparent;
+  }
+
+  .nav-section > a[aria-current="page"],
+  .nav-section-pages a[aria-current="page"] {
+    box-shadow: inset 0 -2px 0 var(--ink-primary);
+  }
+
+  /* On a tenant page the SECTION tab stays marked too — the tenant link is
+   * the one carrying aria-current, this is the visual "you are in Roadmap".
+   * Its own rule: a browser without :has() drops only this, not the tab
+   * styling above. */
+  .nav-section:has(.nav-section-pages [aria-current="page"]) > a {
+    color: var(--ink-primary);
+    font-weight: 600;
+    box-shadow: inset 0 -2px 0 var(--ink-primary);
+  }
+
+  /* Tenant rows sit under the masthead, spanning it, their links inset to the
+   * content column's left edge. Hidden unless they belong to the current
+   * section: either the section link itself is current (first rule), or one
+   * of the tenants is (second). display:none keeps the others out of the tab
+   * order; their section page lists them. */
+  .nav-section-pages {
+    display: none;
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    height: var(--subnav-h);
+    padding: 0
+      max(var(--gutter), calc((100% - var(--content-max)) / 2 + var(--gutter)));
+    border-bottom: 1px solid var(--hairline);
+    overflow-x: auto;
+    scrollbar-width: thin;
+  }
+
+  .nav-section > a[aria-current="page"] + .nav-section-pages {
+    display: flex;
+  }
+
+  .nav-section-pages:has([aria-current="page"]) {
+    display: flex;
+  }
+
+  /* …and the masthead reserves that row's height, so page content starts
+   * below it rather than under it. */
+  .masthead:has(.nav-section > a[aria-current="page"] + .nav-section-pages) {
+    margin-bottom: var(--subnav-h);
+  }
+
+  .masthead:has(.nav-section-pages [aria-current="page"]) {
+    margin-bottom: var(--subnav-h);
+  }
+}
+
+/* Between the stacking breakpoint and a comfortable desktop width the tabs
+ * and the preference toggles do not fit on one line: the toggles take a slim
+ * row of their own above the tabs, so the tab underline still lands on the
+ * masthead's bottom edge. */
+@media (min-width: 641px) and (max-width: 899px) {
+  .masthead-inner {
+    flex-wrap: wrap;
+    row-gap: 0;
+  }
+
+  .toggles {
+    order: -1;
+    flex: 1 0 100%;
+    justify-content: flex-end;
+    padding-top: var(--space-2);
+  }
+
+  .shell-nav {
+    min-height: var(--masthead-h);
+  }
 }
 
 .shell-main {
   flex: 1;
+  width: 100%;
+  max-width: var(--content-max);
   min-width: 0;
-  padding: var(--space-5);
+  margin: 0 auto;
+  padding: var(--space-6) var(--gutter) calc(var(--space-6) * 2);
 }
 
 .shell-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
   margin-bottom: var(--space-5);
-  gap: var(--space-3);
 }
 
 .shell-header h1 {
-  font-size: calc(var(--font-body) + 4px);
   margin: 0;
+  font-size: var(--font-title);
+  font-weight: 600;
+  line-height: 1.15;
+  letter-spacing: -0.025em;
 }
 
 .shell-subtitle {
-  margin: var(--space-1) 0 0;
-  color: var(--ink-muted);
+  max-width: 70ch;
+  margin: var(--space-2) 0 0;
+  color: var(--ink-secondary);
 }
 
+/* display preferences, at the masthead's right edge */
 .toggles {
   display: flex;
+  align-items: center;
   gap: var(--space-2);
+  margin-left: auto;
 }
 
 .toggles button {
   min-height: var(--control-h);
   padding: 0 var(--space-3);
   border: 1px solid var(--hairline);
-  border-radius: 6px;
-  background: var(--surface-card);
+  border-radius: 999px;
+  background: none;
   color: var(--ink-secondary);
+  font: inherit;
   font-size: var(--font-small);
+  white-space: nowrap;
   cursor: pointer;
 }
 
+.toggles button:hover {
+  border-color: var(--ink-muted);
+  color: var(--ink-primary);
+}
+
+/* Pressed is an ink fill plus weight — never the fill alone (aria-pressed
+ * carries it for AT). */
 .toggles button[aria-pressed="true"] {
-  color: var(--accent);
-  border-color: var(--accent);
+  border-color: var(--ink-primary);
+  background: var(--ink-primary);
+  color: var(--surface-card);
   font-weight: 600;
 }
 
 .card {
   background: var(--surface-card);
-  border: 1px solid var(--border-ring);
-  border-radius: 8px;
-  padding: var(--space-4);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-card);
+  padding: var(--space-5);
 }
 
 .card-title {
   margin: 0 0 var(--space-3);
-  font-size: var(--font-body);
+  font-size: var(--font-card-title);
+  font-weight: 600;
+  letter-spacing: -0.01em;
 }
 
+/* auto-fit, not auto-fill: a band with one or two cards gives them the whole
+ * row instead of leaving empty tracks beside a narrow card. */
 .grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
-  gap: var(--space-4);
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
+  gap: var(--space-5);
 }
 
 /* grid items default to min-width:auto, so a wide child (e.g. a nowrap
@@ -191,23 +341,26 @@
 .page-stack {
   display: flex;
   flex-direction: column;
-  gap: var(--space-5);
+  gap: var(--space-6);
 }
 
 /* A Today band's heading (§5/§7): a real h2, styled as the page's structural
  * label — one step above the card titles it sits over. */
 .band-heading {
-  margin: 0 0 var(--space-3);
-  font-size: var(--font-body);
-  font-weight: 700;
+  margin: 0 0 var(--space-4);
+  font-size: var(--font-heading);
+  font-weight: 600;
+  letter-spacing: -0.015em;
   color: var(--ink-primary);
 }
 
 /* kind: stat */
 .stat .stat-value {
   font-size: var(--font-stat);
-  font-weight: 700;
+  font-weight: 650;
   line-height: 1.1;
+  letter-spacing: -0.03em;
+  font-variant-numeric: tabular-nums;
 }
 
 .stat .stat-label {
@@ -262,12 +415,23 @@
   padding: 0;
 }
 
+/* A row wraps: a short label keeps its meta on the same line, right-aligned;
+ * a label too long for the card takes the line and the meta drops under it,
+ * instead of the label being squeezed into a narrow column beside it. */
 .kind-list li {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: var(--space-2);
+  gap: 0 var(--space-3);
   min-height: var(--row-h);
+  padding: var(--space-2) 0;
   border-bottom: 1px solid var(--hairline);
+}
+
+/* a row led by an intent dot stays on one line — a wrapped row would strand
+ * the dot above its label */
+.kind-list li:has(> .dot) {
+  flex-wrap: nowrap;
 }
 
 .kind-list li:last-child {
@@ -279,8 +443,47 @@
   font-size: var(--font-small);
 }
 
+.kind-list li > a {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .kind-list .meta {
   margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Row links (lists, tables, boards, the scope tree): the label IS the link,
+ * so it reads as text — ink, not a wall of accent blue. Hover and focus bring
+ * the accent in. Where a row may or may not be a link (lists, the tree) a
+ * quiet underline marks the ones that are; in a table's first column and on
+ * board labels every entry is one, so the underline waits for hover. */
+.kind-list a,
+.kind-table a,
+.tree a,
+a.board-label {
+  color: var(--ink-primary);
+  text-decoration-color: var(--ink-muted);
+}
+
+.kind-table a,
+a.board-label {
+  text-decoration-line: none;
+}
+
+.kind-table a:hover,
+.kind-table a:focus-visible,
+a.board-label:hover,
+a.board-label:focus-visible {
+  text-decoration-line: underline;
+}
+
+.kind-list a:hover,
+.kind-table a:hover,
+.tree a:hover,
+a.board-label:hover {
+  color: var(--accent);
+  text-decoration-color: currentColor;
 }
 
 /* kind: table — wide tables scroll inside their own container (1.4.10:
@@ -297,17 +500,35 @@
 .kind-table th {
   text-align: left;
   color: var(--ink-muted);
-  font-size: var(--font-small);
-  font-weight: 600;
+  font-size: var(--font-eyebrow);
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
   border-bottom: 1px solid var(--hairline);
-  padding: var(--space-2) var(--space-3);
+  padding: 0 var(--space-3) var(--space-3);
 }
 
 .kind-table td {
   border-bottom: 1px solid var(--hairline);
-  padding: 0 var(--space-3);
+  padding: var(--space-2) var(--space-3);
   height: var(--row-h);
   font-variant-numeric: tabular-nums;
+}
+
+/* the first and last columns sit flush with the card's own padding */
+.kind-table th:first-child,
+.kind-table td:first-child {
+  padding-left: 0;
+}
+
+.kind-table th:last-child,
+.kind-table td:last-child {
+  padding-right: 0;
+}
+
+.kind-table td:first-child {
+  font-weight: 500;
 }
 
 .kind-table tr:last-child td {
@@ -318,7 +539,9 @@
  * view) */
 .thread-title {
   margin: 0 0 var(--space-2);
-  font-size: var(--font-body);
+  font-size: var(--font-heading);
+  font-weight: 600;
+  letter-spacing: -0.015em;
 }
 
 .thread-meta {
@@ -387,7 +610,7 @@
   min-height: calc(var(--row-h) * 2);
   padding: var(--space-3);
   border: 1px solid var(--hairline);
-  border-radius: 6px;
+  border-radius: var(--radius-control);
   background: var(--surface-page);
   color: var(--ink-primary);
   font: inherit;
@@ -408,7 +631,7 @@
   min-height: var(--control-h);
   padding: 0 var(--space-4);
   border: 1px solid var(--accent);
-  border-radius: 6px;
+  border-radius: var(--radius-control);
   background: var(--accent);
   color: var(--accent-ink);
   font-size: var(--font-small);
@@ -439,7 +662,7 @@
   min-height: var(--control-h);
   padding: 0 var(--space-3);
   border: 1px solid var(--hairline);
-  border-radius: 6px;
+  border-radius: var(--radius-control);
   background: var(--surface-card);
   color: var(--ink-secondary);
   font-size: var(--font-small);
@@ -461,7 +684,7 @@
   min-height: var(--control-h);
   padding: 0 var(--space-4);
   border: 1px solid var(--accent);
-  border-radius: 6px;
+  border-radius: var(--radius-control);
   background: var(--accent);
   color: var(--accent-ink);
   font-size: var(--font-small);
@@ -476,7 +699,7 @@
   gap: var(--space-3);
   padding: var(--space-4);
   border: 1px solid var(--hairline);
-  border-radius: 8px;
+  border-radius: var(--radius-card);
   background: var(--surface-page);
 }
 
@@ -501,7 +724,7 @@
   min-height: var(--control-h);
   padding: var(--space-2) var(--space-3);
   border: 1px solid var(--hairline);
-  border-radius: 6px;
+  border-radius: var(--radius-control);
   background: var(--surface-card);
   color: var(--ink-primary);
   font: inherit;
@@ -527,7 +750,7 @@ textarea.page-action-input {
   min-height: var(--control-h);
   padding: 0 var(--space-4);
   border: 1px solid var(--accent);
-  border-radius: 6px;
+  border-radius: var(--radius-control);
   background: var(--accent);
   color: var(--accent-ink);
   font-size: var(--font-small);
@@ -546,7 +769,7 @@ textarea.page-action-input {
   min-height: var(--control-h);
   padding: 0 var(--space-3);
   border: 1px solid var(--hairline);
-  border-radius: 6px;
+  border-radius: var(--radius-control);
   background: var(--surface-card);
   color: var(--ink-secondary);
   font-size: var(--font-small);
@@ -565,7 +788,7 @@ textarea.page-action-input {
   min-height: var(--control-h);
   padding: 0 var(--space-3);
   border: 1px solid var(--hairline);
-  border-radius: 6px;
+  border-radius: var(--radius-control);
   background: var(--surface-card);
   color: var(--ink-secondary);
   font-size: var(--font-small);
@@ -575,7 +798,9 @@ textarea.page-action-input {
 /* kind: document */
 .document-title {
   margin: 0 0 var(--space-2);
-  font-size: var(--font-body);
+  font-size: var(--font-heading);
+  font-weight: 600;
+  letter-spacing: -0.015em;
 }
 
 .document-meta {
@@ -597,17 +822,21 @@ textarea.page-action-input {
   margin-bottom: 0;
 }
 
+/* a readable measure: prose does not run the full width of a wide card */
+.markdown {
+  max-width: 82ch;
+}
+
 .markdown ul,
 .markdown ol {
   padding-left: var(--space-5);
 }
 
 .markdown code {
-  background: var(--surface-card);
-  border: 1px solid var(--hairline);
+  background: var(--surface-sunken);
   border-radius: 4px;
-  padding: 0 4px;
-  font-size: 0.95em;
+  padding: 1px 5px;
+  font-size: 0.92em;
 }
 
 /* kind: board (ui-shell.md §4.2a) — a hierarchical, collapsible read tree.
@@ -637,21 +866,29 @@ textarea.page-action-input {
   min-height: var(--control-h);
   padding: 0 var(--space-3);
   border: 1px solid var(--hairline);
-  border-radius: 6px;
+  border-radius: 999px;
   background: var(--surface-card);
   color: var(--ink-secondary);
+  font: inherit;
   font-size: var(--font-small);
   cursor: pointer;
 }
 
-/* Pressed state carries visible weight ALONGSIDE aria-pressed — the accent
+.board-view-btn:hover,
+.board-facet-btn:hover,
+.board-drawer-toggle:hover {
+  border-color: var(--ink-muted);
+  color: var(--ink-primary);
+}
+
+/* Pressed state carries visible weight ALONGSIDE aria-pressed — the ink
  * fill is not the only signal (the button label always reads, and screen
  * readers get aria-pressed). */
 .board-view-btn[aria-pressed="true"],
 .board-facet-btn[aria-pressed="true"] {
-  border-color: var(--accent);
-  background: var(--accent);
-  color: var(--accent-ink);
+  border-color: var(--ink-primary);
+  background: var(--ink-primary);
+  color: var(--surface-card);
   font-weight: 600;
 }
 
@@ -678,23 +915,38 @@ textarea.page-action-input {
 
 .board-group-heading {
   margin: 0 0 var(--space-2);
-  font-size: var(--font-body);
-  color: var(--ink-secondary);
+  color: var(--ink-muted);
+  font-size: var(--font-eyebrow);
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 .board-node {
   padding: var(--space-1) 0;
 }
 
+/* top-level entries are ruled apart, like rows of one list */
+.board-top > .board-node {
+  padding: var(--space-2) 0;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.board-top > .board-node:last-child {
+  border-bottom: none;
+}
+
 .board-row {
   display: flex;
   align-items: baseline;
-  gap: var(--space-2);
+  gap: var(--space-3);
   min-height: var(--row-h);
 }
 
 .board-index {
   flex-shrink: 0;
+  min-width: 2.2em;
+  text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
@@ -708,7 +960,7 @@ textarea.page-action-input {
   min-height: var(--control-h);
   padding: 0;
   border: 1px solid transparent;
-  border-radius: 6px;
+  border-radius: var(--radius-control);
   background: none;
   color: var(--ink-secondary);
   cursor: pointer;
@@ -722,47 +974,77 @@ textarea.page-action-input {
 .board-main {
   display: flex;
   flex-direction: column;
+  flex: 1;
+  min-width: 0;
   gap: var(--space-1);
   padding: var(--space-1) 0;
 }
 
+/* chip · label · badges · meta. The label takes the free space on its line
+ * and wraps INSIDE it, so a long title no longer drops under its chip and
+ * strands the meta on a third line; badges and meta end up at the right. */
 .board-label-line {
   display: flex;
-  align-items: center;
+  align-items: baseline;
   flex-wrap: wrap;
-  gap: var(--space-2);
+  gap: var(--space-1) var(--space-3);
 }
 
 .board-label {
+  flex: 1 1 16em;
+  min-width: 0;
+  font-weight: 500;
+  /* titles carry long unbreakable tokens (identifiers, paths): let them break
+   * rather than widen the page (reflow, 1.4.10) */
+  overflow-wrap: anywhere;
+}
+
+/* a node that owns a subtree is a heading for it */
+.board-node:has(> .board-children) > .board-row .board-label {
   font-weight: 600;
 }
 
 .board-chip {
-  padding: 0 var(--space-2);
-  border: 1px solid var(--hairline);
-  border-radius: 4px;
-  background: var(--surface-page);
+  padding: 1px var(--space-2);
+  border-radius: 5px;
+  background: var(--surface-sunken);
   color: var(--ink-secondary);
   font-size: var(--font-small);
+  /* a chip is usually a scope slug, which has no spaces to break at */
+  overflow-wrap: anywhere;
 }
 
-/* status chips — intent colors the TEXT, never the only signal (the badge
- * text always reads); the border/background stay neutral */
+/* status badges — a tinted pill whose TEXT is the signal; intent picks the
+ * tint (good / bad), and any other or missing intent stays neutral */
 .board-badge {
-  padding: 0 var(--space-2);
-  border: 1px solid var(--hairline);
-  border-radius: 4px;
+  padding: 1px var(--space-2);
+  border-radius: 5px;
+  background: var(--badge-neutral-bg);
+  color: var(--badge-neutral-ink);
   font-size: var(--font-small);
   font-weight: 600;
+  white-space: nowrap;
+}
+
+.board-badge.intent-good {
+  background: var(--badge-good-bg);
+  color: var(--badge-good-ink);
+}
+
+.board-badge.intent-bad {
+  background: var(--badge-bad-bg);
+  color: var(--badge-bad-ink);
 }
 
 .board-meta {
   margin-left: auto;
+  white-space: nowrap;
 }
 
 .board-annotation {
   color: var(--ink-secondary);
   font-size: var(--font-small);
+  overflow-wrap: anywhere;
 }
 
 /* progress: a dot row (decoration, aria-hidden) + the complete/total text
@@ -827,22 +1109,23 @@ textarea.page-action-input {
 
 /* the toggle lives in the same control row as group-by/facets and reuses their
  * pressed treatment — aria-expanded carries the state for AT, the label's own
- * count carries it visually; the accent fill is never the only signal */
+ * count carries it visually; the ink fill is never the only signal */
 .board-drawer-toggle {
   min-height: var(--control-h);
   padding: 0 var(--space-3);
   border: 1px solid var(--hairline);
-  border-radius: 6px;
+  border-radius: 999px;
   background: var(--surface-card);
   color: var(--ink-secondary);
+  font: inherit;
   font-size: var(--font-small);
   cursor: pointer;
 }
 
 .board-drawer-toggle[aria-expanded="true"] {
-  border-color: var(--accent);
-  background: var(--accent);
-  color: var(--accent-ink);
+  border-color: var(--ink-primary);
+  background: var(--ink-primary);
+  color: var(--surface-card);
   font-weight: 600;
 }
 
@@ -850,9 +1133,9 @@ textarea.page-action-input {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
-  padding: var(--space-3);
+  padding: var(--space-4);
   border: 1px solid var(--hairline);
-  border-radius: 6px;
+  border-radius: var(--radius-card);
   background: var(--surface-card);
 }
 
@@ -897,8 +1180,8 @@ textarea.page-action-input {
 
 .board-drawer-title {
   margin: 0;
-  font-size: var(--font-body);
-  color: var(--ink-secondary);
+  font-size: var(--font-card-title);
+  font-weight: 600;
 }
 
 .board-drawer-head-controls {
@@ -913,7 +1196,7 @@ textarea.page-action-input {
   min-height: var(--control-h);
   padding: 0 var(--space-2);
   border: 1px solid var(--hairline);
-  border-radius: 6px;
+  border-radius: var(--radius-control);
   background: var(--surface-page);
   color: var(--ink-secondary);
   font-size: var(--font-small);
@@ -921,8 +1204,8 @@ textarea.page-action-input {
 }
 
 .board-drawer-btn:hover {
-  border-color: var(--accent);
-  color: var(--accent);
+  border-color: var(--ink-muted);
+  color: var(--ink-primary);
 }
 
 /* status chip: dot + text label, never color alone */
@@ -965,14 +1248,18 @@ textarea.page-action-input {
 
 .tree li > .node {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: var(--space-2);
+  gap: 0 var(--space-2);
   min-height: var(--row-h);
 }
 
 .tree .slug {
+  min-width: 0;
   color: var(--ink-muted);
   font-size: var(--font-small);
+  /* a slug has no spaces: break it rather than widen the page (1.4.10) */
+  overflow-wrap: anywhere;
 }
 
 .sr-only {
@@ -1004,40 +1291,69 @@ textarea.page-action-input {
  * scrolling at 320 CSS px. display:none keeps the collapsed links out of
  * the tab order and the accessibility tree. */
 @media (max-width: 640px) {
-  .shell {
+  .masthead-inner {
     flex-direction: column;
-  }
-
-  .shell-nav {
-    width: auto;
-    border-right: none;
-    border-bottom: 1px solid var(--hairline);
+    gap: 0;
+    min-height: 0;
     padding: var(--space-3) var(--space-4);
   }
 
-  .shell-nav-top {
-    margin-bottom: 0;
+  .shell-nav {
+    flex-direction: column;
+    gap: 0;
+  }
+
+  .brand-mark {
+    width: var(--control-h);
+    height: var(--control-h);
   }
 
   .nav-toggle {
     display: inline-flex;
   }
 
+  /* the whole tree, stacked: sections, each with its tenants indented under
+   * it, then the fallback groups */
   .shell-nav-links {
     display: none;
+    flex-direction: column;
+    gap: var(--space-1);
     padding-top: var(--space-3);
   }
 
-  .shell-nav.nav-open .shell-nav-links {
+  .masthead.nav-open .shell-nav-links {
+    display: flex;
+  }
+
+  .nav-section,
+  .nav-section-pages,
+  .nav-group {
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--space-1);
+  }
+
+  .nav-section-pages {
+    padding-left: var(--space-4);
+  }
+
+  .nav-group {
+    margin-top: var(--space-3);
+  }
+
+  /* the display preferences live in the opened menu, under the links */
+  .toggles {
+    display: none;
+    margin-left: 0;
+    padding-top: var(--space-3);
+  }
+
+  .masthead.nav-open .toggles {
     display: flex;
   }
 
   .shell-main {
-    padding: var(--space-4);
-  }
-
-  .shell-header {
-    flex-wrap: wrap;
+    padding: var(--space-5) var(--space-4) var(--space-6);
   }
 
   .grid {
@@ -1087,6 +1403,8 @@ textarea.page-action-input {
     min-height: 0;
     padding: 0;
     border-bottom: none;
+    /* slugs and identifiers have no spaces to break at */
+    overflow-wrap: anywhere;
   }
 
   .kind-table td:first-child {
