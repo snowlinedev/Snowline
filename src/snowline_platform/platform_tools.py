@@ -281,7 +281,11 @@ def build_platform_tools_surface() -> FastMCP:
         Every milestone is born `planned` — lifecycle is explicit verbs, never
         automatic. `outcome` is the human "done means" line; `target_date` an
         optional ISO YYYY-MM-DD. Fails on an unregistered anchor, a bad name, or a
-        duplicate (a merge tombstone reserves the name forever). Returns the row."""
+        duplicate (a merge tombstone reserves the name forever). Returns the row.
+
+        Milestones are RELEASES ONLY (e.g. `v1.5`) — never capability, feature or
+        gate milestones; capabilities/outcomes belong in PM initiatives and phases
+        (governance decision 0fda34e5)."""
         return await anyio.to_thread.run_sync(
             _create_milestone_sync, anchor, name, outcome, target_date
         )
@@ -326,7 +330,7 @@ def build_platform_tools_surface() -> FastMCP:
         SUBTREE-filters (the given scope and everything below it, so an org anchor
         surfaces its repo-anchored milestones too); `status` filters by lifecycle
         status. Merge tombstones are excluded unless `include_merged=True`.
-        Read-only."""
+        Read-only. Milestones are releases only (decision 0fda34e5)."""
         return await anyio.to_thread.run_sync(
             _list_milestones_sync, anchor, status, include_merged
         )
@@ -420,7 +424,8 @@ def build_platform_tools_surface() -> FastMCP:
         its identity (§4). Only arguments you pass change: an omitted (null)
         argument is left as-is, and the empty string `""` CLEARS that field (for
         `target_date`, `""` clears; a non-empty value is ISO YYYY-MM-DD). Raises if
-        the address is unknown. Returns the refreshed row."""
+        the address is unknown. Returns the refreshed row. Milestones are releases
+        only; keep `outcome` a release outcome, not a capability (decision 0fda34e5)."""
         return await anyio.to_thread.run_sync(
             _update_milestone_sync, address, outcome, target_date
         )
