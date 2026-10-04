@@ -29,7 +29,8 @@ session still sees:
 Already true everywhere, and this spec pins it as a commitment:
 
 - The gateway's composed surfaces run `StreamableHTTPSessionManager(...,
-  stateless=True)` (`gateway_app.py`).
+  stateless=True)` (`gateway_app.py`). *(Superseded for the composed surfaces
+  by issue #240 — see the revisit note below.)*
 - Governance (main + shadow) and memory build `FastMCP(...,
   stateless_http=True)`; pm mirrors the same construction.
 - The gateway opens **per-request** upstream sessions (`gateway.py`) — no
@@ -43,6 +44,32 @@ server-initiated notifications, no sampling, no session-scoped server state).
 That is the platform's existing "LLM is the integration runtime" posture —
 but any future feature wanting server-push must revisit THIS spec first,
 because it would re-couple sessions to processes and forfeit the layer.
+
+**Revisited for issue #240 (2026-10-04): the gateway's composed surfaces are
+now STATEFUL.** Server push turned out to be required, not speculative: after
+a platform restart a client that re-listed during the registry-empty window
+(item 3 above) kept the partial tool list for its whole session, because a
+stateless surface cannot send `notifications/tools/list_changed`. So the
+composed surfaces run `StreamableHTTPSessionManager(..., stateless=False,
+session_idle_timeout=…)` and push `tools/list_changed` when the registry
+changes a surface's upstream set (`gateway_notify.py`). What changes for this
+layer:
+
+- Gateway↔plugin is untouched: upstream sessions are still per-request, and
+  plugins (and the platform's own `/platform/mcp` tool app) stay stateless —
+  plugin kickstarts cost exactly what they did.
+- Client↔gateway sessions now live in the platform process, so a **platform**
+  restart drops them: the client's next request carries a dead
+  `Mcp-Session-Id`, gets 404, and must re-initialize (the MCP spec's required
+  client behavior). Platform restarts were already session-visible (item 2);
+  this adds a re-initialize to that blip, it does not add a new failure class
+  for clients that follow the spec.
+- The single-process constraint is now load-bearing: sessions are in-memory,
+  so the platform must stay one worker (it is) and any proxy must forward
+  `Mcp-Session-Id` (the remote front does).
+- A startup grace (`registry_state.py`) holds `tools/list` for up to
+  `SNOWLINE_STARTUP_GRACE_SECONDS` after boot until the previously-registered
+  plugins are back, shrinking item 3 for clients that ignore `list_changed`.
 
 *Do layers 1–2 help governance/memory?* Layer 1 already covers them (their
 statelessness is why a plugin restart costs only in-flight calls). Layer 2 is

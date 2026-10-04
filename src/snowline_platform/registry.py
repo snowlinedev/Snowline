@@ -6,12 +6,18 @@ entry pairs a plugin's manifest with its runtime status (set by the health
 checker). In-memory is fine for a single platform process BECAUSE plugins
 re-assert membership on a registration heartbeat (issue #39): a platform restart
 empties the registry, and every plugin re-upserts itself within one beat.
-Persistence can still come later if that window ever matters.
+That window is covered on the gateway side (issue #240): composed surfaces
+push `notifications/tools/list_changed` when their upstream set changes, and a
+startup grace holds `tools/list` until the previously-registered plugins are
+back (`registry_state`). Both hang off the OBSERVER hook below, so this module
+stays free of MCP and file I/O.
 """
 
 from __future__ import annotations
 
+import logging
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Literal
@@ -23,7 +29,10 @@ from snowline_platform.manifest import (
     http_prefixes_collide,
 )
 
+log = logging.getLogger("snowline_platform.registry")
+
 UpsertOutcome = Literal["created", "unchanged", "updated"]
+ChangeKind = Literal["created", "updated", "removed", "status"]
 
 
 class PluginStatus(str, Enum):
@@ -36,6 +45,21 @@ class PluginStatus(str, Enum):
 class RegisteredPlugin:
     manifest: PluginManifest
     status: PluginStatus = PluginStatus.UNKNOWN
+
+
+@dataclass(frozen=True)
+class RegistryChange:
+    """One registry mutation that can change what the gateway composes, handed
+    to every observer (issue #240). `kind` is ``created``/``updated`` (an
+    upsert that was not a no-op heartbeat), ``removed`` (unregister), or
+    ``status`` (a health flip across the DOWN boundary — the only status change
+    that alters routability, since UNKNOWN and UP both route)."""
+
+    kind: ChangeKind
+    name: str
+
+
+RegistryObserver = Callable[[RegistryChange], None]
 
 
 class PluginNotFound(Exception):
@@ -69,6 +93,11 @@ class PluginRegistry:
     def __init__(self) -> None:
         self._plugins: dict[str, RegisteredPlugin] = {}
         self._lock = threading.Lock()
+        # Change observers (issue #240) — called AFTER the write, OUTSIDE the
+        # lock (an observer may read the registry back), each isolated by its
+        # own try/except so a failing observer can never fail or roll back the
+        # registry write that triggered it.
+        self._observers: list[RegistryObserver] = []
         # Top-level path segments the platform app ACTUALLY routes — handed
         # over by `create_app` after every route and mount is in place, so a
         # surface name that exists only in config (`SNOWLINE_SURFACES=…,ops`
@@ -76,6 +105,37 @@ class PluginRegistry:
         # `manifest.RESERVED_HTTP_PREFIXES`. Two lines of defense: the manifest
         # validator knows the static set, the registry knows the live one.
         self.reserved_http_prefixes: frozenset[str] = frozenset()
+
+    def add_observer(self, observer: RegistryObserver) -> None:
+        """Subscribe `observer` to routability-relevant mutations. Observers
+        must be quick and non-blocking (they run inline on the writer's thread);
+        anything slow belongs on the observer's own task."""
+        with self._lock:
+            self._observers.append(observer)
+
+    def remove_observer(self, observer: RegistryObserver) -> None:
+        """Unsubscribe `observer`; a no-op if it is not subscribed."""
+        with self._lock:
+            try:
+                self._observers.remove(observer)
+            except ValueError:
+                pass
+
+    def _emit(self, change: RegistryChange) -> None:
+        """Fan `change` out to every observer. Never raises: an observer error is
+        logged and swallowed so the registry write stands regardless."""
+        with self._lock:
+            observers = list(self._observers)
+        for observer in observers:
+            try:
+                observer(change)
+            except Exception:
+                log.exception(
+                    "registry observer %r failed on %s %r",
+                    observer,
+                    change.kind,
+                    change.name,
+                )
 
     def set_reserved_http_prefixes(self, segments: set[str] | frozenset[str]) -> None:
         with self._lock:
@@ -109,7 +169,11 @@ class PluginRegistry:
             self._assert_http_prefixes_free(manifest)
             entry = RegisteredPlugin(manifest=manifest)
             self._plugins[manifest.name] = entry
-            return entry, ("updated" if existing is not None else "created")
+            outcome: UpsertOutcome = (
+                "updated" if existing is not None else "created"
+            )
+        self._emit(RegistryChange(outcome, manifest.name))
+        return entry, outcome
 
     def _assert_http_prefixes_free(self, manifest: PluginManifest) -> None:
         """Raise `HttpPrefixConflict` if any of `manifest`'s http prefixes
@@ -168,6 +232,7 @@ class PluginRegistry:
             if name not in self._plugins:
                 raise PluginNotFound(name)
             del self._plugins[name]
+        self._emit(RegistryChange("removed", name))
 
     def get(self, name: str) -> RegisteredPlugin:
         with self._lock:
@@ -201,4 +266,10 @@ class PluginRegistry:
                 return
             if expected_entry is not None and entry is not expected_entry:
                 return
+            was_down = entry.status is PluginStatus.DOWN
             entry.status = status
+        # Only a flip ACROSS the DOWN boundary changes what the gateway routes
+        # (UNKNOWN and UP are both routable), so only that is an event — the
+        # poller's every-round UP→UP restamp stays silent.
+        if was_down != (status is PluginStatus.DOWN):
+            self._emit(RegistryChange("status", name))

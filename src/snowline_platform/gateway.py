@@ -559,9 +559,19 @@ def build_surface_server(
     surface: str,
     connector: UpstreamConnector,
     allowlist: frozenset[str] | None = None,
+    *,
+    server: Server | None = None,
+    before_list: Callable[[], Awaitable[None]] | None = None,
 ) -> Server:
     """A low-level `mcp.server.lowlevel.Server` for one named surface, wired to a
     `SurfaceGateway`'s list/call handlers.
+
+    `server` lets the caller supply the `Server` instance the handlers are
+    registered on (issue #240: `gateway_notify.ListChangedServer`, which
+    advertises ``tools.listChanged`` and tracks listing sessions — a server with
+    a `track_current_session()` method gets it called on every `tools/list`).
+    `before_list` is awaited at the top of every `tools/list` — the startup
+    grace hook (`registry_state.StartupGrace.wait`); it must be bounded.
 
     We use the LOW-LEVEL Server (not FastMCP) deliberately: the gateway has no
     statically-known tool set — its tools are whatever the live upstreams expose
@@ -571,10 +581,16 @@ def build_surface_server(
     Server is served over streamable-HTTP by a `StreamableHTTPSessionManager`
     mounted on the platform app (see `gateway_app`)."""
     gateway = SurfaceGateway(registry, surface, connector, allowlist)
-    server: Server = Server(f"snowline-{surface}")
+    if server is None:
+        server = Server(f"snowline-{surface}")
+    track = getattr(server, "track_current_session", None)
 
     @server.list_tools()
     async def _list_tools() -> list[types.Tool]:
+        if track is not None:
+            track()
+        if before_list is not None:
+            await before_list()
         return await gateway.list_tools()
 
     # validate_input=False: the OWNING plugin validates against its own

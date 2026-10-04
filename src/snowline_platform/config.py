@@ -53,6 +53,30 @@ DEFAULT_PLATFORM_SELF_URL = "http://127.0.0.1:8848"
 DEFAULT_HEALTH_POLL_INTERVAL = 15.0
 DEFAULT_HEALTH_POLL_TIMEOUT = 5.0
 
+# Where the platform remembers which plugins were registered, across restarts
+# (issue #240): read at boot for the startup grace, rewritten on every registry
+# membership change. Per-machine runtime state, so it lives beside the packaged
+# stack's other per-machine data (`stack.model.APP_SUPPORT_RELPATH`). Set
+# `SNOWLINE_PLATFORM_STATE_FILE` to relocate it; set it EMPTY to disable both
+# the file and the grace.
+DEFAULT_REGISTRY_STATE_FILE = (
+    "~/Library/Application Support/Snowline/platform/registered-plugins.json"
+)
+
+# Startup grace (issue #240): for this many seconds after the platform starts
+# serving, a surface `tools/list` waits (bounded) for the plugins registered
+# before the restart to re-register. Slightly over the SDK's default 15s
+# registration heartbeat (`snowline_plugin_sdk.registration`), so one full beat
+# fits inside it. 0 disables the wait.
+DEFAULT_STARTUP_GRACE_SECONDS = 20.0
+
+# Gateway surfaces run STATEFUL streamable-HTTP sessions (issue #240) so the
+# server can push `tools/list_changed`; a session idle this long (no request on
+# it) is reaped and the client re-initializes on its next request (404 →
+# new session, per the MCP spec). Bounds memory from clients that vanish
+# without a DELETE. <= 0 disables reaping.
+DEFAULT_GATEWAY_SESSION_IDLE_TIMEOUT = 86400.0
+
 # The named MCP surfaces the gateway mounts at startup. `main` is the composed
 # daily-driver surface; `shadow` is the isolated speculation surface (decision
 # 8a7f0a11). Surfaces are mounted at create_app time (before any plugin has
@@ -145,6 +169,37 @@ def health_poll_timeout() -> float:
             "SNOWLINE_HEALTH_POLL_TIMEOUT", DEFAULT_HEALTH_POLL_TIMEOUT
         )
     )
+
+
+def registry_state_file() -> pathlib.Path | None:
+    """The registered-plugins state file (issue #240), or None when disabled
+    (`SNOWLINE_PLATFORM_STATE_FILE` set to empty)."""
+    raw = os.environ.get(
+        "SNOWLINE_PLATFORM_STATE_FILE", DEFAULT_REGISTRY_STATE_FILE
+    ).strip()
+    return pathlib.Path(raw).expanduser() if raw else None
+
+
+def startup_grace_seconds() -> float:
+    return max(
+        0.0,
+        float(
+            os.environ.get(
+                "SNOWLINE_STARTUP_GRACE_SECONDS", DEFAULT_STARTUP_GRACE_SECONDS
+            )
+        ),
+    )
+
+
+def gateway_session_idle_timeout() -> float | None:
+    """Idle reap timeout for stateful gateway sessions; None = never reap."""
+    value = float(
+        os.environ.get(
+            "SNOWLINE_GATEWAY_SESSION_IDLE_TIMEOUT",
+            DEFAULT_GATEWAY_SESSION_IDLE_TIMEOUT,
+        )
+    )
+    return value if value > 0 else None
 
 
 def surfaces() -> tuple[str, ...]:

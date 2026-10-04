@@ -29,6 +29,15 @@ run()-once constraint.
 The session managers' `run()` is a required-for-lifespan async context (the
 StreamableHTTP manager owns the task group serving sessions); they are entered in
 the platform app's lifespan and torn down on shutdown.
+
+Stateful surfaces + `tools/list_changed` (issue #240): each aggregated surface
+runs a STATEFUL session manager so the server keeps each client's session and
+its standalone GET stream, and can therefore PUSH `notifications/tools/
+list_changed` when the registry changes the surface's upstream set (see
+`gateway_notify`). The lifespan subscribes each surface's notifier to the
+registry and runs its debounced broadcaster beside the session managers. The
+platform's own tool app stays stateless — only the gateway dials it, per
+request.
 """
 
 from __future__ import annotations
@@ -36,6 +45,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 
+import anyio
 from mcp.server.lowlevel import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
@@ -48,7 +58,13 @@ from snowline_platform.gateway import (
     UpstreamConnector,
     build_surface_server,
 )
+from snowline_platform.gateway_notify import (
+    ListChangedServer,
+    SessionSet,
+    SurfaceChangeNotifier,
+)
 from snowline_platform.registry import PluginRegistry
+from snowline_platform.registry_state import StartupGrace
 
 # ROOT_SURFACE — the composed daily-driver surface, served at the bare ``/mcp``
 # (every other named surface ``X`` lives at ``/X/mcp``). It is DEFINED in
@@ -94,17 +110,33 @@ class _ServerMount:
     that makes it "the platform's own upstream" is the registry self-entry that
     the gateway then dials back over loopback."""
 
-    def __init__(self, route: str, server: Server) -> None:
+    def __init__(
+        self,
+        route: str,
+        server: Server,
+        *,
+        stateless: bool = True,
+        session_idle_timeout: float | None = None,
+    ) -> None:
         self.route = route
-        # stateless=True: neither the gateway (each list/call re-discovers
-        # upstreams + opens a fresh upstream session) nor the platform tool app
-        # (each tool opens a fresh `session_scope()`) holds per-session server
-        # state, so a stateless transport is the honest model and avoids
-        # session-affinity bookkeeping across the proxy.
+        # Stateless by default: the platform tool app (each tool opens a fresh
+        # `session_scope()`) holds no per-session server state and is only ever
+        # dialed per-request by the gateway, so a stateless transport is the
+        # honest model there. Aggregated SURFACES opt into stateful
+        # (`_SurfaceMount`, issue #240): not because the gateway holds tool
+        # state — list/call still re-discover upstreams and open a fresh
+        # upstream session per request — but because only a live session with
+        # a GET stream can receive a server-pushed `tools/list_changed`. The
+        # cost stateless avoided is session affinity: the session lives in this
+        # process's memory, which is fine for the single-process platform (one
+        # uvicorn worker; the remote front forwards `Mcp-Session-Id`). A
+        # platform restart drops every session; clients get 404 on their old
+        # id and re-initialize, per the MCP spec.
         self._manager = StreamableHTTPSessionManager(
             app=server,
-            stateless=True,
+            stateless=stateless,
             security_settings=_SECURITY,
+            session_idle_timeout=None if stateless else session_idle_timeout,
         )
 
     async def asgi(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -116,7 +148,10 @@ class _ServerMount:
 
 class _SurfaceMount(_ServerMount):
     """A `_ServerMount` for one NAMED platform surface: the low-level server is
-    the gateway aggregator (`build_surface_server`) for that surface."""
+    the gateway aggregator (`build_surface_server`) for that surface, served
+    STATEFUL, with a `SurfaceChangeNotifier` that pushes `tools/list_changed` to
+    its live sessions when the registry changes its upstream set (issue #240),
+    and an optional `StartupGrace` awaited before each `tools/list`."""
 
     def __init__(
         self,
@@ -124,11 +159,28 @@ class _SurfaceMount(_ServerMount):
         registry: PluginRegistry,
         connector: UpstreamConnector,
         allowlist: frozenset[str] | None = None,
+        grace: StartupGrace | None = None,
     ) -> None:
         self.surface = surface
+        self.registry = registry
+        self.sessions = SessionSet()
+        server = ListChangedServer(f"snowline-{surface}", self.sessions)
+        build_surface_server(
+            registry,
+            surface,
+            connector,
+            allowlist,
+            server=server,
+            before_list=grace.wait if grace is not None else None,
+        )
+        self.notifier = SurfaceChangeNotifier(
+            registry, surface, self.sessions, allowlist
+        )
         super().__init__(
             surface_route(surface),
-            build_surface_server(registry, surface, connector, allowlist),
+            server,
+            stateless=False,
+            session_idle_timeout=config.gateway_session_idle_timeout(),
         )
 
 
@@ -136,11 +188,13 @@ def build_surface_mounts(
     registry: PluginRegistry,
     connector: UpstreamConnector | None = None,
     surfaces: tuple[str, ...] | None = None,
+    grace: StartupGrace | None = None,
 ) -> list[_SurfaceMount]:
     """One `_SurfaceMount` per named surface. `surfaces` defaults to the
     configured set (`config.surfaces()` ← ``SNOWLINE_SURFACES``); `connector`
     defaults to the production streamable-HTTP connector; tests inject an
-    in-memory one.
+    in-memory one. `grace` (issue #240) is the shared post-restart
+    `StartupGrace` every surface's `tools/list` awaits; None = no grace.
 
     This is where `SNOWLINE_SURFACE_PLUGINS` is parsed + validated ONCE (issue
     #36 review): `config.surface_plugins()` fail-louds on malformed shape, then
@@ -154,7 +208,7 @@ def build_surface_mounts(
     allowlists = config.surface_plugins()
     config.validate_surface_plugins(allowlists, tuple(names))
     return [
-        _SurfaceMount(s, registry, conn, allowlists.get(s)) for s in names
+        _SurfaceMount(s, registry, conn, allowlists.get(s), grace) for s in names
     ]
 
 
@@ -205,8 +259,21 @@ def mount_gateway(app, mounts: list[_ServerMount]) -> None:
 async def gateway_lifespan(
     mounts: list[_ServerMount],
 ) -> AsyncIterator[None]:
-    """Enter every surface session manager's `run()` for the app lifespan."""
+    """Enter every surface session manager's `run()` for the app lifespan, and
+    — for each aggregated surface — subscribe its change notifier to the
+    registry and run its debounced broadcaster (issue #240). Exit order is the
+    reverse: broadcasters cancelled and unsubscribed first, then the session
+    managers torn down."""
     async with AsyncExitStack() as stack:
         for mount in mounts:
             await stack.enter_async_context(mount.run())
+        surface_mounts = [m for m in mounts if isinstance(m, _SurfaceMount)]
+        tg = await stack.enter_async_context(anyio.create_task_group())
+        stack.callback(tg.cancel_scope.cancel)
+        for mount in surface_mounts:
+            tg.start_soon(mount.notifier.run)
+            mount.registry.add_observer(mount.notifier.registry_changed)
+            stack.callback(
+                mount.registry.remove_observer, mount.notifier.registry_changed
+            )
         yield
