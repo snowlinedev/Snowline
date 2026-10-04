@@ -1358,7 +1358,12 @@ def _flag_now_legal(u: MilestoneUnreconciled) -> bool:
     written by an older build that predates the move (e.g. active→planned before
     `deactivate` existed), so it is no longer a contradiction."""
     move = (u.detail or {}).get("illegal_move")
-    return bool(move) and len(move) == 2 and tuple(move) in LEGAL_TRANSITIONS
+    return (
+        isinstance(move, (list, tuple))
+        and len(move) == 2
+        and all(isinstance(x, str) for x in move)
+        and tuple(move) in LEGAL_TRANSITIONS
+    )
 
 
 def _prune_now_legal_flags(session: Session, m: Milestone) -> None:
