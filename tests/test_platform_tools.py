@@ -62,6 +62,7 @@ _MILESTONE_TOOLS = {
     "get_milestone",
     "milestone_transitions",
     "activate_milestone",
+    "deactivate_milestone",
     "achieve_milestone",
     "cancel_milestone",
     "update_milestone",

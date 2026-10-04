@@ -185,6 +185,41 @@ def test_every_verb_emits_full_row_state_and_authored_at(db_session):
     assert merged["from"] == "acme/repo/beta" and merged["into"] == "acme/repo/alpha"
 
 
+def test_deactivate_emits_full_row_state_with_cleared_activated_at(db_session):
+    """`deactivate` replicates exactly like the other transitions: one
+    `milestone.transitioned` carrying the active→planned triple + FULL ROW STATE,
+    where `activated_at` is null (cleared) so a peer's full-row apply clears it
+    too."""
+    emit.create_outbound_subscription(
+        db_session,
+        "http://peer/replication/events/ingest",
+        "topsecret",
+        list(replication.MILESTONE_EVENTS),
+        epoch="e1",
+        source_id="hub.platform",
+    )
+    _anchor(db_session)
+    milestones.create(db_session, "acme/repo", "alpha")
+    milestones.activate(db_session, "acme/repo/alpha")
+    milestones.deactivate(db_session, "acme/repo/alpha", reason="wrong line")
+    db_session.commit()
+
+    rows = db_session.scalars(
+        select(ReplicationOutboxRow).order_by(ReplicationOutboxRow.seq)
+    ).all()
+    assert [r.payload["event_type"] for r in rows] == [
+        EVENT_MILESTONE_CREATED,
+        EVENT_MILESTONE_TRANSITIONED,
+        EVENT_MILESTONE_TRANSITIONED,
+    ]
+    trans = rows[2].payload["payload"]
+    assert (trans["from_status"], trans["to_status"], trans["reason"]) == (
+        "active", "planned", "wrong line"
+    )
+    assert trans["status"] == "planned" and trans["activated_at"] is None
+    assert trans["authored_at"] is not None
+
+
 def test_no_subscription_emits_nothing(db_session):
     """No outbound stream (pre-pairing default) — emitting is a harmless no-op."""
     scopes.create(db_session, slug="acme", name="Acme", kind="org")
@@ -280,6 +315,71 @@ def test_round_trip_apply_converges_address_keyed_with_anchor_re_resolved(db_ses
         _m_payload("acme/repo", "v1-launch", authored_at=T0), 1,
     )
     assert (status, resp["status"]) == (200, "duplicate")
+
+
+def test_deactivate_apply_converges_back_to_planned(db_session):
+    """A peer's active→planned transition applies like any other: the row
+    converges to planned with `activated_at` CLEARED (full-row LWW write), the
+    transition lands in the log, and planned→active→planned is a legal history
+    (nothing flagged). A later re-activation converges cleanly too."""
+    _anchor(db_session)
+    secret = _register(db_session)["secret"]
+    t1, t2, t3 = (T0 + timedelta(minutes=n) for n in (1, 2, 3))
+    _deliver(db_session, secret, EVENT_MILESTONE_CREATED,
+             _m_payload("acme/repo", "v1", authored_at=T0), 1)
+    _deliver(db_session, secret, EVENT_MILESTONE_TRANSITIONED,
+             _transitioned("acme/repo", "v1", from_status="planned",
+                           to_status="active", authored_at=t1, activated_at=t1), 2)
+    assert milestones.get(db_session, "acme/repo/v1").activated_at == t1
+
+    s, r = _deliver(db_session, secret, EVENT_MILESTONE_TRANSITIONED,
+                    _transitioned("acme/repo", "v1", from_status="active",
+                                  to_status="planned", authored_at=t2,
+                                  reason="wrong line"), 3)
+    assert (s, r["status"]) == (200, "applied")
+    m = milestones.get(db_session, "acme/repo/v1")
+    assert m.status == "planned" and m.activated_at is None
+    assert milestones.list_unreconciled(db_session) == []
+
+    _deliver(db_session, secret, EVENT_MILESTONE_TRANSITIONED,
+             _transitioned("acme/repo", "v1", from_status="planned",
+                           to_status="active", authored_at=t3, activated_at=t3), 4)
+    m = milestones.get(db_session, "acme/repo/v1")
+    assert m.status == "active" and m.activated_at == t3
+    log = milestones.transitions(db_session, "acme/repo/v1")
+    assert [(t["from_status"], t["to_status"]) for t in log] == [
+        ("planned", "active"), ("active", "planned"), ("planned", "active"),
+    ]
+    assert milestones.list_unreconciled(db_session) == []
+
+
+def test_deactivate_loses_lww_to_later_achieve(db_session):
+    """Concurrent `deactivate` (earlier) and `achieve` (later) of one active
+    milestone: the row converges to the LWW winner (achieved, activated_at
+    intact from the winner's full row), the loser's deactivate stays in the log,
+    and the converged planned→achieved step is flagged unreconciled (§9)."""
+    _anchor(db_session)
+    secret = _register(db_session)["secret"]
+    t1, t2, t3 = (T0 + timedelta(minutes=n) for n in (1, 2, 3))
+    _deliver(db_session, secret, EVENT_MILESTONE_CREATED,
+             _m_payload("acme/repo", "v1", authored_at=T0), 1)
+    _deliver(db_session, secret, EVENT_MILESTONE_TRANSITIONED,
+             _transitioned("acme/repo", "v1", from_status="planned",
+                           to_status="active", authored_at=t1, activated_at=t1), 2)
+    # Delivered winner-first: arrival order must not matter.
+    _deliver(db_session, secret, EVENT_MILESTONE_TRANSITIONED,
+             _transitioned("acme/repo", "v1", from_status="active",
+                           to_status="achieved", authored_at=t3,
+                           activated_at=t1, achieved_at=t3), 3)
+    s, r = _deliver(db_session, secret, EVENT_MILESTONE_TRANSITIONED,
+                    _transitioned("acme/repo", "v1", from_status="active",
+                                  to_status="planned", authored_at=t2,
+                                  reason="oops"), 4)
+    assert (s, r["status"]) == (200, "applied")
+    m = milestones.get(db_session, "acme/repo/v1")
+    assert m.status == "achieved" and m.activated_at == t1
+    flags = milestones.list_unreconciled(db_session)
+    assert [f["detail"]["illegal_move"] for f in flags] == [["planned", "achieved"]]
 
 
 def test_unknown_anchor_is_retryable_and_self_heals(db_session):
