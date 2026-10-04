@@ -559,9 +559,15 @@ def build_surface_server(
     surface: str,
     connector: UpstreamConnector,
     allowlist: frozenset[str] | None = None,
+    *,
+    before_list: Callable[[], Awaitable[None]] | None = None,
 ) -> Server:
     """A low-level `mcp.server.lowlevel.Server` for one named surface, wired to a
     `SurfaceGateway`'s list/call handlers.
+
+    `before_list` is awaited at the top of every `tools/list` — the post-restart
+    startup grace hook (issue #240, `registry_state.StartupGrace.wait`); it must
+    be bounded.
 
     We use the LOW-LEVEL Server (not FastMCP) deliberately: the gateway has no
     statically-known tool set — its tools are whatever the live upstreams expose
@@ -575,6 +581,8 @@ def build_surface_server(
 
     @server.list_tools()
     async def _list_tools() -> list[types.Tool]:
+        if before_list is not None:
+            await before_list()
         return await gateway.list_tools()
 
     # validate_input=False: the OWNING plugin validates against its own

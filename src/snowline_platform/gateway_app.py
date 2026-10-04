@@ -35,6 +35,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
+from functools import partial
 
 from mcp.server.lowlevel import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
@@ -49,6 +50,7 @@ from snowline_platform.gateway import (
     build_surface_server,
 )
 from snowline_platform.registry import PluginRegistry
+from snowline_platform.registry_state import StartupGrace
 
 # ROOT_SURFACE — the composed daily-driver surface, served at the bare ``/mcp``
 # (every other named surface ``X`` lives at ``/X/mcp``). It is DEFINED in
@@ -124,11 +126,24 @@ class _SurfaceMount(_ServerMount):
         registry: PluginRegistry,
         connector: UpstreamConnector,
         allowlist: frozenset[str] | None = None,
+        grace: StartupGrace | None = None,
     ) -> None:
         self.surface = surface
         super().__init__(
             surface_route(surface),
-            build_surface_server(registry, surface, connector, allowlist),
+            build_surface_server(
+                registry,
+                surface,
+                connector,
+                allowlist,
+                # Post-restart grace (issue #240): this surface's list waits only
+                # for the previously-registered plugins that would serve IT.
+                before_list=(
+                    partial(grace.wait, surface, allowlist)
+                    if grace is not None
+                    else None
+                ),
+            ),
         )
 
 
@@ -136,11 +151,13 @@ def build_surface_mounts(
     registry: PluginRegistry,
     connector: UpstreamConnector | None = None,
     surfaces: tuple[str, ...] | None = None,
+    grace: StartupGrace | None = None,
 ) -> list[_SurfaceMount]:
     """One `_SurfaceMount` per named surface. `surfaces` defaults to the
     configured set (`config.surfaces()` ← ``SNOWLINE_SURFACES``); `connector`
     defaults to the production streamable-HTTP connector; tests inject an
-    in-memory one.
+    in-memory one. `grace` (issue #240) is the shared post-restart
+    `StartupGrace` each surface's `tools/list` awaits; None = no grace.
 
     This is where `SNOWLINE_SURFACE_PLUGINS` is parsed + validated ONCE (issue
     #36 review): `config.surface_plugins()` fail-louds on malformed shape, then
@@ -154,7 +171,7 @@ def build_surface_mounts(
     allowlists = config.surface_plugins()
     config.validate_surface_plugins(allowlists, tuple(names))
     return [
-        _SurfaceMount(s, registry, conn, allowlists.get(s)) for s in names
+        _SurfaceMount(s, registry, conn, allowlists.get(s), grace) for s in names
     ]
 
 

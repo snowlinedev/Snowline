@@ -21,6 +21,11 @@ TEST_DB_URL = os.environ.get(
     "postgresql+psycopg:///snowline_platform_test",
 )
 os.environ["SNOWLINE_PLATFORM_DATABASE_URL"] = TEST_DB_URL
+# Importing `snowline_platform.app` builds the production singleton, which
+# persists the registered-plugin set (issue #240) — disable that file so a test
+# run never writes into the developer's real per-machine state. Tests that
+# exercise it pass an explicit tmp path to `create_app`.
+os.environ["SNOWLINE_PLATFORM_STATE_FILE"] = ""
 
 import sqlalchemy as sa  # noqa: E402
 from alembic import command  # noqa: E402

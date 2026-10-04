@@ -43,6 +43,11 @@ from starlette.routing import Mount, Route
 
 from snowline_platform.middleware import TrustMiddleware
 from snowline_platform.registry import PluginRegistry
+from snowline_platform.registry_state import (
+    RegistryStateFile,
+    StartupGrace,
+    read_registered,
+)
 from snowline_platform.trust import CidrTrustProvider, TrustResolver
 from snowline_plugin_sdk.replication import replication_delivery_loop
 
@@ -71,6 +76,26 @@ def _migrate_to_head() -> None:
 
 
 @asynccontextmanager
+async def _startup_grace_lifespan(app: FastAPI):
+    """Open the post-restart grace window (issue #240) as the surfaces start
+    serving — a slow boot-migrate must not eat it — and, when it closes,
+    rewrite the state file from the live registry so a plugin that never came
+    back stops costing every later restart a full window. The expiry task is
+    cancelled on shutdown so it never delays it."""
+    grace = app.state.startup_grace
+    if grace is None:
+        yield
+        return
+    grace.start()
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(grace.expire, app.state.registry_state.write)
+        try:
+            yield
+        finally:
+            tg.cancel_scope.cancel()
+
+
+@asynccontextmanager
 async def _lifespan(app: FastAPI):
     try:
         if getattr(app.state, "migrate_on_startup", True):
@@ -79,7 +104,10 @@ async def _lifespan(app: FastAPI):
         # the app lifespan (the gateway, gateway.md §2). The surfaces are mounted
         # at create_app time; their managers' run() is the required-for-lifespan
         # context.
-        async with gateway_lifespan(app.state.gateway_mounts):
+        async with (
+            gateway_lifespan(app.state.gateway_mounts),
+            _startup_grace_lifespan(app),
+        ):
             # The registry is in-memory, so a restart boots it with ONLY the
             # platform self-entry (seeded in create_app, decision 0503fff0) and
             # every mounted surface serves only the platform's native tools until
@@ -158,6 +186,7 @@ def create_app(
     connector: UpstreamConnector | None = None,
     poll_health: bool = False,
     replicate: bool = False,
+    registry_state_file: Path | None = None,
 ) -> FastAPI:
     """Build the platform app. `resolver`/`registry` are injectable for tests;
     `migrate_on_startup=False` skips the lifespan boot-migrate (tests provision
@@ -168,9 +197,29 @@ def create_app(
     don't spawn network traffic or race on status; the production singleton
     opts into both. `replicate` is forwarded straight through as the SDK
     loop's own `enabled` seam (issue #91) rather than deciding locally whether
-    to start the loop at all."""
+    to start the loop at all.
+
+    `registry_state_file` (issue #240) is where the registered plugins'
+    manifests are persisted across restarts, driving the post-restart
+    `StartupGrace` on surface `tools/list`. None (the test-friendly default)
+    disables both; the production singleton passes
+    `config.registry_state_file()`."""
     app = FastAPI(title="Snowline Platform", lifespan=_lifespan)
     app.state.registry = registry or PluginRegistry()
+    # Read who was registered BEFORE this boot, then keep the file current —
+    # both before the self-seed below, whose upsert is the first write.
+    app.state.startup_grace = None
+    app.state.registry_state = None
+    if registry_state_file is not None:
+        app.state.startup_grace = StartupGrace(
+            app.state.registry,
+            read_registered(registry_state_file),
+            config.startup_grace_seconds(),
+        )
+        app.state.registry_state = RegistryStateFile(
+            app.state.registry, registry_state_file, app.state.startup_grace
+        )
+        app.state.registry.add_observer(app.state.registry_state.registry_changed)
     # Seed the platform's OWN upstream (decision 0503fff0): a `platform` registry
     # entry at the platform's loopback base_url mapping `/platform/mcp → main`, so
     # the gateway composes the native scope/milestone tools onto `main` through
@@ -227,7 +276,11 @@ def create_app(
     # named surfaces and mount each as a streamable-HTTP endpoint (e.g. /mcp,
     # /shadow/mcp), behind the trust gate. Mounts share the app's registry, so a
     # plugin registered at runtime is composed without a restart.
-    mounts = build_surface_mounts(app.state.registry, connector=connector)
+    mounts = build_surface_mounts(
+        app.state.registry,
+        connector=connector,
+        grace=app.state.startup_grace,
+    )
     # The SERVE half of the platform-as-its-own-upstream: mount the native tool
     # app at /platform/mcp alongside the composed surfaces, entered in the same
     # gateway lifespan. The COMPOSE half is the self-entry seeded above; the
@@ -374,4 +427,8 @@ def create_app(
 
 # The production singleton: boot-migrate, gateway, health poller, AND the
 # replication delivery loop on.
-app = create_app(poll_health=True, replicate=True)
+app = create_app(
+    poll_health=True,
+    replicate=True,
+    registry_state_file=config.registry_state_file(),
+)
