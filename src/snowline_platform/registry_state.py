@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -68,10 +69,13 @@ def read_registered(path: Path) -> dict[str, PluginManifest]:
         log.warning("registry state: cannot read %s: %s", path, exc)
         return {}
     try:
-        plugins = json.loads(raw)["plugins"]
+        data = json.loads(raw)
+        if data.get("version") != STATE_VERSION:
+            raise ValueError(f"unknown version {data.get('version')!r}")
+        plugins = data["plugins"]
         if not isinstance(plugins, dict):
             raise TypeError("'plugins' is not an object")
-    except (ValueError, KeyError, TypeError) as exc:
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
         log.warning("registry state: ignoring malformed %s: %s", path, exc)
         return {}
     out: dict[str, PluginManifest] = {}
@@ -143,12 +147,39 @@ class StartupGrace:
         self._deadline = clock() + window
         self._by_surface: dict[tuple[str, frozenset[str] | None], frozenset[str]] = {}
         self._logged: set[str] = set()
+        # Shutdown release: `close()` ends the window early and wakes every
+        # in-flight wait. The Event is made in `start()` (it needs a running
+        # loop; construction happens in create_app, before one exists).
+        self._closed = False
+        self._closed_event: anyio.Event | None = None
 
     def start(self) -> None:
         self._deadline = self._clock() + self.window
+        self._closed = False
+        self._closed_event = anyio.Event()
+
+    def close(self) -> None:
+        """End the grace now (lifespan shutdown): every in-flight `wait`
+        returns immediately and no later one waits."""
+        self._closed = True
+        if self._closed_event is not None:
+            self._closed_event.set()
 
     def active(self) -> bool:
-        return bool(self.expected) and self._clock() < self._deadline
+        return (
+            bool(self.expected)
+            and not self._closed
+            and self._clock() < self._deadline
+        )
+
+    async def _pause(self, remaining: float) -> None:
+        """Sleep one poll step, waking early on `close()`."""
+        step = min(POLL_SECONDS, remaining)
+        if self._closed_event is None:
+            await anyio.sleep(step)
+            return
+        with anyio.move_on_after(step):
+            await self._closed_event.wait()
 
     def remaining(self) -> float:
         return max(0.0, self._deadline - self._clock())
@@ -220,17 +251,36 @@ class StartupGrace:
             )
         while missing:
             remaining = self.remaining()
-            if remaining <= 0:
+            if remaining <= 0 or self._closed:
                 break
-            await anyio.sleep(min(POLL_SECONDS, remaining))
+            await self._pause(remaining)
             missing = self.pending_for(surface, allowlist)
-        if missing:
+        if missing and not self._closed:
             log.warning(
                 "startup grace: window ended with plugin(s) %s still not "
                 "re-registered; answering %r tools/list without them",
                 sorted(missing),
                 surface,
             )
+
+    async def wait_for_tool(
+        self, surface: str, allowlist: frozenset[str] | None, tool_name: str
+    ) -> None:
+        """Per-call grace: wait only while the plugin owning `tool_name`
+        (``<plugin>__<tool>``) is an expected-but-missing upstream of
+        `surface`. A call to a plugin that is already back — or that was never
+        expected — goes straight through."""
+        from snowline_platform.gateway import split_namespaced
+
+        try:
+            plugin, _ = split_namespaced(tool_name)
+        except ValueError:
+            return
+        while plugin in self.pending_for(surface, allowlist):
+            remaining = self.remaining()
+            if remaining <= 0 or self._closed:
+                return
+            await self._pause(remaining)
 
     async def expire(self, on_expire: Callable[[], None]) -> None:
         """Sleep until the window closes, then call `on_expire` (the state
@@ -268,18 +318,26 @@ class RegistryStateFile:
         self._registry = registry
         self.path = path
         self._grace = grace
+        # Snapshot + write as one step, so two writers can't interleave and
+        # leave the OLDER snapshot on disk.
+        self._lock = threading.Lock()
 
     def registry_changed(self, change: RegistryChange) -> None:
         self.write()
 
     def write(self) -> None:
-        manifests = {e.manifest.name: e.manifest for e in self._registry.list()}
-        if self._grace is not None:
-            for name in self._grace.pending():
-                manifests.setdefault(name, self._grace.expected[name])
-        try:
-            write_registered(self.path, list(manifests.values()))
-        except OSError as exc:
-            log.warning(
-                "registry state: failed to write %s: %s", self.path, exc
-            )
+        """Never raises: it runs inside registry writes (as an observer) and in
+        the lifespan task group (window expiry), and must break neither."""
+        with self._lock:
+            try:
+                manifests = {
+                    e.manifest.name: e.manifest for e in self._registry.list()
+                }
+                if self._grace is not None:
+                    for name in self._grace.pending():
+                        manifests.setdefault(name, self._grace.expected[name])
+                write_registered(self.path, list(manifests.values()))
+            except Exception as exc:  # noqa: BLE001 — logged; see docstring
+                log.warning(
+                    "registry state: failed to write %s: %s", self.path, exc
+                )

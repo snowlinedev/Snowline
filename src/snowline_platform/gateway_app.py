@@ -143,6 +143,12 @@ class _SurfaceMount(_ServerMount):
                     if grace is not None
                     else None
                 ),
+                # A call waits only for ITS plugin, never the whole surface.
+                before_call=(
+                    partial(grace.wait_for_tool, surface, allowlist)
+                    if grace is not None
+                    else None
+                ),
             ),
         )
 

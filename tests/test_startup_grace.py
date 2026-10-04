@@ -12,7 +12,7 @@ import time
 import anyio
 import httpx
 import pytest
-from mcp import ClientSession
+from mcp import ClientSession, types
 from mcp.client.streamable_http import streamable_http_client
 
 from snowline_platform import registry_state
@@ -363,3 +363,168 @@ def test_grace_lifespan_shutdown_is_not_delayed(tmp_path):
     start = time.monotonic()
     anyio.run(_main)
     assert time.monotonic() - start < 1.0
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: per-call wait, shutdown release, write hygiene.
+# ---------------------------------------------------------------------------
+
+
+async def _call_over_http(app, tool, route="/mcp/"):
+    """One raw JSON-RPC `tools/call` POST (the surfaces are stateless, so no
+    initialize round-trip is needed). Deliberately NOT `ClientSession.call_tool`:
+    the Python client re-lists tools after a call to validate output schemas,
+    which is a real client `tools/list` and rightly waits on the surface."""
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://platform",
+        timeout=httpx.Timeout(30.0),
+    ) as http:
+        resp = await http.post(
+            route,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": tool, "arguments": {"value": "x"}},
+            },
+            headers={
+                "accept": "application/json, text/event-stream",
+                "mcp-protocol-version": "2025-06-18",
+            },
+        )
+    resp.raise_for_status()
+    data = next(
+        line[len("data:"):].strip()
+        for line in resp.text.splitlines()
+        if line.startswith("data:")
+    )
+    return types.CallToolResult.model_validate(json.loads(data)["result"])
+
+
+def _grace_app(tmp_path, monkeypatch, expected, registered):
+    monkeypatch.setenv("SNOWLINE_STARTUP_GRACE_SECONDS", "5")
+    path = tmp_path / "registered-plugins.json"
+    write_registered(path, [_manifest(n) for n in expected])
+    reg = PluginRegistry()
+    for n in registered:
+        reg.upsert(_manifest(n))
+    app = _app(
+        reg,
+        path,
+        {
+            "http://alpha/mcp": make_stub_plugin("alpha", ["read"]),
+            "http://beta/mcp": make_stub_plugin("beta", ["ping"]),
+        },
+    )
+    return app, reg
+
+
+def test_call_to_registered_plugin_does_not_wait_on_another(
+    tmp_path, monkeypatch
+):
+    """The SDK's call_tool cache refresh re-runs the list handler; it must not
+    hold a call to `alpha` (already back) for the still-missing `ghost`."""
+    app, _ = _grace_app(
+        tmp_path, monkeypatch, ["alpha", "ghost"], ["alpha"]
+    )
+
+    async def _main():
+        async with (
+            gateway_lifespan(app.state.gateway_mounts),
+            _startup_grace_lifespan(app),
+        ):
+            assert app.state.startup_grace.pending_for("main") == {"ghost"}
+            start = anyio.current_time()
+            res = await _call_over_http(app, "alpha__read")
+            return res, anyio.current_time() - start
+
+    res, elapsed = anyio.run(_main)
+    assert res.isError is not True
+    assert elapsed < 2.0  # far under the 5s window
+
+
+def test_call_to_pending_plugin_waits_then_succeeds(tmp_path, monkeypatch):
+    app, reg = _grace_app(tmp_path, monkeypatch, ["alpha", "beta"], ["alpha"])
+
+    async def _main():
+        async with (
+            gateway_lifespan(app.state.gateway_mounts),
+            _startup_grace_lifespan(app),
+            anyio.create_task_group() as tg,
+        ):
+
+            async def _register_later():
+                await anyio.sleep(0.3)
+                reg.upsert(_manifest("beta"))
+
+            tg.start_soon(_register_later)
+            start = anyio.current_time()
+            res = await _call_over_http(app, "beta__ping")
+            return res, anyio.current_time() - start
+
+    res, elapsed = anyio.run(_main)
+    assert res.isError is not True
+    assert json.loads(res.content[0].text)["plugin"] == "beta"
+    assert 0.25 < elapsed < 3.0
+
+
+def test_wait_for_tool_ignores_other_and_unknown_plugins():
+    reg = PluginRegistry()
+    reg.upsert(_manifest("alpha"))
+    grace = StartupGrace(
+        reg, _expected(_manifest("alpha"), _manifest("ghost")), window=30.0
+    )
+    for tool in ("alpha__read", "never_expected__x", "not-namespaced"):
+        assert anyio.run(_timed, grace.wait_for_tool, "main", None, tool) < 0.05
+
+
+def test_close_releases_in_flight_waits():
+    grace = StartupGrace(PluginRegistry(), _expected(_manifest("ghost")), 30.0)
+
+    async def _main():
+        grace.start()
+
+        async def _close_later():
+            await anyio.sleep(0.1)
+            grace.close()
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(_close_later)
+            start = anyio.current_time()
+            async with anyio.create_task_group() as waits:
+                waits.start_soon(grace.wait, "main")
+                waits.start_soon(grace.wait_for_tool, "main", None, "ghost__x")
+            elapsed = anyio.current_time() - start
+        # Closed: no later wait either.
+        return elapsed, await _timed(grace.wait, "main")
+
+    elapsed, later = anyio.run(_main)
+    assert elapsed < 1.0
+    assert later < 0.05
+
+
+def test_state_write_swallows_any_error(tmp_path, monkeypatch, caplog):
+    def _boom(path, manifests):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(registry_state, "write_registered", _boom)
+    reg = PluginRegistry()
+    state = RegistryStateFile(reg, tmp_path / "s.json")
+    reg.add_observer(state.registry_changed)
+    with caplog.at_level(logging.WARNING):
+        _, outcome = reg.upsert(_manifest("a"))
+        state.write()  # the expiry path: must not raise into the lifespan
+    assert outcome == "created"
+    assert "unexpected" in caplog.text
+
+
+def test_unknown_state_version_reads_as_empty(tmp_path):
+    path = tmp_path / "s.json"
+    write_registered(path, [_manifest("a")])
+    data = json.loads(path.read_text())
+    data["version"] = 2
+    path.write_text(json.dumps(data))
+    assert read_registered(path) == {}
+    path.write_text("[]")
+    assert read_registered(path) == {}

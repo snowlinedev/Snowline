@@ -92,6 +92,8 @@ async def _startup_grace_lifespan(app: FastAPI):
         try:
             yield
         finally:
+            # Release any tools/list or call still held by the grace.
+            grace.close()
             tg.cancel_scope.cancel()
 
 
