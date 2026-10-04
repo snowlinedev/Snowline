@@ -559,9 +559,21 @@ def build_surface_server(
     surface: str,
     connector: UpstreamConnector,
     allowlist: frozenset[str] | None = None,
+    *,
+    before_list: Callable[[], Awaitable[None]] | None = None,
+    before_call: Callable[[str], Awaitable[None]] | None = None,
 ) -> Server:
     """A low-level `mcp.server.lowlevel.Server` for one named surface, wired to a
     `SurfaceGateway`'s list/call handlers.
+
+    `before_list` is awaited at the top of every CLIENT `tools/list` — the
+    post-restart startup grace hook (issue #240, `registry_state.StartupGrace.
+    wait`); it must be bounded. It is deliberately skipped for the SDK's
+    internal tool-cache refresh (the low-level server re-runs the list handler
+    with ``req=None`` on a `call_tool` cache miss), so a call never waits on the
+    whole surface. `before_call(name)` is awaited before routing each
+    `tools/call` instead — the grace's per-call hook, which waits only for the
+    plugin that owns `name`.
 
     We use the LOW-LEVEL Server (not FastMCP) deliberately: the gateway has no
     statically-known tool set — its tools are whatever the live upstreams expose
@@ -573,8 +585,13 @@ def build_surface_server(
     gateway = SurfaceGateway(registry, surface, connector, allowlist)
     server: Server = Server(f"snowline-{surface}")
 
+    # The positional-only, exactly-typed `req` makes the SDK pass the request
+    # through (`create_call_wrapper`): a real client list carries a request, the
+    # SDK's call_tool cache refresh passes None — only the former waits.
     @server.list_tools()
-    async def _list_tools() -> list[types.Tool]:
+    async def _list_tools(req: types.ListToolsRequest, /) -> list[types.Tool]:
+        if before_list is not None and req is not None:
+            await before_list()
         return await gateway.list_tools()
 
     # validate_input=False: the OWNING plugin validates against its own
@@ -585,6 +602,8 @@ def build_surface_server(
     async def _call_tool(
         name: str, arguments: dict
     ) -> types.CallToolResult:
+        if before_call is not None:
+            await before_call(name)
         try:
             return await gateway.call_tool(name, arguments)
         except GatewayError as exc:
