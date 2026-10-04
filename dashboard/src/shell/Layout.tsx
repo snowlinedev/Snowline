@@ -13,7 +13,12 @@ import {
 import { usePlugins } from "../plugins-context";
 import { SECTIONS, pluginNavGroups, sectionNavEntries } from "../registry";
 
-export function Layout(props: { title: string; children: ReactNode }) {
+export function Layout(props: {
+  title: string;
+  /** Optional one-line secondary text rendered under the title (ui-shell.md §4.2 `page_subtitle`). */
+  subtitle?: string;
+  children: ReactNode;
+}) {
   const [theme, setTheme] = useState<Theme>(currentTheme);
   const [density, setDensity] = useState<Density>(currentDensity);
   // Narrow-viewport nav disclosure (issue #161): the links container is
@@ -128,7 +133,10 @@ export function Layout(props: { title: string; children: ReactNode }) {
       </nav>
       <main className="shell-main">
         <div className="shell-header">
-          <h1>{props.title}</h1>
+          <div className="shell-heading">
+            <h1>{props.title}</h1>
+            {props.subtitle && <p className="shell-subtitle">{props.subtitle}</p>}
+          </div>
           <div className="toggles">
             <button
               type="button"

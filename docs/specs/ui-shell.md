@@ -147,6 +147,12 @@ knows a human name (e.g. which milestone). The manifest `title` (falling
 back to `id`) remains the pre-load and fallback header. Additive and
 optional: pages that omit it render exactly as before.
 
+A response may likewise carry a top-level `page_subtitle`: plain text, one
+line, rendered as a plain paragraph (not a heading) directly under the page
+title in secondary text, e.g. a milestone's type summary. It is shown once the
+data loads; absent, non-string or blank means nothing is rendered. Additive
+and optional, like `page_title`.
+
 `search` (query box + result list, for shadow corpus search) is anticipated
 but **deferred** until the read views prove out.
 
