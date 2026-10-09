@@ -164,8 +164,8 @@ class _SurfaceMount(_ServerMount):
             before_call=(
                 partial(grace.wait_for_tool, surface, allowlist)
                 if grace is not None
-            else None
-                ),
+                else None
+            ),
         )
         super().__init__(surface_route(surface), server)
         assert isinstance(server, GatewayServer)
@@ -201,7 +201,8 @@ class _SurfaceMount(_ServerMount):
             messages.append(message)
             if message["type"] != "http.request":
                 break
-            body += message.get("body", b"")
+            if len(body) <= _MAX_PEEK_BYTES:
+                body += message.get("body", b"")
             if not message.get("more_body", False):
                 break
         if len(body) <= _MAX_PEEK_BYTES and _has_initialize(body):
