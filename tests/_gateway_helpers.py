@@ -15,9 +15,10 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from mcp.server.fastmcp import FastMCP
-from mcp.shared.memory import create_connected_server_and_client_session
+import anyio
+from mcp.shared.memory import create_client_server_memory_streams
 
-from snowline_platform.gateway import Upstream
+from snowline_platform.gateway import InstructionsSession, Upstream
 
 
 class InMemoryConnector:
@@ -31,23 +32,45 @@ class InMemoryConnector:
 
     def __init__(self, servers: dict[str, object]) -> None:
         self._servers = servers
+        # Every connect attempt's upstream URL, in order (cache-hit assertions).
+        self.connects: list[str] = []
 
     @asynccontextmanager
     async def connect(self, upstream: Upstream):
+        self.connects.append(upstream.url)
         server = self._servers.get(upstream.url)
         if server is None:
             raise ConnectionError(f"no in-memory upstream at {upstream.url!r}")
-        async with create_connected_server_and_client_session(
-            server, raise_exceptions=True
-        ) as session:
-            yield session
+        if isinstance(server, FastMCP):
+            server = server._mcp_server
+        # Same wiring as `create_connected_server_and_client_session`, but with
+        # the gateway's `InstructionsSession` so the upstream's initialize
+        # instructions are captured exactly as in production.
+        async with create_client_server_memory_streams() as (client, srv):
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(
+                    lambda: server.run(
+                        srv[0],
+                        srv[1],
+                        server.create_initialization_options(),
+                        raise_exceptions=True,
+                    )
+                )
+                try:
+                    async with InstructionsSession(*client) as session:
+                        await session.initialize()
+                        yield session
+                finally:
+                    tg.cancel_scope.cancel()
 
 
-def make_stub_plugin(name: str, tool_names: list[str]) -> FastMCP:
+def make_stub_plugin(
+    name: str, tool_names: list[str], instructions: str | None = None
+) -> FastMCP:
     """A tiny FastMCP plugin exposing `tool_names`, each an echo tool that returns
     a dict tagged with the plugin + tool (so a routed call is provably reaching
     THIS plugin's THIS tool). Stateless HTTP to match the plugin convention."""
-    mcp = FastMCP(name, stateless_http=True)
+    mcp = FastMCP(name, instructions=instructions, stateless_http=True)
 
     for tool_name in tool_names:
 

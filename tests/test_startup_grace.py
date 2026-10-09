@@ -528,3 +528,78 @@ def test_unknown_state_version_reads_as_empty(tmp_path):
     assert read_registered(path) == {}
     path.write_text("[]")
     assert read_registered(path) == {}
+
+
+async def _initialize_over_http(app):
+    async with (
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://platform",
+            timeout=httpx.Timeout(30.0),
+            follow_redirects=True,
+        ) as http,
+        streamable_http_client(
+            "http://platform/mcp", http_client=http
+        ) as (read, write, _sid),
+        ClientSession(read, write) as session,
+    ):
+        return await session.initialize()
+
+
+def test_initialize_waits_for_previously_registered_plugin(tmp_path):
+    """The post-restart grace holds `initialize` like `tools/list`, so a session
+    doesn't start with half the composed instructions (issue #251)."""
+    path = tmp_path / "registered-plugins.json"
+    write_registered(path, [_manifest("alpha"), _manifest("beta")])
+    reg = PluginRegistry()
+    reg.upsert(_manifest("alpha"))
+    app = _app(
+        reg,
+        path,
+        {
+            "http://alpha/mcp": make_stub_plugin("alpha", ["read"], "Alpha."),
+            "http://beta/mcp": make_stub_plugin("beta", ["ping"], "Beta."),
+        },
+    )
+
+    async def _main():
+        async with (
+            gateway_lifespan(app.state.gateway_mounts),
+            _startup_grace_lifespan(app),
+            anyio.create_task_group() as tg,
+        ):
+
+            async def _register_later():
+                await anyio.sleep(0.3)
+                reg.upsert(_manifest("beta"))
+
+            tg.start_soon(_register_later)
+            start = anyio.current_time()
+            result = await _initialize_over_http(app)
+            return result, anyio.current_time() - start
+
+    result, elapsed = anyio.run(_main)
+    assert elapsed >= 0.25  # held for beta
+    assert result.instructions == "## alpha\nAlpha.\n\n## beta\nBeta."
+
+
+def test_initialize_does_not_wait_once_window_is_over(tmp_path):
+    path = tmp_path / "registered-plugins.json"
+    write_registered(path, [_manifest("alpha"), _manifest("ghost")])
+    reg = PluginRegistry()
+    reg.upsert(_manifest("alpha"))
+    app = _app(
+        reg, path, {"http://alpha/mcp": make_stub_plugin("alpha", ["r"], "A.")}
+    )
+    app.state.startup_grace.window = 0.0
+    app.state.startup_grace.start()  # window already closed
+
+    async def _main():
+        async with gateway_lifespan(app.state.gateway_mounts):
+            start = anyio.current_time()
+            result = await _initialize_over_http(app)
+            return result, anyio.current_time() - start
+
+    result, elapsed = anyio.run(_main)
+    assert elapsed < 2.0
+    assert result.instructions == "## alpha\nA."
