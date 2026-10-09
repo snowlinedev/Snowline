@@ -8,6 +8,8 @@ real governance upstream end-to-end by `test_gateway_governance`."""
 
 from __future__ import annotations
 
+import logging
+
 import anyio
 
 from snowline_platform.gateway import (
@@ -499,3 +501,183 @@ def test_isolation_by_composition():
         {},
     )
     assert res.isError is True
+
+
+# ---------------------------------------------------------------------------
+# Composed server instructions (issue #251).
+# ---------------------------------------------------------------------------
+
+
+def _instr_gateway(plugins: dict[str, str | None], surface="main"):
+    """A registry with one `main`-mapped plugin per entry (insertion order =
+    registration order) and a `SurfaceGateway` over in-memory stubs."""
+    from snowline_platform.gateway import SurfaceGateway
+
+    reg = PluginRegistry()
+    servers = {}
+    for name, text in plugins.items():
+        reg.upsert(
+            PluginManifest(
+                name=name, base_url=f"http://{name}", surfaces={"/mcp": "main"}
+            )
+        )
+        servers[f"http://{name}/mcp"] = make_stub_plugin(
+            name, ["t"], instructions=text
+        )
+    connector = InMemoryConnector(servers)
+    return reg, connector, SurfaceGateway(reg, surface, connector), servers
+
+
+def test_instructions_composed_one_section_per_plugin_sorted_by_name():
+    # Registered beta-first: output order is by plugin NAME, not registration.
+    _, _, gw, _ = _instr_gateway(
+        {"beta": "Beta rules.", "alpha": "Alpha rules.", "quiet": None}
+    )
+    assert gw.composed_instructions is None  # nothing before a refresh
+    anyio.run(gw.refresh_instructions)
+    assert gw.composed_instructions == (
+        "## alpha\nAlpha rules.\n\n## beta\nBeta rules."
+    )
+
+
+def test_instructions_none_when_no_plugin_has_any():
+    _, _, gw, _ = _instr_gateway({"a": None, "b": ""})
+    anyio.run(gw.refresh_instructions)
+    assert gw.composed_instructions is None
+
+
+def test_instructions_cached_not_refetched_per_refresh_or_heartbeat():
+    reg, connector, gw, _ = _instr_gateway({"alpha": "A.", "beta": "B."})
+
+    async def _go():
+        await gw.refresh_instructions()
+        first = list(connector.connects)
+        # Heartbeat: identical re-register is a no-op, and a refresh (one per
+        # initialize) must not contact anyone.
+        reg.upsert(reg.get("alpha").manifest)
+        await gw.refresh_instructions()
+        await gw.refresh_instructions()
+        return first, list(connector.connects)
+
+    first, after = anyio.run(_go)
+    assert sorted(first) == ["http://alpha/mcp", "http://beta/mcp"]
+    assert after == first
+
+
+def test_instructions_refetched_for_a_changed_registration_only():
+    reg, connector, gw, servers = _instr_gateway({"alpha": "A1.", "beta": "B."})
+
+    async def _go():
+        await gw.refresh_instructions()
+        servers["http://alpha/mcp"] = make_stub_plugin(
+            "alpha", ["t"], instructions="A2."
+        )
+        # Same URL, other manifest content -> an "updated" registration.
+        reg.upsert(
+            PluginManifest(
+                name="alpha",
+                base_url="http://alpha",
+                surfaces={"/mcp": "main", "/shadow/mcp": "shadow"},
+            )
+        )
+        connector.connects.clear()
+        await gw.refresh_instructions()
+
+    anyio.run(_go)
+    assert connector.connects == ["http://alpha/mcp"]
+    assert gw.composed_instructions == "## alpha\nA2.\n\n## beta\nB."
+
+
+def test_instructions_new_registration_added_and_unregistered_dropped():
+    reg, _, gw, servers = _instr_gateway({"alpha": "A."})
+
+    async def _go():
+        await gw.refresh_instructions()
+        servers["http://beta/mcp"] = make_stub_plugin(
+            "beta", ["t"], instructions="B."
+        )
+        reg.upsert(
+            PluginManifest(
+                name="beta", base_url="http://beta", surfaces={"/mcp": "main"}
+            )
+        )
+        await gw.refresh_instructions()
+        both = gw.composed_instructions
+        reg.unregister("alpha")
+        await gw.refresh_instructions()
+        return both, gw.composed_instructions
+
+    both, only_beta = anyio.run(_go)
+    assert both == "## alpha\nA.\n\n## beta\nB."
+    assert only_beta == "## beta\nB."
+
+
+def test_instructions_failed_plugin_skipped_and_logged(caplog, monkeypatch):
+    from snowline_platform import gateway as gw_mod
+
+    monkeypatch.setattr(gw_mod, "CONNECT_RETRY_BACKOFFS", (0.0,))
+    _, connector, gw, servers = _instr_gateway({"alpha": "A.", "dead": "D."})
+    del servers["http://dead/mcp"]  # unreachable upstream
+    with caplog.at_level(logging.WARNING, logger="snowline_platform.gateway"):
+        anyio.run(gw.refresh_instructions)
+    assert gw.composed_instructions == "## alpha\nA."
+    assert "instructions fetch failed" in caplog.text
+    assert "http://dead/mcp" in caplog.text
+
+    # A failure is negative-cached: no re-dial on the very next initialize.
+    connector.connects.clear()
+    anyio.run(gw.refresh_instructions)
+    assert connector.connects == []
+
+
+def test_instructions_per_plugin_cap_truncates_with_marker_and_warns(caplog):
+    from snowline_platform.gateway import (
+        INSTRUCTIONS_PER_PLUGIN_MAX,
+        INSTRUCTIONS_TRUNCATION_MARKER,
+    )
+
+    _, _, gw, _ = _instr_gateway(
+        {"big": "x" * (INSTRUCTIONS_PER_PLUGIN_MAX * 2), "small": "ok"}
+    )
+    with caplog.at_level(logging.WARNING, logger="snowline_platform.gateway"):
+        anyio.run(gw.refresh_instructions)
+    out = gw.composed_instructions
+    big, small = out.split("\n\n## ")
+    body = big.removeprefix("## big\n")
+    assert body.endswith(INSTRUCTIONS_TRUNCATION_MARKER)
+    assert len(body.encode()) == INSTRUCTIONS_PER_PLUGIN_MAX
+    assert small == "small\nok"
+    assert "'big' truncated" in caplog.text
+
+
+def test_instructions_overall_cap_truncates_and_drops_the_rest(
+    caplog, monkeypatch
+):
+    from snowline_platform import gateway as gw_mod
+
+    monkeypatch.setattr(gw_mod, "INSTRUCTIONS_PER_PLUGIN_MAX", 1000)
+    monkeypatch.setattr(gw_mod, "INSTRUCTIONS_TOTAL_MAX", 2500)
+    _, _, gw, _ = _instr_gateway(
+        {n: n * 900 for n in ("a", "b", "c", "d")}  # 4 x ~900 bytes
+    )
+    with caplog.at_level(logging.WARNING, logger="snowline_platform.gateway"):
+        anyio.run(gw.refresh_instructions)
+    out = gw.composed_instructions
+    assert len(out.encode()) <= 2500
+    assert out.startswith("## a\n") and "## b\n" in out
+    assert "## d" not in out  # later plugins dropped
+    assert out.endswith(gw_mod.INSTRUCTIONS_TRUNCATION_MARKER)
+    assert "exceed 2500 bytes" in caplog.text
+    assert "omitted: d" in caplog.text
+
+
+def test_server_initialization_options_read_the_composed_cache():
+    from snowline_platform.gateway import build_surface_server
+
+    reg, connector, _, _ = _instr_gateway({"alpha": "A."})
+    server = build_surface_server(reg, "main", connector)
+    assert server.create_initialization_options().instructions is None
+    anyio.run(server.gateway.refresh_instructions)
+    assert (
+        server.create_initialization_options().instructions == "## alpha\nA."
+    )

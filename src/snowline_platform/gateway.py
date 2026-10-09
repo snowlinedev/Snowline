@@ -53,6 +53,7 @@ the whole read since it's idempotent) for the structural boundary.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
@@ -69,6 +70,22 @@ from snowline_platform.registry import PluginRegistry, PluginStatus
 log = logging.getLogger("snowline_platform.gateway")
 
 _T = TypeVar("_T")
+
+# Composed server INSTRUCTIONS (issue #251). Each plugin's MCP `instructions`
+# (its cross-tool conventions, injected into the client's context at session
+# start) is surfaced under a per-plugin heading in the surface's own
+# `initialize` result. Caps are in UTF-8 BYTES and bound what a client's context
+# pays: per plugin, then overall; anything cut is replaced by a visible marker
+# and logged at WARNING.
+INSTRUCTIONS_PER_PLUGIN_MAX = 4 * 1024
+INSTRUCTIONS_TOTAL_MAX = 16 * 1024
+INSTRUCTIONS_TRUNCATION_MARKER = "\n[... truncated by gateway ...]"
+# A successful fetch is re-used until the plugin's registration changes
+# (observer below) OR this long, whichever first — the TTL only covers a plugin
+# redeploy that kept its manifest identical (the 15s heartbeat is a no-op).
+INSTRUCTIONS_TTL = 600.0
+# A plugin that failed to answer is not re-tried on every initialize.
+INSTRUCTIONS_FAILURE_TTL = 30.0
 
 # Connect-phase retry policy (issue #58 / deploy-continuity.md §3). Module-level
 # so tests can `monkeypatch.setattr` it down to near-zero for fast retry tests.
@@ -157,6 +174,21 @@ class AbstractAsyncCM(Protocol):
     async def __aexit__(self, *exc) -> bool | None: ...
 
 
+class InstructionsSession(ClientSession):
+    """A `ClientSession` that remembers the upstream's `initialize` result
+    instructions (`ClientSession.initialize()` returns them but the connector
+    swallows the call) so the gateway can compose them (issue #251). Connectors
+    must yield this class for a plugin's instructions to be composed; a session
+    without ``server_instructions`` contributes none."""
+
+    server_instructions: str | None = None
+
+    async def initialize(self) -> types.InitializeResult:
+        result = await super().initialize()
+        self.server_instructions = result.instructions
+        return result
+
+
 class UpstreamConnector(Protocol):
     """Opens a `ClientSession` to one upstream plugin-surface.
 
@@ -191,7 +223,7 @@ class StreamableHttpConnector:
             async with streamable_http_client(
                 upstream.url, http_client=http_client
             ) as (read, write, _get_session_id):
-                async with ClientSession(read, write) as session:
+                async with InstructionsSession(read, write) as session:
                     await session.initialize()
                     yield session
 
@@ -367,6 +399,29 @@ def discover_upstreams(
     return upstreams
 
 
+@dataclass
+class _CachedInstructions:
+    """One plugin's cached instructions: `text` is None for "no instructions" OR
+    a failed fetch (`failed`), valid until `expires`."""
+
+    upstream: Upstream
+    text: str | None
+    expires: float
+    failed: bool = False
+
+
+def _cap_instructions(text: str, max_bytes: int) -> tuple[str, bool]:
+    """`text` bounded to `max_bytes` UTF-8 bytes INCLUDING the visible
+    truncation marker (cut on a character boundary). Returns
+    ``(text, was_truncated)``."""
+    raw = text.encode("utf-8")
+    if len(raw) <= max_bytes:
+        return text, False
+    marker_bytes = len(INSTRUCTIONS_TRUNCATION_MARKER.encode("utf-8"))
+    cut = raw[: max(0, max_bytes - marker_bytes)].decode("utf-8", errors="ignore")
+    return cut + INSTRUCTIONS_TRUNCATION_MARKER, True
+
+
 class SurfaceGateway:
     """Aggregates the upstreams of ONE named surface into list/call handlers.
 
@@ -397,10 +452,155 @@ class SurfaceGateway:
         self._surface = surface
         self._connector = connector
         self._allowlist = allowlist
+        # Composed-instructions state (issue #251). `composed_instructions` is
+        # read SYNCHRONOUSLY by the server's initialization options, so it is
+        # filled asynchronously beforehand by `refresh_instructions`.
+        self._instructions: dict[str, _CachedInstructions] = {}
+        self._instructions_lock = anyio.Lock()
+        self._composed: str | None = None
+        self._composed_key: tuple | None = None
+        # A registration / manifest change drops that plugin's cached entry; a
+        # no-op heartbeat re-register emits nothing (registry.upsert).
+        registry.add_observer(self._on_registry_change)
 
     @property
     def surface(self) -> str:
         return self._surface
+
+    def _on_registry_change(self, change) -> None:
+        self._instructions.pop(change.name, None)
+
+    @property
+    def composed_instructions(self) -> str | None:
+        """The current composed instructions (None = none). Cheap and sync."""
+        return self._composed
+
+    async def refresh_instructions(self) -> None:
+        """Bring the composed instructions up to date. Only upstreams with no
+        fresh cache entry (new, re-registered, expired, moved) are contacted --
+        concurrently, with `LIST_TIMEOUT` and connect retry like `list_tools`;
+        a failing one is logged and skipped. Sections are ordered by plugin
+        name. Never raises."""
+        try:
+            async with self._instructions_lock:
+                await self._refresh_instructions()
+        except Exception:  # must never fail an initialize
+            log.exception(
+                "gateway: composing instructions for surface %r failed",
+                self._surface,
+            )
+
+    async def _refresh_instructions(self) -> None:
+        upstreams = discover_upstreams(
+            self._registry, self._surface, self._allowlist
+        )
+        live = {u.plugin_name for u in upstreams}
+        for name in [n for n in self._instructions if n not in live]:
+            del self._instructions[name]
+        now = time.monotonic()
+        stale = [
+            u
+            for u in upstreams
+            if (c := self._instructions.get(u.plugin_name)) is None
+            or c.upstream != u
+            or c.expires <= now
+        ]
+
+        async def _fetch(upstream: Upstream) -> None:
+            async def _attempt() -> str | None:
+                async with self._connector.connect(upstream) as session:
+                    return getattr(session, "server_instructions", None)
+
+            try:
+                with anyio.fail_after(self.LIST_TIMEOUT):
+                    text = await _retry_transient(
+                        _attempt,
+                        upstream=upstream,
+                        surface=self._surface,
+                        what="instructions",
+                    )
+            except Exception as exc:
+                log.warning(
+                    "gateway: instructions fetch failed for upstream %s on "
+                    "surface %r (skipping): %s",
+                    upstream.url,
+                    self._surface,
+                    exc,
+                )
+                self._instructions[upstream.plugin_name] = _CachedInstructions(
+                    upstream,
+                    None,
+                    time.monotonic() + INSTRUCTIONS_FAILURE_TTL,
+                    True,
+                )
+                return
+            text = (text or "").strip() or None
+            if text is not None:
+                text, cut = _cap_instructions(text, INSTRUCTIONS_PER_PLUGIN_MAX)
+                if cut:
+                    log.warning(
+                        "gateway: instructions of plugin %r truncated to %d "
+                        "bytes on surface %r",
+                        upstream.plugin_name,
+                        INSTRUCTIONS_PER_PLUGIN_MAX,
+                        self._surface,
+                    )
+            self._instructions[upstream.plugin_name] = _CachedInstructions(
+                upstream, text, time.monotonic() + INSTRUCTIONS_TTL
+            )
+
+        if stale:
+            async with anyio.create_task_group() as tg:
+                for upstream in stale:
+                    tg.start_soon(_fetch, upstream)
+
+        sections = [
+            (name, c.text)
+            for name in sorted(live)
+            if (c := self._instructions.get(name)) is not None and c.text
+        ]
+        key = tuple(sections)
+        if key != self._composed_key:
+            self._composed_key = key
+            self._composed = self._compose(sections)
+
+    def _compose(self, sections: list[tuple[str, str]]) -> str | None:
+        """One section per plugin (``## <plugin>``) in name order, bounded to
+        `INSTRUCTIONS_TOTAL_MAX` bytes: the section that overflows is cut at a
+        visible marker and later plugins are dropped (logged at WARNING)."""
+        parts: list[str] = []
+        used = 0
+        sep = "\n\n"
+        for i, (name, text) in enumerate(sections):
+            part = f"## {name}\n{text}"
+            lead = len(sep) if parts else 0
+            cost = len(part.encode("utf-8")) + lead
+            if used + cost <= INSTRUCTIONS_TOTAL_MAX:
+                parts.append(part)
+                used += cost
+                continue
+            room = INSTRUCTIONS_TOTAL_MAX - used - lead
+            omitted = [n for n, _ in sections[i + 1 :]]
+            header = f"## {name}\n"
+            if room > len(header) + len(INSTRUCTIONS_TRUNCATION_MARKER):
+                part, _ = _cap_instructions(part, room)
+                parts.append(part)
+            else:
+                omitted.insert(0, name)
+                if parts:
+                    parts[-1] += INSTRUCTIONS_TRUNCATION_MARKER
+                else:
+                    parts.append(INSTRUCTIONS_TRUNCATION_MARKER.strip())
+            log.warning(
+                "gateway: composed instructions for surface %r exceed %d "
+                "bytes; truncated at plugin %r (omitted: %s)",
+                self._surface,
+                INSTRUCTIONS_TOTAL_MAX,
+                name,
+                ", ".join(omitted) or "none",
+            )
+            break
+        return sep.join(parts) or None
 
     async def list_tools(self) -> list[types.Tool]:
         """Merged union of the upstreams' tool lists, each tool NAMESPACED by its
@@ -554,6 +754,27 @@ def _namespace_tool(plugin_name: str, tool: types.Tool) -> types.Tool:
     )
 
 
+class GatewayServer(Server):
+    """A low-level `Server` whose `instructions` are the gateway's composed
+    upstream instructions (issue #251). The SDK reads `instructions` in the
+    SYNC `create_initialization_options()` (per connection when stateless), so
+    the value is a live read of the gateway's cache -- filled beforehand by
+    `SurfaceGateway.refresh_instructions` in the async layer (`gateway_app`)."""
+
+    def __init__(self, name: str, gateway: SurfaceGateway) -> None:
+        super().__init__(name)
+        self.gateway = gateway
+
+    @property
+    def instructions(self) -> str | None:  # type: ignore[override]
+        gateway = self.__dict__.get("gateway")
+        return gateway.composed_instructions if gateway is not None else None
+
+    @instructions.setter
+    def instructions(self, value: str | None) -> None:
+        pass  # Server.__init__ assigns None; the composition is the only source
+
+
 def build_surface_server(
     registry: PluginRegistry,
     surface: str,
@@ -583,7 +804,7 @@ def build_surface_server(
     Server is served over streamable-HTTP by a `StreamableHTTPSessionManager`
     mounted on the platform app (see `gateway_app`)."""
     gateway = SurfaceGateway(registry, surface, connector, allowlist)
-    server: Server = Server(f"snowline-{surface}")
+    server: Server = GatewayServer(f"snowline-{surface}", gateway)
 
     # The positional-only, exactly-typed `req` makes the SDK pass the request
     # through (`create_call_wrapper`): a real client list carries a request, the
@@ -622,6 +843,8 @@ __all__ = [
     "UpstreamConnector",
     "StreamableHttpConnector",
     "SurfaceGateway",
+    "GatewayServer",
+    "InstructionsSession",
     "GatewayError",
     "discover_upstreams",
     "build_surface_server",

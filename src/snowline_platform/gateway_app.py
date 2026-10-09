@@ -33,6 +33,8 @@ the platform app's lifespan and torn down on shutdown.
 
 from __future__ import annotations
 
+import json
+import logging
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 from functools import partial
@@ -46,6 +48,7 @@ from snowline_platform import config
 from snowline_platform.gateway import (
     ROOT_SURFACE,
     StreamableHttpConnector,
+    GatewayServer,
     UpstreamConnector,
     build_surface_server,
 )
@@ -66,6 +69,11 @@ __all__ = [
     "mount_gateway",
     "gateway_lifespan",
 ]
+
+log = logging.getLogger("snowline_platform.gateway_app")
+
+# Bodies above this are not parsed for `initialize` (a real initialize is tiny).
+_MAX_PEEK_BYTES = 1024 * 1024
 
 # DNS-rebinding protection off on the streamable-HTTP transport: the gateway sits
 # behind the platform trust gate (reached on the tailnet or loopback, per
@@ -116,6 +124,17 @@ class _ServerMount:
         return self._manager.run()
 
 
+def _has_initialize(body: bytes) -> bool:
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return False
+    items = payload if isinstance(payload, list) else [payload]
+    return any(
+        isinstance(m, dict) and m.get("method") == "initialize" for m in items
+    )
+
+
 class _SurfaceMount(_ServerMount):
     """A `_ServerMount` for one NAMED platform surface: the low-level server is
     the gateway aggregator (`build_surface_server`) for that surface."""
@@ -129,28 +148,75 @@ class _SurfaceMount(_ServerMount):
         grace: StartupGrace | None = None,
     ) -> None:
         self.surface = surface
-        super().__init__(
-            surface_route(surface),
-            build_surface_server(
-                registry,
-                surface,
-                connector,
-                allowlist,
-                # Post-restart grace (issue #240): this surface's list waits only
-                # for the previously-registered plugins that would serve IT.
-                before_list=(
-                    partial(grace.wait, surface, allowlist)
-                    if grace is not None
-                    else None
-                ),
-                # A call waits only for ITS plugin, never the whole surface.
-                before_call=(
-                    partial(grace.wait_for_tool, surface, allowlist)
-                    if grace is not None
-                    else None
-                ),
+        server = build_surface_server(
+            registry,
+            surface,
+            connector,
+            allowlist,
+            # Post-restart grace (issue #240): this surface's list waits only
+            # for the previously-registered plugins that would serve IT.
+            before_list=(
+                partial(grace.wait, surface, allowlist)
+                if grace is not None
+                else None
+            ),
+            # A call waits only for ITS plugin, never the whole surface.
+            before_call=(
+                partial(grace.wait_for_tool, surface, allowlist)
+                if grace is not None
+                else None
             ),
         )
+        super().__init__(surface_route(surface), server)
+        assert isinstance(server, GatewayServer)
+        self._gateway = server.gateway
+        # Post-restart grace for `initialize` (issue #251), same wait as list.
+        self._grace_wait = (
+            partial(grace.wait, surface, allowlist) if grace is not None else None
+        )
+
+    async def _prepare_initialize(self) -> None:
+        """Before an `initialize` is served: hold for the startup grace (so a
+        session doesn't start with half the instructions), then bring the
+        composed instructions up to date (cached per plugin -- only new or
+        re-registered plugins are contacted). Never raises."""
+        try:
+            if self._grace_wait is not None:
+                await self._grace_wait()
+        except Exception:
+            log.exception("gateway: initialize grace wait failed")
+        await self._gateway.refresh_instructions()
+
+    async def asgi(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Peek POST bodies for a JSON-RPC `initialize` -- the only place the
+        grace + async instructions refresh can run, since the SDK builds
+        initialization options synchronously -- then replay the body."""
+        if scope["type"] != "http" or scope.get("method") != "POST":
+            await super().asgi(scope, receive, send)
+            return
+        messages: list[dict] = []
+        body = b""
+        while True:
+            message = await receive()
+            messages.append(message)
+            if message["type"] != "http.request":
+                break
+            if len(body) <= _MAX_PEEK_BYTES:
+                body += message.get("body", b"")
+            if not message.get("more_body", False):
+                break
+        if len(body) <= _MAX_PEEK_BYTES and _has_initialize(body):
+            await self._prepare_initialize()
+
+        replay = iter(messages)
+
+        async def _receive():
+            try:
+                return next(replay)
+            except StopIteration:
+                return await receive()
+
+        await super().asgi(scope, _receive, send)
 
 
 def build_surface_mounts(

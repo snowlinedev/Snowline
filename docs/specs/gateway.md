@@ -131,6 +131,39 @@ Result: `http://<host>:8850/core/mcp` serves governance-without-PM — governanc
 projected `main` tools — over the tailnet while `/mcp` stays the full composed
 daily driver.
 
+## 2b. Composed server instructions
+
+A plugin's MCP server `instructions` (its cross-tool conventions, injected into
+the client's context at session start) must reach gateway clients, so each
+surface's `initialize` result carries instructions COMPOSED from its live
+upstreams (issue #251):
+
+- **Shape.** One section per plugin, headed `## <plugin>`, sections joined by a
+  blank line, in plugin-NAME order (the same order as `discover_upstreams`, not
+  registration order). A plugin with no instructions contributes nothing; a
+  plugin that fails to answer is skipped and logged (WARNING). If no plugin has
+  any, `instructions` is absent.
+- **Source.** Each upstream's own `initialize` result (`InitializeResult.
+  instructions`), captured by the gateway's `InstructionsSession`.
+- **Caching.** Per plugin, per surface; a surface's `initialize` does NOT fan
+  out. An entry is refreshed only when the plugin's registration is created,
+  updated or removed (registry observer; the 15s heartbeat is a no-op), when
+  its upstream address changes, or when the entry is older than
+  `INSTRUCTIONS_TTL` (10 min, covering a redeploy with an unchanged manifest).
+  A failed fetch is negative-cached for `INSTRUCTIONS_FAILURE_TTL` (30s).
+- **Where it runs.** The SDK builds initialization options synchronously, so
+  `GatewayServer.instructions` is a live read of the gateway's composed cache.
+  The cache is filled asynchronously by `SurfaceGateway.refresh_instructions`,
+  which the surface mount's ASGI layer (`gateway_app`) awaits whenever a POST
+  carries a JSON-RPC `initialize`.
+- **Startup grace.** That same `initialize` hook first awaits the surface's
+  `StartupGrace.wait` (same bounded wait as `tools/list`, §2 / issue #240), so
+  a session never starts with half the instructions after a restart.
+- **Caps** (UTF-8 bytes, module constants in `gateway`):
+  `INSTRUCTIONS_PER_PLUGIN_MAX` = 4 KiB, `INSTRUCTIONS_TOTAL_MAX` = 16 KiB.
+  Overflow is cut at a visible `INSTRUCTIONS_TRUNCATION_MARKER`; plugins that
+  no longer fit are dropped; each truncation is logged at WARNING.
+
 ## 3. UI composition
 
 Each plugin's manifest declares its UI; the gateway serves/proxies it under the

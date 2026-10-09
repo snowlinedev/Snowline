@@ -342,3 +342,43 @@ def test_mount_ordering_is_prefix_specific_not_len():
     mount_gateway(app, mounts)
     assert app.mounted[-1] == "/mcp"
     assert app.mounted.index("/a/b/mcp") < app.mounted.index("/shadow/mcp")
+
+
+def test_initialize_returns_composed_upstream_instructions_over_http():
+    reg = PluginRegistry()
+    for name in ("beta", "alpha", "quiet"):
+        reg.upsert(
+            PluginManifest(
+                name=name, base_url=f"http://{name}", surfaces={"/mcp": "main"}
+            )
+        )
+    connector = InMemoryConnector(
+        {
+            "http://alpha/mcp": make_stub_plugin("alpha", ["a"], "Alpha rules."),
+            "http://beta/mcp": make_stub_plugin("beta", ["b"], "Beta rules."),
+            "http://quiet/mcp": make_stub_plugin("quiet", ["q"]),
+        }
+    )
+    app = _app_with(reg, connector)
+
+    async def _init_once():
+        async with _asgi_client(app) as http_client:
+            async with streamable_http_client(
+                "http://platform/mcp", http_client=http_client
+            ) as (read, write, _sid):
+                async with ClientSession(read, write) as session:
+                    return await session.initialize()
+
+    async def _go():
+        async with gateway_lifespan(app.state.gateway_mounts):
+            first = await _init_once()
+            connector.connects.clear()
+            # A second session re-uses the cache: no upstream is dialed.
+            second = await _init_once()
+            return first, second, list(connector.connects)
+
+    first, second, dialed = anyio.run(_go)
+    expected = "## alpha\nAlpha rules.\n\n## beta\nBeta rules."
+    assert first.instructions == expected
+    assert second.instructions == expected
+    assert dialed == []
