@@ -60,31 +60,11 @@ PLATFORM_PLUGIN_NAME = "platform"
 PLATFORM_MCP_PATH = "/platform/mcp"
 
 _INSTRUCTIONS = """\
-This is the Snowline PLATFORM surface — the platform's OWN identity primitives, \
-scopes and milestones, served natively (not by any plugin). SCOPES are the \
-universal addressing tree (`owner/repo`, initiatives, components): `list_scopes`, \
-`resolve_scope` (non-mutating lookup — never auto-creates), `scope_tree`, \
-`scope_ancestors` (the isolation-halting applicability chain a reader inherits \
-UPWARD), `create_scope` / `update_scope`. MILESTONES are the portfolio's \
-cross-plugin release-correlation keys, addressed `<anchor>/<name>`: \
-`create_milestone` (the only mint path — born `planned`), `resolve_milestone` \
-(shorthand is legitimate input, storage is canonical, unknown hard-fails with \
-suggestions and NEVER mints), `list_milestones`, the lifecycle verbs \
-`activate_milestone`/`deactivate_milestone`/`achieve_milestone`/\
-`cancel_milestone` (explicit, never automatic; activate a release when work on it \
-STARTS — an active milestone is its scope's current release), `get_milestone` (audit read — returns a merge tombstone as itself), \
-`update_milestone` (outcome/target_date only, `""` clears), and \
-`milestone_transitions` (the append-only lifecycle log). Drift reconciliation: \
-`merge_milestone` aliases one milestone into another (state-compatible only; the \
-tombstone reserves its name forever), `milestone_aliases` reads a target's \
-tombstone closure, and `add_milestone_dependency`/`remove_milestone_dependency`/\
-`milestone_dependencies` manage the cycle-guarded, readiness-only dependency DAG \
-(cross-anchor edges allowed). Release line (ship order per anchor, independent \
-of dependencies): `place_in_line` / `remove_from_line`, read with \
-`list_milestones(anchor=, in_line=True)`. Replication conflicts (lifecycle \
-contradictions between partitions; empty in steady state): \
-`list_milestone_conflicts` / `resolve_milestone_conflict`. Slugs and names are case-insensitive on input and \
-stored canonical-lowercase.\
+Snowline PLATFORM surface: scopes (the `owner/repo` addressing tree; \
+`list_scopes`, `resolve_scope`) and the milestone registry (`list_milestones`, \
+`create_milestone`). Milestones are releases: activate one when work on it starts, \
+and the release line answers what's next. Replication conflicts: \
+`list_milestone_conflicts`.\
 """
 
 # DNS-rebinding protection off on the streamable-HTTP transport, matching the
