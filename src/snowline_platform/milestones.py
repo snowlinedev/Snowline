@@ -532,14 +532,19 @@ def create(
             f"milestone {anchor_slug + '/' + name!r} already exists"
         )
 
+    # Both LWW registers (§9) are born at the same instant: the descriptive
+    # clock (`lww_*`) and the lifecycle clock (`lifecycle_*`).
+    born, src = _now(), _local_source_id()
     m = Milestone(
         anchor_scope_id=anchor_scope.id,
         name=name,
         outcome=outcome,
         target_date=target_date,
         status="planned",
-        lww_authored_at=_now(),
-        lww_source_id=_local_source_id(),
+        lww_authored_at=born,
+        lww_source_id=src,
+        lifecycle_authored_at=born,
+        lifecycle_source_id=src,
     )
     session.add(m)
     try:
@@ -591,19 +596,21 @@ def _transition(
     *,
     clear: bool = False,
 ) -> Milestone:
-    """Apply one lifecycle transition + stamp the §6 LWW clock + emit
-    `milestone.transitioned` (§9). `stamp` is the `*_at` column to set — or, with
-    `clear=True` (`deactivate`), the column to reset to NULL. The
-    transition's `authored_at` == the row's `lww_authored_at` == the emitted
-    event's `authored_at`, all one instant, so a peer's LWW comparison and its
-    illegal-history reconstruction see the identical clock this instance did."""
+    """Apply one lifecycle transition + stamp the LIFECYCLE register's LWW clock
+    + emit `milestone.transitioned` (§9). `stamp` is the `*_at` column to set —
+    or, with `clear=True` (`deactivate`), the column to reset to NULL. The
+    transition's `authored_at` == the row's `lifecycle_authored_at` == the
+    emitted event's `authored_at`, all one instant, so a peer's LWW comparison
+    and its illegal-history reconstruction see the identical clock this instance
+    did. The DESCRIPTIVE clock (`lww_authored_at`) is NOT advanced — a
+    transition does not touch outcome/target_date/line_rank (#247)."""
     frm = m.status
     now = _now()
     src = _local_source_id()
     m.status = to_status
     setattr(m, stamp, None if clear else now)
-    m.lww_authored_at = now
-    m.lww_source_id = src
+    m.lifecycle_authored_at = now
+    m.lifecycle_source_id = src
     # The §4 warnings are computed AT the transition and PERSISTED on its log
     # row (QA 6396993e) — the response reads the same list, and later audits
     # see exactly what the caller was told at the moment of the act.
@@ -721,8 +728,9 @@ def update(
 ) -> Milestone:
     """Modify display fields — `outcome` / `target_date` — NEVER identity (§4).
     A provided value of `None` CLEARS the field; omitting the argument leaves it
-    unchanged. A REAL change stamps the §6 LWW clock + emits `milestone.updated`
-    (§9); a no-op call (nothing provided, or values equal to what is stored)
+    unchanged. A REAL change stamps the DESCRIPTIVE register's §6 LWW clock +
+    emits `milestone.updated` (§9) — never the lifecycle clock, and a peer's
+    apply of the event never moves status/stamps (#247); a no-op call (nothing provided, or values equal to what is stored)
     stamps and emits NOTHING — a content-free write must not advance the LWW
     clock, or it could shadow a genuine concurrent peer update. Raises
     `MilestoneNotFoundError` if unknown."""
@@ -754,7 +762,8 @@ def update(
 
 
 def _stamp(m: Milestone) -> None:
-    """Advance the row's §6 LWW clock for a local mutable-state write."""
+    """Advance the row's DESCRIPTIVE §6 LWW clock for a local descriptive write
+    (outcome / target_date / line_rank — never lifecycle, #247)."""
     m.lww_authored_at = _now()
     m.lww_source_id = _local_source_id()
 
@@ -1347,7 +1356,15 @@ def to_replication_payload(milestone: Milestone) -> dict:
     """The `milestone.created` / `milestone.updated` event body — FULL ROW STATE
     keyed by the canonical address (§9). Carries everything apply needs to
     reconstruct the row: the anchor slug (re-resolved to a local `anchor_scope_id`
-    at apply), the name, the mutable fields, and the `authored_at` LWW stamp."""
+    at apply), the name, the mutable fields, the `authored_at` LWW stamp, and the
+    two per-register clocks (#247): `descriptive_authored_at` (outcome /
+    target_date / line_rank) and `lifecycle_authored_at` (status + `*_at`).
+
+    `authored_at` keeps its pre-#247 meaning for old receivers — the descriptive
+    clock on created/updated, the transition instant on transitioned. The
+    lifecycle keys stay on `milestone.updated` too, so a pre-#247 receiver
+    (whose apply requires them) keeps working; a current receiver IGNORES them on
+    `updated` — lifecycle only moves on lifecycle events (§9)."""
     return {
         "address": address_of(milestone),
         "anchor": milestone.anchor.slug,
@@ -1365,9 +1382,13 @@ def to_replication_payload(milestone: Milestone) -> dict:
         ),
         # Release-line rank as a wire string (release-line.md §2.3). Apply treats
         # an ABSENT key as "preserve local" (old-peer safety) — see
-        # `_write_row_state`.
+        # `_write_descriptive`.
         "line_rank": fracrank.to_wire(milestone.line_rank),
         "authored_at": _iso(milestone.lww_authored_at),
+        # Per-register clocks (#247, §9). Apply falls back to `authored_at`
+        # when a key is absent (a pre-#247 peer).
+        "descriptive_authored_at": _iso(milestone.lww_authored_at),
+        "lifecycle_authored_at": _iso(milestone.lifecycle_authored_at),
     }
 
 
@@ -1458,31 +1479,43 @@ def _parse_date(value: str | None) -> date | None:
     return date.fromisoformat(value) if value else None
 
 
-def _lww_incoming(payload: dict, envelope: dict) -> tuple[datetime, str]:
-    """The incoming event's LWW key `(authored_at, source_id)` — `source_id` from
-    the ENVELOPE (`source`), breaking an authored-at tie (§6)."""
-    return (
-        _parse_dt(payload["authored_at"]) or datetime.min,
-        envelope.get("source") or "",
-    )
-
-
 def _lww_local(m: Milestone) -> tuple[datetime, str]:
-    """The local row's LWW key. A NULL clock (a pre-replication row) sorts lowest,
-    so any authored incoming event wins over it."""
+    """The local row's DESCRIPTIVE-register LWW key (also the merge-pointer clock).
+    A NULL clock (a pre-replication row) sorts lowest, so any authored incoming
+    event wins over it."""
     return (m.lww_authored_at or datetime.min, m.lww_source_id or "")
 
 
-def _write_row_state(m: Milestone, payload: dict, envelope: dict) -> None:
-    """Overwrite the row's MUTABLE state from a full-row payload + advance the LWW
-    clock (§6). Never touches identity (`anchor_scope_id`/`name`) or the tombstone
-    pointer (`merged_into_id` is owned by `milestone.merged` apply)."""
+def _lifecycle_local(m: Milestone) -> tuple[datetime, str]:
+    """The local row's LIFECYCLE-register LWW key (#247). NULL sorts lowest."""
+    return (m.lifecycle_authored_at or datetime.min, m.lifecycle_source_id or "")
+
+
+def _register_stamp(payload: dict, key: str) -> datetime | None:
+    """An incoming payload's per-register clock (`descriptive_authored_at` /
+    `lifecycle_authored_at`), falling back to `authored_at` when the key is
+    absent or null — a pre-#247 peer carries one whole-row clock only."""
+    return _parse_dt(payload.get(key)) or _parse_dt(payload["authored_at"])
+
+
+# Which register(s) each full-row event may move on an EXISTING row (§9, #247):
+# lifecycle (status + `*_at`) moves only on lifecycle events, descriptive
+# (outcome / target_date / line_rank) only on created/updated. A `created` seeds
+# both. An INSERT (the row is new here) always seeds both, from any event.
+_REGISTERS = {
+    EVENT_MILESTONE_CREATED: (True, True),  # (descriptive, lifecycle)
+    EVENT_MILESTONE_UPDATED: (True, False),
+    EVENT_MILESTONE_TRANSITIONED: (False, True),
+}
+
+
+def _write_descriptive(m: Milestone, payload: dict, envelope: dict) -> None:
+    """Overwrite the DESCRIPTIVE register (outcome / target_date / line_rank) +
+    advance its clock (§6). Never touches identity (`anchor_scope_id`/`name`) or
+    the tombstone pointer (`merged_into_id` is owned by `milestone.merged`
+    apply)."""
     m.outcome = payload["outcome"]
-    m.status = payload["status"]
     m.target_date = _parse_date(payload["target_date"])
-    m.activated_at = _parse_dt(payload["activated_at"])
-    m.achieved_at = _parse_dt(payload["achieved_at"])
-    m.cancelled_at = _parse_dt(payload["cancelled_at"])
     # Release-line rank, OLD-PEER SAFE (release-line.md §2.3): a payload WITHOUT
     # the `line_rank` key comes from a peer that predates the field, so the
     # local value is PRESERVED — only an explicit null clears. Otherwise an
@@ -1491,15 +1524,31 @@ def _write_row_state(m: Milestone, payload: dict, envelope: dict) -> None:
         m.line_rank = fracrank.from_wire(payload["line_rank"])
     if m.merged_into_id is not None:
         m.line_rank = None  # a tombstone is never in a line (§2.2 merge rule)
-    m.lww_authored_at = _parse_dt(payload["authored_at"])
+    m.lww_authored_at = _register_stamp(payload, "descriptive_authored_at")
     m.lww_source_id = envelope.get("source")
+
+
+def _write_lifecycle(m: Milestone, payload: dict, envelope: dict) -> None:
+    """Overwrite the LIFECYCLE register (status + the `*_at` stamps) + advance
+    its own clock (§6, #247)."""
+    m.status = payload["status"]
+    m.activated_at = _parse_dt(payload["activated_at"])
+    m.achieved_at = _parse_dt(payload["achieved_at"])
+    m.cancelled_at = _parse_dt(payload["cancelled_at"])
+    m.lifecycle_authored_at = _register_stamp(payload, "lifecycle_authored_at")
+    m.lifecycle_source_id = envelope.get("source")
 
 
 def _upsert_row(session: Session, envelope: dict) -> Milestone:
     """Address-keyed upsert of a full-row event (§9): re-resolve the anchor scope
-    by SLUG, then insert (new) or LWW-converge (existing). A missing anchor scope
-    raises the retryable `MilestoneAnchorPendingError`. On an LWW loss the local
-    row is kept untouched — and NEVER parked (§9)."""
+    by SLUG, then insert (new — seeds BOTH registers) or converge an existing row
+    PER REGISTER (#247): each register the event type may move (`_REGISTERS`) is
+    LWW-compared against its own clock and written only on a win. So an `updated`
+    never moves lifecycle — including a pre-#247 peer's, which still carries a
+    (possibly stale) status — and a `transitioned` never moves descriptive
+    fields. A missing anchor scope raises the retryable
+    `MilestoneAnchorPendingError`. On an LWW loss the register is kept untouched —
+    and NEVER parked (§9)."""
     payload = envelope["payload"]
     anchor = scopes.resolve(session, payload["anchor"])
     if anchor is None:
@@ -1510,12 +1559,23 @@ def _upsert_row(session: Session, envelope: dict) -> Milestone:
     m = _by_anchor_name(session, anchor.id, payload["name"])
     if m is None:
         m = Milestone(anchor_scope_id=anchor.id, name=payload["name"])
-        _write_row_state(m, payload, envelope)
+        _write_descriptive(m, payload, envelope)
+        _write_lifecycle(m, payload, envelope)
         session.add(m)
         session.flush()
         return m
-    if _lww_incoming(payload, envelope) > _lww_local(m):
-        _write_row_state(m, payload, envelope)
+    descriptive, lifecycle = _REGISTERS[envelope["event_type"]]
+    source = envelope.get("source") or ""
+    changed = False
+    incoming = _register_stamp(payload, "descriptive_authored_at") or datetime.min
+    if descriptive and (incoming, source) > _lww_local(m):
+        _write_descriptive(m, payload, envelope)
+        changed = True
+    incoming = _register_stamp(payload, "lifecycle_authored_at") or datetime.min
+    if lifecycle and (incoming, source) > _lifecycle_local(m):
+        _write_lifecycle(m, payload, envelope)
+        changed = True
+    if changed:
         session.flush()
     return m
 
@@ -1656,8 +1716,9 @@ def _flag_unreconciled(
 
 
 def _apply_transitioned(session: Session, envelope: dict) -> None:
-    """Apply `milestone.transitioned` (§9): LWW-converge the row from full state,
-    ALWAYS append the transition to the log (loser included), then run the §4
+    """Apply `milestone.transitioned` (§9): LWW-converge the LIFECYCLE register
+    against its own clock (the descriptive fields in the payload are ignored on
+    an existing row, #247), ALWAYS append the transition to the log (loser included), then run the §4
     illegal-history check. Converges — never parks on LWW loss."""
     payload = envelope["payload"]
     m = _upsert_row(session, envelope)
