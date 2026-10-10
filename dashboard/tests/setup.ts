@@ -471,6 +471,7 @@ export const FIXTURES: Record<string, unknown> = {
       { name: "core", route: "/core/mcp", allowlist: ["governance"], plugins: ["governance"] },
     ],
   },
+  "/health": { status: "ok", milestones: { conflicts: 0 } },
   "/scopes/tree": {
     tree: [
       {

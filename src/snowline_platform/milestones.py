@@ -1842,27 +1842,161 @@ def apply_milestone_event(session: Session, envelope: dict) -> None:
         )
 
 
-# --- unreconciled state read (§9) -------------------------------------------
+# --- unreconciled state read + disposition (§9) ----------------------------
+
+DISPOSITIONS = ("keep_row", "replay_transition", "dismiss")
+
+# The verb that lands a milestone on a given status — `replay_transition` goes
+# through these so a replay is an ordinary, replicated, freshly-stamped transition.
+_VERB_FOR_STATUS = {
+    "active": "activate",
+    "planned": "deactivate",
+    "achieved": "achieve",
+    "cancelled": "cancel",
+}
 
 
-def list_unreconciled(session: Session) -> list[dict]:
+class UnreconciledNotFoundError(LookupError):
+    """No unreconciled flag with that id (404)."""
+
+
+class UnreconciledResolvedError(ValueError):
+    """The flag is already closed (409)."""
+
+
+def _unreconciled_row(u: MilestoneUnreconciled) -> dict:
+    return {
+        "id": str(u.id),
+        "milestone": address_of(u.milestone),
+        "reason": u.reason,
+        "detail": u.detail,
+        "created_at": _iso(u.created_at),
+        "resolved_at": _iso(u.resolved_at),
+        "disposition": u.disposition,
+        "resolution_reason": u.resolution_reason,
+        "actor": u.actor,
+    }
+
+
+def list_unreconciled(
+    session: Session,
+    anchor: str | None = None,
+    include_resolved: bool = False,
+) -> list[dict]:
     """Every first-class unreconciled milestone row, oldest first (§9) — the
     agent-triage read (the milestone analogue of governance's unreconciled
     decisions, and of the replication parked-events read). An empty list is the
     standing invariant to watch. Flags whose move the current legality table
-    allows (written by an older build) are omitted — see `_flag_now_legal`."""
+    allows (written by an older build) are omitted — see `_flag_now_legal` — and
+    so are CLOSED flags unless `include_resolved`. `anchor` subtree-filters like
+    `list_milestones`."""
+    anchor_slug = canonical_slug(anchor) if anchor is not None else None
     rows = session.scalars(
         select(MilestoneUnreconciled).order_by(
             MilestoneUnreconciled.created_at, MilestoneUnreconciled.id
         )
     )
-    return [
-        {
-            "milestone": address_of(u.milestone),
-            "reason": u.reason,
-            "detail": u.detail,
-            "created_at": _iso(u.created_at),
-        }
-        for u in rows
-        if not _flag_now_legal(u)
-    ]
+    out = []
+    for u in rows:
+        if _flag_now_legal(u):
+            continue
+        if u.resolved_at is not None and not include_resolved:
+            continue
+        a = u.milestone.anchor.slug
+        if anchor_slug is not None and not (
+            a == anchor_slug or a.startswith(anchor_slug + "/")
+        ):
+            continue
+        out.append(_unreconciled_row(u))
+    return out
+
+
+def count_unreconciled(session: Session) -> int:
+    """Open (unresolved, still-illegal) flag count — what `/health` carries."""
+    return len(list_unreconciled(session))
+
+
+def sweep_now_legal_flags(session: Session) -> int:
+    """Delete every stored flag `_flag_now_legal` accepts (written by pre-
+    `deactivate` peers) — the one-time startup sweep. Idempotent: a second run
+    finds nothing. Returns the number deleted."""
+    n = 0
+    for u in session.scalars(select(MilestoneUnreconciled)):
+        if _flag_now_legal(u):
+            session.delete(u)
+            n += 1
+    session.flush()
+    return n
+
+
+def resolve_unreconciled(
+    session: Session,
+    flag_id: str,
+    disposition: str,
+    reason: str,
+    actor: str | None = None,
+) -> dict:
+    """Close an unreconciled flag with a recorded disposition (§9):
+
+    - `keep_row` — accept the applied row as truth; close the flag.
+    - `replay_transition` — re-apply the log's LAST transition's target
+      status as a NEW transition authored now, through the normal verb path
+      (fresh lifecycle stamp, log row, replicated `milestone.transitioned`),
+      then close the flag. Rejected (409, flag stays open) when the row already
+      sits at that status or the move is illegal from the row's status.
+    - `dismiss` — close the flag with no row change.
+
+    `reason` is REQUIRED for every disposition. The closed flag stays as LOCAL
+    triage history (not replicated) and still dedupes re-detection of the same
+    move."""
+    if disposition not in DISPOSITIONS:
+        raise InvalidMilestoneFieldError(
+            f"unknown disposition {disposition!r} — one of {list(DISPOSITIONS)}"
+        )
+    if not reason or not reason.strip():
+        raise InvalidMilestoneFieldError(
+            "resolving a conflict requires a reason — the disposition must "
+            "record why"
+        )
+    try:
+        uid = uuid.UUID(str(flag_id))
+    except ValueError:
+        raise UnreconciledNotFoundError(f"no conflict {flag_id!r}") from None
+    u = session.get(MilestoneUnreconciled, uid)
+    if u is None:
+        raise UnreconciledNotFoundError(f"no conflict {flag_id!r}")
+    if u.resolved_at is not None:
+        raise UnreconciledResolvedError(
+            f"conflict {flag_id} is already resolved ({u.disposition})"
+        )
+    if disposition == "replay_transition":
+        m = u.milestone
+        last = session.scalar(
+            select(MilestoneTransition)
+            .where(MilestoneTransition.milestone_id == m.id)
+            .order_by(
+                MilestoneTransition.authored_at.desc(),
+                MilestoneTransition.source_id.desc(),
+            )
+            .limit(1)
+        )
+        target = last.to_status if last is not None else None
+        verb = _VERB_FOR_STATUS.get(target)
+        if verb is None:
+            raise InvalidMilestoneFieldError(
+                f"conflict {flag_id} carries no replayable transition"
+            )
+        if m.status == target:
+            raise IllegalTransitionError(
+                f"{address_of(m)!r} is already {target!r} — nothing to replay "
+                "(use keep_row or dismiss)"
+            )
+        # Raises IllegalTransitionError, leaving the flag open, if the move is
+        # not legal from the row's current status.
+        globals()[verb](session, address_of(m), reason=reason)
+    u.resolved_at = _now()
+    u.disposition = disposition
+    u.resolution_reason = reason
+    u.actor = actor
+    session.flush()
+    return _unreconciled_row(u)

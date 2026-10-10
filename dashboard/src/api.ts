@@ -114,6 +114,15 @@ async function get<T>(path: string): Promise<T> {
   return (await resp.json()) as T;
 }
 
+/** Milestone replication conflicts awaiting triage, from the platform `/health`
+ * `milestones.conflicts` field (milestones.md section 9, #248). Failure-tolerant:
+ * a missing/failed health read is "unknown", never an error state; the attention
+ * row only renders for a positive count. */
+export const fetchMilestoneConflicts = (): Promise<number> =>
+  get<{ milestones?: { conflicts?: number | null } }>("/health")
+    .then((b) => b.milestones?.conflicts ?? 0)
+    .catch(() => 0);
+
 export const fetchPlugins = () =>
   get<{ plugins: PluginEntry[] }>("/plugins").then((b) => b.plugins);
 export const fetchSurfaces = () =>

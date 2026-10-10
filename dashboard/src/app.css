@@ -1249,6 +1249,19 @@ textarea.page-action-input {
   overflow-wrap: anywhere;
 }
 
+/* attention row: a triage task, amber like a degraded status (not a fault) */
+.attention-row {
+  margin: 0 0 var(--space-4);
+  padding: var(--space-2) var(--space-3);
+  border-left: 4px solid var(--status-degraded);
+  color: var(--ink-secondary);
+}
+
+.attention-row a {
+  color: var(--status-degraded);
+  font-weight: 600;
+}
+
 /* scope tree */
 .tree ul {
   list-style: none;

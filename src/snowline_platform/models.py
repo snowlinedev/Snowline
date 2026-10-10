@@ -253,6 +253,12 @@ class MilestoneUnreconciled(Base):
     created_at: Mapped[datetime] = mapped_column(
         default=_utcnow, server_default=func.timezone("utc", func.now())
     )
+    # Triage disposition (milestones.md §9, #248). LOCAL state, never replicated.
+    # `reason` above is the flag's own text; the disposition's is `resolution_reason`.
+    resolved_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    disposition: Mapped[str | None] = mapped_column(String, nullable=True)
+    resolution_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    actor: Mapped[str | None] = mapped_column(String, nullable=True)
 
     milestone: Mapped["Milestone"] = relationship()
 

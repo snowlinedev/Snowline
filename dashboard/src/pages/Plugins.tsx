@@ -1,4 +1,4 @@
-import { fetchPlugins } from "../api";
+import { fetchMilestoneConflicts, fetchPlugins } from "../api";
 import { Card, KindTable, PendingNote, PluginStatusCell } from "../kinds/kinds";
 import { Layout } from "../shell/Layout";
 import { useData } from "../useData";
@@ -6,8 +6,18 @@ import { useData } from "../useData";
 
 export function Plugins() {
   const plugins = useData(fetchPlugins, 10);
+  const conflicts = useData(fetchMilestoneConflicts, 30);
+  const n = conflicts.state === "ready" ? conflicts.data : 0;
   return (
     <Layout title="Plugins">
+      {n > 0 && (
+        <p className="attention-row" role="status">
+          <a href="/ui/pm/milestones">
+            {n} milestone {n === 1 ? "conflict" : "conflicts"}
+          </a>{" "}
+          awaiting triage. Resolve with the platform__resolve_milestone_conflict tool.
+        </p>
+      )}
       <Card>
         {plugins.state === "ready" ? (
           <KindTable

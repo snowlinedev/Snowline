@@ -79,6 +79,29 @@ def _migrate_to_head() -> None:
     command.upgrade(cfg, "head")
 
 
+def sweep_stale_milestone_flags() -> int:
+    """One-time startup sweep (milestones.md §9, #248): delete stored unreconciled
+    flags the current legality table accepts (written by pre-`deactivate` peers).
+    Idempotent; logs the count. Never blocks boot."""
+    from snowline_platform import milestones
+
+    try:
+        with session_scope() as session:
+            n = milestones.sweep_now_legal_flags(session)
+    except Exception:  # noqa: BLE001 — a sweep failure must not stop the platform
+        log.warning("boot: milestone conflict sweep failed", exc_info=True)
+        return 0
+    log.info("boot: milestone conflict sweep deleted %d now-legal flag(s)", n)
+    return n
+
+
+def _milestone_conflict_count() -> int:
+    from snowline_platform import milestones
+
+    with session_scope() as session:
+        return milestones.count_unreconciled(session)
+
+
 @asynccontextmanager
 async def _startup_grace_lifespan(app: FastAPI):
     """Open the post-restart grace window (issue #240) as the surfaces start
@@ -106,6 +129,7 @@ async def _lifespan(app: FastAPI):
     try:
         if getattr(app.state, "migrate_on_startup", True):
             _migrate_to_head()
+            sweep_stale_milestone_flags()
         # Enter every aggregated MCP surface's streamable-HTTP session manager for
         # the app lifespan (the gateway, gateway.md §2). The surfaces are mounted
         # at create_app time; their managers' run() is the required-for-lifespan
@@ -343,6 +367,14 @@ def create_app(
                 plugin_reasons.append(f"plugin {name}: {entry.degraded_reason}")
             plugins[name] = row
         body = apply_to_health({"status": "ok", "plugins": plugins}, block)
+        # A conflict is a triage task, not a service fault: carried, never
+        # degrading (milestones.md §9, #248).
+        try:
+            conflicts = await anyio.to_thread.run_sync(_milestone_conflict_count)
+        except Exception:  # noqa: BLE001 — liveness must not depend on the count
+            log.warning("health: milestone conflict count failed", exc_info=True)
+            conflicts = None
+        body["milestones"] = {"conflicts": conflicts}
         if plugin_reasons:
             body["status"] = "degraded"
             prior = body.get("degraded_reason")

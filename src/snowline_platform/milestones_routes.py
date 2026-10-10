@@ -9,6 +9,9 @@ Out-of-process plugins (governance, PM) cannot import the platform, so they read
   GET  /milestones/resolve?ref=&context=    single-ref resolution (§3)
   POST /milestones/resolve-batch            {refs:[...], context?} -> per-ref
                                             {address, status, resolved_via_alias}
+  GET  /milestones/conflicts[?anchor=&include_resolved=]
+                                            unreconciled lifecycle conflicts + count (§9)
+  POST /milestones/conflicts/{id}/resolve   {disposition, reason} close one (§9)
   POST /milestones/merge                    {from, into} merge → alias tombstone
   GET  /milestones/{address}                the row (audit read; 404 if unknown)
   GET  /milestones/{address}/aliases        the tombstone closure for a target
@@ -150,6 +153,52 @@ async def resolve_batch(
             "resolved_via_alias": via_alias,
         }
     return {"results": results}
+
+
+@router.get("/conflicts")
+async def list_conflicts(
+    request: Request,
+    anchor: str | None = None,
+    include_resolved: bool = False,
+    session: Session = Depends(get_session),
+) -> dict:
+    """Unreconciled lifecycle conflicts (§9) — expected empty in steady state."""
+    try:
+        rows = milestones.list_unreconciled(
+            session, anchor=anchor, include_resolved=include_resolved
+        )
+    except milestones.scopes.InvalidSlugError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from None
+    return {"conflicts": rows, "count": len(rows)}
+
+
+@router.post("/conflicts/{conflict_id}/resolve")
+async def resolve_conflict(
+    conflict_id: str,
+    request: Request,
+    disposition: str = Body(...),
+    reason: str = Body(...),
+    actor: str | None = Body(None),
+    session: Session = Depends(get_session),
+) -> dict:
+    """Close a conflict: `keep_row` | `replay_transition` | `dismiss`, with a
+    REQUIRED reason. 404 unknown id; 409 already resolved or an illegal replay;
+    422 bad disposition / blank reason."""
+    principal = getattr(request.state, "principal", None)
+    try:
+        return milestones.resolve_unreconciled(
+            session, conflict_id, disposition, reason,
+            actor=actor or (principal.id if principal else None),
+        )
+    except milestones.UnreconciledNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from None
+    except (
+        milestones.UnreconciledResolvedError,
+        milestones.IllegalTransitionError,
+    ) as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from None
+    except milestones.InvalidMilestoneFieldError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from None
 
 
 @router.post("/merge")
