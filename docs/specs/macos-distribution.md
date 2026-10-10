@@ -175,6 +175,20 @@ makes that coupling honest.
   manifest, then tags and publishes — and is safe to re-run after a partial
   failure, skipping tags and releases that already exist rather than
   duplicating them.
+- **Milestone gate (#242):** before building, `cut` maps the train version to
+  its release milestone (`vX.Y.Z` -> `snowlinedev/vX.Y`; a PATCH respin
+  belongs to its MINOR's milestone) and asks pm's `milestone_status` (MCP
+  `pm__milestone_status` through the gateway at `$SNOWLINE_PLATFORM_URL/mcp`).
+  It **refuses** when `completion.achievable` is false or
+  `completion.required_remaining.count > 0`, listing the first 10 required
+  titles + ids, `blocked_by_cancelled`, stale criteria and the
+  `readiness_summary`. `--force` prints the same list as a warning and
+  proceeds, recording `"gated": {"milestone", "forced": true,
+  "required_remaining": N}` in `release/train.json` (additive). **Advisory
+  fallback:** if the milestone does not resolve (`registry: null`) or pm is
+  unreachable, the cut warns loudly and proceeds, recording
+  `"gated": {"skipped": "<reason>"}` — a pm outage never blocks a cut.
+  `--dry-run` runs the gate and reports its verdict without cutting.
 - The installer resolves "latest" from the platform repo's latest release
   and pins everything else off the manifest inside it.
 

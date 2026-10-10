@@ -559,3 +559,107 @@ def test_status_says_so_when_no_train_has_been_cut(config, checkouts, tmp_path, 
     runner = FakeRunner(make_handler())
     cut_mod.status(config, checkouts=checkouts, runner=runner, report=print)
     assert "train: none yet" in capsys.readouterr().out
+
+
+# -- milestone gate (#242) ---------------------------------------------------
+
+from snowline_platform.release import gate as gate_mod  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _no_real_pm(monkeypatch):
+    """No test may dial a live platform: the default fetcher reports pm down."""
+
+    def down(milestone):
+        raise gate_mod.GateUnavailable("test: no pm")
+
+    monkeypatch.setattr(gate_mod, "fetch_milestone_status", down)
+
+
+def _pm_status(count=2, achievable=False, registry=True, **extra):
+    body = {
+        "registry": {"status": "open"} if registry else None,
+        "completion": {
+            "achievable": achievable,
+            "required_remaining": {
+                "count": count,
+                "items": [
+                    {"id": f"{i:08x}-0000", "title": f"required item {i}"} for i in range(count)
+                ],
+            },
+            "blockers": {"blocked_by_cancelled": ["deadbeef"], "stale_criteria": ["c1"]},
+        },
+        "readiness_summary": "2 of 5 required open",
+    }
+    body.update(extra)
+    return body
+
+
+def _gate_cut(config, checkouts, tmp_path, fetch, *, dry_run=True, force=False):
+    handler = make_handler(heads={"Snowline": PLATFORM_SHA, "snowline-pm": PM_SHA})
+    runner = FakeRunner(handler, dry_run=dry_run)
+    plan = cut_mod.cut(
+        config, "v0.1.0", checkouts=checkouts, out_dir=tmp_path / "build",
+        runner=runner, force=force, fetch_status=fetch, report=runner.report_lines.append,
+    )
+    return plan, runner
+
+
+def test_version_to_milestone_mapping():
+    assert gate_mod.train_milestone("v0.5.0") == "snowlinedev/v0.5"
+    assert gate_mod.train_milestone("v0.5.1") == "snowlinedev/v0.5"
+    assert gate_mod.train_milestone("v1.0.0") == "snowlinedev/v1.0"
+
+
+def test_cut_refuses_on_open_required_items(config, checkouts, tmp_path):
+    seen = []
+
+    def fetch(ms):
+        seen.append(ms)
+        return _pm_status()
+
+    handler = make_handler(heads={"Snowline": PLATFORM_SHA, "snowline-pm": PM_SHA})
+    runner = FakeRunner(handler)
+    with pytest.raises(m.ReleaseError, match="2 required item"):
+        cut_mod.cut(
+            config, "v0.1.0", checkouts=checkouts, out_dir=tmp_path / "build",
+            runner=runner, fetch_status=fetch, report=runner.report_lines.append,
+        )
+    assert seen == ["snowlinedev/v0.1"]
+    out = "\n".join(runner.report_lines)
+    assert "00000000  required item 0" in out
+    assert "blocked_by_cancelled" in out and "stale criteria" in out
+    assert "readiness: 2 of 5 required open" in out
+    assert runner.runs == [] and not runner.did_read("uv", "build")
+
+
+def test_cut_force_warns_and_records_gated(config, checkouts, tmp_path):
+    plan, runner = _gate_cut(config, checkouts, tmp_path, lambda ms: _pm_status(), force=True)
+    assert plan.gated == {"milestone": "snowlinedev/v0.1", "forced": True, "required_remaining": 2}
+    assert json.loads(m.render_manifest(plan))["gated"]["forced"] is True
+    assert "--force given" in "\n".join(runner.report_lines)
+
+
+def test_cut_proceeds_when_milestone_unresolved_with_warning(config, checkouts, tmp_path):
+    plan, runner = _gate_cut(config, checkouts, tmp_path, lambda ms: _pm_status(registry=False))
+    assert "skipped" in plan.gated and "resolve" in plan.gated["skipped"]
+    assert "WARNING" in "\n".join(runner.report_lines)
+
+
+def test_cut_proceeds_when_pm_unreachable_with_warning(config, checkouts, tmp_path):
+    def boom(ms):
+        raise ConnectionError("refused")
+
+    plan, runner = _gate_cut(config, checkouts, tmp_path, boom)
+    assert "pm unreachable" in plan.gated["skipped"]
+    assert "NOT gated" in "\n".join(runner.report_lines)
+
+
+def test_dry_run_reports_gate(config, checkouts, tmp_path):
+    plan, runner = _gate_cut(config, checkouts, tmp_path, lambda ms: _pm_status())
+    out = "\n".join(runner.report_lines)
+    assert "milestone gate (snowlinedev/v0.1)" in out
+    assert "a real cut would REFUSE" in out
+    assert runner.runs == []
+    ok, _ = _gate_cut(config, checkouts, tmp_path, lambda ms: _pm_status(0, True))
+    assert ok.gated["forced"] is False
