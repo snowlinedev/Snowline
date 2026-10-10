@@ -460,7 +460,8 @@ the §6 rules stated, not implied):
 - **Event vocabulary**: `milestone.created` / `milestone.updated` /
   `milestone.transitioned` / `milestone.dependency_changed` /
   `milestone.merged`, each carrying **full row state** plus an **authored-at
-  stamp** — the LWW clock (replication §6: pure two-event resolution, LWW by
+  stamp** — the LWW clock (per register for the row events — see "Two LWW
+  registers" below) (replication §6: pure two-event resolution, LWW by
   authored-at, `source_id` tiebreak). `update` and dependency edits replicate
   too — a verb with no event silently never replicates.
 - **`line_rank`** (release-line.md §2.3) rides the full-row payload of every
@@ -469,7 +470,43 @@ the §6 rules stated, not implied):
   resolves it. **Old-peer safety:** on apply, a payload **without** the
   `line_rank` key preserves the local value, and only an explicit `null`
   clears it, so an edit from a peer that predates the field cannot wipe the
-  line (`_write_row_state`).
+  line (`_write_descriptive`).
+- **Two LWW registers per row** (snowlinedev/Snowline#247). A row is not one
+  last-writer-wins value but two, each with its own clock, so a concurrent
+  `update` can never silently revert a transition (the bug: instance A
+  deactivates at t1, unsynced instance B edits `outcome` at t2 > t1, and B's
+  full row — still `active` — won on A by whole-row LWW, with no transition
+  logged and no flag raised):
+  - **Lifecycle register** — `status`, `activated_at`, `achieved_at`,
+    `cancelled_at`; clock `lifecycle_authored_at` / `lifecycle_source_id`.
+    Stamped only by `create` and the lifecycle verbs. On apply it moves
+    **only** on `milestone.created` and `milestone.transitioned`, ordered by
+    the payload's `lifecycle_authored_at` (falling back to `authored_at`,
+    which on a transition is the same instant), `source_id` tiebreak.
+  - **Descriptive register** — `outcome`, `target_date`, `line_rank`; clock
+    `lww_authored_at` / `lww_source_id`. Stamped by `create`, `update`, and
+    release-line placement. On apply it moves **only** on `milestone.created`
+    and `milestone.updated`, ordered by `descriptive_authored_at` (falling
+    back to `authored_at`). The `line_rank` absent-key rule above is
+    unchanged.
+  - The merge pointer (`merged_into`) is owned by `milestone.merged` apply and
+    LWW-compares against the descriptive clock, as before.
+  - A **`created`** seeds both registers; an event that **inserts** a row this
+    instance has not seen (any of the three) seeds both from its full row.
+  - Every full-row payload carries `descriptive_authored_at` and
+    `lifecycle_authored_at` beside `authored_at`, whose meaning is unchanged
+    (the descriptive clock on created/updated, the transition instant on
+    transitioned).
+  - **Old-peer behaviour.** `milestone.updated` still carries the full row
+    (status and stamps included) so a peer older than #247 — whose apply
+    requires those keys — keeps working; a current receiver **ignores** the
+    lifecycle keys on `updated`. Because lifecycle has only ever changed via
+    transition verbs, an `updated` from *any* peer, old or new, can no longer
+    revert status here. An older peer *receiving* still applies whole-row LWW
+    and keeps the old bug until it upgrades. A benign race (B's `updated`
+    carries a status that A has since transitioned away from) is not a
+    contradiction and raises **no** unreconciled flag; only an illegal
+    converged transition history does.
 - **Concurrent transitions** (e.g. `activate` on the hub, `cancel` on the
   spoke, during a partition): the row converges by LWW per replication §6,
   the loser's transition stays in the transition log, and a pair that is

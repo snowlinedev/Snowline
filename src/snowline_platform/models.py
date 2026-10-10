@@ -117,16 +117,22 @@ class Milestone(Base):
     - `merged_into_id` — self-FK alias tombstone (§7). The COLUMN lands now so the
       merge verb (a later increment) needs no second migration; it is always NULL
       until then.
-    - `lww_authored_at` / `lww_source_id` — the ROW-LEVEL last-writer-wins clock
-      (milestones.md §9, replication-continuity §6): the authored-at + authoring
-      `source_id` of the write that last set this row's MUTABLE state (status /
-      outcome / target_date / the `*_at` stamps / the merge tombstone). Replication
-      apply converges the row by comparing an incoming event's
-      `(authored_at, source_id)` against these — a pure two-event LWW resolution,
-      `source_id` breaking an authored-at tie (§6). NULL on rows written before
-      replication was configured; local writes stamp them going forward. Distinct
-      from the append-only transition log, which retains BOTH instances' status
-      transitions (the loser's included) for the §4 illegal-history check.
+    - `lww_authored_at` / `lww_source_id` — the DESCRIPTIVE register's
+      last-writer-wins clock (milestones.md §9, replication-continuity §6): the
+      authored-at + authoring `source_id` of the write that last set this row's
+      descriptive state (outcome / target_date / line_rank) — and the clock a
+      re-merge of a tombstone LWW-compares against. Replication apply converges
+      the register by comparing an incoming event's `(authored_at, source_id)`
+      against these — a pure two-event LWW resolution, `source_id` breaking an
+      authored-at tie (§6). NULL on rows written before replication was
+      configured; local writes stamp them going forward.
+    - `lifecycle_authored_at` / `lifecycle_source_id` — the LIFECYCLE register's
+      own clock (status + the `*_at` stamps), stamped only by `create` and the
+      lifecycle verbs and moved on apply only by `milestone.created` /
+      `milestone.transitioned` (#247). Separate so a concurrent descriptive
+      `update` can never revert a transition. Distinct from the append-only
+      transition log, which retains BOTH instances' status transitions (the
+      loser's included) for the §4 illegal-history check.
     """
 
     __tablename__ = "milestones"
@@ -157,6 +163,12 @@ class Milestone(Base):
     # docstring. Nullable: only replication-configured local writes stamp it.
     lww_authored_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     lww_source_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    # The LIFECYCLE register's own LWW clock (snowlinedev/Snowline#247) — see the
+    # class docstring. Nullable for the same reason as the descriptive clock.
+    lifecycle_authored_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    lifecycle_source_id: Mapped[str | None] = mapped_column(String, nullable=True)
     # The release-line rank (release-line.md §2): a fractional index ordering the
     # anchor's line, NULL = not in the line. Unbounded NUMERIC so SQL and Python
     # order it numerically; it travels as a STRING on the wire (`to_row`, the
