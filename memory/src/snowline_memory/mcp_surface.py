@@ -25,7 +25,8 @@ This is the Snowline MEMORY surface — cross-folder, cross-machine agent SESSIO
 MEMORY: the durable working context a session needs to be productive \
 (conventions, gotchas, user preferences, current focus, references), reachable \
 from any folder or machine. `memory_digest` is the SESSION-START read — call it \
-at the top of a session for a one-line index of everything known. `recall` \
+at the top of a session for a bounded overview (kind/scope counts + recent \
+notes); pass a scope for that scope's one-line index. `recall` \
 searches (full-text when you pass a query, newest-first otherwise). `remember` \
 saves/updates a note (upsert by kebab `name`). `list_memories` / `forget` are \
 hygiene. Memory is WORKING CONTEXT, distinct from governance DECISIONS: a memory \
@@ -118,21 +119,41 @@ def build_main_surface() -> FastMCP:
             _recall_sync, query, kind, scope, limit
         )
 
-    def _digest_sync(scope):
+    def _digest_sync(scope, offset, limit, full):
         with session_scope() as session:
-            return memory.memory_digest(session, scope=scope)
+            return memory.memory_digest(
+                session, scope=scope, offset=offset, limit=limit, full=full
+            )
 
     @mcp.tool()
-    async def memory_digest(scope: str | None = None) -> dict:
-        """The SESSION-START read — call this at the top of a session. Returns
-        EVERY known memory as a cheap one-line `name — description` index, grouped
-        by kind, so you can see what's known at a glance and `recall` the full
-        body of anything relevant. With a `scope` it narrows to that scope's notes
-        plus portfolio-wide ones; without, it returns everything. Deterministic
-        and cheap — safe to call every session (it's the compensation for the
-        harness not auto-injecting memory).
+    async def memory_digest(
+        scope: str | None = None,
+        offset: int = 0,
+        limit: int | None = None,
+        full: bool = False,
+    ) -> dict:
+        """The SESSION-START read — call this at the top of a session. Always
+        bounded so it fits the tool-output budget.
+
+        Without `scope`: a small OVERVIEW (capped ~12k chars) — `kinds` counts,
+        `scopes` counts (portfolio-wide = scope null), the 25 most recently
+        updated memories in `recent` (descriptions clipped to 120 chars),
+        `total`, and a `hint`; `truncated: true` if `recent` was shrunk to fit.
+
+        With `scope`: that scope's notes PLUS portfolio-wide ones as a one-line
+        `name — description` index grouped by kind (descriptions clipped to 160
+        chars; `truncated_descriptions` counts them), with `items_total`. Pages
+        are capped at `limit` items (default 200) and ~24k chars; when more
+        remain `next_offset` is set — call again with `offset=next_offset`.
+        Order is stable (kind, then name).
+
+        `full=True` is the legacy dump (every memory, unclipped descriptions,
+        scope-less allowed) but still paginated by `offset`/`limit` and the 24k
+        cap — never unbounded. `recall` fetches the body of anything relevant.
         """
-        return await anyio.to_thread.run_sync(_digest_sync, scope)
+        return await anyio.to_thread.run_sync(
+            _digest_sync, scope, offset, limit, full
+        )
 
     def _list_sync(kind, scope, limit):
         with session_scope() as session:

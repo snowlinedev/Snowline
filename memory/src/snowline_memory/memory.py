@@ -35,6 +35,7 @@ case-insensitive (#134) — but never resolved against the platform.
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timedelta, timezone
 
@@ -573,39 +574,156 @@ def recall(
     return out
 
 
-def memory_digest(session: Session, scope: str | None = None) -> dict:
-    """The session-start read: EVERY applicable memory as a one-line
-    `name — description` entry, grouped by kind. Cheap and deterministic (no FTS,
-    no ranking). With `scope`: that scope's rows PLUS portfolio-wide rows;
-    without: all memories. Kinds appear in the soft-enum order first, then any
-    novel kinds alphabetically; entries within a kind are name-sorted so the
-    digest is stable across calls."""
+# --- digest budget ---------------------------------------------------------
+# The digest is the session-start read and must fit an MCP tool-output budget
+# at any store size (#199). Caps are on the serialized JSON length.
+DIGEST_OVERVIEW_CAP = 12_000  # scope-less overview, whole result
+DIGEST_INDEX_CAP = 24_000  # scoped / full index, per page
+DIGEST_RECENT_DEFAULT = 25  # overview `recent` length before shrinking
+DIGEST_OVERVIEW_DESC_MAX = 120  # description chars in the overview
+DIGEST_INDEX_DESC_MAX = 160  # description chars in the scoped index
+DIGEST_PAGE_DEFAULT = 200  # scoped / full page size (`limit`)
+
+
+def _clip(text: str | None, n: int) -> tuple[str, bool]:
+    text = text or ""
+    if len(text) <= n:
+        return text, False
+    return text[: n - 1].rstrip() + "\u2026", True
+
+
+def _json_len(obj: dict) -> int:
+    return len(json.dumps(obj, ensure_ascii=False))
+
+
+def memory_digest(
+    session: Session,
+    scope: str | None = None,
+    offset: int = 0,
+    limit: int | None = None,
+    full: bool = False,
+) -> dict:
+    """The session-start read, bounded by construction (#199).
+
+    - No `scope` (and not `full`): a small OVERVIEW — kind counts, scope counts
+      (portfolio-wide counted as scope null), the N most recently updated
+      memories with descriptions clipped to 120 chars, `total`, and a `hint`.
+      The whole result is capped at ~12k chars; if `recent` would overflow, N
+      shrinks and `truncated` is true.
+    - With `scope`: the one-line index for that scope PLUS portfolio-wide rows,
+      grouped by kind (soft-enum order, then novel kinds alphabetically; name
+      order within a kind), descriptions clipped to 160 chars
+      (`truncated_descriptions` counts the clipped ones).
+    - `full=True`: the same index without description clipping, also for the
+      scope-less case (legacy dump).
+    Index results are paginated: `offset`/`limit` (default 200) over the stable
+    flat order, further shrunk so a page stays under ~24k chars;
+    `next_offset` is the offset of the next page or null at the end."""
     scope = validate_scope(scope)
     filters = [Memory.forgotten.is_(False)]  # tombstones are never read (#80)
     sf = _scope_filter(scope)
     if sf is not None:
         filters.append(sf)
 
-    stmt = select(Memory).where(*filters).order_by(Memory.name.asc())
-    rows = list(session.scalars(stmt))
+    if scope is None and not full:
+        return _digest_overview(session, filters)
 
-    groups: dict[str, list[dict]] = {}
+    offset = max(0, int(offset or 0))
+    lim = DIGEST_PAGE_DEFAULT if limit is None else max(1, int(limit))
+
+    rows = list(session.scalars(select(Memory).where(*filters)))
+    # Soft-enum kinds first (declared order), then novel kinds alphabetically;
+    # name-sorted within a kind so the digest is stable across calls.
+    rank = {k: i for i, k in enumerate(KINDS)}
+    rows.sort(key=lambda m: (rank.get(m.kind, len(KINDS)), m.kind, m.name))
+    total = len(rows)
+
+    def build(n: int) -> dict:
+        groups: list[dict] = []
+        clipped = 0
+        for m in rows[offset : offset + n]:
+            if full:
+                desc = m.description
+            else:
+                desc, was = _clip(m.description, DIGEST_INDEX_DESC_MAX)
+                clipped += was
+            if not groups or groups[-1]["kind"] != m.kind:
+                groups.append({"kind": m.kind, "entries": []})
+            groups[-1]["entries"].append(
+                {"name": m.name, "description": desc, "scope": m.scope_slug}
+            )
+        end = offset + n
+        return {
+            "scope": scope,
+            "items_total": total,
+            "truncated_descriptions": clipped,
+            "offset": offset,
+            "next_offset": end if end < total else None,
+            "groups": groups,
+        }
+
+    n = min(lim, max(0, total - offset))
+    out = build(n)
+    while n > 1 and _json_len(out) > DIGEST_INDEX_CAP:
+        # Overshoot-proportional shrink, then converge one page at a time.
+        n = max(1, min(n - 1, int(n * DIGEST_INDEX_CAP / _json_len(out))))
+        out = build(n)
+    return out
+
+
+def _digest_overview(session: Session, filters: list) -> dict:
+    rows = list(session.scalars(select(Memory).where(*filters)))
+    kind_counts: dict[str, int] = {}
+    scope_counts: dict[str | None, int] = {}
     for m in rows:
-        groups.setdefault(m.kind, []).append(
-            {"name": m.name, "description": m.description, "scope": m.scope_slug}
-        )
-
-    # Soft-enum kinds first (in declared order), then any novel kinds sorted.
-    ordered_kinds = [k for k in KINDS if k in groups] + sorted(
-        k for k in groups if k not in KINDS
-    )
-    grouped = [{"kind": k, "entries": groups[k]} for k in ordered_kinds]
-
-    return {
-        "scope": scope,
-        "items_total": len(rows),
-        "groups": grouped,
+        kind_counts[m.kind] = kind_counts.get(m.kind, 0) + 1
+        scope_counts[m.scope_slug] = scope_counts.get(m.scope_slug, 0) + 1
+    rank = {k: i for i, k in enumerate(KINDS)}
+    kinds = {
+        k: kind_counts[k]
+        for k in sorted(kind_counts, key=lambda k: (rank.get(k, len(KINDS)), k))
     }
+    scopes = [
+        {"scope": s, "count": c}
+        for s, c in sorted(
+            scope_counts.items(), key=lambda kv: (-kv[1], kv[0] is None, kv[0] or "")
+        )
+    ]
+    # updated_at desc, name asc on ties (matches list_memories).
+    recent_rows = sorted(rows, key=lambda m: m.name)
+    recent_rows.sort(key=lambda m: m.updated_at, reverse=True)
+
+    def build(n: int, n_scopes: int) -> dict:
+        recent = [
+            {
+                "name": m.name,
+                "kind": m.kind,
+                "scope": m.scope_slug,
+                "description": _clip(m.description, DIGEST_OVERVIEW_DESC_MAX)[0],
+                "updated_at": m.updated_at.isoformat() if m.updated_at else None,
+            }
+            for m in recent_rows[:n]
+        ]
+        return {
+            "scope": None,
+            "total": len(rows),
+            "kinds": kinds,
+            "scopes": scopes[:n_scopes],
+            "recent": recent,
+            "truncated": n < min(DIGEST_RECENT_DEFAULT, len(rows))
+            or n_scopes < len(scopes),
+            "hint": "pass scope=<slug> for that scope's full index, or recall(query=...)",
+        }
+
+    n, ns = min(DIGEST_RECENT_DEFAULT, len(rows)), len(scopes)
+    out = build(n, ns)
+    while n > 0 and _json_len(out) > DIGEST_OVERVIEW_CAP:
+        n -= 1
+        out = build(n, ns)
+    while ns > 0 and _json_len(out) > DIGEST_OVERVIEW_CAP:
+        ns -= 1
+        out = build(n, ns)
+    return out
 
 
 def list_memories(

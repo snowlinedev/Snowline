@@ -86,7 +86,7 @@ class Instance:
 
     def digest_names(self) -> set[str]:
         with self.sessions() as s:
-            out = memory.memory_digest(s)
+            out = memory.memory_digest(s, full=True)  # name sets need the index, not the overview (#199)
         return {e["name"] for g in out["groups"] for e in g["entries"]}
 
     def outbox(self) -> list[ReplicationOutboxRow]:

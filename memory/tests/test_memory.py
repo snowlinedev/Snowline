@@ -80,7 +80,7 @@ def test_remember_normalizes_kind_case(db_session):
     assert row["kind"] == "gotcha"
 
     memory.remember(db_session, content="y", name="lower-kind", kind="gotcha")
-    out = memory.memory_digest(db_session)
+    out = memory.memory_digest(db_session, full=True)  # group shape needs the index (#199)
     assert [g["kind"] for g in out["groups"]] == ["gotcha"]  # ONE group
     assert len(out["groups"][0]["entries"]) == 2
 
@@ -393,7 +393,7 @@ def test_digest_groups_by_kind_in_soft_enum_order(db_session):
     memory.remember(db_session, content="b", name="b-user", kind="user")
     memory.remember(db_session, content="c", name="c-project", kind="project")
 
-    out = memory.memory_digest(db_session)
+    out = memory.memory_digest(db_session, full=True)  # scope-less default is now an overview (#199)
     assert out["items_total"] == 3
     kinds = [g["kind"] for g in out["groups"]]
     # Soft-enum order: user before project before gotcha.
@@ -416,9 +416,100 @@ def test_digest_scope_includes_portfolio_wide(db_session):
 def test_digest_novel_kind_sorts_after_soft_enum(db_session):
     memory.remember(db_session, content="a", name="known", kind="user")
     memory.remember(db_session, content="b", name="weird", kind="zzz-custom")
-    out = memory.memory_digest(db_session)
+    out = memory.memory_digest(db_session, full=True)  # group shape needs the index (#199)
     kinds = [g["kind"] for g in out["groups"]]
     assert kinds == ["user", "zzz-custom"]  # novel kind after the soft enum
+
+
+# --- digest budget (#199) ----------------------------------------------------
+
+import json  # noqa: E402
+
+
+def _seed(db_session, n, desc_len=500, scopes=("acme/a", "acme/b", None)):
+    for i in range(n):
+        memory.remember(
+            db_session,
+            content="body",
+            name=f"mem-{i:04d}",
+            description="d" * desc_len,
+            kind=("user", "project", "gotcha")[i % 3],
+            scope=scopes[i % len(scopes)],
+        )
+
+
+def test_digest_scopeless_is_bounded_overview(db_session):
+    _seed(db_session, 300)
+    out = memory.memory_digest(db_session)
+    assert len(json.dumps(out, ensure_ascii=False)) < 12_000
+    assert out["total"] == 300
+    assert out["kinds"] == {"user": 100, "project": 100, "gotcha": 100}
+    assert {(s["scope"], s["count"]) for s in out["scopes"]} == {
+        ("acme/a", 100), ("acme/b", 100), (None, 100)
+    }
+    assert len(out["recent"]) == 25 and out["truncated"] is False
+    stamps = [r["updated_at"] for r in out["recent"]]
+    assert stamps == sorted(stamps, reverse=True)
+    assert all(len(r["description"]) <= 120 for r in out["recent"])
+    assert set(out["recent"][0]) == {"name", "kind", "scope", "description", "updated_at"}
+    assert "scope=" in out["hint"]
+
+
+def test_digest_overview_shrinks_and_flags_truncated(db_session, monkeypatch):
+    _seed(db_session, 40)
+    monkeypatch.setattr(memory, "DIGEST_OVERVIEW_CAP", 3_000)
+    out = memory.memory_digest(db_session)
+    assert len(json.dumps(out, ensure_ascii=False)) <= 3_000
+    assert 0 < len(out["recent"]) < 25
+    assert out["truncated"] is True
+
+
+def test_digest_scoped_keeps_full_index_with_truncated_descriptions(db_session):
+    _seed(db_session, 30)
+    memory.remember(db_session, content="x", name="other", scope="acme/zzz")
+    memory.remember(db_session, content="x", name="short-one", description="tiny", scope="acme/a")
+    out = memory.memory_digest(db_session, scope="acme/a")
+    entries = [e for g in out["groups"] for e in g["entries"]]
+    names = {e["name"] for e in entries}
+    assert "other" not in names and "short-one" in names
+    assert out["items_total"] == len(entries) == 10 + 10 + 1  # a + portfolio-wide + short
+    assert out["next_offset"] is None
+    assert all(len(e["description"]) <= 160 for e in entries)
+    assert out["truncated_descriptions"] == 20
+
+
+def test_digest_scoped_paginates_over_cap(db_session):
+    _seed(db_session, 300, desc_len=300, scopes=("acme/a",))
+    seen, offset, pages = [], 0, 0
+    while offset is not None:
+        out = memory.memory_digest(db_session, scope="acme/a", offset=offset, limit=1000)
+        assert len(json.dumps(out, ensure_ascii=False)) <= 24_000
+        seen += [(g["kind"], e["name"]) for g in out["groups"] for e in g["entries"]]
+        offset = out["next_offset"]
+        pages += 1
+    assert pages > 1
+    assert len(seen) == len(set(seen)) == 300
+    rank = {"user": 0, "project": 1, "gotcha": 3}
+    assert seen == sorted(seen, key=lambda t: (rank[t[0]], t[1]))
+
+
+def test_digest_full_is_paginated_not_unbounded(db_session):
+    _seed(db_session, 300, desc_len=500)
+    out = memory.memory_digest(db_session, full=True)
+    entries = [e for g in out["groups"] for e in g["entries"]]
+    assert out["items_total"] == 300
+    assert len(json.dumps(out, ensure_ascii=False)) <= 24_000
+    assert len(entries) < 300 and out["next_offset"] == len(entries)
+    assert all(len(e["description"]) == memory._DESCRIPTION_MAX for e in entries)  # unclipped (write clamps at _DESCRIPTION_MAX)
+    assert out["truncated_descriptions"] == 0
+
+
+def test_digest_empty_store(db_session):
+    out = memory.memory_digest(db_session)
+    assert out["total"] == 0 and out["kinds"] == {} and out["scopes"] == []
+    assert out["recent"] == [] and out["truncated"] is False
+    idx = memory.memory_digest(db_session, scope="acme/a")
+    assert idx["items_total"] == 0 and idx["groups"] == [] and idx["next_offset"] is None
 
 
 # --- model/migration index parity (no DB) ------------------------------------
@@ -487,7 +578,7 @@ def test_forget_keeps_a_tombstone_row(db_session):
     assert row is not None and row.forgotten is True
     assert memory.list_memories(db_session)["items_total"] == 0
     assert memory.recall(db_session)["items_total"] == 0
-    assert memory.memory_digest(db_session)["items_total"] == 0
+    assert memory.memory_digest(db_session, full=True)["items_total"] == 0  # overview uses `total` (#199)
 
 
 def test_local_remember_after_forget_resurrects(clean_db):
@@ -607,7 +698,7 @@ def test_digest_entry_shape_pins_keys(db_session):
     memory.remember(
         db_session, content="x", name="pin-digest", kind="user", scope="acme/widget"
     )
-    out = memory.memory_digest(db_session)
+    out = memory.memory_digest(db_session, full=True)  # entry shape lives in the index (#199)
     entry = out["groups"][0]["entries"][0]
     # `kind` is the group key, not a per-entry field — the entry shape is
     # deliberately name/description/scope.
