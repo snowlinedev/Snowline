@@ -153,6 +153,34 @@ title in secondary text, e.g. a milestone's type summary. It is shown once the
 data loads; absent, non-string or blank means nothing is rendered. Additive
 and optional, like `page_title`.
 
+#### Page sections (`sections`)
+
+A response of any page kind may carry an additive, optional top-level
+`sections` array rendered under the page's main content:
+
+```json
+"sections": [
+  { "key": "channels", "title": "Channels", "kind": "table",
+    "columns": [{ "key": "name", "label": "Channel" }],
+    "rows": [{ "cells": { "name": "alpha" }, "href": "/shadow/alpha" }],
+    "empty": "No channels." }
+]
+```
+
+- **Shape:** `{ key, title, kind: "table", columns, rows, empty? }`.
+  `columns`, `rows` (cells, row `href`) and `empty` are exactly the page-level
+  `table` kind's contract and render through the same table component. Only
+  `kind: "table"` is defined; a malformed section (or any other kind) renders
+  the fail-visible malformed-data card in place, and the remaining sections
+  still render.
+- **Ordering:** payload order, after the main content.
+- **Heading level:** each section is a region labelled (`aria-labelledby`) by
+  its `title`, rendered as an `h2` (the shell's page title is the `h1`).
+- **Empty state:** no rows renders the `empty` text (default "Nothing here."),
+  not an empty table.
+- **Absent = unchanged:** a missing, non-array or empty `sections` renders the
+  page exactly as before.
+
 `search` (query box + result list, for shadow corpus search) is anticipated
 but **deferred** until the read views prove out.
 
