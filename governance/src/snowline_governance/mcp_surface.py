@@ -60,54 +60,22 @@ from snowline_governance.scope_client import (
 )
 
 _MAIN_INSTRUCTIONS = """\
-This is the Snowline GOVERNANCE surface — the real decision graph AND the \
-artifact (spec/plan/reference) graph: record/supersede decisions and read them, \
-register/revise/resolve governing artifacts and set their governs/maturity, and \
-read the ancestor-inherited governance that applies at a scope. Decisions: \
-`record_decision`, `supersede_decision`, `get_decision`, `list_decisions`, \
-`applicable_decisions`. Artifacts: `register_artifact` (inline-backed — content \
-lives in the substrate), `revise_artifact`, `resolve_artifact` (collapse \
-competing version leaves), `supersede_artifact` (retire a whole artifact in \
-favor of another — the consolidation verb), `retire_artifact` (retire with a \
-reason and NO successor), `get_artifact` (carries the \
-canonical body by default), `get_artifact_version` (one version's body — \
-competing leaves, superseded history), `list_artifacts`, \
-`list_artifact_versions` (versions stamped with a release milestone slug), \
-`set_governs`, `set_maturity`, `set_code_refs` (the spec↔code anchor map), \
-`applicable_artifacts` (artifacts governing a \
-scope, ancestor-inherited), `governance_corpus_search` (full-text over current \
-artifact versions + decision leaves), `artifacts_for_path` (which specs cite \
-a code path). `applicable_*` resolve "what governs here" by walking the \
-scope tree UPWARD and halting at the first isolated ancestor. Scopes are owned \
-by the platform; governance references them by slug and reads the scope tree \
-from the platform to compute applicability.\
+Snowline GOVERNANCE surface: the decision graph (`record_decision`, \
+`supersede_decision`, `list_decisions`, `applicable_decisions`) and the artifact \
+graph of governing specs/plans/references (`register_artifact`, `revise_artifact`, \
+`applicable_artifacts`, `governance_corpus_search`). Decisions are recorded \
+rationale, changed only by supersession; artifacts are versioned documents that \
+govern scopes. `applicable_*` walk the scope tree upward, halting at the first \
+isolated ancestor. Memory that hardens into policy should graduate via \
+`record_decision`.\
 """
 
 _SHADOW_INSTRUCTIONS = """\
-This is the Snowline SPECULATION (shadow) surface (decision 8a7f0a11): a place to \
-explore rival design directions in ISOLATION from the real governance graph, \
-until a line is explicitly graduated. You hold WRITE-SHADOW + READ-REAL tools \
-only. Write-shadow: `create_branch` (a named speculation line per scope, \
-addressed `<scope>:<name>`), `list_branches`, `get_branch`, \
-`set_narrative_notes` (the running reasoning thread), `add_node` (a \
-not-yet-real decision), `add_citation` (inward-only: a node may cite another \
-node in its OWN branch, or a real decision — never the reverse), \
-`list_citations`, `archive_branch` (the active→archived status flip — a pure \
-shadow op; record WHY first via the main surface's `record_branch_rejection`), \
-`add_message` (append a turn to the branch's durable conversation log — the same \
-log the UI composer writes; `get_branch` returns its recent tail), \
-and `shadow_corpus_search` (full-text over the shadow content \
-+ the real decisions backlinked to a shadow line). Read-real grounding: \
-`get_decision`, `list_decisions`, `applicable_decisions`, `get_artifact`, \
-`get_artifact_version`, `list_artifacts`, `list_artifact_versions`, \
-`applicable_artifacts`, `governance_corpus_search`, `artifacts_for_path` — \
-read and search the \
-real graph freely to ground \
-your speculation. It deliberately exposes NO real-write verb — `record_decision`, \
-`supersede_decision`, and the artifact write verbs are ABSENT by construction, on \
-the separate `main` surface only. This ensures a speculation session physically \
-cannot misfire a real decision into the graph (the write-isolation safety \
-property). Scopes are owned by the platform; governance references them by slug.\
+Snowline SPECULATION (shadow) surface: explore rival design directions in \
+isolation from the real governance graph until a line is graduated. Write tools \
+(`create_branch`, `add_node`) touch shadow branches only; real-graph tools \
+(`list_decisions`, `applicable_decisions`, `get_artifact`) are read-only. Real \
+writes exist only on the `main` surface.\
 """
 
 # DNS-rebinding protection on the streamable-HTTP transport (the monolith's

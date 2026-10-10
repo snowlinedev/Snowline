@@ -21,18 +21,11 @@ from snowline_memory import memory
 from snowline_memory.db import session_scope
 
 _INSTRUCTIONS = """\
-This is the Snowline MEMORY surface — cross-folder, cross-machine agent SESSION \
-MEMORY: the durable working context a session needs to be productive \
-(conventions, gotchas, user preferences, current focus, references), reachable \
-from any folder or machine. `memory_digest` is the SESSION-START read — call it \
-at the top of a session for a bounded overview (kind/scope counts + recent \
-notes); pass a scope for that scope's one-line index. `recall` \
-searches (full-text when you pass a query, newest-first otherwise). `remember` \
-saves/updates a note (upsert by kebab `name`). `list_memories` / `forget` are \
-hygiene. Memory is WORKING CONTEXT, distinct from governance DECISIONS: a memory \
-that hardens into policy should GRADUATE to `record_decision` on the governance \
-surface, not live in memory forever. Scopes are platform-owned; memory tags a \
-note with an optional scope slug (a soft reference), portfolio-wide when omitted.\
+Snowline MEMORY surface: durable cross-folder, cross-machine session working \
+context (conventions, gotchas, preferences, current focus). At session start call \
+`memory_digest()` for a bounded overview, then `memory_digest(scope=...)` for the \
+repo's index, then `recall` to pull bodies. Save with `remember`. Memory that \
+hardens into policy should graduate to a governance decision.\
 """
 
 # DNS-rebinding protection off (governance's default) — behind the platform trust

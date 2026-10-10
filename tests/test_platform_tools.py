@@ -458,3 +458,16 @@ def test_create_scope_write_verb_round_trips_and_persists(clean_db):
     # The write committed — the row is visible from a fresh session.
     with session_scope() as s:
         assert scopes.resolve(s, "acme/gadget") is not None
+
+
+def test_platform_instructions_size_and_content():
+    """Instructions are injected into every session (Snowline#263): keep them
+    terse and free of dangling tool references."""
+    import re
+
+    from snowline_platform.platform_tools import _INSTRUCTIONS
+
+    assert len(_INSTRUCTIONS.encode("utf-8")) <= 900
+    assert "list_milestones" in _INSTRUCTIONS
+    tools = {t.name for t in anyio.run(build_platform_tools_surface().list_tools)}
+    assert set(re.findall(r"`([a-z_]+)(?:\(|`)", _INSTRUCTIONS)) <= tools
