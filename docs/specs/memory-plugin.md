@@ -125,11 +125,17 @@ All verbs run their blocking DB work in a thread (the monolith's
   Without: newest-first. `kind` filters exactly; `scope` returns that scope's
   rows **plus** portfolio-wide (`scope_slug IS NULL`) rows. Returns the matching
   rows + `items_total`.
-- **`memory_digest(scope?)`** — the **session-start read**. ALL memories as
-  one-line entries (`name — description`), grouped by kind, cheap and
-  deterministic (no FTS, no ranking). With `scope`: that scope's rows plus
-  portfolio-wide rows; without: everything. This is the compensation for the
-  harness not auto-injecting memory — call it at the top of any session.
+- **`memory_digest(scope?, offset?, limit?, full?)`** — the **session-start
+  read**, bounded to fit the MCP tool-output budget (#199). Without `scope`: an
+  overview (`total`, `kinds` counts, `scopes` counts with portfolio-wide as
+  null, the 25 most recent memories with descriptions clipped to 120 chars,
+  `hint`), capped ~12k chars (`truncated: true` if `recent` was shrunk). With
+  `scope`: that scope's rows plus portfolio-wide rows as `name — description`
+  entries grouped by kind (descriptions clipped to 160; `truncated_descriptions`
+  counts them), paginated by `offset`/`limit` (default 200) and ~24k chars per
+  page with `next_offset`. `full=True` is the legacy unclipped dump, still
+  paginated. Deterministic (no FTS, no ranking). Call it at the top of any
+  session.
 - **`list_memories(kind?, scope?, limit?)`** — hygiene/browse. Headers (name,
   description, kind, scope, updated_at), newest-first, filtered like `recall`.
 - **`forget(name)`** — delete one memory by name. Idempotent (a no-op miss
@@ -185,8 +191,8 @@ automatically.
   generates a name when omitted, derives a description when omitted.
 - `recall` ranks by FTS when a query is present, newest-first otherwise, and
   filters by kind + scope (scope ⊇ portfolio-wide).
-- `memory_digest` returns all applicable memories as one-line entries grouped by
-  kind, scope-filtered plus portfolio-wide.
+- `memory_digest` is bounded: scope-less = overview; scoped = one-line entries
+  grouped by kind (scope plus portfolio-wide), paginated under the 24k cap.
 - The importer round-trips fixture markdown files idempotently.
 - Imports no platform internals / no monolith code (import-pure); runs against
   its own DB.
