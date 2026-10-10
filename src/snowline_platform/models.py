@@ -109,6 +109,7 @@ class Milestone(Base):
       anchor scope, **including merge tombstones** (§7) — a merged-away name is
       reserved forever. The `(anchor_scope_id, name)` unique constraint holds that
       across live rows and tombstones alike (a tombstone stays a row here).
+    - `title` — optional human-friendly display title (§2, #156); never identity.
     - `outcome` — the outcome statement / exit-criteria prose (§2). Machine/human
       criteria are NOT modeled here — they are PM work items (§6.2).
     - `status` — planned | active | achieved | cancelled, with `activated_at` /
@@ -175,6 +176,11 @@ class Milestone(Base):
     # replication payload — `fracrank.to_wire`). Part of the row's mutable LWW
     # state; a tombstone never carries one (merge clears it).
     line_rank: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+    # The human-friendly DISPLAY title (snowlinedev/Snowline#156, §2): editable
+    # prose (<= 120 chars, trimmed, empty -> NULL) shown in place of the slug
+    # address. Never identity — the address stays the reference. DESCRIPTIVE-
+    # register state (§9); a tombstone never carries one (merge clears it).
+    title: Mapped[str | None] = mapped_column(Text, nullable=True)
     # ONE clock per row (QA 4c566e49): naive UTC, same as the lifecycle stamps.
     created_at: Mapped[datetime] = mapped_column(
         default=_utcnow, server_default=func.timezone("utc", func.now())

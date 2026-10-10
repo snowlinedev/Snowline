@@ -21,7 +21,7 @@ Out-of-process plugins (governance, PM) cannot import the platform, so they read
   POST /milestones                          create (the only mint path)
   POST /milestones/{address}/activate|deactivate|achieve|cancel   lifecycle
                                             verbs (deactivate requires reason)
-  PATCH /milestones/{address}               update outcome / target_date
+  PATCH /milestones/{address}               update title / outcome / target_date
   POST /milestones/{address}/line           {after?|before?} place in the
                                             release line (release-line.md §3)
   DELETE /milestones/{address}/line         remove from the release line
@@ -237,6 +237,7 @@ async def create_milestone(
     name: str = Body(...),
     outcome: str | None = Body(None),
     target_date: date | None = Body(None),
+    title: str | None = Body(None),
     session: Session = Depends(get_session),
 ) -> dict:
     try:
@@ -246,6 +247,7 @@ async def create_milestone(
             name=name,
             outcome=outcome,
             target_date=target_date,
+            title=title,
         )
     except milestones.MilestoneConflictError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from None
@@ -492,13 +494,15 @@ async def update_milestone(
     # a null value CLEARS that field (the service's _UNSET-vs-None distinction —
     # typed Body(None) params can't express "omitted", they'd clear on every
     # partial update).
-    unknown = set(payload) - {"outcome", "target_date"}
+    unknown = set(payload) - {"title", "outcome", "target_date"}
     if unknown:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             f"unknown milestone fields: {sorted(unknown)}",
         )
     kwargs: dict = {}
+    if "title" in payload:
+        kwargs["title"] = payload["title"]
     if "outcome" in payload:
         kwargs["outcome"] = payload["outcome"]
     if "target_date" in payload:
@@ -516,4 +520,8 @@ async def update_milestone(
         milestone = milestones.update(session, address, **kwargs)
     except milestones.MilestoneNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from None
+    except milestones.InvalidMilestoneFieldError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)
+        ) from None
     return milestones.to_row(milestone)

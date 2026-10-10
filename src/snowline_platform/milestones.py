@@ -229,6 +229,31 @@ def validate_name(name: str) -> str:
     return folded
 
 
+# The display title (#156, §2): human-friendly prose shown in place of the slug
+# address. Never identity. Trimmed; empty/whitespace-only folds to NULL; capped.
+TITLE_MAX_LEN = 120
+
+
+def normalize_title(title: str | None) -> str | None:
+    """Fold a display title to its stored form: `None` stays `None`, surrounding
+    whitespace is trimmed, an empty result is `None` (a clear). Raises
+    `InvalidMilestoneFieldError` on a non-string or a title over
+    `TITLE_MAX_LEN` characters (measured after trimming)."""
+    if title is None:
+        return None
+    if not isinstance(title, str):
+        raise InvalidMilestoneFieldError("milestone title must be a string")
+    title = title.strip()
+    if not title:
+        return None
+    if len(title) > TITLE_MAX_LEN:
+        raise InvalidMilestoneFieldError(
+            f"milestone title is {len(title)} characters; the limit is "
+            f"{TITLE_MAX_LEN} (§2)"
+        )
+    return title
+
+
 def address_of(milestone: Milestone) -> str:
     """The canonical address `<anchor slug>/<name>` — the cross-instance identity
     (§9) and the shape every consumer stores."""
@@ -498,8 +523,10 @@ def create(
     name: str,
     outcome: str | None = None,
     target_date: date | None = None,
+    title: str | None = None,
 ) -> Milestone:
-    """The ONLY mint path (§4). Enforces a slash-free name, a 1-or-2-segment
+    """The ONLY mint path (§4). `title` is the optional display title (#156),
+    normalized by `normalize_title`. Enforces a slash-free name, a 1-or-2-segment
     REGISTERED anchor scope, and uniqueness against live rows AND tombstones alike
     (a tombstoned name is reserved forever; the error names the alias target).
     Every milestone is born `planned` — lifecycle is explicit verbs, never
@@ -519,6 +546,7 @@ def create(
             "platform first (nothing auto-vivifies)"
         )
     name = validate_name(name)
+    title = normalize_title(title)
 
     existing = _by_anchor_name(session, anchor_scope.id, name)
     if existing is not None:
@@ -538,6 +566,7 @@ def create(
     m = Milestone(
         anchor_scope_id=anchor_scope.id,
         name=name,
+        title=title,
         outcome=outcome,
         target_date=target_date,
         status="planned",
@@ -725,8 +754,11 @@ def update(
     *,
     outcome=_UNSET,
     target_date=_UNSET,
+    title=_UNSET,
 ) -> Milestone:
-    """Modify display fields — `outcome` / `target_date` — NEVER identity (§4).
+    """Modify display fields — `title` / `outcome` / `target_date` — NEVER
+    identity (§4). `title` is normalized (`normalize_title`: trimmed, empty →
+    cleared, ≤ 120 chars) before comparison.
     A provided value of `None` CLEARS the field; omitting the argument leaves it
     unchanged. A REAL change stamps the DESCRIPTIVE register's §6 LWW clock +
     emits `milestone.updated` (§9) — never the lifecycle clock, and a peer's
@@ -734,8 +766,13 @@ def update(
     stamps and emits NOTHING — a content-free write must not advance the LWW
     clock, or it could shadow a genuine concurrent peer update. Raises
     `MilestoneNotFoundError` if unknown."""
+    if title is not _UNSET:
+        title = normalize_title(title)
     m = get(session, address)
     changed = False
+    if title is not _UNSET and m.title != title:
+        m.title = title
+        changed = True
     if outcome is not _UNSET and m.outcome != outcome:
         m.outcome = outcome
         changed = True
@@ -763,7 +800,7 @@ def update(
 
 def _stamp(m: Milestone) -> None:
     """Advance the row's DESCRIPTIVE §6 LWW clock for a local descriptive write
-    (outcome / target_date / line_rank — never lifecycle, #247)."""
+    (title / outcome / target_date / line_rank — never lifecycle, #247)."""
     m.lww_authored_at = _now()
     m.lww_source_id = _local_source_id()
 
@@ -1140,12 +1177,12 @@ def merge(session: Session, from_address: str, into_address: str) -> dict:
     # Re-point edges + tombstone `from` (the mechanics shared with replication
     # apply — see `_perform_merge`); raises `MilestoneMergeError` if the edge
     # union would cycle, before anything is written.
-    into_inherited_rank = _perform_merge(session, frm, into)
+    into_inherited = _perform_merge(session, frm, into)
     session.flush()
     emit_event(
         session, EVENT_MILESTONE_MERGED, _merged_payload(frm, into)
     )
-    if into_inherited_rank:
+    if into_inherited:
         _stamp(into)
         session.flush()
         emit_event(session, EVENT_MILESTONE_UPDATED, to_replication_payload(into))
@@ -1172,7 +1209,9 @@ def _perform_merge(session: Session, frm: Milestone, into: Milestone) -> bool:
     `from`'s tombstone pointer + stamp the §6 LWW clock (the clock a later
     re-merge LWW-compares against). Status is left as-is (the row is now an alias;
     resolution never surfaces its status). Clears `from`'s release-line rank and
-    returns True when `into` inherited it (release-line.md §2.2).
+    display title, and returns True when `into` inherited either one
+    (release-line.md §2.2; #156 — `into` keeps its own title, inheriting
+    `from`'s only when it had none).
 
     The caller owns the DIFFERING guards: the `merge` verb pre-checks state
     compatibility + already-tombstone and lets a cycle surface as
@@ -1230,6 +1269,14 @@ def _perform_merge(session: Session, frm: Milestone, into: Milestone) -> bool:
             into.line_rank = frm.line_rank
             inherited = True
         frm.line_rank = None
+    # Display title (#156) — the same shape as the rank rule, minus the anchor
+    # condition (a title is not positional): `into` keeps its own; an untitled
+    # `into` inherits `from`'s; the tombstone never carries one.
+    if frm.title is not None:
+        if into.title is None:
+            into.title = frm.title
+            inherited = True
+        frm.title = None
     return inherited
 
 
@@ -1325,6 +1372,10 @@ def to_row(milestone: Milestone) -> dict:
         "address": address_of(milestone),
         "anchor": milestone.anchor.slug,
         "name": milestone.name,
+        # Display title (#156) + the render convenience: the title when set,
+        # else the slug name. The `address` stays the identity to store.
+        "title": milestone.title,
+        "display_name": milestone.title or milestone.name,
         "outcome": milestone.outcome,
         "status": milestone.status,
         "target_date": _iso(milestone.target_date),
@@ -1357,7 +1408,7 @@ def to_replication_payload(milestone: Milestone) -> dict:
     keyed by the canonical address (§9). Carries everything apply needs to
     reconstruct the row: the anchor slug (re-resolved to a local `anchor_scope_id`
     at apply), the name, the mutable fields, the `authored_at` LWW stamp, and the
-    two per-register clocks (#247): `descriptive_authored_at` (outcome /
+    two per-register clocks (#247): `descriptive_authored_at` (title / outcome /
     target_date / line_rank) and `lifecycle_authored_at` (status + `*_at`).
 
     `authored_at` keeps its pre-#247 meaning for old receivers — the descriptive
@@ -1384,6 +1435,10 @@ def to_replication_payload(milestone: Milestone) -> dict:
         # an ABSENT key as "preserve local" (old-peer safety) — see
         # `_write_descriptive`.
         "line_rank": fracrank.to_wire(milestone.line_rank),
+        # Display title (#156) — DESCRIPTIVE register, same absent-key rule as
+        # `line_rank`: apply PRESERVES the local title when the key is absent (a
+        # pre-#156 peer); only an explicit null clears.
+        "title": milestone.title,
         "authored_at": _iso(milestone.lww_authored_at),
         # Per-register clocks (#247, §9). Apply falls back to `authored_at`
         # when a key is absent (a pre-#247 peer).
@@ -1500,7 +1555,7 @@ def _register_stamp(payload: dict, key: str) -> datetime | None:
 
 # Which register(s) each full-row event may move on an EXISTING row (§9, #247):
 # lifecycle (status + `*_at`) moves only on lifecycle events, descriptive
-# (outcome / target_date / line_rank) only on created/updated. A `created` seeds
+# (title / outcome / target_date / line_rank) only on created/updated. A `created` seeds
 # both. An INSERT (the row is new here) always seeds both, from any event.
 _REGISTERS = {
     EVENT_MILESTONE_CREATED: (True, True),  # (descriptive, lifecycle)
@@ -1510,7 +1565,8 @@ _REGISTERS = {
 
 
 def _write_descriptive(m: Milestone, payload: dict, envelope: dict) -> None:
-    """Overwrite the DESCRIPTIVE register (outcome / target_date / line_rank) +
+    """Overwrite the DESCRIPTIVE register (title / outcome / target_date /
+    line_rank) +
     advance its clock (§6). Never touches identity (`anchor_scope_id`/`name`) or
     the tombstone pointer (`merged_into_id` is owned by `milestone.merged`
     apply)."""
@@ -1522,8 +1578,13 @@ def _write_descriptive(m: Milestone, payload: dict, envelope: dict) -> None:
     # unrelated `outcome` edit from an old peer would wipe the line.
     if "line_rank" in payload:
         m.line_rank = fracrank.from_wire(payload["line_rank"])
+    # Display title (#156), the same OLD-PEER-SAFE absent-key rule: a pre-#156
+    # peer's payload has no `title` key, so its outcome edit must not wipe ours.
+    if "title" in payload:
+        m.title = payload["title"]
     if m.merged_into_id is not None:
         m.line_rank = None  # a tombstone is never in a line (§2.2 merge rule)
+        m.title = None  # nor titled (#156 merge rule)
     m.lww_authored_at = _register_stamp(payload, "descriptive_authored_at")
     m.lww_source_id = envelope.get("source")
 
