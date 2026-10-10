@@ -60,6 +60,16 @@ target one but must never require one.
   names are slash-free): `v1-launch` = bare name, resolved via context (§3);
   `turtlesedge/v1-launch` = org-anchored; `turtlesedge/turtletracks/v1-launch`
   = repo-anchored. No parse ambiguity anywhere.
+- `title` — optional human-friendly **display title** (snowlinedev/Snowline#156),
+  e.g. "Spanish GA" beside `turtlesedge/turtletracks/qa-spanish-general-availability-20260724`.
+  Editable (`create` / `update`, HTTP + MCP), nullable, at most 120 characters,
+  trimmed, and empty or whitespace-only folds to null (an explicit null or `""`
+  clears it). It is **never identity**: the address stays the stable reference
+  every consumer stores and resolves. Rows (`GET`, list, resolve) carry `title`
+  plus a convenience `display_name` (= `title` when set, else the slug `name`)
+  that UIs render, with the address as secondary text. Descriptive-register
+  state for replication (§9); merge clears the tombstone's title and an untitled
+  `into` inherits `from`'s (§7).
 - `outcome` — the outcome statement / exit-criteria prose. Machine-checkable
   and human criteria are **not** modeled here — they are PM work items (§6.2).
 - `status` — `planned` | `active` | `achieved` | `cancelled`, with
@@ -187,6 +197,12 @@ and agents relay it — so the tools resolve it; **storage is always canonical**
     `DELETE /milestones/{address}/line`, and
     `GET /milestones?anchor=<slug>&in_line=true` (exact anchor, line order).
     MCP: `place_in_line`, `remove_from_line`, `list_milestones(in_line=)`.
+- **Display title** (#156): `POST /milestones` and `PATCH /milestones/{address}`
+  accept `title`; MCP `create_milestone(title=)` / `update_milestone(title=)`
+  (`""` clears). Every row read carries `title` + `display_name` (§2). The
+  shell's plugin page header already renders a payload's `page_title` /
+  `page_subtitle`, so a consumer page shows `display_name` as the title and
+  the address as the subtitle.
 - **MCP tools on the platform `main` surface**: `create_milestone`,
   `resolve_milestone`, `list_milestones` (registry rows — distinct from PM's
   work roll-up read of the same name; prefixes disambiguate),
@@ -414,6 +430,10 @@ restated here.
     cleared. `into` inherits `from`'s rank when `into` had none and shares the
     anchor (the merged release keeps its place); otherwise `into` keeps its
     own. An inheriting merge also emits `milestone.updated` for `into`.
+  - **Display title** (#156): the tombstone's `title` is cleared; `into`
+    keeps its own, inheriting `from`'s only when it had none (no anchor
+    condition — a title is not positional). Inheriting also emits
+    `milestone.updated` for `into`.
   - The platform **never bulk-retags plugin data** (it cannot write plugin
     stores — the LLM is the integration runtime); consumers' stored addresses
     stay put and reads agree via alias-set matching (§5). The merge response
@@ -471,6 +491,10 @@ the §6 rules stated, not implied):
   `line_rank` key preserves the local value, and only an explicit `null`
   clears it, so an edit from a peer that predates the field cannot wipe the
   line (`_write_descriptive`).
+- **`title`** (#156) rides the same full-row payloads under the **same
+  absent-key rule**: a payload without the `title` key (a pre-#156 peer)
+  preserves the local title; only an explicit `null` clears it. Apply writes
+  a tombstone's title as null.
 - **Two LWW registers per row** (snowlinedev/Snowline#247). A row is not one
   last-writer-wins value but two, each with its own clock, so a concurrent
   `update` can never silently revert a transition (the bug: instance A
@@ -483,12 +507,13 @@ the §6 rules stated, not implied):
     **only** on `milestone.created` and `milestone.transitioned`, ordered by
     the payload's `lifecycle_authored_at` (falling back to `authored_at`,
     which on a transition is the same instant), `source_id` tiebreak.
-  - **Descriptive register** — `outcome`, `target_date`, `line_rank`; clock
+  - **Descriptive register** — `title`, `outcome`, `target_date`,
+    `line_rank`; clock
     `lww_authored_at` / `lww_source_id`. Stamped by `create`, `update`, and
     release-line placement. On apply it moves **only** on `milestone.created`
     and `milestone.updated`, ordered by `descriptive_authored_at` (falling
-    back to `authored_at`). The `line_rank` absent-key rule above is
-    unchanged.
+    back to `authored_at`). The `line_rank` and `title` absent-key rules
+    above are unchanged.
   - The merge pointer (`merged_into`) is owned by `milestone.merged` apply and
     LWW-compares against the descriptive clock, as before.
   - A **`created`** seeds both registers; an event that **inserts** a row this

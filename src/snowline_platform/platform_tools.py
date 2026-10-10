@@ -264,12 +264,21 @@ def build_platform_tools_surface() -> FastMCP:
     # --- milestones (milestones.md §5) --------------------------------------
 
     def _create_milestone_sync(
-        anchor: str, name: str, outcome: str | None, target_date: str | None
+        anchor: str,
+        name: str,
+        outcome: str | None,
+        target_date: str | None,
+        title: str | None,
     ) -> dict:
         parsed = _parse_date(target_date)
         with session_scope() as session:
             m = milestones.create(
-                session, anchor=anchor, name=name, outcome=outcome, target_date=parsed
+                session,
+                anchor=anchor,
+                name=name,
+                outcome=outcome,
+                target_date=parsed,
+                title=title,
             )
             return milestones.to_row(m)
 
@@ -279,20 +288,24 @@ def build_platform_tools_surface() -> FastMCP:
         name: str,
         outcome: str | None = None,
         target_date: str | None = None,
+        title: str | None = None,
     ) -> dict:
         """Mint a milestone — the ONLY create path. `anchor` is a REGISTERED
         1-or-2-segment scope (org- or repo-level; no portfolio/global anchor);
         `name` is a slash-free lowercase slug (the address is `<anchor>/<name>`).
         Every milestone is born `planned` — lifecycle is explicit verbs, never
         automatic. `outcome` is the human "done means" line; `target_date` an
-        optional ISO YYYY-MM-DD. Fails on an unregistered anchor, a bad name, or a
-        duplicate (a merge tombstone reserves the name forever). Returns the row.
+        optional ISO YYYY-MM-DD. `title` is an optional human-friendly display
+        title (<= 120 chars, trimmed) that lists render in place of the address —
+        the address stays the identity to store. Fails on an unregistered anchor,
+        a bad name, or a duplicate (a merge tombstone reserves the name forever).
+        Returns the row (with `display_name` = title or the slug name).
 
         Milestones are RELEASES ONLY (e.g. `v1.5`) — never capability, feature or
         gate milestones; capabilities/outcomes belong in PM initiatives and phases
         (governance decision 0fda34e5)."""
         return await anyio.to_thread.run_sync(
-            _create_milestone_sync, anchor, name, outcome, target_date
+            _create_milestone_sync, anchor, name, outcome, target_date, title
         )
 
     def _resolve_milestone_sync(ref: str, context: str | None) -> dict:
@@ -515,13 +528,18 @@ def build_platform_tools_surface() -> FastMCP:
         )
 
     def _update_milestone_sync(
-        address: str, outcome: str | None, target_date: str | None
+        address: str,
+        outcome: str | None,
+        target_date: str | None,
+        title: str | None,
     ) -> dict:
         # Body-present-key semantics MCP can't express natively (no way to send a
         # Python sentinel), so mirror `update_scope`: None = leave unchanged; the
         # empty string "" = the documented CLEAR signal (→ service None, which
         # clears). A non-empty `target_date` parses as ISO.
         kwargs: dict = {}
+        if title is not None:
+            kwargs["title"] = title  # "" (or whitespace) normalizes to a clear
         if outcome is not None:
             kwargs["outcome"] = None if outcome == "" else outcome
         if target_date is not None:
@@ -536,15 +554,17 @@ def build_platform_tools_surface() -> FastMCP:
         address: str,
         outcome: str | None = None,
         target_date: str | None = None,
+        title: str | None = None,
     ) -> dict:
-        """Modify a milestone's display fields — `outcome` / `target_date` — NEVER
-        its identity (§4). Only arguments you pass change: an omitted (null)
-        argument is left as-is, and the empty string `""` CLEARS that field (for
-        `target_date`, `""` clears; a non-empty value is ISO YYYY-MM-DD). Raises if
+        """Modify a milestone's display fields — `title` / `outcome` /
+        `target_date` — NEVER its identity (§4). Only arguments you pass change:
+        an omitted (null) argument is left as-is, and the empty string `""` CLEARS
+        that field (for `target_date`, `""` clears; a non-empty value is ISO
+        YYYY-MM-DD). `title` is the display title (<= 120 chars, trimmed). Raises if
         the address is unknown. Returns the refreshed row. Milestones are releases
         only; keep `outcome` a release outcome, not a capability (decision 0fda34e5)."""
         return await anyio.to_thread.run_sync(
-            _update_milestone_sync, address, outcome, target_date
+            _update_milestone_sync, address, outcome, target_date, title
         )
 
     def _merge_milestone_sync(from_address: str, into_address: str) -> dict:
