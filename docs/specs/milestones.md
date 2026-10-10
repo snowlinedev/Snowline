@@ -201,19 +201,19 @@ and agents relay it — so the tools resolve it; **storage is always canonical**
   surface — create/resolve/list/lifecycle/get/transitions — followed via
   self-registration. Merge, dependency verbs, and `update_milestone` still
   follow.)*
-- **Events — deferred.** The platform has **no event bus**: the only spec'd
-  signed webhook bus is governance's own (governance-plugin.md §7, a plugin
-  store), and the platform's replication-class scope stream is pairing-scoped
-  peer replication, not a subscribable channel. Milestone lifecycle events
-  (`milestone.*`) therefore wait on a **platform-owned webhook-class bus** —
-  its own component spec, in the shape of governance §7 (HMAC, contract
-  version, outbox), at which point `milestone.*` types join the drift-guarded
-  `EVENT_TYPES` registries in both packages per replication-continuity §3.2,
-  and webhook-class emission stays separate from the replication-class stream
-  (origin suppression makes replication events unusable as notifications).
-  **Until then, consumers poll the read API** — PM's lifecycle-event design
-  (pm#64) should treat the registry transition log as the source it will
-  eventually subscribe to.
+- **Events — two classes, one real today.** The REPLICATION-class stream is
+  real: every milestone write emits `milestone.created` / `milestone.updated`
+  / `milestone.transitioned` / `milestone.merged` into the platform's
+  pairing-scoped peer stream (§9; drift-guarded `EVENT_TYPES` in both the
+  platform and the SDK since PR #152), with per-row LWW registers (§9, PR #270)
+  and the `line_rank` absent-key rule (release-line.md §2.3). That stream is
+  peer replication, not a subscribable channel: origin suppression makes its
+  events unusable as notifications. The WEBHOOK-class bus — a platform-owned
+  component in the shape of governance-plugin.md §7 (HMAC, contract version,
+  outbox) that consumers could subscribe to — is still **deferred**; until it
+  exists, consumers poll the read API and the transition log (`GET
+  /milestones/{address}/transitions`), which PM's lifecycle-event design
+  (pm#64) should treat as the source it will eventually subscribe to.
 
 ## 6. Consumer contracts
 
