@@ -71,6 +71,8 @@ _MILESTONE_TOOLS = {
     "remove_milestone_dependency",
     "milestone_dependencies",
     "milestone_aliases",
+    "place_in_line",
+    "remove_from_line",
 }
 _ALL_PLATFORM_TOOLS = {f"platform__{t}" for t in _SCOPE_TOOLS | _MILESTONE_TOOLS}
 
@@ -381,6 +383,60 @@ def test_milestone_aliases_round_trips_through_composed_surface(clean_db):
         "target": "acme/widget/launch",
         "aliases": ["acme/widget/v1-launch"],
     }
+
+
+def test_release_line_tools_round_trip_through_composed_surface(clean_db):
+    """`platform__place_in_line` / `platform__remove_from_line` and
+    `platform__list_milestones(in_line=True)` round-trip through the composed
+    surface (release-line.md §3)."""
+    with session_scope() as s:
+        scopes.create(s, slug="acme/widget", name="Widget", kind="project")
+        for n in ("v1", "v2", "v3"):
+            milestones.create(s, anchor="acme/widget", name=n)
+
+    app = _app(_connector_with_platform())
+
+    async def _calls(session):
+        out = []
+        for args in (
+            {"address": "acme/widget/v1"},
+            {"address": "acme/widget/v3"},
+            {"address": "acme/widget/v2", "before": "v3"},
+        ):
+            out.append(await session.call_tool("platform__place_in_line", args))
+        out.append(
+            await session.call_tool(
+                "platform__list_milestones", {"anchor": "acme/widget", "in_line": True}
+            )
+        )
+        out.append(
+            await session.call_tool(
+                "platform__remove_from_line", {"address": "acme/widget/v1"}
+            )
+        )
+        out.append(
+            await session.call_tool(
+                "platform__place_in_line",
+                {"address": "acme/widget/v1", "after": "acme/widget/v1"},
+            )
+        )
+        return out
+
+    placed1, placed3, placed2, listed, removed, bad = anyio.run(
+        _run_against_surface, app, "/mcp", _calls
+    )
+    for res in (placed1, placed3, placed2, listed, removed):
+        assert res.isError is not True, res.content[0].text
+    assert json.loads(placed2.content[0].text)["line"] == [
+        "acme/widget/v1", "acme/widget/v2", "acme/widget/v3"
+    ]
+    assert [m["address"] for m in json.loads(listed.content[0].text)["milestones"]] == [
+        "acme/widget/v1", "acme/widget/v2", "acme/widget/v3"
+    ]
+    body = json.loads(removed.content[0].text)
+    assert body["line_rank"] is None
+    assert body["line"] == ["acme/widget/v2", "acme/widget/v3"]
+    assert bad.isError is True
 
 
 def test_create_scope_write_verb_round_trips_and_persists(clean_db):

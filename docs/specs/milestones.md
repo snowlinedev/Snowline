@@ -47,8 +47,10 @@ target one but must never require one.
   (the #134/#139 convention, composing with scope-slug folding in addresses);
   unique within its anchor scope, **including merge tombstones** (§7).
   **Reserved names** (amendment, PR #149 review): `transitions`, `aliases`,
-  `dependencies`, `activate`, `deactivate`, `achieve`, `cancel` can never be
-  milestone names (`deactivate` added with the verb, decision `68f4ed4b`) —
+  `dependencies`, `activate`, `deactivate`, `achieve`, `cancel`, `line` can
+  never be milestone names (`deactivate` added with the verb, decision
+  `68f4ed4b`; `line` with the release-line route, whose migration fails
+  loudly if a row is already so named) —
   they collide with the HTTP surface's address-suffix route grammar, and a
   milestone so named would make requests to its own address misroute to the
   suffix handler with a shorter address. (The fixed single-segment paths —
@@ -82,6 +84,12 @@ target one but must never require one.
   anchor is not a fence); the cycle guard runs over the global edge set. Gates
   are for **readiness reads only** — they never block lifecycle verbs (§4).
 - `merged_into_id` — self-FK alias tombstone (§7).
+- `line_rank` — nullable fractional rank placing the milestone in its
+  anchor's **release line** (ship order: which release comes next). The line
+  is the anchor's live ranked milestones, exact anchor only, ordered by
+  `(line_rank, address)`. Independent of `depends_on` and of status. Stored as
+  unbounded `NUMERIC`, carried as a string on the wire. The model lives in
+  `snowline-pm/docs/specs/release-line.md` §2.
 - `created_at` / `updated_at`.
 
 ## 3. Resolution (the drift killer)
@@ -116,7 +124,9 @@ and agents relay it — so the tools resolve it; **storage is always canonical**
   tombstone address, returns the tombstone itself with its target noted (the
   audit read; `resolve` is the one that follows the alias).
 - `list(anchor=None, status=None)` — subtree-filters by anchor; **excludes
-  tombstones by default** (`include_merged=` opts in).
+  tombstones by default** (`include_merged=` opts in). `in_line=True` (needs
+  `anchor`) returns the anchor's release line instead: exact anchor, ranked
+  live rows, line order.
 - `create(anchor, name, outcome, target_date=None)` — the only mint path;
   enforces slash-free name, 1-or-2-segment anchor, and uniqueness **against
   live rows and tombstones alike** (a tombstoned name is reserved forever; the
@@ -150,6 +160,13 @@ and agents relay it — so the tools resolve it; **storage is always canonical**
   removed — silent ignoring would hide real plan breakage.
 - `merge(from_address, into_address)` — §7.
 - `update` — outcome / target_date / display fields; never identity.
+- `place_in_line(address, after=None, before=None)` /
+  `remove_from_line(address)` — release-line placement (release-line.md §3).
+  At most one neighbour; neither appends at the end; re-placing moves. The
+  neighbour must resolve (alias-following) to the same anchor and already be
+  in the line; tombstones are rejected. Any status may be ranked, placement
+  **never transitions**, and achieved/cancelled members keep their rank. Both
+  return the row plus `line: [address…]`.
 
 ## 5. Surfaces
 
@@ -166,6 +183,10 @@ and agents relay it — so the tools resolve it; **storage is always canonical**
     resolving to this milestone. Milestone-keyed consumer reads match stored
     stamps/tags against **the target's full alias set**, or §7's "reads via
     either address agree" is mechanically impossible.
+  - Release line: `POST /milestones/{address}/line` body `{after?|before?}`,
+    `DELETE /milestones/{address}/line`, and
+    `GET /milestones?anchor=<slug>&in_line=true` (exact anchor, line order).
+    MCP: `place_in_line`, `remove_from_line`, `list_milestones(in_line=)`.
 - **MCP tools on the platform `main` surface**: `create_milestone`,
   `resolve_milestone`, `list_milestones` (registry rows — distinct from PM's
   work roll-up read of the same name; prefixes disambiguate),
@@ -389,6 +410,10 @@ restated here.
   - `from`'s `depends_on` edges (both directions) are re-pointed to `into`,
     deduplicated, and the cycle guard re-runs — the merge **fails** if the
     union would cycle.
+  - **Release line** (release-line.md §2.2): the tombstone's `line_rank` is
+    cleared. `into` inherits `from`'s rank when `into` had none and shares the
+    anchor (the merged release keeps its place); otherwise `into` keeps its
+    own. An inheriting merge also emits `milestone.updated` for `into`.
   - The platform **never bulk-retags plugin data** (it cannot write plugin
     stores — the LLM is the integration runtime); consumers' stored addresses
     stay put and reads agree via alias-set matching (§5). The merge response
@@ -438,6 +463,13 @@ the §6 rules stated, not implied):
   stamp** — the LWW clock (replication §6: pure two-event resolution, LWW by
   authored-at, `source_id` tiebreak). `update` and dependency edits replicate
   too — a verb with no event silently never replicates.
+- **`line_rank`** (release-line.md §2.3) rides the full-row payload of every
+  row event as a string or null. Placement (and a rare rebalance, one event
+  per renumbered row) emits `milestone.updated`; ordinary per-row LWW
+  resolves it. **Old-peer safety:** on apply, a payload **without** the
+  `line_rank` key preserves the local value, and only an explicit `null`
+  clears it, so an edit from a peer that predates the field cannot wipe the
+  line (`_write_row_state`).
 - **Concurrent transitions** (e.g. `activate` on the hub, `cancel` on the
   spoke, during a partition): the row converges by LWW per replication §6,
   the loser's transition stays in the transition log, and a pair that is

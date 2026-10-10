@@ -17,12 +17,14 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime
+from decimal import Decimal
 
 from sqlalchemy import (
     JSON,
     Date,
     DateTime,
     ForeignKey,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -155,6 +157,12 @@ class Milestone(Base):
     # docstring. Nullable: only replication-configured local writes stamp it.
     lww_authored_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     lww_source_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    # The release-line rank (release-line.md §2): a fractional index ordering the
+    # anchor's line, NULL = not in the line. Unbounded NUMERIC so SQL and Python
+    # order it numerically; it travels as a STRING on the wire (`to_row`, the
+    # replication payload — `fracrank.to_wire`). Part of the row's mutable LWW
+    # state; a tombstone never carries one (merge clears it).
+    line_rank: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
     # ONE clock per row (QA 4c566e49): naive UTC, same as the lifecycle stamps.
     created_at: Mapped[datetime] = mapped_column(
         default=_utcnow, server_default=func.timezone("utc", func.now())
