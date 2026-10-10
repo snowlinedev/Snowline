@@ -154,7 +154,8 @@ def test_consecutive_failures_survive_restart_via_head_attempts(session):
     _deliver(session, _down, NOW + timedelta(hours=1), DeliveryHealth())
     peer = replication_health(session, now=NOW, state=DeliveryHealth())["outbox"]["peers"]["hub.pm"]
     assert peer["consecutive_failures"] == 2
-    assert peer["unreachable_since"] is None  # unknown after restart
+    # After a restart it is seeded from the stuck row (#269), not unknown.
+    assert peer["unreachable_since"] is not None
 
 
 def test_unreachable_past_threshold_degrades(session):
@@ -294,3 +295,95 @@ def test_apply_to_health_merges_and_degrades():
 @pytest.fixture(autouse=True)
 def _interval(monkeypatch):
     monkeypatch.setenv("SNOWLINE_REPLICATION_INTERVAL", "30")
+
+
+# --- restart seeding of unreachable_since from the stuck outbox row (#269) ----
+
+
+def _stuck_row(session, created_at, attempts):
+    from sqlalchemy import select
+
+    from snowline_plugin_sdk.replication.models import ReplicationOutboxRow
+
+    emit.emit_event(session, "thing.recorded", {})
+    session.commit()
+    row = session.execute(select(ReplicationOutboxRow)).scalars().one()
+    row.created_at = created_at
+    row.attempts = attempts
+    session.commit()
+    return row
+
+
+def test_restart_with_old_stuck_row_degrades_on_first_health_call(session):
+    _setup(session)
+    stamp = NOW - timedelta(days=26)
+    _stuck_row(session, stamp, attempts=1025)
+    block = replication_health(session, now=NOW, state=DeliveryHealth())
+    peer = block["outbox"]["peers"]["hub.pm"]
+    assert peer["unreachable_since"] == stamp.isoformat() + "Z"
+    assert peer["consecutive_failures"] == 1025
+    assert block["status"] == "degraded"
+    assert "peer hub.pm not delivering" in block["degraded_reason"]
+
+
+def test_seed_only_fills_missing_in_memory_value(session):
+    _setup(session)
+    _stuck_row(session, NOW - timedelta(hours=1), attempts=3)
+    # In-memory value OLDER than the stamp: kept.
+    state = DeliveryHealth()
+    old = NOW - timedelta(hours=5)
+    state.record_failure("hub.pm", old, "boom")
+    peer = replication_health(session, now=NOW, state=state)["outbox"]["peers"]["hub.pm"]
+    assert peer["unreachable_since"] == old.isoformat() + "Z"
+    # Missing: filled from the row.
+    peer = replication_health(session, now=NOW, state=DeliveryHealth())["outbox"]["peers"]["hub.pm"]
+    assert peer["unreachable_since"] == (NOW - timedelta(hours=1)).isoformat() + "Z"
+    # Post-restart first failure (in-memory NEWER than the stuck row): the
+    # durable, earlier evidence wins so the wedge is not reset to the restart.
+    state = DeliveryHealth()
+    state.record_failure("hub.pm", NOW - timedelta(minutes=1), "boom")
+    block = replication_health(session, now=NOW, state=state)
+    assert block["outbox"]["peers"]["hub.pm"]["unreachable_since"] == (
+        NOW - timedelta(hours=1)
+    ).isoformat() + "Z"
+    assert block["status"] == "degraded"
+
+
+def test_success_clears_seeded_unreachable(session):
+    _setup(session)
+    _stuck_row(session, NOW - timedelta(days=1), attempts=5)
+    state = DeliveryHealth()
+    assert replication_health(session, now=NOW, state=state)["status"] == "degraded"
+    assert _deliver(session, _ok, NOW + timedelta(minutes=1), state) == 1
+    block = replication_health(session, now=NOW + timedelta(minutes=1), state=state)
+    assert block["outbox"]["peers"]["hub.pm"]["unreachable_since"] is None
+    assert block["status"] == "ok"
+
+
+def test_no_seed_when_rows_have_zero_attempts(session):
+    _setup(session)
+    _stuck_row(session, NOW - timedelta(days=26), attempts=0)
+    block = replication_health(session, now=NOW, state=DeliveryHealth())
+    peer = block["outbox"]["peers"]["hub.pm"]
+    assert peer["pending"] == 1
+    assert peer["unreachable_since"] is None
+    assert block["status"] == "ok"
+
+
+def test_seed_measured_against_db_clock(session):
+    """No `now` override: age comes from the DB clock, so a row stamped 2h ago
+    in the DB's frame seeds a ~2h-old unreachable_since in naive UTC."""
+    from sqlalchemy import select
+
+    from snowline_plugin_sdk.replication.health import _db_clock, _utcnow
+
+    _setup(session)
+    db_now = session.execute(select(_db_clock(session))).scalar_one()
+    _stuck_row(session, db_now - timedelta(hours=2), attempts=2)
+    block = replication_health(session, state=DeliveryHealth())
+    assert block["status"] == "degraded"
+    since = datetime.fromisoformat(
+        block["outbox"]["peers"]["hub.pm"]["unreachable_since"].rstrip("Z")
+    )
+    age = (_utcnow() - since).total_seconds()
+    assert 2 * 3600 - 30 < age < 2 * 3600 + 30

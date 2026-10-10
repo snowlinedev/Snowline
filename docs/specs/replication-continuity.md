@@ -157,8 +157,19 @@ adopter's `/health` carries it (`snowline_plugin_sdk.replication.health`:
   non-ACK (transport error, 5xx, 409, bare 4xx, rejection) extends the
   failure run; `unreachable_since` is the run's first failure; any ACK
   clears it. `consecutive_failures` is the larger of the in-memory run and the
-  stream head's `attempts` (survives a restart; `unreachable_since` does not —
-  after a restart the threshold clock restarts at the next failure).
+  stream head's `attempts` (survives a restart).
+- **Restart behaviour:** `unreachable_since` is also seeded from durable
+  state, so a restart (or crash loop) never reports a long wedge as a fresh
+  outage (#269). The same grouped query returns, per stream, the earliest
+  `created_at` among pending rows with `attempts > 0` (the outbox keeps no
+  first-attempt stamp; the head is first attempted within one tick of being
+  authored, so this is the closest durable proxy). Its age is measured on the
+  DB clock like `oldest_pending_age_s` and mapped into the in-memory frame;
+  the EARLIER of it and any in-memory value is reported (a post-restart first
+  failure must not reset the clock; an older in-memory value is never
+  replaced by a newer stamp). Rows with zero attempts (a fresh backlog) never
+  seed. An ACK clears it as before, and a wedge older than the threshold
+  degrades on the very first `/health` call.
 - Per tick: whether the last loop tick raised, with `Class: message`
   (truncated), and the consecutive raising-tick count.
 - Pending counts/age come from ONE grouped query over `replication_outbox`

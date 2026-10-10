@@ -39,7 +39,7 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, func, select
+from sqlalchemy import DateTime, case, func, select
 from sqlalchemy.orm import Session
 
 from snowline_plugin_sdk.replication.models import (
@@ -178,6 +178,17 @@ def _outbox_rows(session: Session) -> list[tuple]:
             func.count().label("n"),
             func.min(ReplicationOutboxRow.created_at).label("oldest"),
             func.max(ReplicationOutboxRow.attempts).label("attempts"),
+            # Durable evidence of when the current failure run began: the
+            # earliest `created_at` among rows already attempted (the table
+            # keeps no first-attempt stamp; the stuck head is attempted on
+            # the first tick after it is authored, so this is within one
+            # tick of the first failure). NULL when no row was ever tried.
+            func.min(
+                case(
+                    (ReplicationOutboxRow.attempts > 0, ReplicationOutboxRow.created_at),
+                    else_=None,
+                )
+            ).label("stuck_since"),
         )
         .where(ReplicationOutboxRow.status == "pending")
         .group_by(ReplicationOutboxRow.subscription_id)
@@ -191,6 +202,7 @@ def _outbox_rows(session: Session) -> list[tuple]:
                 pending.c.n,
                 pending.c.oldest,
                 pending.c.attempts,
+                pending.c.stuck_since,
                 _db_clock(session).label("db_now"),
             )
             .select_from(ReplicationSubscription)
@@ -241,7 +253,10 @@ def replication_health(
     peers: dict[str, dict] = {}
     total = 0
     oldest_all: datetime | None = None
-    for peer_source_id, target_url, n, oldest, attempts, db_now in rows:
+    unreachable: dict[str, datetime] = {
+        k: v.unreachable_since for k, v in mem_peers.items() if v.unreachable_since
+    }
+    for peer_source_id, target_url, n, oldest, attempts, stuck_since, db_now in rows:
         if age_clock is None and db_now is not None:
             age_clock = db_now
         key = peer_source_id or target_url
@@ -263,6 +278,17 @@ def replication_health(
                 entry["consecutive_failures"], int(attempts or 0)
             )
         total += n
+        if n and stuck_since is not None:
+            # Seed from the stuck row (restart-proof): translate its DB-clock
+            # age into the in-memory (naive UTC) frame. Earlier wins, so a
+            # post-restart first failure doesn't mask a long wedge, while an
+            # older in-memory value is never replaced by a newer stamp.
+            seeded = now - ((age_clock or now) - stuck_since)
+            seeded = min(seeded, now)
+            cur = unreachable.get(key)
+            if cur is None or seeded < cur:
+                unreachable[key] = seeded
+                entry["unreachable_since"] = _iso(seeded)
         if oldest is not None and (oldest_all is None or oldest < oldest_all):
             oldest_all = oldest
 
@@ -297,7 +323,7 @@ def replication_health(
     reasons: list[str] = []
     threshold = unreachable_after_seconds()
     for key in sorted(peers):
-        since = mem_peers.get(key, _PeerState()).unreachable_since
+        since = unreachable.get(key)
         if since is None:
             continue
         down_for = (now - since).total_seconds()
