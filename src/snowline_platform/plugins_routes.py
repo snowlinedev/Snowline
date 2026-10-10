@@ -30,6 +30,7 @@ def _entry_dict(entry: RegisteredPlugin) -> dict:
     return {
         "name": entry.manifest.name,
         "status": entry.status.value,
+        "degraded_reason": entry.degraded_reason,
         "manifest": entry.manifest.model_dump(),
     }
 

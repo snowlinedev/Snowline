@@ -40,6 +40,7 @@
   --accent-ink: #ffffff;    /* text on accent fills */
   --status-up: #0ca30c;
   --status-down: #d03b3b;
+  --status-degraded: #b26b00; /* amber: serving, but needs attention */
   --status-unknown: #63625c;
   --focus-ring: #2362b3;
   /* Badge pairs: a tinted fill with its own ink, so a status badge reads as a
@@ -65,6 +66,7 @@
   --accent-ink: #0b0b0b;
   --status-up: #0ca30c;
   --status-down: #e66767;
+  --status-degraded: #e0a43a;
   --status-unknown: #9a9890;
   --focus-ring: #6da7ec;
   --badge-good-bg: #1d3320;

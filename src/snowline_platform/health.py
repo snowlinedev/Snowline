@@ -8,7 +8,9 @@ treated identically (health.md): route-around, surface, keep retrying.
 
 The signal is deliberately minimal — a 2xx from ``base_url + health_path`` within
 the timeout is healthy; anything else (non-2xx, connection refused, DNS/TLS
-error, timeout) is `DOWN`. There is no body contract; 2xx *is* the contract. A
+error, timeout) is `DOWN`. 2xx is the liveness contract; the ONE body field read
+is an optional self-reported ``"status": "degraded"`` (issue #241), which maps a
+2xx to `DEGRADED` — still routable — carrying the plugin's `degraded_reason`. A
 `DOWN` plugin that recovers flips back to `UP` on the next round automatically.
 
 A single background task (started in the app lifespan, cancelled on shutdown)
@@ -45,12 +47,43 @@ def health_url(manifest: PluginManifest) -> str:
     return f"{manifest.base_url}{manifest.health_path}"
 
 
-async def check(client: httpx.AsyncClient, entry: RegisteredPlugin) -> PluginStatus:
-    """Poll one plugin's health endpoint → `UP` (2xx) or `DOWN` (anything else).
+def _degraded_verdict(entry: RegisteredPlugin, resp: httpx.Response) -> str | None:
+    """The plugin's self-reported degradation reason, or None when it reports
+    ok / no parseable body (2xx with no body contract stays `UP`). A degraded
+    body without a reason still degrades, with a generic reason.
 
-    Every transport failure — connection refused (crashed local), DNS/TLS error
-    or timeout (unreachable remote) — is caught and mapped to `DOWN`, never
-    raised: an unhealthy plugin must not break the round."""
+    The platform's OWN self-entry is judged by its `replication` block only:
+    its top-level `status` is the AGGREGATE (it goes `degraded` when any other
+    plugin is), and reading that back onto the self-entry would mark the
+    platform degraded for another plugin's fault."""
+    try:
+        body = resp.json()
+    except Exception:  # noqa: BLE001 - non-JSON 2xx is a plain UP
+        return None
+    if not isinstance(body, dict):
+        return None
+    from snowline_platform.platform_tools import PLATFORM_PLUGIN_NAME
+
+    if entry.manifest.name == PLATFORM_PLUGIN_NAME:
+        body = body.get("replication")
+        if not isinstance(body, dict):
+            return None
+    if body.get("status") != "degraded":
+        return None
+    reason = body.get("degraded_reason")
+    if not reason and isinstance(body.get("replication"), dict):
+        reason = body["replication"].get("degraded_reason")
+    return str(reason) if reason else "plugin reported degraded"
+
+
+async def probe(
+    client: httpx.AsyncClient, entry: RegisteredPlugin
+) -> tuple[PluginStatus, str | None]:
+    """Poll one plugin's health endpoint → (`UP` | `DEGRADED` | `DOWN`,
+    degraded reason). Every transport failure — connection refused (crashed
+    local), DNS/TLS error or timeout (unreachable remote) — is caught and
+    mapped to `DOWN`, never raised: an unhealthy plugin must not break the
+    round."""
     try:
         resp = await client.get(health_url(entry.manifest))
     except httpx.HTTPError as exc:
@@ -60,8 +93,20 @@ async def check(client: httpx.AsyncClient, entry: RegisteredPlugin) -> PluginSta
             health_url(entry.manifest),
             exc,
         )
-        return PluginStatus.DOWN
-    return PluginStatus.UP if resp.is_success else PluginStatus.DOWN
+        return PluginStatus.DOWN, None
+    if not resp.is_success:
+        return PluginStatus.DOWN, None
+    reason = _degraded_verdict(entry, resp)
+    if reason is not None:
+        return PluginStatus.DEGRADED, reason
+    return PluginStatus.UP, None
+
+
+async def check(client: httpx.AsyncClient, entry: RegisteredPlugin) -> PluginStatus:
+    """`probe`'s status alone: `UP` (2xx), `DEGRADED` (2xx self-reporting
+    degraded), or `DOWN` (anything else)."""
+    status, _ = await probe(client, entry)
+    return status
 
 
 async def poll_once(
@@ -78,15 +123,21 @@ async def poll_once(
         # non-HTTPError (e.g. a RuntimeError from a client closed mid-round on
         # shutdown) must stay THIS plugin's DOWN — never abort the task group and
         # cancel the sibling checks (round isolation, health.md).
+        reason: str | None = None
         try:
-            status = await check(client, entry)
+            status, reason = await probe(client, entry)
         except Exception:
             log.exception("health: unexpected error checking %s", entry.manifest.name)
             status = PluginStatus.DOWN
         # `expected_entry` pins the write to the entry this round actually
         # probed: if an `updated` upsert replaced it mid-round, the result
         # describes the OLD address and must not mark the new entry (issue #39).
-        registry.set_status(entry.manifest.name, status, expected_entry=entry)
+        registry.set_status(
+            entry.manifest.name,
+            status,
+            expected_entry=entry,
+            degraded_reason=reason,
+        )
         results[entry.manifest.name] = status
 
     async with anyio.create_task_group() as tg:

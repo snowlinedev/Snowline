@@ -5,7 +5,8 @@ The SDK owns the *envelope*: the transactional outbox + per-stream emit-time
 `seq` allocation (`emit`), the delivery loop with the replication retry class
 (unbounded retry, capped per-row backoff, per-ingest reachability probe — §3.1),
 the per-stream watermark + contiguous-apply gate, signature verify, origin
-suppression, and parking (`ingest`, §3.2/§8.1), plus the tailnet-gated
+suppression, and parking (`ingest`, §3.2/§8.1), the delivery-health block a
+plugin's `/health` carries (`health`, issue #241), plus the tailnet-gated
 replication-admin surface + ingest route (`admin`, §5). The PLUGIN owns the
 *domain*: it supplies the idempotent apply function and calls `emit_event` from
 its domain writes. A plugin opts in by adopting these modules, not by rewriting
@@ -31,6 +32,13 @@ from .emit import (
     set_subscription_secret,
 )
 from .envelope import build_envelope, sign_body, verify_signature
+from .health import (
+    DELIVERY_HEALTH,
+    DeliveryHealth,
+    apply_to_health,
+    replication_health,
+    replication_health_from_scope,
+)
 from .ingest import (
     ParkNow,
     ingest_delivery,
@@ -79,4 +87,9 @@ __all__ = [
     "list_parked",
     "is_applying_replicated_event",
     "ParkNow",
+    "DELIVERY_HEALTH",
+    "DeliveryHealth",
+    "replication_health",
+    "replication_health_from_scope",
+    "apply_to_health",
 ]

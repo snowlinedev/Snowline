@@ -15,7 +15,7 @@
 
 import type { PluginEntry } from "../api";
 import { fetchSurfaces } from "../api";
-import { KindList, LoadableCard, StateNote, Stat, StatusChip } from "../kinds/kinds";
+import { KindList, LoadableCard, PluginStatusCell, StateNote, Stat } from "../kinds/kinds";
 import { usePlugins } from "../plugins-context";
 import { sectionNavEntries, type SectionDef } from "../registry";
 import { Layout } from "../shell/Layout";
@@ -53,7 +53,7 @@ function SystemHealth() {
           <KindList
             items={data.map((p) => ({
               text: p.name,
-              meta: <StatusChip status={p.status} />,
+              meta: <PluginStatusCell status={p.status} reason={p.degraded_reason} />,
             }))}
             empty="No plugins registered."
           />

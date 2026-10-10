@@ -85,6 +85,7 @@ const PAIRS = [
   ["badge-bad-ink", "surface-card", 4.5],
   ["status-up", "surface-card", 3],
   ["status-down", "surface-card", 3],
+  ["status-degraded", "surface-card", 3],
   ["status-unknown", "surface-card", 3],
   ["focus-ring", "surface-page", 3],
   ["focus-ring", "surface-card", 3],

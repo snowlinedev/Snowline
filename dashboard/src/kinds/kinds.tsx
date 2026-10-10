@@ -25,6 +25,7 @@ import {
   fetchUiData,
   postUiApi,
   UiApiError,
+  type PluginStatus,
   type UIAction,
   type UIComposer,
 } from "../api";
@@ -158,11 +159,27 @@ export function KindTable(props: {
 
 /* ---- status chip: dot + label, never color alone ------------------------- */
 
-export function StatusChip(props: { status: "up" | "down" | "unknown" }) {
+export function StatusChip(props: { status: PluginStatus }) {
   return (
     <span className={`chip ${props.status}`}>
       <span className="dot" aria-hidden="true" />
       {props.status}
+    </span>
+  );
+}
+
+/** A plugin's status chip plus, while `degraded`, its self-reported reason as
+ * visible text (issue #241) — the reason is the actionable part. */
+export function PluginStatusCell(props: {
+  status: PluginStatus;
+  reason?: string | null;
+}) {
+  return (
+    <span className="plugin-status">
+      <StatusChip status={props.status} />
+      {props.status === "degraded" && props.reason && (
+        <span className="degraded-reason">{props.reason}</span>
+      )}
     </span>
   );
 }

@@ -24,8 +24,49 @@ routable). This component is what *sets* that status.
 A plugin is **healthy** when an HTTP `GET` of its `base_url + health_path`
 (manifest fields; `health_path` defaults to `/health`) returns a 2xx within the
 poll timeout. Anything else — non-2xx, connection refused, DNS failure, TLS
-error, timeout — is **unhealthy**. There is no body contract; 2xx *is* the
-contract (matches the platform's own `/health` returning `{"status": "ok"}`).
+error, timeout — is **unhealthy**. 2xx *is* the liveness contract. The one
+body field the poller reads is an OPTIONAL self-reported `status` (below); a
+plugin with no body, or no `status`, is plain `UP`.
+
+### Status vocabulary — `ok` | `degraded` | `down` (issue #241)
+
+| Value      | Who says it                  | Meaning                                                                    | Routed? |
+|------------|------------------------------|----------------------------------------------------------------------------|---------|
+| `ok`       | the plugin (`/health` body)  | serving and healthy                                                        | yes     |
+| `degraded` | the plugin (`/health` body)  | serving (2xx), but a background duty is failing — e.g. replication delivery | yes     |
+| `down`     | the platform (never self-reported) | non-2xx / unreachable health endpoint                                | no      |
+
+A `degraded` body carries a human-readable `degraded_reason` (top level; the
+poller falls back to `replication.degraded_reason`). It **must still answer
+200** — `degraded` is an attention signal, not a routing verdict; a plugin
+that answers non-2xx is `DOWN` whatever its body says.
+
+The replication delivery loop (SDK, replication-continuity §3.1 "Delivery
+health") is the first producer: a plugin's `/health` gains a
+`replication.outbox` block and goes `degraded` when a peer has not accepted a
+delivery for longer than `SNOWLINE_REPLICATION_UNREACHABLE_AFTER_S` (default
+900s) or the delivery tick itself raised on ≥ 3 consecutive runs.
+
+### The platform's own `/health` — the aggregate
+
+```json
+{"status": "ok" | "degraded",
+ "degraded_reason": "plugin pm: peer mbp.pm not delivering for …",   // only when degraded
+ "plugins": {"<name>": {"status": "up" | "degraded" | "down" | "unknown",
+                        "replication_degraded_reason": "…"}},       // only when degraded
+ "replication": { …the platform's own SDK delivery-health block… }}
+```
+
+Overall `degraded` when any plugin is `DEGRADED` or the platform's own
+replication block is degraded. A `DOWN` plugin is listed but does **not**
+change the overall status (unchanged semantics — it is routed around). The
+platform self-entry is excluded from `plugins`, and the poller judges the
+self-entry by its `replication` block only (its top-level status is the
+aggregate — reading that back would mark the platform degraded for another
+plugin's fault). `degraded_reason` joins every cause, so a downstream reader
+(pm's briefing) needs only that field. `GET /plugins` carries each entry's
+`degraded_reason` for the dashboard (System › Plugins / Plugin status show
+`degraded` amber with the reason).
 
 ### Status mapping
 
@@ -34,10 +75,11 @@ The poll maps each plugin to a `PluginStatus`:
 | Observation                               | Status |
 |-------------------------------------------|--------|
 | 2xx within timeout                        | `UP`   |
+| 2xx whose body says `"status": "degraded"` | `DEGRADED` (routable) |
 | non-2xx, or any transport error / timeout | `DOWN` |
 
 `UNKNOWN` is only the *pre-first-poll* state (set at registration). Once a plugin
-has been polled it is always `UP` or `DOWN`. Recovery is automatic: a `DOWN`
+has been polled it is always `UP`, `DEGRADED` or `DOWN`. Recovery is automatic: a `DOWN`
 plugin that starts returning 2xx flips back to `UP` on the next poll, with no
 operator action.
 
@@ -67,7 +109,8 @@ request). No restart, no cache to invalidate.
 
 ### Interaction with the gateway
 
-Unchanged gateway code: `discover_upstreams` skips `DOWN`, so the moment the
+Unchanged gateway code: `discover_upstreams` skips `DOWN` (and only `DOWN` —
+`DEGRADED` stays routable), so the moment the
 poller marks a plugin `DOWN` it disappears from every named surface's tool list
 and becomes unroutable (calls return a clear `GatewayError`, never a hang). When
 the poller flips it back to `UP`, it reappears. `UNKNOWN` remains routable so a

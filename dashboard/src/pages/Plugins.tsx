@@ -1,5 +1,5 @@
 import { fetchPlugins } from "../api";
-import { Card, KindTable, PendingNote, StatusChip } from "../kinds/kinds";
+import { Card, KindTable, PendingNote, PluginStatusCell } from "../kinds/kinds";
 import { Layout } from "../shell/Layout";
 import { useData } from "../useData";
 
@@ -21,7 +21,7 @@ export function Plugins() {
             rows={plugins.data.map((p) => ({
               cells: {
                 name: p.name,
-                status: <StatusChip status={p.status} />,
+                status: <PluginStatusCell status={p.status} reason={p.degraded_reason} />,
                 base_url: p.manifest.base_url,
                 surfaces: Object.entries(p.manifest.surfaces)
                   .map(([path, surface]) => `${path} → ${surface}`)
