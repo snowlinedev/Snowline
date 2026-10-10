@@ -8,6 +8,8 @@ wait, then cancels."""
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import anyio
 import httpx
 
@@ -280,3 +282,197 @@ def test_health_loop_polls_then_cancels():
         return reg.get("gov").status
 
     assert anyio.run(go) is PluginStatus.UP
+
+
+# --- degraded (issue #241) -----------------------------------------------------
+
+_DEGRADED_BODY = {
+    "status": "degraded",
+    "plugin": "pm",
+    "degraded_reason": "peer mbp.pm not delivering for 1200s (> 900s): ConnectError: refused",
+    "replication": {"status": "degraded", "degraded_reason": "x", "outbox": {}},
+}
+
+
+def test_check_degraded_on_self_reported_degraded_body():
+    reg = _reg(PluginManifest(name="pm", base_url="http://pm:1", surfaces={"/mcp": "main"}))
+
+    async def go():
+        async with _mock_client(lambda req: httpx.Response(200, json=_DEGRADED_BODY)) as c:
+            await health.poll_once(reg, c)
+
+    anyio.run(go)
+    entry = reg.get("pm")
+    assert entry.status is PluginStatus.DEGRADED
+    assert entry.degraded_reason == _DEGRADED_BODY["degraded_reason"]
+    # Degraded is still routable — only DOWN is routed around.
+    assert {u.plugin_name for u in discover_upstreams(reg, "main")} == {"pm"}
+
+
+def test_degraded_reason_falls_back_to_replication_block_then_generic():
+    reg = _reg(PluginManifest(name="pm", base_url="http://pm:1"))
+    entry = reg.get("pm")
+
+    async def go(body):
+        async with _mock_client(lambda req: httpx.Response(200, json=body)) as c:
+            return await health.probe(c, entry)
+
+    assert anyio.run(go, {"status": "degraded", "replication": {"degraded_reason": "r"}}) == (
+        PluginStatus.DEGRADED, "r"
+    )
+    assert anyio.run(go, {"status": "degraded"}) == (
+        PluginStatus.DEGRADED, "plugin reported degraded"
+    )
+    # ok / non-dict bodies stay UP (2xx is still the contract).
+    assert anyio.run(go, {"status": "ok"}) == (PluginStatus.UP, None)
+    assert anyio.run(go, ["x"]) == (PluginStatus.UP, None)
+
+
+def test_recovery_clears_degraded_reason():
+    reg = _reg(PluginManifest(name="pm", base_url="http://pm:1"))
+    state = {"body": _DEGRADED_BODY}
+
+    async def go():
+        async with _mock_client(lambda req: httpx.Response(200, json=state["body"])) as c:
+            await health.poll_once(reg, c)
+            state["body"] = {"status": "ok"}
+            await health.poll_once(reg, c)
+
+    anyio.run(go)
+    assert reg.get("pm").status is PluginStatus.UP
+    assert reg.get("pm").degraded_reason is None
+
+
+def test_non_2xx_degraded_body_is_still_down():
+    """DOWN semantics unchanged: a non-2xx is DOWN whatever the body says."""
+    reg = _reg(PluginManifest(name="pm", base_url="http://pm:1"))
+
+    async def go():
+        async with _mock_client(lambda req: httpx.Response(503, json=_DEGRADED_BODY)) as c:
+            return await health.poll_once(reg, c)
+
+    assert anyio.run(go) == {"pm": PluginStatus.DOWN}
+    assert reg.get("pm").degraded_reason is None
+
+
+def test_platform_self_entry_judged_by_its_replication_block_only():
+    """The platform's top-level status is the AGGREGATE; reading it back onto
+    the self-entry would mark the platform degraded for another plugin."""
+    from snowline_platform.platform_tools import PLATFORM_PLUGIN_NAME
+
+    reg = _reg(PluginManifest(name=PLATFORM_PLUGIN_NAME, base_url="http://plat:1"))
+    entry = reg.get(PLATFORM_PLUGIN_NAME)
+
+    async def go(body):
+        async with _mock_client(lambda req: httpx.Response(200, json=body)) as c:
+            return await health.probe(c, entry)
+
+    aggregate_only = {
+        "status": "degraded",
+        "degraded_reason": "plugin pm: x",
+        "replication": {"status": "ok", "degraded_reason": None},
+    }
+    assert anyio.run(go, aggregate_only) == (PluginStatus.UP, None)
+    own = {
+        "status": "degraded",
+        "replication": {"status": "degraded", "degraded_reason": "tick raised"},
+    }
+    assert anyio.run(go, own) == (PluginStatus.DEGRADED, "tick raised")
+
+
+def _app_client():
+    from starlette.testclient import TestClient
+
+    from snowline_platform.app import create_app
+    from snowline_platform.trust import Principal, TrustResolver
+
+    class _AlwaysTrust:
+        def resolve(self, peer_ip, headers):
+            return Principal(id="test-owner", source="test")
+
+    app = create_app(resolver=TrustResolver([_AlwaysTrust()]), migrate_on_startup=False)
+    return app, TestClient(app)
+
+
+def test_platform_health_aggregate_ok_and_down_unchanged():
+    app, client = _app_client()
+    reg = app.state.registry
+    reg.upsert(PluginManifest(name="gov", base_url="http://gov:1"))
+    reg.upsert(PluginManifest(name="mem", base_url="http://mem:1"))
+    reg.set_status("gov", PluginStatus.UP)
+    reg.set_status("mem", PluginStatus.DOWN)
+
+    r = client.get("/health")
+    assert r.status_code == 200
+    body = r.json()
+    # A DOWN plugin is shown but does not change the overall status.
+    assert body["status"] == "ok"
+    assert body["plugins"] == {"gov": {"status": "up"}, "mem": {"status": "down"}}
+    assert "degraded_reason" not in body
+    assert body["replication"]["status"] == "ok"
+    assert set(body["replication"]["outbox"]) >= {
+        "pending", "oldest_pending_age_s", "peers", "tick"
+    }
+
+
+def test_platform_health_aggregate_degraded_names_the_plugin():
+    app, client = _app_client()
+    reg = app.state.registry
+    reg.upsert(PluginManifest(name="pm", base_url="http://pm:1"))
+    reg.upsert(PluginManifest(name="gov", base_url="http://gov:1"))
+    reg.set_status("pm", PluginStatus.DEGRADED, degraded_reason="peer mbp.pm not delivering")
+    reg.set_status("gov", PluginStatus.UP)
+
+    r = client.get("/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "degraded"
+    assert body["plugins"]["pm"] == {
+        "status": "degraded",
+        "replication_degraded_reason": "peer mbp.pm not delivering",
+    }
+    assert body["plugins"]["gov"] == {"status": "up"}
+    assert body["degraded_reason"] == "plugin pm: peer mbp.pm not delivering"
+    # /plugins carries the reason for the dashboard.
+    listed = {p["name"]: p for p in client.get("/plugins").json()["plugins"]}
+    assert listed["pm"]["status"] == "degraded"
+    assert listed["pm"]["degraded_reason"] == "peer mbp.pm not delivering"
+
+
+def test_platform_health_degrades_on_its_own_replication(monkeypatch):
+    """The platform's OWN delivery loop counts too (it replicates scopes)."""
+    from snowline_plugin_sdk.replication.health import DELIVERY_HEALTH
+
+    app, client = _app_client()
+    for _ in range(3):
+        DELIVERY_HEALTH.record_tick(datetime(2026, 7, 4), OverflowError("boom"))
+    body = client.get("/health").json()
+    assert body["status"] == "degraded"
+    assert body["degraded_reason"] == (
+        "delivery tick raised 3 consecutive times: OverflowError: boom"
+    )
+    assert body["replication"]["status"] == "degraded"
+
+
+def test_platform_health_outbox_age_on_postgres_is_zone_correct(clean_db, monkeypatch):
+    """Against real Postgres: `created_at` is a naive `now()` default in the
+    SESSION timezone (not UTC), so the age must use the DB's own clock — a
+    just-emitted row is seconds old, not hours, on a non-UTC server (the hub
+    runs America/Detroit)."""
+    from snowline_plugin_sdk.replication import emit
+
+    from snowline_platform.db import session_scope
+
+    monkeypatch.setenv("SNOWLINE_REPLICATION_SOURCE_ID", "test.platform")
+    with session_scope() as s:
+        emit.create_outbound_subscription(
+            s, "http://peer:1/events/ingest", "x", ["scope.created"],
+            epoch="e1", peer_source_id="spoke.platform",
+        )
+        emit.emit_event(s, "scope.created", {"slug": "a"})
+
+    _, client = _app_client()
+    outbox = client.get("/health").json()["replication"]["outbox"]
+    assert outbox["pending"] == 1
+    assert outbox["peers"]["spoke.platform"]["pending"] == 1
+    assert 0 <= outbox["oldest_pending_age_s"] < 600

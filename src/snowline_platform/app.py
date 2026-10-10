@@ -42,7 +42,7 @@ from snowline_platform.health import health_poll_loop
 from starlette.routing import Mount, Route
 
 from snowline_platform.middleware import TrustMiddleware
-from snowline_platform.registry import PluginRegistry
+from snowline_platform.registry import PluginRegistry, PluginStatus
 from snowline_platform.registry_state import (
     RegistryStateFile,
     StartupGrace,
@@ -50,6 +50,10 @@ from snowline_platform.registry_state import (
 )
 from snowline_platform.trust import CidrTrustProvider, TrustResolver
 from snowline_plugin_sdk.replication import replication_delivery_loop
+from snowline_plugin_sdk.replication.health import (
+    apply_to_health,
+    replication_health_from_scope,
+)
 
 log = logging.getLogger("snowline_platform.app")
 
@@ -314,7 +318,38 @@ def create_app(
 
     @app.get("/health")
     async def health() -> dict:
-        return {"status": "ok"}
+        """Liveness (always 200 while serving) + the aggregate view (issue
+        #241, health.md "Status vocabulary"): `status` is `ok` | `degraded`;
+        `plugins` maps every registered plugin (the self-entry excluded) to
+        its polled status, with `replication_degraded_reason` on a DEGRADED
+        one; `replication` is the platform's OWN SDK delivery-health block.
+        Overall `degraded` when the platform's own replication degraded or
+        any plugin is DEGRADED. A DOWN plugin does NOT change the overall
+        status (unchanged semantics: DOWN is routed around, and shown in
+        `plugins`). `degraded_reason` joins every cause, so a reader (pm's
+        briefing, later) needs only this one field."""
+        block = await anyio.to_thread.run_sync(
+            replication_health_from_scope, session_scope
+        )
+        plugins: dict[str, dict] = {}
+        plugin_reasons: list[str] = []
+        for entry in app.state.registry.list():
+            name = entry.manifest.name
+            if name == platform_tools.PLATFORM_PLUGIN_NAME:
+                continue
+            row: dict = {"status": entry.status.value}
+            if entry.status is PluginStatus.DEGRADED:
+                row["replication_degraded_reason"] = entry.degraded_reason
+                plugin_reasons.append(f"plugin {name}: {entry.degraded_reason}")
+            plugins[name] = row
+        body = apply_to_health({"status": "ok", "plugins": plugins}, block)
+        if plugin_reasons:
+            body["status"] = "degraded"
+            prior = body.get("degraded_reason")
+            body["degraded_reason"] = "; ".join(
+                ([prior] if prior else []) + plugin_reasons
+            )
+        return body
 
     @app.get("/whoami")
     async def whoami(request: Request) -> dict:

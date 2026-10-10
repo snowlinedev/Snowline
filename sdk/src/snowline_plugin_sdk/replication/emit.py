@@ -50,6 +50,11 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from snowline_plugin_sdk.replication import ingest as _ingest
+from snowline_plugin_sdk.replication.health import (
+    DELIVERY_HEALTH,
+    DeliveryHealth,
+    peer_key,
+)
 from snowline_plugin_sdk.replication.envelope import (
     REJECTION_REASONS,
     build_envelope,
@@ -290,9 +295,14 @@ def _backoff(attempts: int) -> timedelta:
     """Exponential from one delivery interval, capped at ~interval x 10 (§3.1):
     a two-week partition retries every ~5 minutes at the default 30s interval,
     never dead-letters, and drains within one interval of the probe seeing the
-    heal."""
+    heal.
+
+    The exponent is clamped BEFORE doubling (issue #235): `2 ** (attempts - 1)`
+    for attempts past ~1024 overflows float in the multiply, so the cap's
+    `min()` never ran and retry bookkeeping itself raised every tick. 2**10
+    already exceeds the x10 ceiling, so the clamp never changes a result."""
     interval = _interval_seconds()
-    return timedelta(seconds=min(interval * (2 ** (attempts - 1)), interval * 10))
+    return timedelta(seconds=min(interval * (2 ** min(attempts - 1, 10)), interval * 10))
 
 
 def _probe_ingests(
@@ -325,6 +335,7 @@ def deliver_pending(
     *,
     now: datetime | None = None,
     reachability: dict[str, bool] | None = None,
+    health: DeliveryHealth | None = None,
 ) -> int:
     """One delivery pass over every active outbound stream. Returns the count
     newly ACKed (applied / duplicate / parked all count — a park ACKs exactly
@@ -353,10 +364,17 @@ def deliver_pending(
 
     The tick opens with the §3.1 reachability probe; an ingest transitioning
     unreachable → reachable gets its rows' backoff cleared, which is what makes
-    §10's "within one delivery interval of reconnect" satisfiable."""
+    §10's "within one delivery interval of reconnect" satisfiable.
+
+    Every delivery outcome is also recorded into `health` (default: the
+    process-wide `DELIVERY_HEALTH`) BEFORE the row's retry bookkeeping runs,
+    so `/health` sees a failing peer even if that bookkeeping itself raises
+    (issue #241 — the #235 overflow was invisible exactly that way)."""
     now = now or _utcnow()
     if reachability is None:
         reachability = _REACHABILITY
+    if health is None:
+        health = DELIVERY_HEALTH
 
     subs = session.scalars(
         select(ReplicationSubscription).where(
@@ -402,6 +420,7 @@ def deliver_pending(
                 resp = client.post(sub.target_url, content=body, headers=headers)
             except Exception as exc:  # noqa: BLE001 - transport error → retry
                 reachability[sub.target_url] = False
+                health.record_failure(peer_key(sub), now, exc)
                 _record_retry(row, now, str(exc))
                 session.commit()
                 break
@@ -411,6 +430,7 @@ def deliver_pending(
                 row.delivered_at = now
                 row.next_attempt_at = None
                 delivered += 1
+                health.record_success(peer_key(sub), now)
                 session.commit()
                 continue
             if _is_vocabulary_rejection(resp):
@@ -419,6 +439,7 @@ def deliver_pending(
                 # until the cause is fixed and the row is requeued.
                 row.status = "rejected"
                 row.last_error = _response_error(resp)
+                health.record_failure(peer_key(sub), now, row.last_error)
                 log.error(
                     "replication delivery REJECTED (stream %s/%s seq %s): %s",
                     sub.source_id, sub.epoch, row.seq, row.last_error,
@@ -427,7 +448,9 @@ def deliver_pending(
                 # Everything else is retryable: 409 refusals (ordering /
                 # version hold — §3.1/§3.2), bare 4xx stream-level conditions,
                 # 5xx. See the docstring's classification rationale.
-                _record_retry(row, now, _response_error(resp))
+                error = _response_error(resp)
+                health.record_failure(peer_key(sub), now, error)
+                _record_retry(row, now, error)
             session.commit()
             break  # non-ACK: never advance past an undelivered seq
     return delivered
@@ -776,6 +799,11 @@ async def replication_delivery_loop(
     while True:
         try:
             await anyio.to_thread.run_sync(_tick)
-        except Exception:  # noqa: BLE001 - the loop must outlive any one tick
+        except Exception as exc:  # noqa: BLE001 - the loop must outlive any one tick
+            # Recorded for /health (issue #241): >= 3 consecutive raising
+            # ticks degrade the plugin instead of only filling the log.
+            DELIVERY_HEALTH.record_tick(_utcnow(), exc)
             log.exception("replication delivery tick failed; loop continues")
+        else:
+            DELIVERY_HEALTH.record_tick(_utcnow())
         await anyio.sleep(_interval_seconds())

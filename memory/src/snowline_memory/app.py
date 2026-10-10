@@ -29,6 +29,10 @@ from fastapi import FastAPI
 from snowline_plugin_sdk.registration import install_heartbeat_httpx_filter
 from snowline_plugin_sdk.replication import replication_delivery_loop
 from snowline_plugin_sdk.replication.admin import build_replication_router
+from snowline_plugin_sdk.replication.health import (
+    apply_to_health,
+    replication_health_from_scope,
+)
 
 from snowline_memory import config, memory, registration
 from snowline_memory.db import session_scope
@@ -119,7 +123,16 @@ def create_app(
 
     @app.get("/health")
     async def health() -> dict:
-        return {"status": "ok", "plugin": registration.PLUGIN_NAME}
+        # The SDK replication delivery-health block (issue #241): outbox
+        # state + `degraded` when a peer stops accepting deliveries past the
+        # threshold or the delivery tick keeps raising. Never raises; still
+        # 200 when degraded so the gateway keeps routing here.
+        block = await anyio.to_thread.run_sync(
+            replication_health_from_scope, session_scope
+        )
+        return apply_to_health(
+            {"status": "ok", "plugin": registration.PLUGIN_NAME}, block
+        )
 
     # Memory's replication HTTP surface (replication-continuity §5, #80): the
     # signed-event ingest route + the tailnet-gated admin routes the pairing CLI

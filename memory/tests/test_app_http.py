@@ -88,4 +88,10 @@ def test_health_endpoint():
                 return (await http.get("http://mem/health")).json()
 
     body = anyio.run(go)
-    assert body == {"status": "ok", "plugin": "memory"}
+    assert body["status"] == "ok"
+    assert body["plugin"] == "memory"
+    # The SDK delivery-health block rides along (issue #241).
+    assert body["replication"]["status"] == "ok"
+    assert set(body["replication"]["outbox"]) >= {
+        "pending", "oldest_pending_age_s", "peers", "tick"
+    }

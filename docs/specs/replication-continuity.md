@@ -129,6 +129,48 @@ companions keep it correct:
   never dead-letters. Receiver-side authentic-but-unappliable events park
   instead (§8.1).
 
+#### Delivery health — the outbox on `/health` (issue #241)
+
+Unbounded retry makes a failing stream *quiet by design* — the loop swallows
+per-tick exceptions so a transient fault can never kill it. That posture let a
+loop fail on every tick for weeks (#235, a backoff overflow) behind a green
+`/health`. So the SDK's delivery loop also keeps delivery health, and every
+adopter's `/health` carries it (`snowline_plugin_sdk.replication.health`:
+`replication_health_from_scope(session_scope)` + `apply_to_health(body, block)`):
+
+```json
+"replication": {
+  "status": "ok" | "degraded",
+  "degraded_reason": "…" | null,
+  "outbox": {
+    "pending": 3, "oldest_pending_age_s": 1250.4,
+    "peers": {"<peer_source_id or ingest URL>": {
+        "pending": 3, "consecutive_failures": 41,
+        "last_success_at": "…Z" | null, "last_error": "ConnectError: …" | null,
+        "unreachable_since": "…Z" | null}},
+    "tick": {"last_at": "…Z", "last_error": "OverflowError: …" | null,
+             "consecutive_errors": 0}}}
+```
+
+- Per peer (in memory, fed by every delivery outcome — recorded BEFORE the
+  row's retry bookkeeping, so a raising bookkeeping step is still seen): any
+  non-ACK (transport error, 5xx, 409, bare 4xx, rejection) extends the
+  failure run; `unreachable_since` is the run's first failure; any ACK
+  clears it. `consecutive_failures` is the larger of the in-memory run and the
+  stream head's `attempts` (survives a restart; `unreachable_since` does not —
+  after a restart the threshold clock restarts at the next failure).
+- Per tick: whether the last loop tick raised, with `Class: message`
+  (truncated), and the consecutive raising-tick count.
+- Pending counts/age come from ONE grouped query over `replication_outbox`
+  per health call, ACTIVE subscriptions only — retiring a stale stream toward
+  a parked peer clears its entry and its degradation.
+- **Degrade rule:** `degraded` when any active peer's `unreachable_since` is
+  older than `SNOWLINE_REPLICATION_UNREACHABLE_AFTER_S` (default 900s), or
+  the tick raised on ≥ 3 consecutive runs. Never `down`: the plugin still
+  serves and `/health` stays 200 (health.md "Status vocabulary"). The block
+  never raises — a failing DB query answers from memory with
+  `outbox.unavailable`.
+
 ### 3.2 Stream identity — emit-time seq, epochs, causal context
 
 The bus today allocates `seq` per-SUBSCRIPTION at DELIVERY time

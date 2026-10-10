@@ -761,4 +761,28 @@ describe("System hosts the native health cards (§3)", () => {
     expect(links).toContain("Scopes");
     expect(links.indexOf("Plugins")).toBeGreaterThan(links.indexOf("main"));
   });
+
+  it("shows a degraded plugin amber with its reason (issue #241)", async () => {
+    const pm: PluginEntry = {
+      ...named("pm", []),
+      status: "degraded",
+      degraded_reason: "peer mbp.pm not delivering for 1200s (> 900s)",
+    };
+    stubRegistry([acme([], []), pm]);
+    renderAt("/system");
+    const main = screen.getByRole("main");
+    await within(main).findByRole("heading", { level: 2, name: "Plugin status" });
+    const reason = await within(main).findByText(
+      "peer mbp.pm not delivering for 1200s (> 900s)",
+    );
+    const cell = reason.closest(".plugin-status");
+    expect(cell).not.toBeNull();
+    const chip = cell!.querySelector(".chip");
+    expect(chip?.classList.contains("degraded")).toBe(true);
+    expect(chip?.textContent).toBe("degraded");
+    // Degraded is not counted as healthy in the plugins-up stat.
+    expect(within(main).getByText("1 / 2")).toBeTruthy();
+    // An up plugin shows no reason text.
+    expect(within(main).getAllByText("degraded")).toHaveLength(1);
+  });
 });

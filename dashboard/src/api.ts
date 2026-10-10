@@ -72,9 +72,15 @@ export type UIBlock = {
   pages: UIPage[];
 };
 
+/** Polled plugin status (health.md "Status vocabulary"): `degraded` is a
+ * 2xx plugin self-reporting a failing background duty — still routable. */
+export type PluginStatus = "up" | "degraded" | "down" | "unknown";
+
 export type PluginEntry = {
   name: string;
-  status: "up" | "down" | "unknown";
+  status: PluginStatus;
+  /** The plugin's self-reported reason while `degraded` (issue #241). */
+  degraded_reason?: string | null;
   manifest: {
     name: string;
     base_url: string;

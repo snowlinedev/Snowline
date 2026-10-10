@@ -367,3 +367,15 @@ def stub_milestone_client():
     """Factory: `stub_milestone_client(statuses, aliases=...)` ->
     `StubMilestoneClient`."""
     return StubMilestoneClient
+
+
+@pytest.fixture(autouse=True)
+def _reset_replication_delivery_health():
+    """The SDK's delivery-health state (issue #241) is process-wide: a test
+    that drives `deliver_pending` into failures must not leave a stale
+    `unreachable_since` that turns a later test's `/health` degraded."""
+    from snowline_plugin_sdk.replication.health import DELIVERY_HEALTH
+
+    DELIVERY_HEALTH.reset()
+    yield
+    DELIVERY_HEALTH.reset()

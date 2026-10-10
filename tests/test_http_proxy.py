@@ -492,7 +492,7 @@ def test_platform_routes_still_answer_with_a_lookalike_prefix_registered():
 
     _wire_mock_upstream(app, handler)
     client = TestClient(app)
-    assert client.get("/health").json() == {"status": "ok"}
+    assert client.get("/health").json()["status"] == "ok"
     assert "plugins" in client.get("/plugins").json()
     assert client.get("/whoami").json()["id"] == "test-owner"
     # /ui-api's own 404 shape (its plugin lookup), not the proxy's.

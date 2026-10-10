@@ -37,6 +37,10 @@ ChangeKind = Literal["created", "updated", "removed"]
 class PluginStatus(str, Enum):
     UNKNOWN = "unknown"  # registered, not yet health-checked
     UP = "up"
+    # 2xx health, but the plugin SELF-REPORTED `status: "degraded"` (issue
+    # #241 — e.g. its replication delivery has been failing past threshold).
+    # Still routable: only DOWN is routed around.
+    DEGRADED = "degraded"
     DOWN = "down"  # crashed, unhealthy, or unreachable — gateway routes around
 
 
@@ -44,6 +48,8 @@ class PluginStatus(str, Enum):
 class RegisteredPlugin:
     manifest: PluginManifest
     status: PluginStatus = PluginStatus.UNKNOWN
+    # The plugin's self-reported reason while DEGRADED (None otherwise).
+    degraded_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -249,6 +255,7 @@ class PluginRegistry:
         status: PluginStatus,
         *,
         expected_entry: RegisteredPlugin | None = None,
+        degraded_reason: str | None = None,
     ) -> None:
         """Update a plugin's runtime status (used by the health checker).
 
@@ -265,3 +272,6 @@ class PluginRegistry:
             if expected_entry is not None and entry is not expected_entry:
                 return
             entry.status = status
+            entry.degraded_reason = (
+                degraded_reason if status is PluginStatus.DEGRADED else None
+            )
