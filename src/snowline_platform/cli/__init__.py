@@ -134,7 +134,10 @@ def _build_release(p: argparse.ArgumentParser) -> None:
             "empty database (spec §2.1), writes release/train.json, then tags "
             "each repo and publishes its own assets. Safe to re-run after a "
             "partial failure: existing tags and releases are reported and "
-            "skipped, never duplicated."
+            "skipped, never duplicated. Before building, the train's milestone "
+            "(vX.Y.Z -> snowlinedev/vX.Y) is checked in pm: the cut REFUSES "
+            "while required items are open (override with --force); an "
+            "unresolved milestone or unreachable pm only warns."
         ),
     )
     cut.add_argument("--version", required=True, help="the train version, e.g. v0.1.0")
@@ -143,6 +146,10 @@ def _build_release(p: argparse.ArgumentParser) -> None:
         help="PATCH respin: rebuild and re-tag ONLY this component; every other "
         "service keeps its previous manifest entry, tag included (spec §4)",
     )
+    cut.add_argument(
+        "--force", action="store_true",
+        help="cut despite open required milestone items (warns; records gated.forced in train.json)",
+    )
     cut.add_argument("--skip-tests", action="store_true", help="skip the per-repo test runs")
     cut.add_argument(
         "--skip-smoke", action="store_true",
@@ -150,7 +157,7 @@ def _build_release(p: argparse.ArgumentParser) -> None:
     )
     cut.add_argument(
         "--dry-run", action="store_true",
-        help="preflight + plan only; builds, tags, releases and databases are untouched",
+        help="preflight + plan + milestone-gate verdict only; builds, tags, releases and databases are untouched",
     )
     _add_release_common(cut)
     cut.add_argument(
@@ -372,6 +379,7 @@ def _cmd_release_cut(args) -> int:
         skip_tests=args.skip_tests,
         skip_smoke=args.skip_smoke,
         report=print,
+        force=args.force,
     )
     return 0
 

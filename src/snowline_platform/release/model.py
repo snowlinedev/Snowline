@@ -358,6 +358,8 @@ class TrainPlan:
     version: str
     services: tuple[ServicePlan, ...]
     respin: str | None = None
+    # Milestone-gate outcome (issue #242), recorded additively in train.json.
+    gated: dict | None = None
 
     @property
     def components_to_build(self) -> tuple[str, ...]:
@@ -371,6 +373,12 @@ class TrainPlan:
         return tuple(p for p in self.services if p.component == name)
 
     def to_manifest(self) -> dict:
+        manifest = self._manifest_core()
+        if self.gated is not None:
+            manifest["gated"] = self.gated
+        return manifest
+
+    def _manifest_core(self) -> dict:
         return {
             "version": self.version,
             "components": {

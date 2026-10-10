@@ -31,6 +31,7 @@ passed, and every publishing step is a no-op when it has already happened —
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import shutil
@@ -39,6 +40,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import gate as g
 from . import model as m
 from . import runner as r
 from .model import Component, ReleaseConfig, ReleaseError, Service, TrainPlan
@@ -532,6 +534,8 @@ def cut(
     skip_tests: bool = False,
     skip_smoke: bool = False,
     report: r.Report = print,
+    force: bool = False,
+    fetch_status: g.StatusFetcher | None = None,
 ) -> TrainPlan:
     m.validate_version(version)
     manifest_comp = config.manifest_component
@@ -566,6 +570,10 @@ def cut(
         respin=respin,
     )
     cutter.sdk_version = m.sdk_train_version(config, plan)
+    gated = _milestone_gate(
+        version, force, fetch_status or g.fetch_milestone_status, runner.dry_run, report
+    )
+    plan = dataclasses.replace(plan, gated=gated)
 
     report(f"\ntrain {version}" + (f" (respin of {respin})" if respin else ""))
     for sp in plan.services:
@@ -605,6 +613,33 @@ def cut(
     for note in cutter.notes:
         report(f"  next: {note}")
     return plan
+
+
+def _milestone_gate(version, force, fetch, dry_run, report) -> dict:
+    """Spec "Milestone gate" (#242). Returns the `gated` record; raises
+    ReleaseError to refuse. Advisory (warn + proceed) when pm cannot judge."""
+    milestone = g.train_milestone(version)
+    report(f"\nmilestone gate ({milestone})")
+    verdict = g.evaluate(milestone, fetch)
+    if verdict.status == "skipped":
+        report(f"  WARNING: milestone gate SKIPPED, this cut is NOT gated: {verdict.reason}")
+    elif verdict.status == "ok":
+        report("  ok: no required items remain open")
+        for line in verdict.lines:
+            report(f"  {line}")
+    else:
+        for line in verdict.lines:
+            report(f"  {line}")
+        if force:
+            report("  WARNING: --force given; cutting despite the open milestone items above")
+        elif dry_run:
+            report("  dry run: a real cut would REFUSE here (pass --force to override)")
+        else:
+            raise ReleaseError(
+                f"milestone {milestone} is not ready: {verdict.required_remaining} "
+                "required item(s) open. Resolve them or re-run with --force."
+            )
+    return verdict.record(force)
 
 
 def status(
