@@ -115,6 +115,25 @@ def test_unreachability_never_dead_letters_and_backoff_caps(session):
     assert len([r for r in down.requests if r.method == "POST"]) == posts_before
 
 
+def test_backoff_never_overflows_at_huge_attempt_counts(session):
+    """Issue #235 regression: `attempts` past ~1024 used to overflow float in
+    `interval * 2 ** (attempts - 1)` before the cap applied, so the retry
+    bookkeeping itself raised every tick. The cap must hold at any count, and
+    a long-wedged head row must still get its next attempt scheduled."""
+    assert emit._backoff(5000) == timedelta(seconds=300)
+    assert emit._backoff(10**6) == timedelta(seconds=300)
+
+    _setup(session)
+    emit.emit_event(session, "thing.recorded", {})
+    row = _rows(session)[0]
+    row.attempts = 5000
+    session.commit()
+    assert _deliver(session, PeerTransport(_down)) == 0
+    row = _rows(session)[0]
+    assert row.attempts == 5001
+    assert row.next_attempt_at == NOW + timedelta(seconds=300)
+
+
 def test_reconnect_reset_flushes_within_one_tick_of_the_heal(session):
     """§3.1's load-bearing probe: rows at the ceiling would not be due for
     minutes, but the unreachable→reachable transition resets their backoff and

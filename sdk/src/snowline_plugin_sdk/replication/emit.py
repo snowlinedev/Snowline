@@ -290,9 +290,14 @@ def _backoff(attempts: int) -> timedelta:
     """Exponential from one delivery interval, capped at ~interval x 10 (§3.1):
     a two-week partition retries every ~5 minutes at the default 30s interval,
     never dead-letters, and drains within one interval of the probe seeing the
-    heal."""
+    heal.
+
+    The exponent is clamped BEFORE doubling (issue #235): `2 ** (attempts - 1)`
+    for attempts past ~1024 overflows float in the multiply, so the cap's
+    `min()` never ran and retry bookkeeping itself raised every tick. 2**10
+    already exceeds the x10 ceiling, so the clamp never changes a result."""
     interval = _interval_seconds()
-    return timedelta(seconds=min(interval * (2 ** (attempts - 1)), interval * 10))
+    return timedelta(seconds=min(interval * (2 ** min(attempts - 1, 10)), interval * 10))
 
 
 def _probe_ingests(
