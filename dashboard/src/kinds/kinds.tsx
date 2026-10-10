@@ -1387,6 +1387,51 @@ export function MalformedDataCard(props: { plugin: string; path: string }) {
   );
 }
 
+/** Additive `sections` (ui-shell.md §4.2): extra `table` sections rendered
+ * under a page's main content, in payload order, with the same table
+ * component and validation as the page-level `table` kind. Absent, non-array
+ * or empty renders nothing, so pages without it are unchanged. Each section
+ * is a labelled region whose title is an h2 (the level below Layout's h1). A
+ * malformed section fails visibly in place; the rest still render. */
+export function PageSections(props: { plugin: string; path: string; payload: unknown }) {
+  const baseId = useId();
+  const raw = isRecord(props.payload) ? props.payload.sections : undefined;
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+  return (
+    <>
+      {raw.map((sec, i) => {
+        const v = isRecord(sec) ? validateTableData(sec) : null;
+        if (
+          !isRecord(sec) ||
+          sec.kind !== "table" ||
+          typeof sec.key !== "string" ||
+          typeof sec.title !== "string" ||
+          !v
+        ) {
+          return <MalformedDataCard key={i} plugin={props.plugin} path={props.path} />;
+        }
+        const headingId = `${baseId}-sec-${i}`;
+        return (
+          <section key={`${sec.key}-${i}`} className="card" aria-labelledby={headingId}>
+            <h2 id={headingId} className="card-title">
+              {sec.title}
+            </h2>
+            <KindTable
+              caption={sec.title}
+              columns={v.columns}
+              rows={v.rows.map((row) => ({
+                ...row,
+                href: prefixHref(props.plugin, row.href),
+              }))}
+              empty={v.empty}
+            />
+          </section>
+        );
+      })}
+    </>
+  );
+}
+
 /** The ONE place a registered widget/page's `kind` becomes a rendered
  * component (ui-shell.md §4). Fails visible (§4.4) rather than dropping
  * silently: an unsupported `contract_version` or unknown `kind` renders the

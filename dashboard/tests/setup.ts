@@ -90,6 +90,34 @@ export const FIXTURES: Record<string, unknown> = {
                   },
                 ],
               },
+              // ui-shell.md §4.2 additive `sections`: extra table sections under
+              // the main content. `sectioned` has two (one empty-state); the
+              // other two share a title/data so byte-identity can be asserted
+              // for `sections: []` vs absent.
+              {
+                id: "sectioned",
+                route: "/sectioned",
+                title: "Sectioned",
+                nav: false,
+                kind: "table",
+                data: "/ui-api/pages/sectioned",
+              },
+              {
+                id: "sections-empty",
+                route: "/sections-empty",
+                title: "Same title",
+                nav: false,
+                kind: "table",
+                data: "/ui-api/pages/sections-empty",
+              },
+              {
+                id: "sections-absent",
+                route: "/sections-absent",
+                title: "Same title",
+                nav: false,
+                kind: "table",
+                data: "/ui-api/pages/sections-absent",
+              },
               {
                 id: "shadow-branch",
                 route: "/shadow/{branch}",
@@ -221,6 +249,42 @@ export const FIXTURES: Record<string, unknown> = {
   // Deliberately malformed (missing required `value`) — exercises the §4.4
   // malformed-data error card.
   "/ui-api/governance/widgets/broken-stat": { nope: true },
+  "/ui-api/governance/pages/sectioned": {
+    columns: [{ key: "branch", label: "Branch" }],
+    rows: [{ cells: { branch: "main-plan-x" } }],
+    sections: [
+      {
+        key: "channels",
+        title: "Channels",
+        kind: "table",
+        columns: [
+          { key: "name", label: "Channel" },
+          { key: "state", label: "State" },
+        ],
+        rows: [
+          { cells: { name: "alpha", state: "open" }, href: "/shadow/alpha" },
+          { cells: { name: "beta", state: "closed" } },
+        ],
+      },
+      {
+        key: "scope_growth",
+        title: "Scope growth",
+        kind: "table",
+        columns: [{ key: "scope", label: "Scope" }],
+        rows: [],
+        empty: "No scope growth yet.",
+      },
+    ],
+  },
+  "/ui-api/governance/pages/sections-empty": {
+    columns: [{ key: "branch", label: "Branch" }],
+    rows: [{ cells: { branch: "main-plan-x" } }],
+    sections: [],
+  },
+  "/ui-api/governance/pages/sections-absent": {
+    columns: [{ key: "branch", label: "Branch" }],
+    rows: [{ cells: { branch: "main-plan-x" } }],
+  },
   "/ui-api/governance/pages/branches": {
     columns: [
       { key: "branch", label: "Branch" },

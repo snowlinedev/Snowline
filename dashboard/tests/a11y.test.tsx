@@ -35,6 +35,8 @@ const PAGES = [
   "/scopes",
   "/governance/shadow",
   "/governance/shadow/main-plan-x",
+  // ui-shell.md §4.2 `sections`: two extra table sections (one empty-state).
+  "/governance/sectioned",
   // The registered `board` page (ui-shell.md §4.2a): audits the collapse
   // controls (real aria-expanded buttons), the group-by / facet toggles
   // (aria-pressed, labelled), and the badges (never color-only) — all through

@@ -8,7 +8,7 @@
 import { useParams } from "react-router-dom";
 
 import type { PluginEntry, UIPage } from "../api";
-import { Card, PageActions, RegisteredKind, useUiData } from "../kinds/kinds";
+import { Card, PageActions, PageSections, RegisteredKind, useUiData } from "../kinds/kinds";
 import { Layout } from "../shell/Layout";
 import { THREAD_COMPOSER_POLL_SECONDS, contractSupported, templateData } from "../registry";
 
@@ -77,6 +77,7 @@ export function PluginPage(props: { plugin: PluginEntry; page: UIPage }) {
           onComposerSent={loadable.reload}
         />
       </Card>
+      <PageSections plugin={props.plugin.name} path={dataPath} payload={payload} />
     </Layout>
   );
 }
