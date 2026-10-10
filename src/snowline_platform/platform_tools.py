@@ -81,7 +81,9 @@ tombstone closure, and `add_milestone_dependency`/`remove_milestone_dependency`/
 `milestone_dependencies` manage the cycle-guarded, readiness-only dependency DAG \
 (cross-anchor edges allowed). Release line (ship order per anchor, independent \
 of dependencies): `place_in_line` / `remove_from_line`, read with \
-`list_milestones(anchor=, in_line=True)`. Slugs and names are case-insensitive on input and \
+`list_milestones(anchor=, in_line=True)`. Replication conflicts (lifecycle \
+contradictions between partitions; empty in steady state): \
+`list_milestone_conflicts` / `resolve_milestone_conflict`. Slugs and names are case-insensitive on input and \
 stored canonical-lowercase.\
 """
 
@@ -407,6 +409,53 @@ def build_platform_tools_surface() -> FastMCP:
         each entry `{from_status, to_status, reason, authored_at}`. Raises if the
         address is unknown. Read-only."""
         return await anyio.to_thread.run_sync(_milestone_transitions_sync, address)
+
+    def _list_conflicts_sync(anchor: str | None, include_resolved: bool) -> dict:
+        with session_scope() as session:
+            rows = milestones.list_unreconciled(
+                session, anchor=anchor, include_resolved=include_resolved
+            )
+            return {"conflicts": rows, "count": len(rows)}
+
+    @mcp.tool()
+    async def list_milestone_conflicts(
+        anchor: str | None = None, include_resolved: bool = False
+    ) -> dict:
+        """List milestone replication CONFLICTS awaiting triage (§9). A conflict is
+        a lifecycle contradiction between partitions: two instances transitioned
+        the same milestone concurrently, the row converged by last-writer-wins,
+        but the log's last transition disagrees with the applied row (the
+        converged history implies a move illegal under §4, e.g. cancelled→active).
+        Each row has `id`, `milestone`, `detail` (the earlier/later transitions)
+        and, once closed, `disposition`. Expected EMPTY in steady state. Resolve
+        each with `resolve_milestone_conflict`. `anchor` subtree-filters;
+        `include_resolved` also lists closed ones. Read-only."""
+        return await anyio.to_thread.run_sync(
+            _list_conflicts_sync, anchor, include_resolved
+        )
+
+    def _resolve_conflict_sync(
+        id: str, disposition: str, reason: str, actor: str | None
+    ) -> dict:
+        with session_scope() as session:
+            return milestones.resolve_unreconciled(
+                session, id, disposition, reason, actor=actor
+            )
+
+    @mcp.tool()
+    async def resolve_milestone_conflict(
+        id: str, disposition: str, reason: str, actor: str | None = None
+    ) -> dict:
+        """Close a milestone conflict (see `list_milestone_conflicts`) with a
+        disposition and a REQUIRED `reason`. `keep_row`: accept the applied row as
+        truth. `replay_transition`: re-apply the logged later transition as a NEW
+        transition authored now (replicates with a fresh lifecycle stamp); rejected
+        if the row already has that status or the move is illegal from it.
+        `dismiss`: close with no row change. Closed flags stay as local triage
+        history. Returns the closed conflict row."""
+        return await anyio.to_thread.run_sync(
+            _resolve_conflict_sync, id, disposition, reason, actor
+        )
 
     def _lifecycle_sync(verb, address: str, reason: str | None) -> dict:
         with session_scope() as session:

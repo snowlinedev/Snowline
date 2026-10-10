@@ -516,6 +516,25 @@ the §6 rules stated, not implied):
   parks on mere LWW loss. Status disagreement between instances also means
   §6.1 canonicality disagrees until convergence — one more reason apply must
   converge rather than park.
+  **Triage surface (#248).** The flags are readable and closable:
+  `GET /milestones/conflicts[?anchor=&include_resolved=true]` →
+  `{conflicts, count}` (MCP `platform__list_milestone_conflicts`), and
+  `POST /milestones/conflicts/{id}/resolve` `{disposition, reason}` (MCP
+  `platform__resolve_milestone_conflict(id, disposition, reason, actor?)`),
+  `reason` REQUIRED. Dispositions: `keep_row` (accept the applied row, close the
+  flag), `replay_transition` (re-apply the log's last transition's target status
+  as a NEW transition authored now, through the normal verb path — fresh
+  lifecycle stamp, replicated like any transition — then close the flag; 409 and
+  the flag stays open if the row already has that status or the move is illegal
+  from it), `dismiss` (close, no row change). The disposition
+  (`resolved_at`, `disposition`, `resolution_reason`, `actor`) is recorded on the
+  flag row; resolved flags drop out of the default read and keep deduping
+  re-detection of the same move. Closed flags are **local triage state and do not
+  replicate** (like the open flags). `/health` carries `milestones: {conflicts: N}`
+  without changing `status` — a conflict is a triage task, not a service fault —
+  and the dashboard Plugins page shows an amber attention row only when N > 0.
+  On startup, after migrations, the platform deletes stored flags the current
+  legality table accepts (written by pre-`deactivate` peers); idempotent, logged.
 - **DAG races**: `add_dependency(A→B)` and `add_dependency(B→A)` (or
   `merge(a,b)` / `merge(b,a)`) can each pass their local cycle guard and
   cycle only in the union — the second-applied edge is **rejected and
