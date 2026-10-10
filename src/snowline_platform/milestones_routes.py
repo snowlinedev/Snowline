@@ -3,7 +3,9 @@
 Out-of-process plugins (governance, PM) cannot import the platform, so they read
 + resolve milestones over HTTP, exactly like the scope surface:
 
-  GET  /milestones                          list (optional ?anchor= & ?status=)
+  GET  /milestones                          list (optional ?anchor= & ?status=;
+                                            ?anchor=&in_line=true = the anchor's
+                                            release line, exact anchor, in order)
   GET  /milestones/resolve?ref=&context=    single-ref resolution (§3)
   POST /milestones/resolve-batch            {refs:[...], context?} -> per-ref
                                             {address, status, resolved_via_alias}
@@ -17,6 +19,9 @@ Out-of-process plugins (governance, PM) cannot import the platform, so they read
   POST /milestones/{address}/activate|deactivate|achieve|cancel   lifecycle
                                             verbs (deactivate requires reason)
   PATCH /milestones/{address}               update outcome / target_date
+  POST /milestones/{address}/line           {after?|before?} place in the
+                                            release line (release-line.md §3)
+  DELETE /milestones/{address}/line         remove from the release line
 
 These ride behind the platform trust middleware automatically — only a trusted
 principal reads/writes the registry.
@@ -64,13 +69,27 @@ async def list_milestones(
     anchor: str | None = None,
     status: str | None = None,
     include_merged: bool = False,
+    in_line: bool = False,
     session: Session = Depends(get_session),
 ) -> dict:
-    return {
-        "milestones": milestones.list_milestones(
-            session, anchor=anchor, status=status, include_merged=include_merged
+    """`in_line=true` (with `anchor`) is the release-line read
+    (release-line.md §3): EXACT-anchor ranked rows in line order, tombstones
+    excluded, no subtree."""
+    try:
+        rows = milestones.list_milestones(
+            session,
+            anchor=anchor,
+            status=status,
+            include_merged=include_merged,
+            in_line=in_line,
         )
-    }
+    except (
+        milestones.InvalidMilestoneFieldError,
+        milestones.scopes.InvalidSlugError,
+    ) as exc:
+        # 422 as a literal: the `status` query param shadows fastapi's module.
+        raise HTTPException(422, str(exc)) from None
+    return {"milestones": rows}
 
 
 @router.get("/resolve")
@@ -330,6 +349,70 @@ router.add_api_route(
     _dependency_edit(milestones.remove_dependency),
     methods=["DELETE"],
 )
+
+
+def _line_errors(fn):
+    try:
+        return fn()
+    except milestones.MilestoneNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from None
+    except milestones.MilestoneResolutionError as exc:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            {"detail": str(exc), "suggestions": exc.suggestions},
+        ) from None
+    except milestones.MilestoneLineError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from None
+    except (
+        milestones.InvalidMilestoneFieldError,
+        milestones.InvalidMilestoneNameError,
+        milestones.scopes.InvalidSlugError,
+    ) as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)
+        ) from None
+
+
+@router.post("/{address:path}/line")
+async def place_in_line(
+    address: str,
+    request: Request,
+    payload: dict | None = Body(None),
+    session: Session = Depends(get_session),
+) -> dict:
+    """Place the milestone in its anchor's release line (release-line.md §3):
+    body `{after}` or `{before}` (at most one; an address or a bare name, which
+    resolves against this milestone's anchor), or `{}` / no body to append at
+    the end. Re-placing a ranked member moves it. 409 on a tombstone, a
+    cross-anchor neighbour or a neighbour not in the line. Returns the row plus
+    `line` (addresses in order). `line` is a reserved milestone name because of
+    exactly this suffix route (a milestone named `line` would misroute here)."""
+    payload = payload or {}
+    unknown = set(payload) - {"after", "before"}
+    if unknown:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"unknown place_in_line fields: {sorted(unknown)} (after|before)",
+        )
+    return _line_errors(
+        lambda: milestones.place_in_line(
+            session,
+            address,
+            after=payload.get("after"),
+            before=payload.get("before"),
+        )
+    )
+
+
+@router.delete("/{address:path}/line")
+async def remove_from_line(
+    address: str,
+    request: Request,
+    session: Session = Depends(get_session),
+) -> dict:
+    """Remove the milestone from its anchor's release line (rank → null;
+    idempotent). Returns the row plus `line`."""
+    return _line_errors(lambda: milestones.remove_from_line(session, address))
 
 
 # Declared AFTER the `/{address}/transitions`, `/aliases`, `/dependencies` suffix

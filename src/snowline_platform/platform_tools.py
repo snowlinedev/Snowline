@@ -79,7 +79,9 @@ STARTS — an active milestone is its scope's current release), `get_milestone` 
 tombstone reserves its name forever), `milestone_aliases` reads a target's \
 tombstone closure, and `add_milestone_dependency`/`remove_milestone_dependency`/\
 `milestone_dependencies` manage the cycle-guarded, readiness-only dependency DAG \
-(cross-anchor edges allowed). Slugs and names are case-insensitive on input and \
+(cross-anchor edges allowed). Release line (ship order per anchor, independent \
+of dependencies): `place_in_line` / `remove_from_line`, read with \
+`list_milestones(anchor=, in_line=True)`. Slugs and names are case-insensitive on input and \
 stored canonical-lowercase.\
 """
 
@@ -311,12 +313,16 @@ def build_platform_tools_surface() -> FastMCP:
         return await anyio.to_thread.run_sync(_resolve_milestone_sync, ref, context)
 
     def _list_milestones_sync(
-        anchor: str | None, status: str | None, include_merged: bool
+        anchor: str | None, status: str | None, include_merged: bool, in_line: bool
     ) -> dict:
         with session_scope() as session:
             return {
                 "milestones": milestones.list_milestones(
-                    session, anchor=anchor, status=status, include_merged=include_merged
+                    session,
+                    anchor=anchor,
+                    status=status,
+                    include_merged=include_merged,
+                    in_line=in_line,
                 )
             }
 
@@ -325,16 +331,59 @@ def build_platform_tools_surface() -> FastMCP:
         anchor: str | None = None,
         status: str | None = None,
         include_merged: bool = False,
+        in_line: bool = False,
     ) -> dict:
         """List registry rows, address-ordered (distinct from PM's work roll-up
         read of the same name — the `platform__` prefix disambiguates). `anchor`
         SUBTREE-filters (the given scope and everything below it, so an org anchor
         surfaces its repo-anchored milestones too); `status` filters by lifecycle
         status. Merge tombstones are excluded unless `include_merged=True`.
-        Read-only. Milestones are releases only (decision 0fda34e5)."""
+        `in_line=True` (requires `anchor`) instead returns that anchor's RELEASE
+        LINE: only ranked rows anchored EXACTLY there (no subtree), in line order
+        — the line says which release ships next, while `depends_on` says which
+        release needs another's work. Read-only. Milestones are releases only
+        (decision 0fda34e5)."""
         return await anyio.to_thread.run_sync(
-            _list_milestones_sync, anchor, status, include_merged
+            _list_milestones_sync, anchor, status, include_merged, in_line
         )
+
+    def _place_in_line_sync(
+        address: str, after: str | None, before: str | None
+    ) -> dict:
+        with session_scope() as session:
+            return milestones.place_in_line(
+                session, address, after=after, before=before
+            )
+
+    @mcp.tool()
+    async def place_in_line(
+        address: str, after: str | None = None, before: str | None = None
+    ) -> dict:
+        """Place a milestone in its anchor's RELEASE LINE — the ordered sequence
+        of releases that says which one ships next. That is different from
+        `depends_on`, which says one release needs another's work and never
+        orders the line. Pass at most one of `after` / `before` (an address, or a
+        bare name resolved against this milestone's anchor); with neither the
+        milestone goes to the END of the line. Re-placing a member moves it. The
+        neighbour must share the anchor and already be in the line (the error
+        lists the line); a merge tombstone cannot be placed. Any status may be
+        ranked and placing never activates or achieves anything. Returns the row
+        plus `line` (addresses in order)."""
+        return await anyio.to_thread.run_sync(
+            _place_in_line_sync, address, after, before
+        )
+
+    def _remove_from_line_sync(address: str) -> dict:
+        with session_scope() as session:
+            return milestones.remove_from_line(session, address)
+
+    @mcp.tool()
+    async def remove_from_line(address: str) -> dict:
+        """Take a milestone out of its anchor's RELEASE LINE (the ship-order
+        sequence; unrelated to `depends_on` edges, which are left untouched).
+        Idempotent on a milestone that is not in the line; rejected on a merge
+        tombstone. Returns the row plus `line` (addresses in order)."""
+        return await anyio.to_thread.run_sync(_remove_from_line_sync, address)
 
     def _get_milestone_sync(address: str) -> dict:
         with session_scope() as session:

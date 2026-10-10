@@ -40,12 +40,13 @@ import re
 import uuid
 from collections import defaultdict
 from datetime import date, datetime, timezone
+from decimal import Decimal
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from snowline_platform import scopes
+from snowline_platform import fracrank, scopes
 from snowline_platform.models import (
     Milestone,
     MilestoneDependency,
@@ -73,7 +74,7 @@ NAME_RE = re.compile(rf"^{_NAME_SEG}$")
 
 # Names that collide with the HTTP surface's ADDRESS-SUFFIX routes
 # (`/{address}/transitions|aliases|dependencies|activate|deactivate|achieve|
-# cancel`): a
+# cancel|line`): a
 # milestone so named would make requests to its own address misroute to the
 # suffix handler with a SHORTER address — the exact class of grammar ambiguity
 # the slash-free name rule exists to kill — so they are reserved at the name
@@ -88,6 +89,9 @@ RESERVED_NAMES = frozenset(
         "deactivate",
         "achieve",
         "cancel",
+        # The release-line suffix route (release-line.md §2.2); the migration
+        # that added it fails loudly if a row already carries the name.
+        "line",
     }
 )
 
@@ -138,6 +142,13 @@ class MilestoneDependencyError(ValueError):
 
 class DependencyCycleError(MilestoneDependencyError):
     """Adding the edge would create a cycle in the global dependency DAG (§2)."""
+
+
+class MilestoneLineError(ValueError):
+    """A release-line placement is illegal (release-line.md §2.2/§3): the
+    milestone is a merge tombstone, a neighbour is anchored elsewhere, a
+    neighbour is not in the line (the message lists the line), or a neighbour is
+    the milestone itself."""
 
 
 class MilestoneResolutionError(LookupError):
@@ -436,11 +447,31 @@ def list_milestones(
     anchor: str | None = None,
     status: str | None = None,
     include_merged: bool = False,
+    in_line: bool = False,
 ) -> list[dict]:
     """Registry rows, address-ordered (§4). `anchor` SUBTREE-filters — the given
     anchor scope and everything below it (slug-prefix), so listing an org anchor
     surfaces its repo-anchored milestones too. `status` filters by lifecycle
-    status. Tombstones are EXCLUDED by default (`include_merged=` opts in)."""
+    status. Tombstones are EXCLUDED by default (`include_merged=` opts in).
+
+    `in_line=True` is the RELEASE-LINE read (release-line.md §3): it requires
+    `anchor`, matches that anchor EXACTLY (no subtree), returns only ranked live
+    rows (tombstones always excluded) and orders them by `(line_rank, address)`
+    — line order. `status` still composes."""
+    if in_line:
+        if anchor is None:
+            raise InvalidMilestoneFieldError(
+                "in_line=true needs an anchor — a release line belongs to "
+                "exactly one anchor scope (release-line.md §2.1)"
+            )
+        anchor_scope = scopes.resolve(session, validate_slug(anchor))
+        if anchor_scope is None:
+            return []
+        return [
+            to_row(m)
+            for m in _line_members(session, anchor_scope.id)
+            if status is None or m.status == status
+        ]
     anchor_slug = canonical_slug(anchor) if anchor is not None else None
     rows: list[tuple[str, Milestone]] = []
     for m in session.scalars(select(Milestone)):
@@ -711,6 +742,171 @@ def update(
     return m
 
 
+# --- release line (release-line.md §2/§3) -----------------------------------
+#
+# An anchor's RELEASE LINE is its live milestones with a non-null `line_rank`,
+# anchored EXACTLY at that scope, ordered by `(line_rank, address)`. A rank is a
+# fractional index (`fracrank`), so a move rewrites ONE row — which is what lets
+# the line replicate as ordinary per-row LWW (§2.3) without forks or cycles.
+# Ranking is independent of `depends_on` (edges never move ranks, ranks never
+# add edges) and of lifecycle (placement never transitions; achieved/cancelled
+# members keep their rank so the line keeps its history).
+
+
+def _stamp(m: Milestone) -> None:
+    """Advance the row's §6 LWW clock for a local mutable-state write."""
+    m.lww_authored_at = _now()
+    m.lww_source_id = _local_source_id()
+
+
+def _line_members(session: Session, anchor_scope_id: uuid.UUID) -> list[Milestone]:
+    """The anchor's release line in order — live (non-tombstone) rows with a rank,
+    anchored EXACTLY at `anchor_scope_id`, ordered `(line_rank, address)`. Within
+    one anchor the address order is the name order, so equal ranks (two peers
+    placing into the same gap concurrently) tiebreak deterministically on every
+    instance."""
+    rows = session.scalars(
+        select(Milestone).where(
+            Milestone.anchor_scope_id == anchor_scope_id,
+            Milestone.merged_into_id.is_(None),
+            Milestone.line_rank.is_not(None),
+        )
+    )
+    return sorted(rows, key=lambda m: (m.line_rank, m.name))
+
+
+def _line_addresses(session: Session, anchor_scope_id: uuid.UUID) -> list[str]:
+    return [address_of(m) for m in _line_members(session, anchor_scope_id)]
+
+
+def _line_result(session: Session, m: Milestone) -> dict:
+    """The line verbs' response: the row plus `line` — the anchor's line as
+    addresses, in order (release-line.md §3)."""
+    return {**to_row(m), "line": _line_addresses(session, m.anchor_scope_id)}
+
+
+def _line_neighbour(session: Session, m: Milestone, ref: str, role: str) -> Milestone:
+    """Resolve an `after`/`before` neighbour (alias-following; a bare name walks
+    `m`'s anchor as context) and enforce the §2.2 rules: same anchor, not `m`
+    itself, and already in the line (the error lists the line)."""
+    n = resolve(session, ref, context=m.anchor.slug)
+    if n.id == m.id:
+        raise MilestoneLineError(
+            f"{address_of(m)!r} cannot be placed {role} itself"
+        )
+    if n.anchor_scope_id != m.anchor_scope_id:
+        raise MilestoneLineError(
+            f"neighbour {address_of(n)!r} is anchored at {n.anchor.slug!r}, not "
+            f"{m.anchor.slug!r} — a release line is per anchor; cross-anchor "
+            "sequencing is out of scope (use depends_on, release-line.md §2.2)"
+        )
+    if n.line_rank is None:
+        line = _line_addresses(session, m.anchor_scope_id)
+        raise MilestoneLineError(
+            f"neighbour {address_of(n)!r} is not in {m.anchor.slug!r}'s release "
+            "line — place it first. The line is: "
+            + (", ".join(line) if line else "(empty)")
+        )
+    return n
+
+
+def _rebalance(session: Session, members: list[Milestone]) -> None:
+    """Renumber `members` (already in line order) 1..n — the rare fallback when
+    no strict midpoint fits (`fracrank.RebalanceNeeded`) or two members share a
+    rank and something must go between them. Each renumbered row is a real
+    mutable-state change, so each stamps its clock and emits `milestone.updated`."""
+    for i, member in enumerate(members, start=1):
+        new = Decimal(i)
+        if member.line_rank != new:
+            member.line_rank = new
+            _stamp(member)
+            session.flush()
+            emit_event(
+                session, EVENT_MILESTONE_UPDATED, to_replication_payload(member)
+            )
+
+
+def _rank_for(
+    others: list[Milestone], after: Milestone | None, before: Milestone | None
+) -> Decimal:
+    """The rank placing a member after `after` / before `before` / (neither) at
+    the end of `others` (the line WITHOUT the member being placed). Raises
+    `fracrank.RebalanceNeeded`, or ValueError on an equal-rank gap."""
+    if after is not None:
+        i = next(k for k, o in enumerate(others) if o.id == after.id)
+        high = others[i + 1].line_rank if i + 1 < len(others) else None
+        return fracrank.between(after.line_rank, high)
+    if before is not None:
+        i = next(k for k, o in enumerate(others) if o.id == before.id)
+        low = others[i - 1].line_rank if i > 0 else None
+        return fracrank.between(low, before.line_rank)
+    return fracrank.between(others[-1].line_rank if others else None, None)
+
+
+def place_in_line(
+    session: Session,
+    address: str,
+    after: str | None = None,
+    before: str | None = None,
+) -> dict:
+    """Place the milestone at `address` in its anchor's release line
+    (release-line.md §3): directly `after` or `before` a neighbour (at most one),
+    or — with neither — at the END (after the last ranked member). Re-placing a
+    member that is already ranked MOVES it. Only the placed row changes (a
+    midpoint rank), except on the rare precision/equal-rank rebalance.
+
+    Rejected (`MilestoneLineError`) on a merge tombstone, on a neighbour anchored
+    elsewhere (neighbours resolve alias-following; a bare name uses this
+    milestone's anchor as context), and on a neighbour not in the line (the
+    error lists the line). Any status may be ranked and placement never
+    transitions. Emits `milestone.updated` (§9). Returns the row plus
+    `line: [address…]` in order."""
+    if after is not None and before is not None:
+        raise InvalidMilestoneFieldError(
+            "place_in_line takes at most one of `after` / `before`"
+        )
+    m = get(session, address)
+    if m.merged_into_id is not None:
+        raise MilestoneLineError(
+            f"{address_of(m)!r} is a merge tombstone aliased to "
+            f"{address_of(m.merged_into)!r} — place the target instead"
+        )
+    a = _line_neighbour(session, m, after, "after") if after is not None else None
+    b = _line_neighbour(session, m, before, "before") if before is not None else None
+
+    others = [o for o in _line_members(session, m.anchor_scope_id) if o.id != m.id]
+    try:
+        rank = _rank_for(others, a, b)
+    except (fracrank.RebalanceNeeded, ValueError):
+        _rebalance(session, others)
+        rank = _rank_for(others, a, b)
+    if m.line_rank != rank:
+        m.line_rank = rank
+        _stamp(m)
+        session.flush()
+        emit_event(session, EVENT_MILESTONE_UPDATED, to_replication_payload(m))
+    return _line_result(session, m)
+
+
+def remove_from_line(session: Session, address: str) -> dict:
+    """Take the milestone at `address` out of its anchor's release line — sets
+    `line_rank` to null (release-line.md §3). Idempotent on an unranked row (no
+    write, no event). Rejected on a merge tombstone. Emits `milestone.updated`
+    on a real change. Returns the row plus `line: [address…]` in order."""
+    m = get(session, address)
+    if m.merged_into_id is not None:
+        raise MilestoneLineError(
+            f"{address_of(m)!r} is a merge tombstone aliased to "
+            f"{address_of(m.merged_into)!r} — it is never in a line"
+        )
+    if m.line_rank is not None:
+        m.line_rank = None
+        _stamp(m)
+        session.flush()
+        emit_event(session, EVENT_MILESTONE_UPDATED, to_replication_payload(m))
+    return _line_result(session, m)
+
+
 # --- transitions read (audit) -----------------------------------------------
 
 
@@ -896,6 +1092,9 @@ def merge(session: Session, from_address: str, into_address: str) -> dict:
     - `from`'s dependency edges, BOTH directions, are re-pointed to `into`,
       deduplicated (self-edges from the re-point dropped), and the global cycle
       guard re-runs — the merge FAILS if the union would cycle.
+    - Release line (release-line.md §2.2): the tombstone's `line_rank` is
+      cleared; `into` inherits it when `into` was unranked and shares the
+      anchor, otherwise keeps its own.
     - Nothing is logged to the transition log (merge is not a lifecycle
       transition); `from`'s status is left as-is (the row is now an alias, and
       resolution never surfaces its status).
@@ -932,11 +1131,15 @@ def merge(session: Session, from_address: str, into_address: str) -> dict:
     # Re-point edges + tombstone `from` (the mechanics shared with replication
     # apply — see `_perform_merge`); raises `MilestoneMergeError` if the edge
     # union would cycle, before anything is written.
-    _perform_merge(session, frm, into)
+    into_inherited_rank = _perform_merge(session, frm, into)
     session.flush()
     emit_event(
         session, EVENT_MILESTONE_MERGED, _merged_payload(frm, into)
     )
+    if into_inherited_rank:
+        _stamp(into)
+        session.flush()
+        emit_event(session, EVENT_MILESTONE_UPDATED, to_replication_payload(into))
     return {
         "tombstone": to_row(frm),
         "target": address_of(into),
@@ -951,7 +1154,7 @@ def merge(session: Session, from_address: str, into_address: str) -> dict:
     }
 
 
-def _perform_merge(session: Session, frm: Milestone, into: Milestone) -> None:
+def _perform_merge(session: Session, frm: Milestone, into: Milestone) -> bool:
     """The merge MECHANICS shared by the `merge` verb and replication apply (§7,
     §9): re-point `from`'s edges (both directions) onto `into`, drop self-edges,
     dedupe against existing edges, re-run the GLOBAL cycle guard on the prospective
@@ -959,7 +1162,8 @@ def _perform_merge(session: Session, frm: Milestone, into: Milestone) -> None:
     re-point any inbound alias so depth-1 holds in both orderings, then set
     `from`'s tombstone pointer + stamp the §6 LWW clock (the clock a later
     re-merge LWW-compares against). Status is left as-is (the row is now an alias;
-    resolution never surfaces its status).
+    resolution never surfaces its status). Clears `from`'s release-line rank and
+    returns True when `into` inherited it (release-line.md §2.2).
 
     The caller owns the DIFFERING guards: the `merge` verb pre-checks state
     compatibility + already-tombstone and lets a cycle surface as
@@ -1004,6 +1208,20 @@ def _perform_merge(session: Session, frm: Milestone, into: Milestone) -> None:
     frm.merged_into_id = into.id  # the tombstone; status stays as-is
     frm.lww_authored_at = _now()
     frm.lww_source_id = _local_source_id()
+
+    # Release line (release-line.md §2.2): the tombstone leaves the line; `into`
+    # takes `from`'s place only when it had no rank of its own AND shares the
+    # anchor (a line never spans anchors) — otherwise `into` keeps its own rank.
+    # Deterministic from local state, so replication apply re-derives the same
+    # outcome; the verb ALSO emits `milestone.updated` for `into` so a peer
+    # whose state differed converges by LWW.
+    inherited = False
+    if frm.line_rank is not None:
+        if into.line_rank is None and into.anchor_scope_id == frm.anchor_scope_id:
+            into.line_rank = frm.line_rank
+            inherited = True
+        frm.line_rank = None
+    return inherited
 
 
 # --- aliases (§5) -----------------------------------------------------------
@@ -1109,6 +1327,7 @@ def to_row(milestone: Milestone) -> dict:
             if milestone.merged_into_id is not None
             else None
         ),
+        "line_rank": fracrank.to_wire(milestone.line_rank),
         "created_at": _iso(milestone.created_at),
         "updated_at": _iso(milestone.updated_at),
     }
@@ -1144,6 +1363,10 @@ def to_replication_payload(milestone: Milestone) -> dict:
             if milestone.merged_into_id is not None
             else None
         ),
+        # Release-line rank as a wire string (release-line.md §2.3). Apply treats
+        # an ABSENT key as "preserve local" (old-peer safety) — see
+        # `_write_row_state`.
+        "line_rank": fracrank.to_wire(milestone.line_rank),
         "authored_at": _iso(milestone.lww_authored_at),
     }
 
@@ -1260,6 +1483,14 @@ def _write_row_state(m: Milestone, payload: dict, envelope: dict) -> None:
     m.activated_at = _parse_dt(payload["activated_at"])
     m.achieved_at = _parse_dt(payload["achieved_at"])
     m.cancelled_at = _parse_dt(payload["cancelled_at"])
+    # Release-line rank, OLD-PEER SAFE (release-line.md §2.3): a payload WITHOUT
+    # the `line_rank` key comes from a peer that predates the field, so the
+    # local value is PRESERVED — only an explicit null clears. Otherwise an
+    # unrelated `outcome` edit from an old peer would wipe the line.
+    if "line_rank" in payload:
+        m.line_rank = fracrank.from_wire(payload["line_rank"])
+    if m.merged_into_id is not None:
+        m.line_rank = None  # a tombstone is never in a line (§2.2 merge rule)
     m.lww_authored_at = _parse_dt(payload["authored_at"])
     m.lww_source_id = envelope.get("source")
 
