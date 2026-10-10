@@ -122,6 +122,11 @@ companions keep it correct:
   intervals. With the probe, the next tick detects the heal and flushes the
   backlog — which is what makes §10's "within one delivery interval of
   reconnect" criterion satisfiable.
+  Probe classification: any HTTP response counts as reachable except a
+  gateway-originated 502/503 (deliveries route through the peer's `/via`
+  gateway, which answers 503 "plugin is down" / 502 "upstream unreachable"
+  instead of refusing the connection), which counts as unreachable and is
+  recorded in the peer's health like a connection error.
 - **Dead-letter stays reserved for *rejections*** — a delivered event the
   receiver refused (bad signature, contract-version mismatch) — which
   indicate a bug, not a partition. An ORDERING refusal (§3.2's "expected

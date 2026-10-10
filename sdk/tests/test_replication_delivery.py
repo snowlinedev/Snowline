@@ -738,3 +738,105 @@ def test_requeue_guard_loads_the_subscription_with_for_update(session, monkeypat
     emit.requeue_rejected(session, row_id)
     emit.requeue_rejected_bulk(session, sub_id)  # requeued: 0 — flags still load
     assert lock_flags == [True, True]
+
+
+# --- gateway-originated 502/503 is unreachable (issue #233) --------------------
+
+URL = "http://peer.example/events/ingest"
+
+
+def _gateway(status, detail):
+    def respond(request):
+        if request.method == "GET":
+            return httpx.Response(status, json={"detail": detail})
+        return httpx.Response(200, json={"status": "applied"})
+
+    return respond
+
+
+def _probe(status, detail="x"):
+    reachability: dict[str, bool] = {}
+    errors: dict[str, str] = {}
+    with httpx.Client(transport=PeerTransport(_gateway(status, detail))) as client:
+        emit._probe_ingests(client, {URL}, reachability, errors)
+    return reachability, errors
+
+
+def test_probe_503_is_unreachable():
+    reachability, errors = _probe(503, "plugin 'pm' is down")
+    assert reachability == {URL: False}
+    assert errors[URL].startswith("gateway 503")
+
+
+def test_probe_502_is_unreachable():
+    reachability, _ = _probe(502, "plugin 'pm' upstream unreachable: boom")
+    assert reachability == {URL: False}
+
+
+@pytest.mark.parametrize("status", [404, 405, 401, 200])
+def test_probe_404_405_still_reachable(status):
+    reachability, errors = _probe(status)
+    assert reachability == {URL: True}
+    assert errors == {}
+
+
+def test_heal_after_503_to_405_resets_next_attempt_within_one_interval(session):
+    _setup(session)
+    emit.emit_event(session, "thing.recorded", {})
+    reachability: dict[str, bool] = {}
+    state = {"status": 503}
+
+    def gateway(request):
+        if state["status"] == 503:
+            return httpx.Response(503, json={"detail": "plugin 'pm' is down"})
+        if request.method == "GET":
+            return httpx.Response(405)
+        return httpx.Response(200, json={"status": "applied"})
+
+    # Tick 1: gateway 503s both probe and POST -> backoff recorded.
+    assert _deliver(session, PeerTransport(gateway), reachability=reachability) == 0
+    row = _rows(session)[0]
+    assert row.next_attempt_at is not None and row.next_attempt_at > NOW
+    assert reachability == {URL: False}
+
+    # Plugin returns: gateway now answers 405 to the probe. Five seconds later
+    # the row is NOT due, but the probe heal resets next_attempt_at and the
+    # same tick delivers it.
+    state["status"] = 405
+    transport = PeerTransport(gateway)
+    n = _deliver(
+        session, transport, now=NOW + timedelta(seconds=5), reachability=reachability
+    )
+    assert n == 1
+    assert [r.method for r in transport.requests] == ["GET", "POST"]
+    row = _rows(session)[0]
+    assert row.status == "delivered" and row.next_attempt_at is None
+
+
+def test_probe_unreachable_feeds_peer_health(session):
+    from snowline_plugin_sdk.replication.health import DeliveryHealth
+
+    _setup(session)
+    emit.emit_event(session, "thing.recorded", {})
+    health = DeliveryHealth()
+    # Tick 1 puts the head row into backoff (POST also 503s).
+    gw = PeerTransport(_gateway_all_down)
+    with httpx.Client(transport=gw) as client:
+        emit.deliver_pending(session, client, now=NOW, reachability={}, health=health)
+    first = health.peers[URL].consecutive_failures
+    # Tick 2: row not due, so only the probe can report the failure.
+    gw2 = PeerTransport(_gateway_all_down)
+    with httpx.Client(transport=gw2) as client:
+        emit.deliver_pending(
+            session, client, now=NOW + timedelta(seconds=1), reachability={},
+            health=health,
+        )
+    st = health.peers[URL]
+    assert [r.method for r in gw2.requests] == ["GET"]
+    assert st.consecutive_failures == first + 1
+    assert st.last_error.startswith("gateway 503")
+    assert st.unreachable_since == NOW
+
+
+def _gateway_all_down(request):
+    return httpx.Response(503, json={"detail": "plugin 'pm' is down"})

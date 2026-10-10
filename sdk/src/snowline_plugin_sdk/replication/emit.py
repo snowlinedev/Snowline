@@ -305,24 +305,50 @@ def _backoff(attempts: int) -> timedelta:
     return timedelta(seconds=min(interval * (2 ** min(attempts - 1, 10)), interval * 10))
 
 
+_GATEWAY_DOWN_STATUSES = frozenset({502, 503})
+
+
+def _is_gateway_unreachable(resp) -> bool:
+    """True when a probe response means "the plugin behind the gateway is down".
+
+    Deliveries route through the peer's platform gateway (`/via`, decision
+    0b8390f7), so a DOWN plugin no longer refuses the connection: the gateway
+    itself answers 503 (`plugin 'pm' is down`) or 502 (upstream unreachable).
+    Those are the ONLY statuses the `/via` proxy emits for a down plugin, so
+    they count as unreachable; every other status (404, 405, 401, 2xx, ...)
+    still means "the ingest is answering" and stays reachable. Without this the
+    unreachable → reachable heal transition never fires behind a gateway and a
+    returning plugin waits out the full capped backoff (issue #233)."""
+    return resp.status_code in _GATEWAY_DOWN_STATUSES
+
+
 def _probe_ingests(
-    client, urls: set[str], reachability: dict[str, bool]
+    client,
+    urls: set[str],
+    reachability: dict[str, bool],
+    errors: dict[str, str] | None = None,
 ) -> set[str]:
     """Cheaply probe every ingest endpoint that has queued rows; return the set
     that just transitioned unreachable → reachable (whose rows get their backoff
-    reset). ANY HTTP response counts as reachable — the probe asks "is the
+    reset). Any HTTP response counts as reachable — the probe asks "is the
     ingest answering?", not "would a delivery succeed?" (a GET on a POST-only
-    route answering 405 is a healthy ingest). Per-INGEST, not per-peer, on
+    route answering 405 is a healthy ingest) — EXCEPT a gateway-originated
+    502/503 (`_is_gateway_unreachable`). Per-INGEST, not per-peer, on
     purpose (§3.1): a single plugin's ingest healing on an otherwise-reachable
-    peer must trigger the reset too."""
+    peer must trigger the reset too. When `errors` is given, each URL found
+    unreachable this probe gets its error text recorded there (for health)."""
     healed: set[str] = set()
     for url in urls:
         was_reachable = reachability.get(url)
         try:
-            client.get(url)
-            reachable = True
-        except Exception:  # noqa: BLE001 - any transport error means unreachable
+            resp = client.get(url)
+            reachable = not _is_gateway_unreachable(resp)
+            if not reachable and errors is not None:
+                errors[url] = "gateway " + _response_error(resp).removeprefix("HTTP ")
+        except Exception as exc:  # noqa: BLE001 - any transport error means unreachable
             reachable = False
+            if errors is not None:
+                errors[url] = str(exc)
         reachability[url] = reachable
         if reachable and was_reachable is False:
             healed.add(url)
@@ -397,7 +423,19 @@ def deliver_pending(
     # The reconnect reset (§3.1): probe first, then clear backoff on healed
     # ingests' rows so the backlog flushes THIS tick, not ~10 intervals later.
     queued_urls = {s.target_url for s in subs if s.id in pending_by_sub}
-    healed = _probe_ingests(client, queued_urls, reachability)
+    probe_errors: dict[str, str] = {}
+    healed = _probe_ingests(client, queued_urls, reachability, probe_errors)
+    # A probe-detected unreachable peer feeds the same per-peer health the
+    # delivery loop writes (#268), so /health sees a gateway-503 peer even while
+    # its head row is still backing off and no POST is attempted.
+    for sub in subs:
+        if sub.id not in pending_by_sub or sub.target_url not in probe_errors:
+            continue
+        head = pending_by_sub[sub.id][0]
+        # A DUE head is about to be POSTed, and that attempt records its own
+        # outcome; only a backing-off head needs the probe to speak for it.
+        if head.next_attempt_at is not None and head.next_attempt_at > now:
+            health.record_failure(peer_key(sub), now, probe_errors[sub.target_url])
     if healed:
         for sub in subs:
             if sub.target_url in healed:
@@ -424,7 +462,7 @@ def deliver_pending(
                 _record_retry(row, now, str(exc))
                 session.commit()
                 break
-            reachability[sub.target_url] = True
+            reachability[sub.target_url] = not _is_gateway_unreachable(resp)
             if 200 <= resp.status_code < 300:
                 row.status = "delivered"
                 row.delivered_at = now
