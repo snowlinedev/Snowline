@@ -653,6 +653,48 @@ def test_sync_refuses_on_a_source_run_hub(tmp_path):
     s.check_not_source_hub(home)  # does not raise
 
 
+def _stack_hub_guard_raises(home, dirs):
+    try:
+        s.check_not_source_hub(home, plist_dirs=dirs)
+    except m.StackError:
+        return True
+    return False
+
+
+def test_hub_guard_trips_on_a_system_daemon_plist(tmp_path):
+    """#239: once the hub's plists move to /Library/LaunchDaemons the guard
+    must still recognise it (no stack.json)."""
+    home = tmp_path / "home"
+    agents, daemons = m.launch_agents_dir(home), tmp_path / "LaunchDaemons"
+    agents.mkdir(parents=True)
+    daemons.mkdir()
+    (daemons / "dev.snowline.memory.plist").write_text("<plist/>")
+    assert _stack_hub_guard_raises(home, [agents, daemons])
+
+
+def test_hub_guard_trips_on_a_user_agent_plist(tmp_path):
+    home = tmp_path / "home"
+    agents, daemons = m.launch_agents_dir(home), tmp_path / "LaunchDaemons"
+    agents.mkdir(parents=True)
+    daemons.mkdir()
+    (agents / "dev.snowline.pm.plist").write_text("<plist/>")
+    assert _stack_hub_guard_raises(home, [agents, daemons])
+
+
+def test_hub_guard_passes_with_neither(tmp_path):
+    home = tmp_path / "home"
+    assert not _stack_hub_guard_raises(home, [m.launch_agents_dir(home), tmp_path / "LaunchDaemons"])
+
+
+def test_hub_guard_passes_when_stack_json_exists(tmp_path):
+    home = tmp_path / "home"
+    daemons = tmp_path / "LaunchDaemons"
+    daemons.mkdir()
+    (daemons / "dev.snowline.platform.plist").write_text("<plist/>")
+    _stack_config(home)
+    assert not _stack_hub_guard_raises(home, [m.launch_agents_dir(home), daemons])
+
+
 def test_unpack_dashboard_strips_the_tarballs_top_level_dist(tmp_path):
     """The cutter packs a top-level `dist/` entry (the v0.1.0 shape);
     unpacking must strip it so the dest itself holds index.html — without

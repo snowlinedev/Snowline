@@ -101,21 +101,29 @@ def tty_prompt(message: str) -> str:
     return line.strip()
 
 
-def check_not_source_hub(home: Path) -> None:
+def check_not_source_hub(
+    home: Path, *, plist_dirs: Sequence[Path] | None = None
+) -> None:
     """Refuse to install the packaged stack on a machine already running
     Snowline services sync does not manage — i.e. the source-run hub, whose
     posture lives in launchd plists, not in the `<service>.env` filenames the
     env guard reads (#210 review: without this, `curl … | sh` on the mini
     would bootstrap a SECOND service set onto the hub's own ports). A
     stack-managed spoke always has stack.json, so its own plists don't trip
-    this."""
+    this.
+
+    The hub's plists live either in ~/Library/LaunchAgents (login-time) or,
+    once moved by ops/hub/install-daemons.sh (#239), in the system
+    /Library/LaunchDaemons — both are checked. `plist_dirs` is injectable so
+    tests never read the real system directory."""
     if m.stack_config_path(home).exists():
         return
-    agents = m.launch_agents_dir(home)
+    if plist_dirs is None:
+        plist_dirs = [m.launch_agents_dir(home), m.SYSTEM_LAUNCH_DAEMONS_DIR]
     existing = [
         m.plist_label(svc)
         for svc in SERVICE_ORDER
-        if (agents / f"{m.plist_label(svc)}.plist").exists()
+        if any((d / f"{m.plist_label(svc)}.plist").exists() for d in plist_dirs)
     ]
     if existing:
         raise m.StackError(
