@@ -159,3 +159,12 @@ def _reset_replication_delivery_health():
     DELIVERY_HEALTH.reset()
     yield
     DELIVERY_HEALTH.reset()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_system_launch_daemons(tmp_path, monkeypatch):
+    """The source-run-hub guard also looks in /Library/LaunchDaemons (#239);
+    never let a real hub's installed daemons leak into sync tests."""
+    from snowline_platform.stack import model as stack_model
+
+    monkeypatch.setattr(stack_model, "SYSTEM_LAUNCH_DAEMONS_DIR", tmp_path / "_no_system_daemons")

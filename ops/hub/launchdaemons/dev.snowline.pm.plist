@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- System LaunchDaemon for the hub's pm service (#239). Installed by
+     ops/hub/install-daemons.sh; see docs/ops/hub-daemons.md. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.snowline.pm</string>
+    <key>UserName</key>
+    <string>seanlynch</string>
+    <key>GroupName</key>
+    <string>staff</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>/Users/seanlynch/Projects/snowline-platform/ops/hub/launchdaemons/run-service.sh</string>
+        <string>pm</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/seanlynch/Projects/snowline-pm</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/seanlynch</string>
+        <key>PATH</key>
+        <string>/Users/seanlynch/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/seanlynch/Library/Logs/snowline-pm.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/seanlynch/Library/Logs/snowline-pm.log</string>
+</dict>
+</plist>

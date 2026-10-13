@@ -158,3 +158,13 @@ If step 1 or 2 fails, re-check §3 (the backend host/port variables — try
 `tailscale serve status` and confirm the target matches the address and
 port the platform actually bound) before assuming Tailscale itself is
 broken.
+
+## 8. The Snowline services themselves (LaunchDaemons)
+
+The serve mapping above only fronts the platform; the four services
+(`dev.snowline.{platform,pm,governance,memory}`) must themselves be up at
+boot. They run as system LaunchDaemons (not per-user LaunchAgents) so a
+reboot with nobody logged in still brings them back; see
+[hub-daemons.md](hub-daemons.md). The deploy routine restart step is
+therefore `sudo launchctl kickstart -k system/dev.snowline.<svc>` (it was
+`launchctl kickstart -k gui/$UID/dev.snowline.<svc>` while they were agents).

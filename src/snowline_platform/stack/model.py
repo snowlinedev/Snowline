@@ -134,6 +134,9 @@ def launch_agents_dir(home: Path) -> Path:
     return home / LAUNCH_AGENTS_RELPATH
 
 
+SYSTEM_LAUNCH_DAEMONS_DIR = Path("/Library/LaunchDaemons")
+
+
 def plist_label(service: str) -> str:
     return f"dev.snowline.{service}"
 
