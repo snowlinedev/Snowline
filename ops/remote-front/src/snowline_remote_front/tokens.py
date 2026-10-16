@@ -57,7 +57,12 @@ class AccessTokenCodec:
         )
 
     def _sign(self, payload_b64: str) -> str:
-        mac = hmac.new(self._key, payload_b64.encode("ascii"), hashlib.sha256).digest()
+        # UTF-8, not ASCII: on the verify path this segment comes straight from
+        # an untrusted bearer string, and `.encode("ascii")` would raise a
+        # UnicodeEncodeError out of the signing step — turning a non-ASCII
+        # garbage token into a 500 instead of the 401 it is. Minted payloads
+        # are base64url (ASCII), so their signature is unchanged.
+        mac = hmac.new(self._key, payload_b64.encode("utf-8"), hashlib.sha256).digest()
         return _b64u_encode(mac)
 
     def mint(
@@ -94,11 +99,21 @@ class AccessTokenCodec:
             payload_b64, signature = token.split(".", 1)
         except ValueError:
             return None
-        if not hmac.compare_digest(signature, self._sign(payload_b64)):
+        # Compare over BYTES: `compare_digest` raises TypeError on a non-ASCII
+        # str, so an untrusted bearer with a non-ASCII signature segment would
+        # otherwise 500 instead of failing verification.
+        if not hmac.compare_digest(
+            signature.encode("utf-8"), self._sign(payload_b64).encode("ascii")
+        ):
             return None
         try:
             payload = json.loads(_b64u_decode(payload_b64))
         except (ValueError, json.JSONDecodeError):
+            return None
+        # A validly-signed non-object payload can only come from our own key
+        # signing something else, but the read below must not AttributeError
+        # its way to a 500 on the auth path.
+        if not isinstance(payload, dict):
             return None
         expires_at = payload.get("exp")
         if not isinstance(expires_at, int) or expires_at < int(time.time()):
@@ -107,9 +122,12 @@ class AccessTokenCodec:
             res = payload.get("res")
             if not isinstance(res, str) or res.rstrip("/") != self._expected_resource:
                 return None
+        client_id = payload.get("cid")
+        if not isinstance(client_id, str):
+            return None
         return AccessToken(
             token=token,
-            client_id=payload["cid"],
+            client_id=client_id,
             scopes=payload.get("scp") or [],
             expires_at=expires_at,
             resource=payload.get("res"),

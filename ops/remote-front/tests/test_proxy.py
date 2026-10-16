@@ -216,3 +216,39 @@ def test_token_minted_for_another_resource_is_401():
     resp_resless = anyio.run(_foreign_resource_post, app, resless)
     assert resp_foreign.status_code == 401
     assert resp_resless.status_code == 401
+
+
+async def _post_with_raw_bearer(app, token: str):
+    # The header goes out as raw BYTES: an HTTP client is free to put non-ASCII
+    # octets in a header value, and the ASGI server hands them to us as a
+    # latin-1-decoded (so non-ASCII) str.
+    async with front_client(app) as client:
+        return await client.post(
+            "/mcp",
+            headers={"Authorization": f"Bearer {token}".encode()},
+            json={"jsonrpc": "2.0", "method": "ping", "id": 1},
+        )
+
+
+def test_non_ascii_bearer_token_is_401_not_500():
+    # The codec verifies an UNTRUSTED string, so signing/comparing it must run
+    # over bytes: `.encode("ascii")` would raise UnicodeEncodeError and
+    # `compare_digest` TypeError on a non-ASCII str, surfacing an auth failure
+    # as a 500 instead of the spec 401.
+    app = build_front()
+    for token in ("pä.yload", "payload.signé", "nödots"):
+        resp = anyio.run(_post_with_raw_bearer, app, token)
+        assert resp.status_code == 401, token
+
+
+def test_codec_verify_rejects_non_ascii_and_non_object_payloads():
+    from ._helpers import SIGNING_KEY
+    from snowline_remote_front.tokens import AccessTokenCodec, _b64u_encode
+
+    codec = AccessTokenCodec(SIGNING_KEY)
+    for token in ("pä.yload", "payload.signé", "nödots", ""):
+        assert codec.verify(token) is None
+    # A validly-signed payload that isn't a claims object must not blow up the
+    # claim reads either.
+    payload_b64 = _b64u_encode(b"[1, 2, 3]")
+    assert codec.verify(f"{payload_b64}.{codec._sign(payload_b64)}") is None

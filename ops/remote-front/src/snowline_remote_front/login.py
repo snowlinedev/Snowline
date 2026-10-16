@@ -159,7 +159,13 @@ def login_routes(
                 txn, context=context, error="Incorrect credential.", status=401
             )
         throttle.on_success()
-        redirect_url = provider.complete_login(txn)
+        try:
+            redirect_url = provider.complete_login(txn)
+        except KeyError:
+            # The txn expired (or was consumed by a concurrent submit) between
+            # the check above and the mint — the owner gets the expired page,
+            # not a 500.
+            return _render("", error=_EXPIRED, status=400)
         return RedirectResponse(
             url=redirect_url, status_code=302, headers={"Cache-Control": "no-store"}
         )

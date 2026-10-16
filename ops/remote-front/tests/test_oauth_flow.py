@@ -262,3 +262,33 @@ def test_expired_refresh_token_is_rejected():
     resp = anyio.run(_expired_refresh, app)
     assert resp.status_code == 400
     assert resp.json()["error"] == "invalid_grant"
+
+
+async def _login_post_losing_the_txn(app):
+    """The TTL/double-submit race: the txn is live when /login POST validates it
+    and gone by the time the code is minted."""
+    async with front_client(app) as client:
+        reg = await register_client(client)
+        _verifier, challenge = pkce_pair()
+        txn = await authorize_to_txn(
+            client, client_id=reg["client_id"], challenge=challenge
+        )
+        provider = app.state.provider
+        real_pending_login = provider.pending_login
+
+        def pending_then_drop(t):
+            context = real_pending_login(t)
+            provider._pending.pop(t, None)  # the racing expiry/second submit
+            return context
+
+        provider.pending_login = pending_then_drop
+        return await client.post(
+            "/login", data={"txn": txn, "password": OWNER_PASSWORD}
+        )
+
+
+def test_login_losing_the_txn_mid_submit_is_the_expired_page_not_500():
+    app = build_front()
+    resp = anyio.run(_login_post_losing_the_txn, app)
+    assert resp.status_code == 400
+    assert "expired" in resp.text
