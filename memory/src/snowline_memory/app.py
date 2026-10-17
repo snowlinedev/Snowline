@@ -138,12 +138,14 @@ def create_app(
     # signed-event ingest route + the tailnet-gated admin routes the pairing CLI
     # drives. Registered BEFORE the `/` MCP mount (same reason `/health` is) so
     # Starlette matches these routes ahead of the catch-all mount. `apply_event`
-    # is memory's idempotent per-name-LWW domain apply.
+    # is memory's idempotent per-name-LWW domain apply; `enumerate_backfill` is
+    # its §7.1 cold-start-union enumerator (the backfill open verb walks it).
     app.include_router(
         build_replication_router(
             session_scope,
             memory.apply_event,
             ingest_path=REPLICATION_INGEST_PATH,
+            enumerator=memory.enumerate_backfill,
         )
     )
 

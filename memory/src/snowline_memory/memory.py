@@ -40,7 +40,7 @@ import re
 from datetime import datetime, timedelta, timezone
 
 from snowline_plugin_sdk.contract import EVENT_MEMORY_FORGOTTEN, EVENT_MEMORY_SET
-from snowline_plugin_sdk.replication import emit_event
+from snowline_plugin_sdk.replication import emit_event, live_source_id
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
@@ -837,7 +837,11 @@ def apply_event(session: Session, envelope: dict) -> None:
     payload = envelope.get("payload") or {}
     name = payload["name"]
     event_at = _event_at(payload)
-    src = payload.get("source_id") or ""
+    # The payload names the write's AUTHOR (a backfilled row keeps its original
+    # author, which may be neither instance's stream). Only a payload missing it
+    # falls back to the envelope's stream source — with any `#backfill` suffix
+    # stripped (§7.1), so register state never records a stream identity.
+    src = payload.get("source_id") or live_source_id(envelope.get("source")) or ""
 
     if event_type == EVENT_MEMORY_SET:
         _apply_set(
@@ -858,3 +862,50 @@ def apply_event(session: Session, envelope: dict) -> None:
         _apply_forget(session, name=name, event_at=event_at, source_id=src)
     else:
         raise ValueError(f"unknown memory event type {event_type!r}")
+
+
+# --- §7.1 backfill enumerator (#98) -------------------------------------------
+
+
+def enumerate_backfill(session: Session):
+    """Memory's §7.1 cold-start-union enumerator: every register in the store,
+    replayed as ONE event from the EXISTING vocabulary that reproduces its
+    current state on an empty peer and is the ordinary LWW path on a peer that
+    already holds the name.
+
+      * a live memory → `memory.set` with its full value;
+      * a TOMBSTONE → `memory.forgotten` (never skipped — a walk of live rows
+        only would let the peer's older `set` resurrect a deletion).
+
+    The payload carries the register's ORIGINAL clock — `event_at` =
+    `last_event_at`, `source_id` = `last_source_id` (the write's author, which
+    may be the peer itself or a legacy stamp) — never import time: that clock
+    is the §6 LWW key, so a backfilled remember/forget race resolves exactly as
+    its live equivalent would. Walk order is deterministic: `(last_event_at,
+    id)`. Read-only."""
+    rows = session.scalars(select(Memory).order_by(Memory.last_event_at, Memory.id))
+    for m in rows:
+        if m.forgotten:
+            yield (
+                EVENT_MEMORY_FORGOTTEN,
+                {
+                    "id": str(m.id),
+                    "name": m.name,
+                    "event_at": m.last_event_at.isoformat(),
+                    "source_id": m.last_source_id,
+                },
+            )
+        else:
+            yield (
+                EVENT_MEMORY_SET,
+                {
+                    "id": str(m.id),
+                    "name": m.name,
+                    "description": m.description,
+                    "content": m.content,
+                    "kind": m.kind,
+                    "scope_slug": m.scope_slug,
+                    "event_at": m.last_event_at.isoformat(),
+                    "source_id": m.last_source_id,
+                },
+            )
