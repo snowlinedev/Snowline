@@ -579,3 +579,45 @@ def reapply_parked(
     _recompute_applied_seq(session, stream)
     session.flush()
     return _stream_dict(stream)
+
+
+def drop_parked(session: Session, source_id: str, epoch: str, seq: int) -> dict:
+    """DROP one parked event WITHOUT applying it — spec §7.1's third parking
+    verb, beside list and re-apply: the operator's explicit declaration that the
+    event is resolved some other way. Built for the union procedure: an old
+    unresolved park on a pre-union stream is superseded by the backfill, which
+    re-enumerates the row and re-delivers its payload (applying, or re-parking
+    loudly under the union's own identity), so once the union verifies, the old
+    park is dropped rather than re-applied.
+
+    The parked row is deleted and, when its stream still exists, the applied
+    frontier is recomputed: dropping UNPINS `applied_seq` exactly like a
+    successful re-apply would (the dropped seq is resolved by declaration, so
+    peer_seen stops reporting it as unseen). Logged at WARNING with the event's
+    identity — dropping is deliberate data handling, never a silent skip.
+    Raises ValueError on an unknown park."""
+    parked = session.get(ReplicationParkedEvent, (source_id, epoch, seq))
+    if parked is None:
+        raise ValueError(f"no parked event ({source_id!r}, {epoch!r}, seq {seq})")
+    dropped = {
+        "source_id": parked.source_id,
+        "epoch": parked.epoch,
+        "seq": parked.seq,
+        "event_type": parked.event_type,
+        "reason": parked.reason,
+    }
+    session.delete(parked)
+    session.flush()
+    stream = session.get(ReplicationInboundStream, (source_id, epoch))
+    if stream is not None:
+        _recompute_applied_seq(session, stream)
+        session.flush()
+    log.warning(
+        "replication parked event DROPPED without apply (stream %s/%s seq %s, "
+        "%s): %s",
+        source_id, epoch, seq, dropped["event_type"], dropped["reason"],
+    )
+    return {
+        "dropped": dropped,
+        "stream": _stream_dict(stream) if stream is not None else None,
+    }

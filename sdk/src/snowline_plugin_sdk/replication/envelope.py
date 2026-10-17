@@ -118,3 +118,50 @@ def verify_signature(secret: str, body: bytes, signature: str | None) -> bool:
         signature[len("sha256=") :] if signature.startswith("sha256=") else signature
     )
     return hmac.compare_digest(provided, sign_body(secret, body))
+
+
+# --- the §7.1 backfill stream identity ----------------------------------------
+#
+# A cold-start union (spec §7.1, #98) replays one instance's domain rows to its
+# peer as synthetic events on an ORDINARY stream with a reserved identity:
+# `source_id = <live source_id>#backfill`. The suffix is the ONLY marker a
+# backfill envelope carries — no extra envelope field, no contract bump — and it
+# is load-bearing three ways: the live and backfill streams coexist under the
+# §5 single-active-stream-per-source invariant (different sources), the same
+# invariant applied to the backfill id yields "one backfill per direction at a
+# time", and `peer_seen`'s live lookup can never match a backfill stream.
+
+BACKFILL_SUFFIX = "#backfill"
+
+
+def backfill_source_id(live_source_id: str) -> str:
+    """The reserved backfill stream identity for a live `source_id`
+    (`mini.governance` → `mini.governance#backfill`). Idempotent on an id that
+    already carries the suffix."""
+    if is_backfill_source(live_source_id):
+        return live_source_id
+    return f"{live_source_id}{BACKFILL_SUFFIX}"
+
+
+def is_backfill_source(source_id: str | None) -> bool:
+    """True iff `source_id` names a §7.1 backfill stream."""
+    return isinstance(source_id, str) and source_id.endswith(BACKFILL_SUFFIX)
+
+
+def live_source_id(source_id: str | None) -> str | None:
+    """`source_id` with any `#backfill` suffix stripped — the normalization an
+    apply performs before recording an envelope's source into DOMAIN state (§6's
+    LWW registers, §7.1 provenance), so register state stays byte-identical
+    across instances whichever way the winning event arrived."""
+    if is_backfill_source(source_id):
+        return source_id[: -len(BACKFILL_SUFFIX)]
+    return source_id
+
+
+def is_backfill_envelope(envelope: dict) -> bool:
+    """The apply-seam hook (§7.1): True iff this envelope arrived on a backfill
+    stream. The applies that behave differently under a union (the platform's
+    scope convergence, governance's §6.1 detection inputs) key off this and
+    NOTHING else; every other apply is deliberately identical for live and
+    backfilled events."""
+    return is_backfill_source((envelope or {}).get("source"))
