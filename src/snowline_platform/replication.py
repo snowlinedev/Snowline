@@ -154,6 +154,9 @@ def build_router(
         apply_platform_event,
         ingest_path=INGEST_PATH,
         admin_prefix=ADMIN_PREFIX,
+        # §7.1: the platform's union half is the scope namespace — the backfill
+        # open verb walks `scope.created` for every scope (parents first).
+        enumerator=scopes.enumerate_backfill,
     )
 
     @router.get(MANIFEST_PATH)

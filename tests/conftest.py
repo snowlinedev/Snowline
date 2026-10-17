@@ -149,6 +149,66 @@ def db_session(clean_db):
         yield s
 
 
+# --- two-instance harness (§7.1 union, #98) ----------------------------------
+#
+# The cold-start union needs TWO complete platform stores (scopes + the SDK
+# replication tables), each migrated via the alembic chain, with independent
+# engines — the same shape as memory's `repl_a`/`repl_b` convergence harness.
+# Names DERIVE from the test database's own name, so a session pointed at a
+# throwaway SNOWLINE_PLATFORM_TEST_DATABASE_URL stays isolated.
+
+_UNION_DB_URLS = {
+    name: sa.make_url(TEST_DB_URL)
+    .set(database=f"{_db_name(TEST_DB_URL)}_{name}")
+    .render_as_string(hide_password=False)
+    for name in ("union_a", "union_b")
+}
+
+_UNION_TABLES = (
+    "scopes, milestones, milestone_transitions, milestone_dependencies, "
+    "milestone_unreconciled, replication_subscriptions, replication_outbox, "
+    "replication_stream_counters, replication_inbound_streams, "
+    "replication_parked_events"
+)
+
+
+@pytest.fixture(scope="session")
+def _platform_union_stores() -> dict:
+    if not _postgres_reachable():
+        pytest.skip("Postgres not reachable — platform union tests skipped")
+    from sqlalchemy.orm import sessionmaker
+
+    makers = {}
+    prev = os.environ.get("SNOWLINE_PLATFORM_DATABASE_URL")
+    try:
+        for name, url in _UNION_DB_URLS.items():
+            drop_database(url)
+            create_database(url)
+            # env.py reads the URL from SNOWLINE_PLATFORM_DATABASE_URL.
+            os.environ["SNOWLINE_PLATFORM_DATABASE_URL"] = url
+            command.upgrade(alembic_config(), "head")
+            engine = sa.create_engine(url, future=True)
+            makers[name] = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    finally:
+        if prev is not None:
+            os.environ["SNOWLINE_PLATFORM_DATABASE_URL"] = prev
+    yield makers
+    for maker in makers.values():
+        maker.kw["bind"].dispose()
+    for url in _UNION_DB_URLS.values():
+        drop_database(url)
+
+
+@pytest.fixture()
+def platform_stores(_platform_union_stores) -> dict:
+    """Both union stores truncated clean before each test."""
+    for maker in _platform_union_stores.values():
+        with maker() as s:
+            s.execute(sa.text(f"TRUNCATE {_UNION_TABLES} RESTART IDENTITY CASCADE"))
+            s.commit()
+    return _platform_union_stores
+
+
 @pytest.fixture(autouse=True)
 def _reset_replication_delivery_health():
     """The SDK's delivery-health state (issue #241) is process-wide: a test

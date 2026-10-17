@@ -66,18 +66,25 @@ def make_store(db_url: str | None = None):
     return engine, maker, scope
 
 
-def make_participant(*, ingest_path: str = "/events/ingest", db_url: str | None = None):
+def make_participant(*, ingest_path: str = "/events/ingest", db_url: str | None = None,
+                     apply=None, enumerator=None):
     """A plugin-shaped app: the SDK replication router over a fresh store with a
-    recording apply seam. Returns a namespace (app, scope, sessionmaker, engine,
+    recording apply seam (or the given `apply`) and an optional §7.1 backfill
+    `enumerator`. Returns a namespace (app, scope, sessionmaker, engine,
     applied)."""
     engine, maker, scope = make_store(db_url)
     applied: list[dict] = []
 
-    def apply(session, envelope):
+    def recording_apply(session, envelope):
         applied.append(envelope)
 
     app = FastAPI()
-    app.include_router(build_replication_router(scope, apply, ingest_path=ingest_path))
+    app.include_router(
+        build_replication_router(
+            scope, apply or recording_apply, ingest_path=ingest_path,
+            enumerator=enumerator,
+        )
+    )
     return SimpleNamespace(
         app=app, scope=scope, sessionmaker=maker, engine=engine, applied=applied
     )
@@ -87,7 +94,8 @@ def make_platform(*, plugins: list[dict], db_url: str | None = None,
                   ingest_path: str = "/replication/events/ingest",
                   platform_contract_version: int = CONTRACT_VERSION,
                   platform_events: tuple[str, ...] = SCOPE_EVENTS,
-                  platform_advertised_base_url: str | None = None):
+                  platform_advertised_base_url: str | None = None,
+                  inst=None):
     """A platform-shaped app: a participant app (the platform's own scope stream)
     PLUS a `GET /plugins` registry returning `plugins` (each a
     `{name,status,manifest}` entry the way `plugins_routes` does) PLUS the §8
@@ -95,8 +103,11 @@ def make_platform(*, plugins: list[dict], db_url: str | None = None,
     pairing CLI reads to version-check the platform stream. The
     `platform_contract_version`/`platform_events` knobs let a test skew the
     platform's declared contract across the two sides, exactly as `plugin_entry`
-    does for a plugin."""
-    inst = make_participant(ingest_path=ingest_path, db_url=db_url)
+    does for a plugin. `inst` substitutes a prebuilt participant namespace
+    (an `.app` serving the platform's real replication router, say) for the
+    default recording one."""
+    if inst is None:
+        inst = make_participant(ingest_path=ingest_path, db_url=db_url)
 
     @inst.app.get("/plugins")
     async def list_plugins() -> dict:  # noqa: D401 - test fixture route

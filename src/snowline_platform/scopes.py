@@ -22,16 +22,41 @@ collision error taxonomy §8 needs — see `apply_scope_event`'s docstring.
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 import uuid
+from datetime import datetime, timedelta, timezone
 
+from snowline_plugin_sdk.contract import EVENT_SCOPE_CREATED, EVENT_SCOPE_UPDATED
+from snowline_plugin_sdk.replication import ParkNow, emit_event, is_backfill_envelope
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from snowline_platform.models import Scope
-from snowline_plugin_sdk.contract import EVENT_SCOPE_CREATED, EVENT_SCOPE_UPDATED
-from snowline_plugin_sdk.replication import ParkNow, emit_event
+
+log = logging.getLogger("snowline_platform.scopes")
+
+
+def _utcnow() -> datetime:
+    """Naive UTC — the scope LWW clock's house convention (§7.1). Scope rows'
+    `created_at`/`updated_at` used to be DB `now()` defaults, which on a
+    `timestamp without time zone` column is the SERVER's local wall time — not
+    comparable across two instances in different time zones. Local writes now
+    stamp both explicitly in UTC (legacy rows keep their old stamps)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _parse_stamp(value) -> datetime | None:
+    """A payload stamp back to naive UTC (tolerates an aware ISO string)."""
+    if not value:
+        return None
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
 
 # --- slug / kind contract (carried from the monolith parser, §2.1) ----------
 
@@ -239,6 +264,8 @@ def create(
     isolated: bool = False,
     status: str = "active",
     scope_id: uuid.UUID | None = None,
+    created_at: datetime | None = None,
+    updated_at: datetime | None = None,
 ) -> Scope:
     """Create a scope (spec §3). Enforces the bare-slug⇔org invariant and
     resolves `parent_id`:
@@ -310,6 +337,10 @@ def create(
         parent_id = prow.id
     # else: parent is explicitly None/"" — parent_id stays None, NO derivation.
 
+    # Explicit UTC stamps (§7.1's scope LWW clock — see `_utcnow`). The apply
+    # seam passes the AUTHOR's stamps so a replicated row carries the origin's
+    # coordinate, never import time.
+    now = _utcnow()
     kwargs = dict(
         slug=slug,
         name=name,
@@ -317,6 +348,8 @@ def create(
         parent_id=parent_id,
         isolated=isolated,
         status=status,
+        created_at=created_at or now,
+        updated_at=updated_at or created_at or now,
     )
     if scope_id is not None:
         kwargs["id"] = scope_id
@@ -380,6 +413,16 @@ def update(
                 )
             scope.parent_id = prow.id
 
+    # The LWW coordinate (§7.1): set EXPLICITLY (which also suppresses the
+    # column's `onupdate=now()` default) and made strictly monotonic against the
+    # row's current stamp — a local author SAW the value it overwrites, so its
+    # write must beat it even when that value carries a peer's skewed-ahead
+    # clock (last-writer means last-OBSERVED-writer; governance's emit clamp is
+    # the same discipline).
+    now = _utcnow()
+    if scope.updated_at is not None and now <= scope.updated_at:
+        now = scope.updated_at + timedelta(microseconds=1)
+    scope.updated_at = now
     session.flush()
     emit_event(session, EVENT_SCOPE_UPDATED, to_replication_payload(scope))
     return scope
@@ -418,7 +461,12 @@ def to_replication_payload(scope: Scope) -> dict:
     (never reused, spec §8) and reusing `create`/`update`'s existing
     parent-slug resolution is what turns an out-of-order parent into the
     ordinary retryable ordering gap spec §8's note describes, with no new
-    machinery."""
+    machinery.
+
+    `created_at` / `updated_at` (§7.1, ADDITIVE — no contract bump; every apply
+    reads them `.get`-tolerantly) are the scope's LWW clock: `updated_at`
+    arbitrates metadata between two rows for the same slug (falling back to
+    `created_at` when absent); `created_at` is provenance only."""
     return {
         "id": str(scope.id),
         "slug": scope.slug,
@@ -427,7 +475,120 @@ def to_replication_payload(scope: Scope) -> dict:
         "parent": scope.parent.slug if scope.parent is not None else None,
         "isolated": scope.isolated,
         "status": scope.status,
+        "created_at": scope.created_at.isoformat() if scope.created_at else None,
+        "updated_at": scope.updated_at.isoformat() if scope.updated_at else None,
     }
+
+
+# --- §7.1 scope identity: slug is the cross-instance identity ----------------
+#
+# Live replication lets every instance hold the same scope UUID (one mint,
+# replicated). A cold-start union breaks that: an instance stood up empty
+# re-creates the same slugs under DIFFERENT ids, permanently. So scope UUIDs
+# are instance-local and the SLUG is the identity: `scope.updated` applies by
+# slug everywhere (wire id advisory), and on a backfill stream `scope.created`
+# for a slug held under another id CONVERGES instead of parking.
+
+
+def _metadata(name, kind, isolated, status, parent) -> str:
+    """A canonical rendering of a scope's replicated metadata — the stable,
+    content-derived tiebreak when two rows' LWW stamps are EQUAL (a pure
+    function of the two states, so both sides pick the same winner)."""
+    return json.dumps(
+        [name, kind, bool(isolated), status, parent or None], sort_keys=True
+    )
+
+
+def _incoming_wins(local: Scope, payload: dict, incoming_at: datetime | None) -> bool:
+    """§7.1's scope LWW: the incoming state wins iff its `(updated stamp,
+    canonical metadata)` strictly beats the local row's. A payload with no
+    stamp at all (a pre-§7.1 peer) applies unconditionally — today's live
+    behavior, kept for rolling-upgrade compatibility."""
+    if incoming_at is None:
+        return True
+    local_at = local.updated_at or local.created_at or datetime.min
+    incoming_key = (
+        incoming_at,
+        _metadata(
+            payload.get("name"), payload.get("kind"), payload.get("isolated"),
+            payload.get("status"), payload.get("parent"),
+        ),
+    )
+    local_key = (
+        local_at,
+        _metadata(
+            local.name, local.kind, local.isolated, local.status,
+            local.parent.slug if local.parent is not None else None,
+        ),
+    )
+    return incoming_key > local_key
+
+
+def _resolve_parent_id(session: Session, parent_slug: str | None) -> uuid.UUID | None:
+    """The LOCAL row id for a payload's parent slug. An unknown parent is the
+    ordinary retryable ordering gap (`ScopeNotFoundError`, §8) — never ParkNow."""
+    if not parent_slug:
+        return None
+    prow = resolve(session, validate_slug(parent_slug))
+    if prow is None:
+        raise ScopeNotFoundError(f"parent scope {parent_slug!r} does not exist")
+    return prow.id
+
+
+def _converge(
+    session: Session,
+    local: Scope,
+    payload: dict,
+    *,
+    heal_parent: bool,
+) -> bool:
+    """Converge `local` toward the incoming state by the §7.1 LWW clock. Returns
+    whether the incoming state won.
+
+    On a win, every metadata field takes the incoming value and the row's
+    `updated_at` becomes the WINNING EVENT'S stamp — set explicitly, so the
+    column's `onupdate=now()` cannot silently rebase the coordinate to import
+    time (which would let an older backlogged update beat a newer one).
+
+    `heal_parent` (the backfill `scope.created` convergence): the parent edge is
+    resolved BY SLUG and a missing link heals from either side — the result is
+    the winner's parent, or the loser's when the winner has none. A cold-start
+    side that created `a/b/c` before `a/b` existed thus adopts the peer's
+    `a/b` link (and keeps its own when it is the side holding the link), so
+    both instances' ancestor chains stay congruent for §6.1's walk. A live
+    `scope.updated` applies the winner's parent verbatim (an explicit clear is
+    a real write)."""
+    incoming_at = _parse_stamp(payload.get("updated_at")) or _parse_stamp(
+        payload.get("created_at")
+    )
+    local_parent_slug = local.parent.slug if local.parent is not None else None
+    wins = _incoming_wins(local, payload, incoming_at)
+    if wins:
+        parent_slug = payload.get("parent")
+        if heal_parent and not parent_slug:
+            parent_slug = local_parent_slug
+        if (payload.get("kind") or local.kind) == "org":
+            parent_slug = None
+        kind = payload.get("kind") or local.kind
+        _validate_kind_for_slug(local.slug, kind)
+        local.parent_id = _resolve_parent_id(session, parent_slug)
+        local.name = payload.get("name", local.name)
+        local.kind = kind
+        local.isolated = bool(payload.get("isolated", local.isolated))
+        local.status = payload.get("status", local.status)
+        local.updated_at = incoming_at or _utcnow()
+    elif heal_parent and local_parent_slug is None and payload.get("parent"):
+        if local.kind != "org":
+            # A heal is convergence, not a new write: the LWW coordinate stays.
+            local.parent_id = _resolve_parent_id(session, payload["parent"])
+    # Force `updated_at` into the UPDATE's SET clause even when its value is
+    # unchanged (a heal, or a win at an equal stamp): left out, the column's
+    # `onupdate=now()` default would silently rebase the coordinate to import
+    # time on any row this apply touched.
+    flag_modified(local, "updated_at")
+    session.flush()
+    session.expire(local, ["parent"])
+    return wins
 
 
 def apply_scope_event(session: Session, envelope: dict) -> None:
@@ -469,13 +630,44 @@ def apply_scope_event(session: Session, envelope: dict) -> None:
     present locally is a no-op — covers `reapply_parked` replay and any
     future re-delivery ambiguity, even though the SDK's watermark already
     keeps a live stream from re-invoking apply for an already-applied seq.
+
+    **§7.1 narrows the park posture** to the LIVE `scope.created` same-new-slug
+    race above. `scope.updated` applies BY SLUG everywhere (wire id advisory)
+    and converges metadata by the payload's `updated_at` LWW clock — an id
+    mismatch is no longer a collision, because a cold-start union leaves scope
+    ids permanently instance-local. On a BACKFILL stream (`#backfill` source),
+    `scope.created` for a slug held locally converges by slug (`_converge`,
+    parent healed by slug) instead of parking — the collision is the expected
+    case for every shared scope there, not a race.
     """
     payload = envelope["payload"]
     event_type = envelope["event_type"]
     scope_id = uuid.UUID(payload["id"])
+    backfill = is_backfill_envelope(envelope)
 
     if event_type == EVENT_SCOPE_CREATED:
-        if session.get(Scope, scope_id) is not None:
+        if backfill:
+            # §7.1 union convergence: slug is the identity. A slug held locally
+            # (under ANY id — the peer's, from a shared pre-divergence era, or
+            # this instance's own re-creation) is the EXPECTED case for every
+            # shared scope, not a race: keep the local row and id, LWW the
+            # metadata, heal the parent edge by slug, log at WARNING — and
+            # never park (parking would flood §8.1 with non-events and pin the
+            # scope stream's frontier at zero).
+            local = resolve(session, payload["slug"])
+            if local is None and session.get(Scope, scope_id) is not None:
+                local = session.get(Scope, scope_id)
+            if local is not None:
+                won = _converge(session, local, payload, heal_parent=True)
+                if local.id != scope_id:
+                    log.warning(
+                        "scope %r converged by slug on a union backfill: local id "
+                        "%s kept, peer id %s advisory (metadata %s, spec §7.1)",
+                        local.slug, local.id, scope_id,
+                        "taken from the peer" if won else "kept",
+                    )
+                return
+        elif session.get(Scope, scope_id) is not None:
             return  # already applied — idempotent replay
         try:
             create(
@@ -487,31 +679,64 @@ def apply_scope_event(session: Session, envelope: dict) -> None:
                 isolated=payload["isolated"],
                 status=payload["status"],
                 scope_id=scope_id,
+                created_at=_parse_stamp(payload.get("created_at")),
+                updated_at=_parse_stamp(payload.get("updated_at")),
             )
         except ScopeConflictError as exc:
-            # Permanent cross-partition slug collision (§8): the slug is taken by
-            # a different id and will never un-collide — park now, don't burn the
-            # retry budget (#92). ScopeNotFoundError (unknown parent) is NOT
-            # caught here: it stays retryable and self-heals.
+            # A LIVE same-new-slug race across a partition (§8, narrowed by
+            # §7.1 to exactly this case): the slug is taken by a different id
+            # and will never un-collide — park now, don't burn the retry budget
+            # (#92). ScopeNotFoundError (unknown parent) is NOT caught here: it
+            # stays retryable and self-heals.
             raise ParkNow(str(exc)) from exc
     elif event_type == EVENT_SCOPE_UPDATED:
+        # §7.1: `scope.updated` applies BY SLUG everywhere; the wire id is
+        # advisory. After a union, scope ids are permanently instance-local, and
+        # an id-keyed update would park every post-union update to a shared
+        # slug forever (no re-apply could ever succeed). Under live-from-genesis
+        # replication the ids coincide, so nothing observable changes there.
         existing = resolve(session, payload["slug"])
-        if existing is not None and existing.id != scope_id:
-            raise ParkNow(
-                f"scope {payload['slug']!r} update targets id {scope_id} but "
-                f"the local row under that slug has id {existing.id} — "
-                f"cross-partition slug collision (spec §8)"
+        if existing is None:
+            # The scope hasn't replicated here yet — the ordinary retryable
+            # ordering gap (§8), never a park.
+            raise ScopeNotFoundError(f"no scope with slug {payload['slug']!r}")
+        if existing.id != scope_id:
+            log.info(
+                "scope.updated for %r applied by slug: wire id %s, local id %s "
+                "(spec §7.1)", existing.slug, scope_id, existing.id,
             )
-        update(
-            session,
-            payload["slug"],
-            name=payload["name"],
-            kind=payload["kind"],
-            parent=payload["parent"],
-            isolated=payload["isolated"],
-            status=payload["status"],
-        )
+        _converge(session, existing, payload, heal_parent=False)
     else:
         raise ValueError(
             f"scope replication apply: unknown event_type {event_type!r}"
         )
+
+
+def enumerate_backfill(session: Session):
+    """The platform's §7.1 scope enumerator — `scope.created` ONLY (never
+    `scope.updated`), one per row, carrying the row's FINAL state including its
+    authored/updated stamps: on an empty peer it reproduces the row; on a peer
+    holding the slug it is the backfill convergence path (`_converge`).
+
+    Walk order is deterministic AND parent-first: rows sorted by `(created_at,
+    id)`, each emitted only after its parent (a topological pass over the
+    `parent_id` forest), so a child's parent slug always resolves on the
+    receiver within the same stream — no ordering-gap retries. Read-only.
+
+    Milestones ride the same platform stream live but are NOT enumerated: §7.1
+    scopes the platform's union half to the scope namespace."""
+    rows = list(session.scalars(select(Scope).order_by(Scope.created_at, Scope.id)))
+    by_id = {r.id: r for r in rows}
+    emitted: set[uuid.UUID] = set()
+
+    def visit(row: Scope, stack: set[uuid.UUID]):
+        if row.id in emitted:
+            return
+        parent = by_id.get(row.parent_id) if row.parent_id else None
+        if parent is not None and parent.id not in stack:
+            yield from visit(parent, stack | {parent.id})
+        emitted.add(row.id)
+        yield (EVENT_SCOPE_CREATED, to_replication_payload(row))
+
+    for row in rows:
+        yield from visit(row, {row.id})
