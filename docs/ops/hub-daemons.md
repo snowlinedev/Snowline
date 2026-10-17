@@ -77,6 +77,19 @@ Restarting a service is now
 `sudo launchctl kickstart -k system/dev.snowline.<svc>` instead of
 `launchctl kickstart -k gui/$UID/dev.snowline.<svc>`.
 
+No sudo is needed for the routine deploy restart, though. The daemon process
+runs as `seanlynch` with `KeepAlive true`, so killing it is enough and launchd
+relaunches it (verified 2026-10-15: pm back on a new pid with `/health` 200
+within ~2s):
+
+```sh
+kill -TERM "$(launchctl print system/dev.snowline.<svc> | awk '/^\tpid = /{print $3}')"
+```
+
+This is the restart an agent session uses after `git pull --ff-only`; the
+`sudo launchctl kickstart -k` form is equivalent and also covers a daemon
+whose process is not currently running.
+
 ## Stack-sync guard
 
 `check_not_source_hub` (`src/snowline_platform/stack/sync.py`) refuses to
