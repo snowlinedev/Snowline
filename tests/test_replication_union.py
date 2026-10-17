@@ -25,9 +25,10 @@ import json
 import logging
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from snowline_plugin_sdk.contract import EVENT_SCOPE_CREATED, EVENT_SCOPE_UPDATED
@@ -36,12 +37,18 @@ from snowline_plugin_sdk.replication.envelope import build_envelope, sign_body
 from sqlalchemy import select
 
 from snowline_platform import (
+    milestones,
     replication,
     replication_pairing,
     replication_union,
     scopes,
 )
-from snowline_platform.models import Scope
+from snowline_platform.models import (
+    Milestone,
+    MilestoneDependency,
+    MilestoneTransition,
+    Scope,
+)
 
 from ._replication_helpers import (
     RoutedClient,
@@ -599,3 +606,140 @@ def test_drop_retired_parks_after_the_union_verifies(union_pair):
     result = pair.union(repair=True, drop_retired_parks=True)
     assert [(p["source_id"], p["seq"]) for p in result.dropped_parks] == [("roam.platform", 1)]
     assert pair.parked(pair.hub) == []
+
+
+# --- milestones ride the platform stream too (review of #98, M1) ----------------
+
+
+def _milestones_of(inst):
+    """Every milestone row as (outcome, status, alias target, transition log),
+    plus the dependency edge set — both by canonical address."""
+    with inst.sessionmaker() as s:
+        rows = {}
+        for m in s.scalars(select(Milestone)):
+            log = sorted(
+                (t.from_status, t.to_status, t.authored_at)
+                for t in s.scalars(
+                    select(MilestoneTransition).where(MilestoneTransition.milestone_id == m.id)
+                )
+            )
+            rows[milestones.address_of(m)] = (
+                m.outcome, m.status,
+                milestones.address_of(m.merged_into) if m.merged_into_id else None,
+                log,
+            )
+        deps = {
+            (
+                milestones.address_of(s.get(Milestone, e.dependent_id)),
+                milestones.address_of(s.get(Milestone, e.dependency_id)),
+            )
+            for e in s.scalars(select(MilestoneDependency))
+        }
+        return rows, deps
+
+
+def _seed_milestone_history(pair: _Pair):
+    """mini: `acme/v1` activated, `acme/v2` depending on it, `acme/old` merged
+    into `v2`. roam (stood up empty): re-created `acme` and `acme/v1` with a
+    NEWER outcome but an older lifecycle clock, plus its own `acme/v3`."""
+    def hub(s):
+        scopes.create(s, slug="acme", name="Acme", kind="org")
+        milestones.create(s, "acme", "v1", outcome="hub outcome")
+        milestones.activate(s, "acme/v1", reason="go")
+        milestones.create(s, "acme", "v2", outcome="after v1")
+        milestones.add_dependency(s, "acme/v2", "acme/v1")
+        milestones.create(s, "acme", "old")
+        milestones.merge(s, "acme/old", "acme/v2")
+
+    def spoke(s):
+        scopes.create(s, slug="acme", name="Acme", kind="org")
+        v1 = milestones.create(s, "acme", "v1", outcome="roam outcome (newer)")
+        v1.lww_authored_at = datetime.now(UTC).replace(tzinfo=None) + timedelta(hours=1)  # descriptive: roam wins
+        v1.lifecycle_authored_at = _t(1)  # lifecycle: the hub's activation wins
+        milestones.create(s, "acme", "v3", outcome="roam only")
+
+    _write(pair.hub, hub)
+    _write(pair.spoke, spoke)
+
+
+def test_enumerator_walks_rows_then_transitions_then_edges_then_merges(union_pair):
+    pair = union_pair
+    _seed_milestone_history(pair)
+    with pair.hub.sessionmaker() as s:
+        events = list(milestones.enumerate_backfill(s))
+    assert [(t, p.get("address") or p.get("dependent") or p.get("from")) for t, p in events] == [
+        ("milestone.created", "acme/v1"),
+        ("milestone.transitioned", "acme/v1"),
+        ("milestone.created", "acme/v2"),
+        ("milestone.created", "acme/old"),
+        ("milestone.dependency_changed", "acme/v2"),
+        ("milestone.merged", "acme/old"),
+    ]
+    created_v1, transitioned_v1 = events[0][1], events[1][1]
+    # The log event carries the row's FINAL lifecycle clock (so it loses the
+    # register compare on a peer the created event seeded) and its own instant.
+    assert transitioned_v1["lifecycle_authored_at"] == created_v1["lifecycle_authored_at"]
+    assert transitioned_v1["authored_at"] != created_v1["authored_at"]
+    assert (transitioned_v1["from_status"], transitioned_v1["to_status"]) == ("planned", "active")
+    # Scopes come first on the combined platform stream.
+    with pair.hub.sessionmaker() as s:
+        combined = [t for t, _ in replication.enumerate_backfill(s)]
+    assert combined[0] == EVENT_SCOPE_CREATED and combined[1:] == [t for t, _ in events]
+
+
+def test_union_carries_milestones_both_ways(union_pair):
+    pair = union_pair
+    _seed_milestone_history(pair)
+    result = pair.union()
+    assert result.skipped == []
+    hub_rows, hub_deps = _milestones_of(pair.hub)
+    spoke_rows, spoke_deps = _milestones_of(pair.spoke)
+    # No write lost, both directions — and identical state on both sides.
+    assert set(hub_rows) == set(spoke_rows) == {"acme/v1", "acme/v2", "acme/old", "acme/v3"}
+    assert hub_rows == spoke_rows
+    assert hub_deps == spoke_deps == {("acme/v2", "acme/v1")}
+    # Same-milestone edit resolves PER REGISTER by LWW: roam's newer outcome,
+    # the hub's newer lifecycle (active) — and the hub's transition log row
+    # landed on roam.
+    outcome, status, alias, log = spoke_rows["acme/v1"]
+    assert (outcome, status, alias) == ("roam outcome (newer)", "active", None)
+    assert [(f, t) for f, t, _ in log] == [("planned", "active")]
+    assert spoke_rows["acme/old"][2] == "acme/v2"  # the tombstone followed
+    assert hub_rows["acme/v3"][0] == "roam only"
+    assert pair.parked(pair.hub) == [] and pair.parked(pair.spoke) == []
+    # Re-running under fresh epochs changes nothing.
+    pair.union()
+    assert _milestones_of(pair.hub) == (hub_rows, hub_deps)
+    assert _milestones_of(pair.spoke) == (spoke_rows, spoke_deps)
+
+
+# --- mixed-version refusal (review of #98, M2) ------------------------------------
+
+
+class _Pre98Client:
+    """The real routed client, except one participant answers 404 on the §7.1
+    backfill surface — an instance that predates #98."""
+
+    def __init__(self, inner, missing_url: str):
+        self._inner, self._missing = inner, missing_url
+
+    def get(self, url, **kw):
+        if url == self._missing:
+            return httpx.Response(404, json={"detail": "Not Found"},
+                                  request=httpx.Request("GET", url))
+        return self._inner.get(url, **kw)
+
+    def post(self, url, **kw):
+        return self._inner.post(url, **kw)
+
+
+def test_refuses_a_peer_without_the_backfill_surface(union_pair):
+    pair = union_pair
+    _write(pair.hub, lambda s: scopes.create(s, slug="acme", name="Acme", kind="org"))
+    pair.client = _Pre98Client(pair.client, "http://spoke/replication-admin/backfill")
+    with pytest.raises(replication_union.UnionError, match="upgrade the peer first"):
+        pair.union()
+    # Refused BEFORE step 1: nothing was paired, nothing opened, nothing parked.
+    assert pair.client.get("http://spoke/replication-admin/inbound").json() == []
+    assert pair.client.get("http://hub/replication-admin/inbound").json() == []
+    assert set(pair.scopes_of(pair.spoke)) == set()

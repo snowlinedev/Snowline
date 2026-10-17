@@ -26,7 +26,7 @@ import json
 import logging
 import re
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from snowline_plugin_sdk.contract import EVENT_SCOPE_CREATED, EVENT_SCOPE_UPDATED
 from snowline_plugin_sdk.replication import ParkNow, emit_event, is_backfill_envelope
@@ -46,7 +46,7 @@ def _utcnow() -> datetime:
     `timestamp without time zone` column is the SERVER's local wall time — not
     comparable across two instances in different time zones. Local writes now
     stamp both explicitly in UTC (legacy rows keep their old stamps)."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 def _parse_stamp(value) -> datetime | None:
@@ -55,7 +55,7 @@ def _parse_stamp(value) -> datetime | None:
         return None
     dt = datetime.fromisoformat(value)
     if dt.tzinfo is not None:
-        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        dt = dt.astimezone(UTC).replace(tzinfo=None)
     return dt
 
 # --- slug / kind contract (carried from the monolith parser, §2.1) ----------
@@ -723,8 +723,9 @@ def enumerate_backfill(session: Session):
     `parent_id` forest), so a child's parent slug always resolves on the
     receiver within the same stream — no ordering-gap retries. Read-only.
 
-    Milestones ride the same platform stream live but are NOT enumerated: §7.1
-    scopes the platform's union half to the scope namespace."""
+    Milestones ride the same platform stream and are enumerated AFTER the
+    scopes by `replication.enumerate_backfill` (`milestones.enumerate_backfill`),
+    so every anchor is on the receiver before its milestones arrive."""
     rows = list(session.scalars(select(Scope).order_by(Scope.created_at, Scope.id)))
     by_id = {r.id: r for r in rows}
     emitted: set[uuid.UUID] = set()
