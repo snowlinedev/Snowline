@@ -483,3 +483,30 @@ def test_after_retirement_one_live_stream_per_direction_remains(hub_spoke):
     spoke.remember("after", "live", at=_t(50))
     _sync(hub, spoke)
     assert hub.register("after") == ("live", False, "roam.memory")
+
+
+def test_memory_app_serves_the_backfill_open_verb(db_session):
+    """The wired surface: `create_app` hands the SDK router memory's
+    enumerator, so the §7.1 open verb walks the store (not a 501)."""
+    import anyio
+
+    from snowline_memory.app import create_app
+
+    with mock.patch.dict(os.environ, {"SNOWLINE_REPLICATION_SOURCE_ID": "mini.memory"}):
+        memory.remember(db_session, content="c", name="n")
+        db_session.commit()
+    app = create_app(
+        migrate_on_startup=False, register_on_startup=False, replicate_on_startup=False
+    )
+
+    async def call() -> httpx.Response:
+        transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 4242))
+        async with httpx.AsyncClient(transport=transport, base_url="http://mem") as c:
+            return await c.post("/replication-admin/backfill/open", json={
+                "target_url": "http://roam/events/ingest", "secret": "s",
+                "epoch": "bf-1", "source_id": "mini.memory",
+            })
+
+    resp = anyio.run(call)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["enumerated"] == {EVENT_MEMORY_SET: 1}

@@ -125,6 +125,10 @@ class Decision(Base):
     shadow_origin_node_id: Mapped[str | None] = mapped_column(String, nullable=True)
     shadow_origin_label: Mapped[str | None] = mapped_column(String, nullable=True)
     shadow_origin_kind: Mapped[str | None] = mapped_column(String, nullable=True)
+    # §7.1 provenance (#98): the (`#backfill`-stripped) source of the stream a
+    # REPLICATED decision arrived on; NULL = locally authored. What makes
+    # "locally authored" computable for a union backfill's §6.1 detection.
+    origin_source: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 class Artifact(Base):

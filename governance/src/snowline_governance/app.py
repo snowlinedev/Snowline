@@ -32,7 +32,12 @@ from snowline_plugin_sdk.replication.health import (
     replication_health_from_scope,
 )
 
-from snowline_governance import config, registration, replication_apply
+from snowline_governance import (
+    config,
+    registration,
+    replication_apply,
+    replication_stream,
+)
 from snowline_governance.db import session_scope
 from snowline_governance.mcp_surface import build_main_surface, build_shadow_surface
 from snowline_governance.milestone_client import MilestoneClient
@@ -182,6 +187,8 @@ def create_app(
             session_scope,
             replication_apply.build_apply(scope_client),
             ingest_path=INGEST_PATH,
+            # §7.1 cold-start union: the backfill open verb walks this.
+            enumerator=replication_stream.enumerate_backfill,
         )
     )
 

@@ -195,11 +195,17 @@ class StubScopeClient:
         self,
         tree: dict[str, str | None],
         isolated: set[str] | None = None,
+        *,
+        id_salt: str = "",
     ) -> None:
+        # `id_salt` gives this "instance" its OWN scope ids for the same slugs —
+        # the §7.1 cold-start union's permanent id divergence (two platforms
+        # that each minted the shared slugs independently).
         self._tree = tree
         self._isolated = isolated or set()
         self._ids = {
-            slug: uuid.uuid5(uuid.NAMESPACE_URL, f"scope:{slug}") for slug in tree
+            slug: uuid.uuid5(uuid.NAMESPACE_URL, f"scope:{id_salt}{slug}")
+            for slug in tree
         }
         self.ancestors_calls: list[str] = []
         self.resolve_calls: list[str] = []
@@ -367,6 +373,68 @@ def stub_milestone_client():
     """Factory: `stub_milestone_client(statuses, aliases=...)` ->
     `StubMilestoneClient`."""
     return StubMilestoneClient
+
+
+# --- two-instance harness (§7.1 union, #98) ----------------------------------
+#
+# The memory suite's `repl_a`/`repl_b` convergence pattern, for governance: TWO
+# complete governance stores (domain + SDK replication tables), each migrated
+# via the alembic chain, with independent sessionmakers. Names derive from the
+# test database's own name so a throwaway SNOWLINE_GOVERNANCE_TEST_DATABASE_URL
+# stays isolated from any other run.
+
+_REPL_DB_URLS = {
+    name: sa.make_url(TEST_DB_URL)
+    .set(database=f"{_db_name(TEST_DB_URL)}_{name}")
+    .render_as_string(hide_password=False)
+    for name in ("repl_a", "repl_b")
+}
+
+_REPL_TABLES = (
+    "decisions, artifacts, artifact_versions, artifact_governs, "
+    "shadow_branches, shadow_nodes, shadow_node_citations, "
+    "shadow_conversation_events, webhook_subscriptions, webhook_deliveries, "
+    "decision_concurrences, replication_lww_registers, "
+    "replication_subscriptions, replication_outbox, "
+    "replication_stream_counters, replication_inbound_streams, "
+    "replication_parked_events"
+)
+
+
+@pytest.fixture(scope="session")
+def _governance_replication_stores() -> dict:
+    if not _postgres_reachable():
+        pytest.skip("Postgres not reachable — governance convergence tests skipped")
+    from sqlalchemy.orm import sessionmaker
+
+    makers = {}
+    prev = os.environ.get("SNOWLINE_GOVERNANCE_DATABASE_URL")
+    try:
+        for name, url in _REPL_DB_URLS.items():
+            drop_database(url)
+            create_database(url)
+            os.environ["SNOWLINE_GOVERNANCE_DATABASE_URL"] = url
+            command.upgrade(alembic_config(), "head")
+            engine = sa.create_engine(url, future=True)
+            makers[name] = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    finally:
+        if prev is not None:
+            os.environ["SNOWLINE_GOVERNANCE_DATABASE_URL"] = prev
+    yield makers
+    for maker in makers.values():
+        maker.kw["bind"].dispose()
+    for url in _REPL_DB_URLS.values():
+        drop_database(url)
+
+
+@pytest.fixture()
+def governance_stores(_governance_replication_stores) -> dict:
+    """Both stores truncated clean before each test."""
+    for maker in _governance_replication_stores.values():
+        with maker() as s:
+            s.execute(sa.text(f"TRUNCATE {_REPL_TABLES} RESTART IDENTITY CASCADE"))
+            s.commit()
+    return _governance_replication_stores
 
 
 @pytest.fixture(autouse=True)
