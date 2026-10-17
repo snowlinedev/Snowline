@@ -516,6 +516,41 @@ def test_scope_outage_is_retryable_then_parks_then_reapplies(
         assert stream.applied_seq == 1
 
 
+def test_backfill_branch_collision_parks_now_live_stays_retryable(db_session, apply_fn):
+    """Review of #98 (L4): a same-(scope, name) shadow branch authored on BOTH
+    sides across a partition is a PERMANENT collision on a backfill stream —
+    the other side's branch pre-dates pairing and never goes away — so apply
+    parks NOW instead of stalling the union for the whole retry bound. A live
+    stream keeps the ordinary retryable posture (§8)."""
+    from sqlalchemy.exc import IntegrityError
+
+    _pair_outbound(db_session)
+    scope, sid = "acme/widget", _sid("acme/widget")
+    shadow.create_branch(db_session, scope, sid, "line-a")
+    db_session.flush()
+    payload = _payload(
+        id=str(uuid.uuid4()),
+        scope_id=str(uuid.uuid4()),
+        scope=scope,
+        name="line-a",
+        narrative_notes=None,
+        created_at=utcnow().isoformat(),
+    )
+    backfilled = build_envelope(
+        "shadow.branch_created", payload, source_id=f"{PEER}#backfill",
+        epoch="bf1", seq=1, peer_seen=0,
+    )
+    with pytest.raises(sdk_ingest.ParkNow, match="permanent collision"):
+        apply_fn(db_session, backfilled)
+    db_session.rollback()  # the park path's rollback discipline (also the test's branch)
+    _pair_outbound(db_session)
+    shadow.create_branch(db_session, scope, sid, "line-a")
+    db_session.flush()
+    with pytest.raises(IntegrityError):
+        apply_fn(db_session, _envelope("shadow.branch_created", payload))
+    db_session.rollback()
+
+
 def test_unknown_scope_slug_is_retryable(db_session, apply_fn):
     """§8: a branch in a scope this instance doesn't know yet raises (ordinary
     scope-stream lag self-heals on redelivery) — never half-applies."""

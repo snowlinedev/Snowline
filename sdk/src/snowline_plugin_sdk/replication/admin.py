@@ -415,7 +415,7 @@ def build_replication_router(
                 status_code=501,
                 detail="this participant has no backfill enumerator (spec §7.1)",
             )
-        try:
+        def _walk() -> dict:
             with session_scope() as session:
                 return _emit.open_backfill_subscription(
                     session,
@@ -425,6 +425,13 @@ def build_replication_router(
                     live_source_id=source_id,
                     enumerator=enumerator,
                 )
+
+        try:
+            # The walk is one synchronous transaction over EVERY row — off the
+            # event loop (like `/snapshot`'s pg_dump), so this plugin keeps
+            # ingesting the peer's backfill and serving its MCP surface while
+            # it enumerates.
+            return await run_in_threadpool(_walk)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from None
 

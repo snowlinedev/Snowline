@@ -60,6 +60,7 @@ import logging
 import uuid
 from datetime import datetime
 
+from snowline_plugin_sdk.replication import ParkNow
 from snowline_plugin_sdk.replication.envelope import (
     is_backfill_envelope,
     live_source_id,
@@ -69,6 +70,7 @@ from snowline_plugin_sdk.replication.models import (
     ReplicationSubscription,
 )
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from snowline_governance import artifacts, concurrence, replication_stream
 from snowline_governance.contract import (
@@ -432,7 +434,21 @@ def _apply_branch_created(session, client, envelope: dict) -> None:
     )
     # A same-(scope, name) branch authored on both sides trips the unique
     # constraint here — loud + retryable + parked, the §8 collision posture.
-    session.flush()
+    # On a BACKFILL stream the collision is permanent by construction (the
+    # other side's branch pre-dates pairing and will never go away), so it
+    # parks NOW instead of spending the retry bound — hours of a stalled
+    # union — on an outcome that cannot change (review of #98).
+    try:
+        session.flush()
+    except IntegrityError as exc:
+        if is_backfill_envelope(envelope):
+            raise ParkNow(
+                f"shadow branch {p['scope']}:{p['name']} already exists locally "
+                f"under another id — a branch authored on both sides across the "
+                f"partition is a permanent collision on a backfill stream "
+                f"(§7.1/§8.1); parked for triage"
+            ) from exc
+        raise
 
 
 def _apply_branch_archived(session, client, envelope: dict) -> None:

@@ -990,10 +990,42 @@ it open:**
   unreconciled view already hides superseded members).
 - **DROP unpins.** Dropping a park recomputes `applied_seq` exactly like a
   successful re-apply — the dropped seq is resolved by declaration.
-- **A participant without an enumerator** (501 / pre-#98 404 on the open
-  verb) is WARNED and skipped by the union tool, with its receiver-side half
-  retired again; milestones (on the platform stream) are not enumerated —
-  the platform's half is the scope namespace, as specified above.
+- **A participant without an enumerator** (501 on the open verb) is WARNED
+  and skipped by the union tool, with its receiver-side half retired again —
+  as it is on ANY failed open, so a half-open backfill never dangles.
+- **Milestones ARE enumerated.** The "scope namespace" wording above predates
+  milestone replication (#152); the union rule admits no exception, so the
+  platform enumerator walks scopes first, then the milestone namespace from
+  its existing vocabulary: `milestone.created` per row (final state, both
+  registers, tombstones included) followed by that row's `milestone.
+  transitioned` log, then `milestone.dependency_changed` (`add`) per current
+  edge, then `milestone.merged` per tombstone. Additive `descriptive_source_id`
+  / `lifecycle_source_id` / `transition_source_id` / `source_id` keys carry
+  each register's STORED author (the `lww_source` discipline); apply strips
+  `#backfill` from the stream source where no key is present.
+- **Both sides must serve the backfill surface.** The union tool probes `GET
+  <admin>/backfill` on every participant on BOTH sides before step 1 and
+  refuses on a 404/501 ("upgrade the peer first"): a pre-#98 receiver would
+  register the backfill inbound fine and then PARK every shared slug under
+  the old id-keyed collision rule.
+- **The straddle window is bounded, not closed.** The walker's snapshot is
+  serialized when its open call starts; a domain transaction that read the
+  subscription table BEFORE the pairing commit and commits AFTER that snapshot
+  is in neither the live stream nor the enumeration. The union tool waits one
+  poll interval between pairing and the first walk, which outlasts any
+  plausible open transaction; a transaction held open across that gap is the
+  residual exposure (runbook: quiesce writers during a union).
+- **Legacy scope stamps stay server-local by decision.** Rows stamped by the
+  old `now()` defaults keep their local-time values (no data migration): the
+  update clamp only ever moves a stamp forward, and a behind-UTC legacy stamp
+  loses an LWW compare it would also have lost under live replication, so
+  the exposure is bounded to a legacy write and a peer write less than one
+  zone offset apart that straddle the upgrade.
+- **A shadow-branch name collision parks at once on a backfill stream.** The
+  unique `(scope, name)` IntegrityError stays retryable on live streams (§8)
+  but is permanent by construction under a union, so the apply raises
+  `ParkNow` when the envelope is a backfill one — one loud stop instead of
+  the retry bound.
 
 ## 8. The scope namespace — the platform dogfoods the contract
 

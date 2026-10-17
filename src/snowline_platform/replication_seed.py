@@ -63,6 +63,7 @@ from sqlalchemy import create_engine, delete, select
 from sqlalchemy.orm import Session
 
 from snowline_platform.replication import via_base
+from snowline_plugin_sdk.replication.envelope import is_backfill_source
 from snowline_platform.replication_pairing import (
     Participant,
     discover_participants,
@@ -606,6 +607,17 @@ def _retire_orphan_forward(client, sp: SeedParticipant, *, report: Report) -> No
         return
     for sub in listed.json():
         if sub.get("active") and sub.get("target_url") == sp.spoke_ingest_url:
+            if is_backfill_source(sub.get("source_id")):
+                # §7.1 mutual exclusion, ENFORCED: a union backfill targets the
+                # same ingest URL, and silently retiring it would strand the
+                # union mid-walk. Never seed while a union is in flight.
+                raise SeedError(
+                    f"[prime] {sp.name}: a §7.1 union backfill stream "
+                    f"{sub['source_id']} (epoch {sub.get('epoch')}) is active "
+                    f"toward {sp.spoke_ingest_url} — never run `replicate seed` "
+                    "while a union is in flight; finish it (or retire its "
+                    "backfill streams on both halves) first"
+                )
             client.post(
                 f"{sp.primary.admin_base}/outbound/retire", json={"id": sub["id"]}
             )

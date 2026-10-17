@@ -293,16 +293,21 @@ def open_backfill(
             "source_id": sender.source_id,
         },
     )
-    if resp.status_code in (404, 501):
-        # No enumerator (501), or a participant predating the backfill surface
-        # (404). Undo the receiver's half so nothing dangles.
+    if resp.status_code >= 400:
+        # Undo the receiver's half FIRST, whatever the failure — a dangling
+        # `#backfill` inbound would stop the next run on "half-open backfill"
+        # (review of #98). 501 = no enumerator, 404 = a participant predating
+        # the backfill surface: both are "skip, loudly" for the caller; any
+        # other status (a 409 from a concurrent open, an enumerator raising on
+        # a bad row) is an error.
         _post_json(
             client,
             f"{receiver.admin_base}/inbound/retire",
             {"source_id": bf_source, "epoch": epoch},
         )
-        return None
-    _raise_for_status(resp, f"POST {sender.admin_base}/backfill/open")
+        if resp.status_code in (404, 501):
+            return None
+        _raise_for_status(resp, f"POST {sender.admin_base}/backfill/open")
     opened = resp.json()
     report(
         f"[union/backfill] {name}: opened {bf_source} -> {receiver.source_id} "
@@ -449,6 +454,33 @@ def _backfill_both_ways(
     return opened
 
 
+def check_backfill_surface(
+    client, local: dict[str, Participant], peer: dict[str, Participant], names: list[str]
+) -> None:
+    """Refuse the union unless EVERY participant on BOTH sides serves the §7.1
+    backfill surface (`GET <admin>/backfill`). A pre-#98 receiver registers a
+    backfill inbound fine (the generic `/inbound` route predates the union) but
+    its scope apply still PARKS every shared slug (the old id-keyed collision
+    rule) — one park per shared scope, manual cleanup, and the reverse
+    direction silently skipped. Probing both sides up front closes the whole
+    mixed-version class with one message: upgrade the peer first."""
+    missing: list[str] = []
+    for name in names:
+        for side, inst in (("local", local[name]), ("peer", peer[name])):
+            resp = client.get(f"{inst.admin_base}/backfill")
+            if resp.status_code in (404, 501):
+                missing.append(f"{name}@{inst.source_id} ({side})")
+                continue
+            _raise_for_status(resp, f"GET {inst.admin_base}/backfill")
+    if missing:
+        raise UnionError(
+            "refusing the union: the §7.1 backfill surface is missing on "
+            + ", ".join(missing)
+            + " — upgrade the peer first (a pre-#98 instance would park every "
+            "shared scope instead of converging it)"
+        )
+
+
 # --- the whole union ----------------------------------------------------------------
 
 
@@ -481,9 +513,19 @@ def union(
             + ", ".join(repr(n) for n in plan.refused)
         )
     names = plan.to_pair
+    check_backfill_surface(client, local, peer, names)
 
     # 1. live streams first — forward-in-time replication starts NOW.
     result.paired = pair_first(client, local, peer, names, repair=repair, report=report)
+    if result.paired != "reused":
+        # One poll interval before the first walk: the walker's snapshot is
+        # serialized when its open call starts, so a domain transaction that
+        # read the subscription table BEFORE the pairing commit (no live outbox
+        # row) and commits AFTER that snapshot would be in neither the live
+        # stream nor the enumeration. The window is the gap between these two
+        # instants; waiting out the longest plausible open transaction closes
+        # it in practice (spec §7.1 implementation notes).
+        drive()
 
     # 2. the scope namespace, both directions, to completion.
     scope_names = [n for n in names if n == PLATFORM_PARTICIPANT]

@@ -330,14 +330,32 @@ After it completes:
   provenance column existed read as locally authored and flag extra pairs —
   expect them and bulk-resolve with `mark_decisions_compatible`. (The cold-start
   case has none: the empty side has no replicated history.)
-- **Milestones are not unioned** by this tool (§7.1 scopes the platform's half
-  to the scope namespace). Re-create any milestone authored on only one side
-  during the partition by hand.
+- **Milestones union too** (the platform stream carries scopes AND
+  milestones): a milestone authored on one side during the partition exists
+  on both afterwards, a same-address edit resolves per register by LWW, and
+  both sides' transition logs merge — check `milestone_unreconciled` on both
+  instances for any illegal converged move (§9), as after live replication.
+- **Shared-slug scopes: re-check `isolated` / `status` / `name` afterwards.**
+  The cold-start side's re-creation of a shared slug is the NEWER write, so
+  its defaults (`isolated=False`, default name) win the LWW on both sides —
+  the hub's curated `isolated=True` is overwritten. Restore it with
+  `update_scope` after the union; `isolated` drives `applicable_*` and the
+  §6.1 ancestors walk.
+- **Both sides must run #98 or newer.** The tool probes the backfill surface
+  on every participant on both sides first and refuses with "upgrade the peer
+  first" — do that (`snowline stack sync`) rather than working around it: a
+  pre-#98 side would park every shared scope instead of converging it.
+- **Quiesce writers for the first poll interval.** The tool waits one poll
+  interval between pairing and the first walk so that a write whose
+  transaction straddled the pairing instant lands in the live stream; a
+  transaction held open longer than that is the one residual way to lose a
+  write (spec §7.1 implementation notes).
 
 **Never run `snowline replicate seed` while a union is in flight.** A seed
-re-prime retires ANY active outbound targeting the spoke's ingest URL — a
-backfill outbound included, since it targets the same URL — stranding the
-union's stream mid-walk. Finish (or abandon and retire) the union first.
+re-prime retires ANY active outbound targeting the spoke's ingest URL — and a
+backfill outbound targets the same URL, so the prime now REFUSES (SeedError)
+when it finds one rather than stranding the union mid-walk. Finish (or abandon
+and retire) the union first.
 
 ## 6a. Rolling back a packaged-channel update (macOS distribution spec §5)
 
