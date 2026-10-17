@@ -184,13 +184,18 @@ def build_replication_router(
     *,
     ingest_path: str = "/events/ingest",
     admin_prefix: str = "/replication-admin",
+    enumerator: _emit.BackfillEnumerator | None = None,
 ) -> APIRouter:
     """The plugin's replication HTTP surface: POST `ingest_path` (the manifest's
     declared ingest route, §4) plus the §5 admin routes under `admin_prefix`.
     `session_scope` is the plugin's own transactional session context;
     `apply` is its idempotent domain apply (see `ingest.ingest_delivery`).
-    Include the returned router in the plugin's FastAPI app BEFORE any
-    catch-all MCP mounts (the same ordering note as `/health`)."""
+    `enumerator` is the plugin's §7.1 backfill enumerator — a deterministic
+    iterator of `(event_type, payload)` over its replicated rows, from its
+    EXISTING vocabulary; without one, the backfill open verb answers 501 (the
+    plugin cannot take part in a cold-start union). Include the returned router
+    in the plugin's FastAPI app BEFORE any catch-all MCP mounts (the same
+    ordering note as `/health`)."""
     router = APIRouter()
 
     @router.post(ingest_path)
@@ -366,6 +371,85 @@ def build_replication_router(
         _require_trusted(request)
         with session_scope() as session:
             return _ingest.list_parked(session)
+
+    @router.post(f"{admin_prefix}/parked/reapply")
+    async def reapply_parked(request: Request, data: dict) -> dict:
+        _require_trusted(request)
+        source_id, epoch, seq = _required(data, "source_id", "epoch", "seq")
+        with session_scope() as session:
+            try:
+                return _ingest.reapply_parked(session, source_id, epoch, int(seq), apply)
+            except ValueError as exc:
+                if "no parked event" in str(exc) or "no inbound stream" in str(exc):
+                    raise HTTPException(status_code=404, detail=str(exc)) from None
+                raise HTTPException(status_code=409, detail=str(exc)) from None
+            except Exception as exc:  # noqa: BLE001 - the apply still fails: stays parked
+                raise HTTPException(status_code=409, detail=str(exc)) from None
+
+    @router.post(f"{admin_prefix}/parked/drop")
+    async def drop_parked(request: Request, data: dict) -> dict:
+        """§7.1's DROP verb: discard one parked event without applying it (the
+        union resolves old parks this way once it verifies)."""
+        _require_trusted(request)
+        source_id, epoch, seq = _required(data, "source_id", "epoch", "seq")
+        with session_scope() as session:
+            try:
+                return _ingest.drop_parked(session, source_id, epoch, int(seq))
+            except ValueError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from None
+
+    # --- §7.1 backfill streams: open (walk) / status / retire ----------------
+
+    @router.post(f"{admin_prefix}/backfill/open")
+    async def open_backfill(request: Request, data: dict) -> dict:
+        """The SENDING half of a backfill: create the `<source_id>#backfill`
+        subscription toward `target_url` under the receiver-minted `secret` and
+        `epoch`, and walk this plugin's enumerator into its outbox (one
+        transaction). `source_id` is this participant's LIVE source id."""
+        _require_trusted(request)
+        target_url, secret, epoch, source_id = _required(
+            data, "target_url", "secret", "epoch", "source_id"
+        )
+        if enumerator is None:
+            raise HTTPException(
+                status_code=501,
+                detail="this participant has no backfill enumerator (spec §7.1)",
+            )
+        def _walk() -> dict:
+            with session_scope() as session:
+                return _emit.open_backfill_subscription(
+                    session,
+                    target_url,
+                    secret,
+                    epoch=epoch,
+                    live_source_id=source_id,
+                    enumerator=enumerator,
+                )
+
+        try:
+            # The walk is one synchronous transaction over EVERY row — off the
+            # event loop (like `/snapshot`'s pg_dump), so this plugin keeps
+            # ingesting the peer's backfill and serving its MCP surface while
+            # it enumerates.
+            return await run_in_threadpool(_walk)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+
+    @router.get(f"{admin_prefix}/backfill")
+    async def backfill_status(request: Request) -> list[dict]:
+        _require_trusted(request)
+        with session_scope() as session:
+            return _emit.backfill_status(session)
+
+    @router.post(f"{admin_prefix}/backfill/retire")
+    async def retire_backfill(request: Request, data: dict) -> dict:
+        _require_trusted(request)
+        (subscription_id,) = _required(data, "id")
+        with session_scope() as session:
+            try:
+                return _emit.retire_backfill_subscription(session, subscription_id)
+            except ValueError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from None
 
     # --- dead-letters: the sender-side mirror (§3.1) --------------------------
 

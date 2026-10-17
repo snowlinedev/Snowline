@@ -130,3 +130,64 @@ def test_contract_version_mismatch_exit_code(monkeypatch, capsys):
     ])
     assert rc == 1
     assert "contract_version mismatch" in capsys.readouterr().err
+
+
+# --- `replicate union` (§7.1, #98) -------------------------------------------
+
+
+def test_union_dry_run_reports_live_pairing_state(two_instances, capsys):
+    rc = cli.main([
+        "replicate", "union", "http://prim-platform",
+        "--local-url", "http://roam-platform",
+        "--local-instance", "roam", "--peer-instance", "primary", "--dry-run",
+    ])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "'governance' live pairing is unpaired" in out
+    with two_instances["roam-gov"].scope() as s:
+        assert s.scalars(select(ReplicationInboundStream)).all() == []
+
+
+def test_union_pairs_first_and_warns_on_participants_without_enumerators(two_instances, capsys):
+    """The recording participants declare no backfill enumerator: the union
+    still pairs the live streams (step 1), then WARNS per side that their
+    history is not unioned — loud, never silent — and leaves nothing open."""
+    rc = cli.main([
+        "replicate", "union", "http://prim-platform",
+        "--local-url", "http://roam-platform",
+        "--local-instance", "roam", "--peer-instance", "primary", "--poll", "0",
+    ])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "paired 2 participant(s)" in out
+    assert "has no backfill enumerator" in out
+    assert "triage the §6.1 unreconciled view ON BOTH INSTANCES" in out
+    with two_instances["prim-gov"].scope() as s:
+        active = [i.source_id for i in s.scalars(select(ReplicationInboundStream)) if i.active]
+    assert active == ["roam.governance"]  # the live stream only — no dangling backfill
+
+
+def test_union_timeout_is_a_clean_error_exit(monkeypatch, capsys):
+    def one_row(session):
+        yield ("decision.recorded", {"id": "d1"})
+
+    apps = {
+        "prim-platform": make_platform(plugins=[
+            plugin_entry("governance", "http://prim-gov", events=["decision.recorded"]),
+        ]),
+        "prim-gov": make_participant(enumerator=one_row),
+        "roam-platform": make_platform(plugins=[
+            plugin_entry("governance", "http://roam-gov", events=["decision.recorded"]),
+        ]),
+        "roam-gov": make_participant(enumerator=one_row),
+    }
+    client = RoutedClient({h: inst.app for h, inst in apps.items()})
+    monkeypatch.setattr(cli, "_client", lambda: client)
+    rc = cli.main([
+        "replicate", "union", "http://prim-platform",
+        "--local-url", "http://roam-platform",
+        "--local-instance", "roam", "--peer-instance", "primary",
+        "--poll", "0", "--timeout", "0",
+    ])
+    assert rc == 1
+    assert "timed out waiting for backfill completion" in capsys.readouterr().err

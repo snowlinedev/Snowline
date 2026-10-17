@@ -34,6 +34,7 @@ increments: replication emission (§9), the governance consumer (§6.1), and the
 
 from __future__ import annotations
 
+import logging
 import difflib
 import os
 import re
@@ -42,7 +43,7 @@ from collections import defaultdict
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -62,6 +63,9 @@ from snowline_plugin_sdk.contract import (
     EVENT_MILESTONE_UPDATED,
 )
 from snowline_plugin_sdk.replication import ParkNow, emit_event
+from snowline_plugin_sdk.replication.envelope import live_source_id
+
+log = logging.getLogger(__name__)
 
 # --- name / status contract (§2) --------------------------------------------
 
@@ -1534,6 +1538,22 @@ def _parse_date(value: str | None) -> date | None:
     return date.fromisoformat(value) if value else None
 
 
+def _event_source(
+    envelope: dict, payload: dict | None = None, key: str | None = None
+) -> str | None:
+    """The §6 LWW identity an incoming event writes/compares with: the
+    payload's ADDITIVE per-register author (`key`, carried by the §7.1
+    backfill enumerator where a stored author exists — the sender may hold a
+    value written by a third party or by the receiver itself, so the stream
+    source alone would rewrite authorship), else the envelope's source with
+    any `#backfill` suffix stripped (the live stream identity IS the author).
+    Under live replication the two coincide, so this changes nothing
+    observable today."""
+    if payload is not None and key is not None and payload.get(key):
+        return payload[key]
+    return live_source_id(envelope.get("source"))
+
+
 def _lww_local(m: Milestone) -> tuple[datetime, str]:
     """The local row's DESCRIPTIVE-register LWW key (also the merge-pointer clock).
     A NULL clock (a pre-replication row) sorts lowest, so any authored incoming
@@ -1586,7 +1606,7 @@ def _write_descriptive(m: Milestone, payload: dict, envelope: dict) -> None:
         m.line_rank = None  # a tombstone is never in a line (§2.2 merge rule)
         m.title = None  # nor titled (#156 merge rule)
     m.lww_authored_at = _register_stamp(payload, "descriptive_authored_at")
-    m.lww_source_id = envelope.get("source")
+    m.lww_source_id = _event_source(envelope, payload, "descriptive_source_id")
 
 
 def _write_lifecycle(m: Milestone, payload: dict, envelope: dict) -> None:
@@ -1597,7 +1617,7 @@ def _write_lifecycle(m: Milestone, payload: dict, envelope: dict) -> None:
     m.achieved_at = _parse_dt(payload["achieved_at"])
     m.cancelled_at = _parse_dt(payload["cancelled_at"])
     m.lifecycle_authored_at = _register_stamp(payload, "lifecycle_authored_at")
-    m.lifecycle_source_id = envelope.get("source")
+    m.lifecycle_source_id = _event_source(envelope, payload, "lifecycle_source_id")
 
 
 def _upsert_row(session: Session, envelope: dict) -> Milestone:
@@ -1626,14 +1646,31 @@ def _upsert_row(session: Session, envelope: dict) -> Milestone:
         session.flush()
         return m
     descriptive, lifecycle = _REGISTERS[envelope["event_type"]]
-    source = envelope.get("source") or ""
     changed = False
-    incoming = _register_stamp(payload, "descriptive_authored_at") or datetime.min
-    if descriptive and (incoming, source) > _lww_local(m):
+    stamp = _register_stamp(payload, "descriptive_authored_at")
+    source = _event_source(envelope, payload, "descriptive_source_id") or ""
+    if descriptive and stamp is None and m.lww_authored_at is None:
+        # No coordinate on EITHER side (both pre-replication rows, backfilled):
+        # there is no LWW to run, and comparing (min, peer) > (min, "") on
+        # both instances would make each take the other's value — a swap, not
+        # a convergence (review of #98 round 2). Keep local; the runbook's
+        # pre-union data fix stamps such rows when a deterministic outcome
+        # is wanted.
+        log.warning(
+            "milestone %s: descriptive register has no LWW clock on either "
+            "side — keeping the local value", payload["address"],
+        )
+    elif descriptive and (stamp or datetime.min, source) > _lww_local(m):
         _write_descriptive(m, payload, envelope)
         changed = True
-    incoming = _register_stamp(payload, "lifecycle_authored_at") or datetime.min
-    if lifecycle and (incoming, source) > _lifecycle_local(m):
+    stamp = _register_stamp(payload, "lifecycle_authored_at")
+    source = _event_source(envelope, payload, "lifecycle_source_id") or ""
+    if lifecycle and stamp is None and m.lifecycle_authored_at is None:
+        log.warning(
+            "milestone %s: lifecycle register has no LWW clock on either "
+            "side — keeping the local value", payload["address"],
+        )
+    elif lifecycle and (stamp or datetime.min, source) > _lifecycle_local(m):
         _write_lifecycle(m, payload, envelope)
         changed = True
     if changed:
@@ -1653,14 +1690,26 @@ def _append_transition_idempotent(
 ) -> None:
     """Append the peer's transition to the log — the LWW LOSER's transition lands
     here too, never dropped (§9). Idempotent on redelivery: the
-    `(milestone, from, to, authored_at, source_id)` tuple keys the dedupe."""
+    `(milestone, from, to, authored_at, source_id)` tuple keys the dedupe — and
+    a stored row with a NULL `source_id` (a local write made while replication
+    was unconfigured) at the very same instant IS this transition: the §7.1
+    union carries such a row out and back with its author's identity learned
+    on the way, which must not land as a second log row."""
     exists = session.scalar(
         select(MilestoneTransition).where(
             MilestoneTransition.milestone_id == m.id,
             MilestoneTransition.from_status == from_status,
             MilestoneTransition.to_status == to_status,
             MilestoneTransition.authored_at == authored_at,
-            MilestoneTransition.source_id == source_id,
+            # The NULL arm: a log row written while replication was unconfigured
+            # carries no source; its own copy returning with the learned author
+            # must not land twice. The false positive — a DISTINCT transition
+            # from the other side with the same move at the same microsecond —
+            # is accepted (review of #98 round 2).
+            or_(
+                MilestoneTransition.source_id == source_id,
+                MilestoneTransition.source_id.is_(None),
+            ),
         )
     )
     if exists is None:
@@ -1790,7 +1839,7 @@ def _apply_transitioned(session: Session, envelope: dict) -> None:
         payload["to_status"],
         payload.get("reason"),
         _parse_dt(payload["authored_at"]),
-        envelope.get("source"),
+        _event_source(envelope, payload, "transition_source_id"),
         warnings=payload.get("warnings"),
     )
     _check_illegal_history(session, m)
@@ -1854,12 +1903,17 @@ def _apply_merged(session: Session, envelope: dict) -> None:
     into = resolve(session, payload["into"])  # follow to the terminal target
     incoming = (
         _parse_dt(payload["authored_at"]) or datetime.min,
-        envelope.get("source") or "",
+        _event_source(envelope, payload, "source_id") or "",
     )
     if frm.merged_into_id is not None:
         if frm.merged_into_id == into.id:
             return  # idempotent replay — already aliased to this target
-        if incoming <= _lww_local(frm):
+        # STRICT `<`: a backfilled `created(from)` carries the tombstone's merge
+        # clock and may already have advanced the local clock to the sender's
+        # (review of #98 round 2); a tie with a DIFFERENT target can only mean
+        # that, so the later merge must still land. Two distinct merges from
+        # one source at the same microsecond cannot exist.
+        if incoming < _lww_local(frm):
             return  # a competing local merge wins by LWW — keep it (§9)
     if into.id == frm.id:
         raise ParkNow(
@@ -1878,7 +1932,7 @@ def _apply_merged(session: Session, envelope: dict) -> None:
     # Stamp the AUTHORED clock (not `_perform_merge`'s apply-time `_now()`), so a
     # later re-merge of this `from` LWW-compares against the true authored instant.
     frm.lww_authored_at = incoming[0]
-    frm.lww_source_id = envelope.get("source")
+    frm.lww_source_id = incoming[1] or None
     session.flush()
 
 
@@ -1901,6 +1955,87 @@ def apply_milestone_event(session: Session, envelope: dict) -> None:
         raise ValueError(
             f"milestone replication apply: unknown event_type {event_type!r}"
         )
+
+
+# --- replication: the §7.1 backfill enumerator ------------------------------
+
+
+def _backfill_row_payload(m: Milestone) -> dict:
+    """`to_replication_payload` plus the ADDITIVE per-register authors (see
+    `_event_source`) where the row stores one."""
+    payload = to_replication_payload(m)
+    if m.lww_source_id:
+        payload["descriptive_source_id"] = m.lww_source_id
+    if m.lifecycle_source_id:
+        payload["lifecycle_source_id"] = m.lifecycle_source_id
+    return payload
+
+
+def enumerate_backfill(session: Session):
+    """The platform's §7.1 MILESTONE enumerator (review of #98: milestone
+    replication postdates §7.1's "scope namespace" wording, and the union rule
+    admits no exception). Every row of the milestone namespace is replayed from
+    the EXISTING vocabulary so an empty peer reproduces it and a peer holding
+    the address takes the per-register LWW path (`_upsert_row`). Deterministic
+    walk order, in an order that applies without ordering-gap retries (anchor
+    scopes ride the same stream FIRST — `replication.enumerate_backfill`):
+
+      1. `milestone.created` per row in `(created_at, id)` order — FULL final
+         state, both registers, tombstones included (a merged-away name is
+         reserved forever, §2) — then that row's `milestone.transitioned` log
+         in `(authored_at, id)` order. A log event carries the row's FINAL
+         lifecycle clock, so on a peer the created event already seeded it
+         loses the register compare and only the log row lands (the loser
+         retained, never dropped — §9; the §4 illegal-history check runs over
+         the converged log as it does live).
+      2. `milestone.dependency_changed` (`add`) per CURRENT edge — endpoints
+         are post-merge targets, so the merges below re-point nothing.
+      3. `milestone.merged` per tombstone at its stored LWW clock (resolution
+         follows any alias on the receiver, so merge chains apply in any order).
+
+    Payload timestamps are the rows' own stamps (the §6 clock, never import
+    time). The additive `descriptive_source_id` / `lifecycle_source_id` /
+    `transition_source_id` / `source_id` keys carry each register's STORED
+    author where one exists; apply falls back to the (`#backfill`-stripped)
+    stream source otherwise, so live payloads are unchanged. Read-only."""
+    rows = list(
+        session.scalars(select(Milestone).order_by(Milestone.created_at, Milestone.id))
+    )
+    by_id = {m.id: m for m in rows}
+    for m in rows:
+        yield (EVENT_MILESTONE_CREATED, _backfill_row_payload(m))
+        transitions = session.scalars(
+            select(MilestoneTransition)
+            .where(MilestoneTransition.milestone_id == m.id)
+            .order_by(MilestoneTransition.authored_at, MilestoneTransition.id)
+        )
+        for t in transitions:
+            payload = {
+                **_backfill_row_payload(m),
+                "from_status": t.from_status,
+                "to_status": t.to_status,
+                "reason": t.reason,
+                "warnings": t.warnings or None,
+                "authored_at": _iso(t.authored_at),
+            }
+            if t.source_id:
+                payload["transition_source_id"] = t.source_id
+            yield (EVENT_MILESTONE_TRANSITIONED, payload)
+    edges = session.scalars(
+        select(MilestoneDependency).order_by(
+            MilestoneDependency.created_at, MilestoneDependency.id
+        )
+    )
+    for e in edges:
+        payload = _dependency_payload("add", by_id[e.dependent_id], by_id[e.dependency_id])
+        payload["authored_at"] = _iso(e.created_at)
+        yield (EVENT_MILESTONE_DEPENDENCY_CHANGED, payload)
+    for m in rows:
+        if m.merged_into_id is not None:
+            payload = _merged_payload(m, by_id[m.merged_into_id])
+            if m.lww_source_id:
+                payload["source_id"] = m.lww_source_id
+            yield (EVENT_MILESTONE_MERGED, payload)
 
 
 # --- unreconciled state read + disposition (§9) ----------------------------

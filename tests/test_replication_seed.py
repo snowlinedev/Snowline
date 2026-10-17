@@ -518,6 +518,23 @@ def test_prime_forward_retires_orphan_on_rerun(tmp_path):
     assert any((not x.active) and x.epoch == e1 for x in subs)  # orphan retired, not deleted
 
 
+def test_prime_forward_refuses_while_a_union_backfill_is_in_flight(tmp_path):
+    """§7.1 mutual exclusion, enforced (review of #98): a union's backfill
+    outbound targets the spoke's ingest URL too, so the re-prime's orphan sweep
+    would silently retire it and strand the union mid-walk. It refuses instead."""
+    sp, primary, _spoke, client = _seed_participant(tmp_path)
+    with primary.scope() as s:
+        emit_mod.open_backfill_subscription(
+            s, sp.spoke_ingest_url, "s" * 64, epoch="bf1",
+            live_source_id=sp.primary.source_id, enumerator=lambda _s: iter(()),
+        )
+    with pytest.raises(seed.SeedError, match="union backfill"):
+        seed.prime_forward(client, sp, report=lambda _m: None)
+    with primary.scope() as s:
+        subs = s.scalars(select(ReplicationSubscription)).all()
+    assert [x.source_id for x in subs if x.active] == ["primary.governance#backfill"]
+
+
 def test_run_reverse_pair_refuses_version_mismatch(tmp_path):
     """Review finding: the §7 reverse-pair reached the handshake directly,
     bypassing the §10 contract_version refuse. It must refuse a mismatch too."""

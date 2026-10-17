@@ -21,17 +21,29 @@ stay usable without fastapi installed.
 """
 
 from .emit import (
+    backfill_status,
     create_outbound_subscription,
     deliver_pending,
     emit_event,
     list_outbound_subscriptions,
     list_rejected,
+    open_backfill_subscription,
     replication_delivery_loop,
     requeue_rejected,
+    retire_backfill_subscription,
     retire_outbound_subscription,
     set_subscription_secret,
 )
-from .envelope import build_envelope, sign_body, verify_signature
+from .envelope import (
+    BACKFILL_SUFFIX,
+    backfill_source_id,
+    build_envelope,
+    is_backfill_envelope,
+    is_backfill_source,
+    live_source_id,
+    sign_body,
+    verify_signature,
+)
 from .health import (
     DELIVERY_HEALTH,
     DeliveryHealth,
@@ -41,6 +53,7 @@ from .health import (
 )
 from .ingest import (
     ParkNow,
+    drop_parked,
     ingest_delivery,
     is_applying_replicated_event,
     list_inbound_streams,
@@ -84,6 +97,15 @@ __all__ = [
     "retire_inbound_stream",
     "rotate_inbound_secret",
     "reapply_parked",
+    "drop_parked",
+    "open_backfill_subscription",
+    "backfill_status",
+    "retire_backfill_subscription",
+    "BACKFILL_SUFFIX",
+    "backfill_source_id",
+    "is_backfill_source",
+    "is_backfill_envelope",
+    "live_source_id",
     "list_parked",
     "is_applying_replicated_event",
     "ParkNow",

@@ -173,7 +173,8 @@ the plan (warnings/refusals) without touching the wire.
 
 Pairing runs **once per pair**; a re-run refuses (the receiver already holds an
 active inbound stream from the sender). To change a live secret, rotate; to
-recover after long divergence, re-seed (§6).
+recover after long divergence, re-seed (§6) — or, when BOTH sides authored
+history while unpaired (a spoke stood up empty), run the union (§6c).
 
 ## 5. Seed a spoke from the primary (§7 — order load-bearing)
 
@@ -251,6 +252,119 @@ Both are required because **a park ACKs as delivered** (§8.1): an empty outbox
 does *not* imply the spoke's writes were applied on the primary. Re-seeding over
 an unresolved park would overwrite the spoke's only applied copy of that write.
 Resolve parks (fix the cause, re-apply from the parked view) before re-seeding.
+
+## 6c. Stood up EMPTY — the cold-start union merge (§7.1, #98)
+
+The scenario §5/§6 cannot cover: the mini went down, `roam` was stood up
+**empty** (no recent backup) and used for days, and now the mini is back with
+months of pre-outage history. **Neither store is a superset** — `pair` alone
+only replicates forward in time, and a §5/§6 seed's restore would overwrite one
+side's writes. The rule is absolute: **no write authored on either side is
+absent after the reunion.** Use the union, never a seed:
+
+```bash
+# Both instances UP. From either box (here roam):
+uv run snowline replicate union http://mini.CHANGEME.ts.net:8850 \
+    --local-url http://127.0.0.1:8848 \
+    --local-peer-url http://roam.CHANGEME.ts.net:8848 \
+    --local-instance roam --peer-instance primary --dry-run   # plan + pairing state
+uv run snowline replicate union http://mini.CHANGEME.ts.net:8850 \
+    --local-url http://127.0.0.1:8848 \
+    --local-peer-url http://roam.CHANGEME.ts.net:8848 \
+    --local-instance roam --peer-instance primary
+# The pair was paired before the outage? add --repair (see step 1).
+```
+
+What it does — one verb, the four §7.1 steps, all over the §5 admin surface:
+
+1. **Pair the live streams first.** Unpaired → a fresh §5 pair. Already live-
+   paired both ways → reused. Previously paired (old streams half-alive after
+   the outage) → `--repair` retires every old stream on **both halves of both
+   sides** (each instance's outbound subscriptions AND inbound registrations),
+   then pairs fresh. A mixed/half-paired state refuses without `--repair`. The
+   §6 re-seed preconditions do NOT apply — the union replaces the restore.
+   Forward-in-time replication starts here; everything after runs under live
+   traffic.
+2. **Backfill the scope namespace, both directions, to completion.** Each
+   side's platform walks every scope into a `<instance>.platform#backfill`
+   stream (receiver-minted secret, fresh epoch); the ordinary delivery loops
+   drain it. Shared slugs (roam re-created them under its own ids) **converge
+   by slug** — each side keeps its own row and id, metadata goes to the newer
+   `updated_at`, missing parent links heal from the peer — logged at WARNING,
+   **never parked**. The tool waits for `applied_seq` == the walker's final seq
+   with nothing parked before any plugin starts.
+3. **Backfill each plugin, both directions** (governance, memory; any plugin
+   without an enumerator is WARNED and skipped — its partition history does not
+   travel until it ships one; pm's lands separately). An empty side simply
+   enumerates nothing.
+4. **Verify, then retire** every backfill stream on both halves. Steady state
+   is again exactly one live stream per direction; the retired backfill
+   streams stay listed for audit.
+
+When it stops (it always stops LOUDLY, never skips):
+
+- **A backfill event parked** — the tool names it. Fix the cause, then
+  `POST <admin>/replication-admin/parked/reapply {source_id, epoch, seq}` (or
+  `…/parked/drop` if it is resolved another way) on the instance holding the
+  park, and **re-run the same command — it resumes** the open streams instead
+  of opening new ones.
+- **A delivery dead-lettered** — a rejection, i.e. a bug; fix, requeue
+  (`…/rejected/requeue`), re-run.
+- **Timeout** (`--timeout`, default 3600s per phase) — the streams stay open;
+  check `GET <admin>/replication-admin/backfill` (sender: final seq, pending,
+  head error) and `GET …/inbound` (receiver: `applied_seq`), then re-run.
+
+After it completes:
+
+- **Triage the §6.1 unreconciled view ON BOTH INSTANCES.** Every backfilled
+  decision is concurrent with every locally-authored decision in an
+  overlapping applicability chain (`peer_seen` 0 is the truth for pre-pairing
+  writes), so a week of partition work against months of history CAN flag
+  plenty — deliberately over-inclusive. Supersede the real conflicts;
+  `mark_decisions_compatible` is the bulk affordance for cohorts you review
+  together. A decision authored live MID-union may flag on one side only.
+- **Old parks on retired pre-union streams** are superseded by the backfill
+  (it re-enumerated every row those deliveries carried). The tool lists them;
+  re-run with `--drop-retired-parks` to drop them once the union verified.
+- **Previously-paired reunion caveat:** decisions replicated in BEFORE the
+  provenance column existed read as locally authored and flag extra pairs —
+  expect them and bulk-resolve with `mark_decisions_compatible`. (The cold-start
+  case has none: the empty side has no replicated history.)
+- **Milestones union too** (the platform stream carries scopes AND
+  milestones): a milestone authored on one side during the partition exists
+  on both afterwards, a same-address edit resolves per register by LWW, and
+  both sides' transition logs merge — check `milestone_unreconciled` on both
+  instances for any illegal converged move (§9), as after live replication.
+- **Milestones with no LWW clock on EITHER side keep their local value.** Rows
+  that predate milestone replication (`lww_authored_at` / `lifecycle_authored_at`
+  NULL) carry no coordinate, so the union does not pick a winner between two
+  such rows — each instance keeps its own and logs a WARNING. Vacuous for a
+  cold-start (the empty side's rows are all stamped); for a previously-paired
+  reunion with pre-migration rows on both sides, stamp them first if a
+  deterministic outcome is wanted:
+  `UPDATE milestones SET lww_authored_at = COALESCE(updated_at, created_at) WHERE lww_authored_at IS NULL`
+  (and the same for `lifecycle_authored_at`), on the side whose values should win.
+- **Shared-slug scopes: re-check `isolated` / `status` / `name` afterwards.**
+  The cold-start side's re-creation of a shared slug is the NEWER write, so
+  its defaults (`isolated=False`, default name) win the LWW on both sides —
+  the hub's curated `isolated=True` is overwritten. Restore it with
+  `update_scope` after the union; `isolated` drives `applicable_*` and the
+  §6.1 ancestors walk.
+- **Both sides must run #98 or newer.** The tool probes the backfill surface
+  on every participant on both sides first and refuses with "upgrade the peer
+  first" — do that (`snowline stack sync`) rather than working around it: a
+  pre-#98 side would park every shared scope instead of converging it.
+- **Quiesce writers for the first poll interval.** The tool waits one poll
+  interval between pairing and the first walk so that a write whose
+  transaction straddled the pairing instant lands in the live stream; a
+  transaction held open longer than that is the one residual way to lose a
+  write (spec §7.1 implementation notes).
+
+**Never run `snowline replicate seed` while a union is in flight.** A seed
+re-prime retires ANY active outbound targeting the spoke's ingest URL — and a
+backfill outbound targets the same URL, so the prime now REFUSES (SeedError)
+when it finds one rather than stranding the union mid-walk. Finish (or abandon
+and retire) the union first.
 
 ## 6a. Rolling back a packaged-channel update (macOS distribution spec §5)
 

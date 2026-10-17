@@ -143,9 +143,11 @@ _REPL_DB_URLS = {
     # render_as_string(hide_password=False), not str(): these URLs are used
     # directly to create the real replication-store engines below, so a masked
     # `***` password would break connections the same way it broke the
-    # maintenance URL.
+    # maintenance URL. The names DERIVE from the test database's own name so a
+    # session pointed at a throwaway SNOWLINE_MEMORY_TEST_DATABASE_URL never
+    # creates/drops the default run's stores (concurrent suites stay isolated).
     name: sa.make_url(TEST_DB_URL)
-    .set(database=f"snowline_memory_{name}")
+    .set(database=f"{_db_name(TEST_DB_URL)}_{name}")
     .render_as_string(hide_password=False)
     for name in ("repl_a", "repl_b")
 }

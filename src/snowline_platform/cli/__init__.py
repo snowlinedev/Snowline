@@ -3,8 +3,9 @@
 Two operator surfaces live here today:
 
 - `snowline replicate ...` — replication pairing + seeding
-  (replication-continuity §5/§7, issue #82). Deliberately CLI, not MCP: agents
-  never manage replication plumbing (§5).
+  (replication-continuity §5/§7, issue #82) and the §7.1 cold-start union merge
+  (`replicate union`, issue #98; library `replication_union`). Deliberately
+  CLI, not MCP: agents never manage replication plumbing (§5).
 - `snowline release ...` — cutting the packaged stable channel's release trains
   (macOS distribution spec §2/§4, issue #202). Host-side by design; see
   `snowline_platform.release.cutter` for why it is not a set of CI workflows.
@@ -111,6 +112,59 @@ def _build_replicate(p: argparse.ArgumentParser) -> None:
         help="re-seed under a fresh epoch: check preconditions + retire old streams first",
     )
     seed_p.set_defaults(handler=_cmd_seed)
+
+    union_p = rsub.add_parser(
+        "union",
+        help="cold-start union merge: reunite two instances that both have unpaired history (§7.1)",
+        description=(
+            "The §7.1 union (#98): (1) pair the live streams first — or with "
+            "--repair retire every old stream on BOTH halves of BOTH sides and "
+            "pair fresh; (2) backfill the scope namespace both directions to "
+            "completion; (3) backfill every opted-in plugin both directions; "
+            "(4) verify, then retire the backfill streams on both halves. "
+            "Resumable: re-running waits on an already-open backfill. NEVER run "
+            "`replicate seed` while a union is in flight — a seed re-prime "
+            "retires any outbound targeting the spoke's ingest URL, backfill "
+            "streams included."
+        ),
+    )
+    union_p.add_argument("peer_url", help="the peer platform's base URL (tailnet address)")
+    union_p.add_argument(
+        "--local-url",
+        default=os.environ.get("SNOWLINE_LOCAL_PLATFORM_URL", DEFAULT_LOCAL_PLATFORM_URL),
+        help="this instance's platform base URL (default: loopback :8848, §5.1)",
+    )
+    union_p.add_argument(
+        "--local-instance",
+        default=os.environ.get("SNOWLINE_INSTANCE_ID"),
+        help="this instance's SNOWLINE_INSTANCE_ID; defaults to the env",
+    )
+    union_p.add_argument("--peer-instance", required=True,
+                         help="the peer instance's SNOWLINE_INSTANCE_ID")
+    union_p.add_argument(
+        "--local-peer-url",
+        default=os.environ.get("SNOWLINE_LOCAL_PEER_URL"),
+        help="THIS instance's gateway as the peer reaches it (see `pair`)",
+    )
+    union_p.add_argument(
+        "--repair", action="store_true",
+        help="the pair was paired before: retire every old live stream on both "
+        "halves of both sides, then pair fresh (§7.1 step 1)",
+    )
+    union_p.add_argument("--poll", type=float, default=15.0,
+                         help="seconds between completion checks (default 15)")
+    union_p.add_argument("--timeout", type=float, default=3600.0,
+                         help="seconds to wait per backfill phase (default 3600)")
+    union_p.add_argument(
+        "--drop-retired-parks", action="store_true",
+        help="after the union verifies, DROP parked events on retired pre-union "
+        "streams (superseded by the backfill)",
+    )
+    union_p.add_argument(
+        "--dry-run", action="store_true",
+        help="discover + plan + report live-pairing state without touching anything",
+    )
+    union_p.set_defaults(handler=_cmd_union)
 
     check = rsub.add_parser(
         "reseed-check",
@@ -441,6 +495,47 @@ def _cmd_pair(args) -> int:
             )
             return 1 if plan.refused else 0
         pairing.pair(client, local, peer, report=print)
+    return 0
+
+
+def _cmd_union(args) -> int:
+    from snowline_platform import replication_union as union_lib
+
+    if not args.local_instance:
+        print(
+            "error: --local-instance not given and SNOWLINE_INSTANCE_ID is unset",
+            file=sys.stderr,
+        )
+        return 1
+    with _client() as client:
+        local = pairing.discover_participants(
+            client, args.local_url, args.local_instance, public_url=args.local_peer_url
+        )
+        peer = pairing.discover_participants(
+            client, args.peer_url, args.peer_instance, peer=True
+        )
+        print(
+            f"discovered {sorted(local)} on local ({args.local_instance}), "
+            f"{sorted(peer)} on peer ({args.peer_instance})"
+        )
+        if args.dry_run:
+            plan = pairing.plan_pairing(local, peer)
+            for note in plan.notes:
+                print(note)
+            for name in plan.to_pair:
+                state = union_lib.live_pairing_state(client, local[name], peer[name])
+                print(f"dry-run: {name!r} live pairing is {state}")
+            return 1 if plan.refused else 0
+        union_lib.union(
+            client,
+            local,
+            peer,
+            repair=args.repair,
+            poll=args.poll,
+            timeout=args.timeout,
+            drop_retired_parks=args.drop_retired_parks,
+            report=print,
+        )
     return 0
 
 

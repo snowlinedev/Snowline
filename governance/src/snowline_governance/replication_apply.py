@@ -60,11 +60,17 @@ import logging
 import uuid
 from datetime import datetime
 
+from snowline_plugin_sdk.replication import ParkNow
+from snowline_plugin_sdk.replication.envelope import (
+    is_backfill_envelope,
+    live_source_id,
+)
 from snowline_plugin_sdk.replication.models import (
     ReplicationOutboxRow,
     ReplicationSubscription,
 )
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from snowline_governance import artifacts, concurrence, replication_stream
 from snowline_governance.contract import (
@@ -137,14 +143,34 @@ def _dt(value) -> datetime | None:
     return None if value is None else replication_stream.parse_at(value)
 
 
-def _require_scope(client: ScopeClient, slug: str) -> None:
+def _require_scope(client: ScopeClient, slug: str) -> dict:
     """§8: an unknown scope slug is a RETRYABLE apply error — ordinary
     scope-stream lag self-heals on redelivery; a slug that never materializes
-    parks at the bound. `ScopeServiceError` (outage) propagates by itself."""
-    if client.resolve(slug) is None:
+    parks at the bound. `ScopeServiceError` (outage) propagates by itself.
+    Returns the LOCAL scope row."""
+    row = client.resolve(slug)
+    if row is None:
         raise ValueError(
             f"unknown scope slug {slug!r} — not (yet) present on this instance"
         )
+    return row
+
+
+def _local_scope_id(client: ScopeClient, slug: str) -> uuid.UUID:
+    """§7.1: plugin apply resolves scope references BY SLUG — the wire
+    `scope_id` is advisory and never trusted into a stored row. After a
+    cold-start union the two instances hold the same slug under DIFFERENT
+    ids (permanently), so the stored soft reference must be THIS instance's
+    id for the slug. Under live-from-genesis replication the two coincide,
+    so this changes nothing observable there."""
+    return uuid.UUID(str(_require_scope(client, slug)["id"]))
+
+
+def _event_source(envelope: dict) -> str:
+    """The envelope's stream source with any `#backfill` suffix stripped — the
+    form recorded into DOMAIN state (LWW registers, provenance), so it stays
+    byte-identical across instances however the event arrived (§7.1)."""
+    return live_source_id(envelope.get("source")) or ""
 
 
 def _require(row, what: str):
@@ -213,7 +239,11 @@ def _lww_apply(
     WARNING with both event ids."""
     payload = envelope["payload"]
     at = replication_stream.parse_at(payload["at"])
-    source = envelope["source"]
+    # The register's authoring source: a §7.1 backfill payload carries the
+    # register's ORIGINAL author (`lww_source` — the sender may hold a value a
+    # third party or the receiver itself wrote); otherwise the stream source,
+    # `#backfill`-stripped (§7.1's one normalization).
+    source = payload.get("lww_source") or _event_source(envelope)
     event_id = payload["event_id"]
     register = session.get(LwwRegister, (kind, object_id, field))
     if register is not None and (at, source) < (
@@ -265,42 +295,64 @@ def _detect_concurrent_siblings(session, client: ScopeClient, envelope: dict) ->
     Idempotent (redelivery / re-apply re-derives the same pairs). Raises on a
     scope-service outage or unknown slug — bounded retryable, never a skip."""
     payload = envelope["payload"]
-    candidates = [
-        row
-        for row in _unseen_local_rows(session, envelope)
-        if row.event_type in _DECISION_EVENTS
-    ]
+    if is_backfill_envelope(envelope):
+        # §7.1: a backfill envelope's peer_seen is 0 and pre-pairing local
+        # history has NO outbox rows on any live stream — the outbox-keyed
+        # candidate set would silently exempt exactly the rows the union
+        # exists to reconcile. Candidates are every locally-AUTHORED decision
+        # instead (provenance NULL); a decision replicated in (live or by a
+        # backfill minutes ago) is never one — it would flag against its own
+        # author's next event.
+        candidates = [
+            (str(d.id), d.scope_slug)
+            for d in session.scalars(
+                select(Decision)
+                .where(Decision.origin_source.is_(None))
+                .order_by(Decision.recorded_at, Decision.id)
+            )
+        ]
+    else:
+        candidates = []
+        for row in _unseen_local_rows(session, envelope):
+            if row.event_type not in _DECISION_EVENTS:
+                continue
+            local = (row.payload or {}).get("payload") or {}
+            candidates.append((local.get("id"), local.get("scope")))
     if not candidates:
         return
     incoming_id = _uuid(payload["id"])
-    incoming_scope_id = payload["scope_id"]
-    # The incoming decision's ancestors-until-isolated chain, by STABLE id
-    # (#11). The §8 unknown-slug gate lives in `_apply_decision` (this walk
-    # only runs when candidates exist, so it cannot be that gate); a raise
-    # here — outage, or a candidate's since-unknown slug — is the same
-    # retryable class.
-    incoming_chain = {str(sc["id"]) for sc in client.ancestors(payload["scope"])}
+    incoming_slug = payload["scope"]
+    # The incoming decision's ancestors-until-isolated chain, keyed by SLUG
+    # (§7.1: the wire `scope_id` is advisory — after a union the two
+    # instances hold a shared slug under different ids, so an id-keyed
+    # comparison would silently miss every cross-instance collision; slug is
+    # the cross-instance identity, and the LOCAL walk is what decides). The
+    # §8 unknown-slug gate lives in `_apply_decision` (this walk only runs
+    # when candidates exist, so it cannot be that gate); a raise here —
+    # outage, or a candidate's since-unknown slug — is the same retryable
+    # class.
+    incoming_chain = {sc["slug"] for sc in client.ancestors(incoming_slug)}
     chains: dict[str, set[str]] = {}
-    for row in candidates:
-        local = (row.payload or {}).get("payload") or {}
-        local_id = _uuid(local.get("id"))
-        if local_id is None or local_id == incoming_id:
+    for local_id_raw, local_slug in candidates:
+        local_id = _uuid(local_id_raw)
+        if local_id is None or local_id == incoming_id or local_slug is None:
             continue
         # Collision surface: the local decision's scope on the incoming's
         # chain, OR the incoming's scope on the local's chain — parent-scope
         # governance runs BOTH directions; unrelated siblings match neither.
-        collides = local.get("scope_id") in incoming_chain
+        collides = local_slug in incoming_chain
         if not collides:
-            slug = local.get("scope")
-            if slug not in chains:
-                chains[slug] = {str(sc["id"]) for sc in client.ancestors(slug)}
-            collides = incoming_scope_id in chains[slug]
+            if local_slug not in chains:
+                chains[local_slug] = {
+                    sc["slug"] for sc in client.ancestors(local_slug)
+                }
+            collides = incoming_slug in chains[local_slug]
         if collides and concurrence.flag_pair(session, incoming_id, local_id):
             log.info(
                 "§6.1 concurrent siblings flagged: incoming decision %s "
                 "(scope %s) vs local decision %s (scope %s) — see the "
                 "unreconciled view",
-                incoming_id, payload["scope"], local_id, local.get("scope"),
+                incoming_id, incoming_slug, local_id, local_slug,
             )
 
 
@@ -310,18 +362,20 @@ def _detect_concurrent_siblings(session, client: ScopeClient, envelope: dict) ->
 def _apply_decision(session, client, envelope: dict) -> None:
     p = envelope["payload"]
     decision_id = _uuid(p["id"])
+    created = False
     if session.get(Decision, decision_id) is None:
         # §8 unknown-slug gate, same as every scope-bearing apply. Detection
         # below only reaches the scope service when concurrent candidates
         # exist, so it cannot double as this gate — without it, a decision in
         # a not-yet-replicated scope would apply ungated in the common
         # (peer_seen-current) case instead of retrying until the scope stream
-        # catches up.
-        _require_scope(client, p["scope"])
+        # catches up. The stored soft reference is the LOCAL id for the slug
+        # (§7.1 — the wire `scope_id` is advisory).
+        scope_id = _local_scope_id(client, p["scope"])
         session.add(
             Decision(
                 id=decision_id,
-                scope_id=_uuid(p["scope_id"]),
+                scope_id=scope_id,
                 scope_slug=p["scope"],
                 decision=p["decision"],
                 rationale=p.get("rationale"),
@@ -329,9 +383,18 @@ def _apply_decision(session, client, envelope: dict) -> None:
                 # A superseded event's append half: the new leaf + its edge.
                 # A missing prior is an FK error → retryable → parks loud.
                 supersedes_id=_uuid(p.get("supersedes_id")),
+                # §7.1 provenance: replicated in, NOT locally authored.
+                origin_source=_event_source(envelope),
             )
         )
         session.flush()
+        created = True
+    if is_backfill_envelope(envelope) and not created:
+        # §7.1: on a union, a UUID no-op (the peer already had the row —
+        # including everything shared from a pre-divergence era) flags
+        # NOTHING; otherwise the shared corpus itself becomes the flood. The
+        # live mechanism keeps re-deriving flags on replay by design.
+        return
     _detect_concurrent_siblings(session, client, envelope)
 
 
@@ -358,11 +421,11 @@ def _apply_branch_created(session, client, envelope: dict) -> None:
     branch_id = _uuid(p["id"])
     if session.get(ShadowBranch, branch_id) is not None:
         return
-    _require_scope(client, p["scope"])
+    scope_id = _local_scope_id(client, p["scope"])  # by slug (§7.1)
     session.add(
         ShadowBranch(
             id=branch_id,
-            scope_id=_uuid(p["scope_id"]),
+            scope_id=scope_id,
             scope_slug=p["scope"],
             name=p["name"],
             narrative_notes=p.get("narrative_notes"),
@@ -371,7 +434,23 @@ def _apply_branch_created(session, client, envelope: dict) -> None:
     )
     # A same-(scope, name) branch authored on both sides trips the unique
     # constraint here — loud + retryable + parked, the §8 collision posture.
-    session.flush()
+    # On a BACKFILL stream the collision is permanent by construction (the
+    # other side's branch pre-dates pairing and will never go away), so it
+    # parks NOW instead of spending the retry bound — hours of a stalled
+    # union — on an outcome that cannot change (review of #98).
+    try:
+        session.flush()
+    except IntegrityError as exc:
+        if is_backfill_envelope(envelope) and "uq_shadow_branch_scope_name" in str(
+            getattr(exc, "orig", exc)
+        ):
+            raise ParkNow(
+                f"shadow branch {p['scope']}:{p['name']} already exists locally "
+                f"under another id — a branch authored on both sides across the "
+                f"partition is a permanent collision on a backfill stream "
+                f"(§7.1/§8.1); parked for triage"
+            ) from exc
+        raise
 
 
 def _apply_branch_archived(session, client, envelope: dict) -> None:
@@ -533,10 +612,11 @@ def _apply_graduated(session, client, envelope: dict) -> None:
 def _apply_artifact_registered(session, client, envelope: dict) -> None:
     p = envelope["payload"]
     governs = p.get("governs") or []
-    for edge in governs:
-        _require_scope(client, edge["scope"])
+    # Governs edges key on the LOCAL id for each slug (§7.1 — wire ids advisory).
+    local_ids = [_local_scope_id(client, edge["scope"]) for edge in governs]
     artifact_id = _uuid(p["id"])
-    if session.get(Artifact, artifact_id) is None:
+    existed = session.get(Artifact, artifact_id) is not None
+    if not existed:
         session.add(
             Artifact(
                 id=artifact_id,
@@ -568,8 +648,13 @@ def _apply_artifact_registered(session, client, envelope: dict) -> None:
                 created_at=_dt(version.get("created_at")),
             )
         )
-    for edge in governs:
-        scope_id = _uuid(edge["scope_id"])
+    if existed and is_backfill_envelope(envelope):
+        # §7.1: a backfilled registration of an artifact this side already
+        # holds must not MERGE governs sets outside the LWW register — the
+        # governs state converges via the enumerated `artifact.governs_set`.
+        session.flush()
+        return
+    for edge, scope_id in zip(governs, local_ids, strict=True):
         if session.get(ArtifactGoverns, (artifact_id, scope_id)) is None:
             session.add(
                 ArtifactGoverns(
@@ -710,20 +795,22 @@ def _apply_governs_set(session, client, envelope: dict) -> None:
         # The write is a wholesale replace, so the whole set is the register's
         # value. Scope existence is checked only on the WINNING path (a losing
         # event applies nothing, so lag on ITS slugs must not stall the stream).
-        for edge in p.get("governs") or []:
-            _require_scope(client, edge["scope"])
+        edges = [
+            (edge["scope"], _local_scope_id(client, edge["scope"]))  # by slug (§7.1)
+            for edge in p.get("governs") or []
+        ]
         session.execute(
             ArtifactGoverns.__table__.delete().where(
                 ArtifactGoverns.artifact_id == artifact_id
             )
         )
         artifact.governs_all = bool(p.get("governs_all"))
-        for edge in p.get("governs") or []:
+        for slug, scope_id in edges:
             session.add(
                 ArtifactGoverns(
                     artifact_id=artifact_id,
-                    scope_id=_uuid(edge["scope_id"]),
-                    scope_slug=edge["scope"],
+                    scope_id=scope_id,
+                    scope_slug=slug,
                 )
             )
 

@@ -42,7 +42,7 @@ import logging
 import os
 import re
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager
 from datetime import datetime, timedelta, timezone
 
@@ -57,7 +57,9 @@ from snowline_plugin_sdk.replication.health import (
 )
 from snowline_plugin_sdk.replication.envelope import (
     REJECTION_REASONS,
+    backfill_source_id,
     build_envelope,
+    is_backfill_source,
     sign_body,
 )
 from snowline_plugin_sdk.replication.models import (
@@ -221,7 +223,15 @@ def emit_event(session: Session, event_type: str, payload: dict) -> list[dict]:
             ReplicationSubscription.source_id, ReplicationSubscription.epoch
         )
     ).all()
-    matching = [s for s in subs if event_type in (s.event_types or [])]
+    # A §7.1 backfill stream is invisible to the emit hook BY CONSTRUCTION: its
+    # vocabulary is empty, and the identity check is the belt to that braces —
+    # a live write fanned onto the walker's counter would interleave
+    # non-deterministic seqs and wear backfill causal context.
+    matching = [
+        s
+        for s in subs
+        if event_type in (s.event_types or []) and not is_backfill_source(s.source_id)
+    ]
     if not matching:
         return []
 
@@ -281,6 +291,203 @@ def _peer_seen(session: Session, peer_source_id: str | None) -> int:
         .order_by(ReplicationInboundStream.created_at.desc())
     ).first()
     return row.applied_seq if row is not None else 0
+
+
+# --- §7.1 backfill streams: the direct-enqueue walker ---------------------------
+#
+# A cold-start union (spec §7.1, #98) manufactures the events two unpaired
+# instances never emitted: the walker replays one instance's domain rows, via
+# the plugin's ENUMERATOR, as synthetic events on a reserved-identity stream
+# (`<live source_id>#backfill`, fresh epoch) that the ORDINARY delivery loop then
+# drains through the peer's EXISTING ingest path. The stream is a plain
+# `ReplicationSubscription` with three deliberate differences, each load-bearing:
+#
+#   * EMPTY vocabulary — `emit_event` never fans a live write onto it (a live
+#     event on the walker's counter would make seqs non-deterministic and wear
+#     backfill causal context). The delivery loop drains its rows regardless.
+#   * `peer_source_id = None`, and the walker stamps `peer_seen` 0 itself —
+#     the truth for pre-pairing writes (their authors provably saw none of the
+#     receiver's stream), and nothing ever consults the live `_peer_seen`
+#     lookup for a backfill envelope.
+#   * Rows are written DIRECTLY by the walker, in deterministic enumeration
+#     order, with seq allocated at ENQUEUE time — the whole walk is ONE
+#     transaction (on Postgres pinned to a REPEATABLE READ snapshot), so the
+#     enumerated set is frozen at a single instant AFTER pairing opened
+#     (overlap-inclusive by construction: a write the live stream also carried
+#     simply no-ops on apply) and an aborted open leaves nothing behind.
+
+BackfillEnumerator = Callable[[Session], Iterable[tuple[str, dict]]]
+
+# Flush cadence for the walker's outbox inserts — keeps the ORM unit of work
+# bounded on a large store without splitting the walk's single transaction.
+_BACKFILL_FLUSH_EVERY = 500
+
+
+def _pin_snapshot(session: Session) -> None:
+    """Pin the walk to ONE snapshot on Postgres (REPEATABLE READ) when the
+    session's transaction has not begun yet — READ COMMITTED would give every
+    enumerator query its own snapshot. A hardening, not a correctness
+    requirement: the bound is overlap-inclusive and apply is idempotent, so a
+    row committed mid-walk only adds a harmless no-op."""
+    try:
+        bind = session.get_bind()
+    except Exception:  # noqa: BLE001 - an unbound session: nothing to pin
+        return
+    if bind.dialect.name != "postgresql" or session.in_transaction():
+        return
+    session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+
+
+def open_backfill_subscription(
+    session: Session,
+    target_url: str,
+    secret: str,
+    *,
+    epoch: str,
+    live_source_id: str,
+    enumerator: BackfillEnumerator,
+) -> dict:
+    """Open one §7.1 backfill stream toward a peer ingest and WALK: create the
+    `<live_source_id>#backfill` subscription (empty vocabulary, no peer stream)
+    and enqueue every `(event_type, payload)` the plugin's `enumerator` yields
+    as an outbox row — seq 1..N in enumeration order, `peer_seen` 0, the
+    current-contract envelope with NO extra marker field (the stream identity
+    is the marker). The SENDING half of a §5-shaped handshake: the receiver has
+    already registered `(<live>#backfill, epoch)` and minted `secret`.
+
+    Read-only on the domain (the walk only reads rows; only the receiver's
+    apply writes). Refuses (ValueError) while another ACTIVE backfill toward the
+    same target exists — one backfill per direction at a time (the receiver's
+    single-active-stream invariant is the real guarantee). Returns the
+    subscription record plus `final_seq` (the completion target the union
+    verifies the receiver's `applied_seq` against) and per-event-type counts."""
+    sid = backfill_source_id(live_source_id)
+    _pin_snapshot(session)
+    existing = session.scalars(
+        select(ReplicationSubscription).where(
+            ReplicationSubscription.source_id == sid,
+            ReplicationSubscription.target_url == target_url,
+            ReplicationSubscription.active.is_(True),
+        )
+    ).first()
+    if existing is not None:
+        raise ValueError(
+            f"a backfill stream {sid!r} toward {target_url!r} is already active "
+            f"(epoch {existing.epoch!r}) — retire it before opening another "
+            f"(one backfill per direction at a time, spec §7.1)"
+        )
+    sub = ReplicationSubscription(
+        target_url=target_url,
+        secret=secret,
+        event_types=[],
+        source_id=sid,
+        epoch=epoch,
+        peer_source_id=None,
+        active=True,
+    )
+    session.add(sub)
+    counter = session.get(ReplicationStreamCounter, (sid, epoch))
+    if counter is None:
+        counter = ReplicationStreamCounter(source_id=sid, epoch=epoch, last_seq=0)
+        session.add(counter)
+    session.flush()
+
+    seq = counter.last_seq
+    counts: dict[str, int] = {}
+    for event_type, payload in enumerator(session):
+        seq += 1
+        session.add(
+            ReplicationOutboxRow(
+                subscription_id=sub.id,
+                seq=seq,
+                event_type=event_type,
+                payload=build_envelope(
+                    event_type,
+                    payload,
+                    source_id=sid,
+                    epoch=epoch,
+                    seq=seq,
+                    peer_seen=0,
+                ),
+                status="pending",
+            )
+        )
+        counts[event_type] = counts.get(event_type, 0) + 1
+        if seq % _BACKFILL_FLUSH_EVERY == 0:
+            session.flush()
+    counter.last_seq = seq
+    session.flush()
+    log.info(
+        "backfill stream %s/%s opened toward %s: %d event(s) enqueued %s",
+        sid, epoch, target_url, seq, counts,
+    )
+    return {**_subscription_dict(sub), "final_seq": seq, "enumerated": counts}
+
+
+def backfill_status(session: Session) -> list[dict]:
+    """Every backfill subscription on this sender (active and retired), newest
+    first, with its delivery progress: `final_seq` (what the walker enqueued)
+    and the outbox's delivered/pending/rejected counts, plus the head row's last
+    error while the stream is stuck. The SENDER-side half of the union's
+    completion check — the receiver's `applied_seq` and parked set are the
+    other half (`list_inbound_streams` / `list_parked` on the peer)."""
+    from sqlalchemy import func
+
+    subs = [
+        s
+        for s in session.scalars(
+            select(ReplicationSubscription).order_by(
+                ReplicationSubscription.created_at.desc(), ReplicationSubscription.id
+            )
+        )
+        if is_backfill_source(s.source_id)
+    ]
+    out = []
+    for sub in subs:
+        counter = session.get(ReplicationStreamCounter, (sub.source_id, sub.epoch))
+        by_status = dict(
+            session.execute(
+                select(ReplicationOutboxRow.status, func.count())
+                .where(ReplicationOutboxRow.subscription_id == sub.id)
+                .group_by(ReplicationOutboxRow.status)
+            ).all()
+        )
+        head = session.scalars(
+            select(ReplicationOutboxRow)
+            .where(
+                ReplicationOutboxRow.subscription_id == sub.id,
+                ReplicationOutboxRow.status != "delivered",
+            )
+            .order_by(ReplicationOutboxRow.seq)
+        ).first()
+        out.append(
+            {
+                **_subscription_dict(sub),
+                "final_seq": counter.last_seq if counter is not None else 0,
+                "delivered": by_status.get("delivered", 0),
+                "pending": by_status.get("pending", 0),
+                "rejected": by_status.get("rejected", 0),
+                "head_seq": head.seq if head is not None else None,
+                "head_error": head.last_error if head is not None else None,
+            }
+        )
+    return out
+
+
+def retire_backfill_subscription(session: Session, subscription_id: str) -> dict:
+    """Retire one backfill stream on the SENDER (§7.1 step 4 — the receiver's
+    inbound registration is retired separately). Refuses (ValueError) an id
+    naming a LIVE stream, so a mixed-up id can never retire the forward
+    stream through the union's verb."""
+    sub = session.get(ReplicationSubscription, _as_uuid(subscription_id))
+    if sub is None:
+        raise ValueError(f"no replication subscription with id {subscription_id!r}")
+    if not is_backfill_source(sub.source_id):
+        raise ValueError(
+            f"subscription {subscription_id!r} ({sub.source_id}) is a live "
+            "stream, not a backfill stream — use the outbound retire verb"
+        )
+    return retire_outbound_subscription(session, subscription_id)
 
 
 # --- delivery: the §3.1 replication retry class -------------------------------

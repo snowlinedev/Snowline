@@ -452,3 +452,275 @@ def governs_set_payload(session, artifact) -> dict:
             "governs": _governs_rows(session, artifact.id),
         }
     )
+
+
+# --- §7.1 backfill enumerator (#98) --------------------------------------------
+#
+# Governance's half of the cold-start union: a deterministic walk of the WHOLE
+# replicated row surface, yielding `(event_type, payload)` pairs from the
+# EXISTING vocabulary (no new event shapes) such that applying them to an empty
+# peer reproduces every row's current state, and applying them to a peer that
+# already holds a row is the ordinary idempotent / LWW path.
+#
+# Rules with teeth (spec §7.1):
+#   * LIFECYCLE STATE is enumerated, not just live rows — a superseding decision
+#     replays as `decision.superseded` (its edge), an archived branch replays
+#     its archival, a retired artifact its retirement, a resolved version its
+#     flip; a walk of "current" rows only would resurrect or orphan history.
+#   * Where one event can't carry a row's final state, the MINIMAL lifecycle
+#     sequence is emitted (artifact: registered → revised… → resolved → its
+#     register-class events).
+#   * Timestamps are ORIGINAL authored-at times, never import time. Register-
+#     class events replay the `LwwRegister` coordinate itself — `at`,
+#     `event_id` and the authoring source (`lww_source`, ADDITIVE: the sender
+#     may hold a value written by a third party or by the receiver itself, so
+#     the stream source can't stand in for it) — so register state converges
+#     byte-identically and a re-run ties instead of winning.
+#   * Non-register events get a DETERMINISTIC `event_id` (uuid5 of the event
+#     and row), so a re-walk yields byte-identical payloads.
+#
+# Walk order is fixed per domain table by (authored_at, id), with FK
+# predecessors first (supersession parents before children, artifact roots
+# before revisions, every node before any citation, decisions + nodes before
+# graduation stamps, every artifact before any retirement pointer).
+
+_BACKFILL_NS = uuid.UUID("5d7e3a0c-98a1-4f2b-9b61-2f0f5c9e7a11")
+
+
+def _replay(payload: dict, event_type: str, row_id, at: datetime | None) -> dict:
+    """Pin a builder's fresh `event_id`/`at` to deterministic, ORIGINAL ones."""
+    payload["event_id"] = str(uuid.uuid5(_BACKFILL_NS, f"{event_type}:{row_id}"))
+    if at is not None:
+        payload["at"] = at.isoformat()
+    return payload
+
+
+def _replay_register(payload: dict, register) -> dict:
+    """Pin a register-class payload to the stored LWW coordinate."""
+    payload["at"] = register.written_at.isoformat()
+    payload["event_id"] = register.event_ref
+    payload["lww_source"] = register.source_id
+    return payload
+
+
+def _parents_first(rows: list, key_parent) -> list:
+    """`rows` (already in (authored_at, id) order) re-ordered so each row
+    follows the row its `key_parent` names — deterministic, cycle-safe."""
+    by_id = {r.id: r for r in rows}
+    out: list = []
+    done: set = set()
+
+    def visit(row, chain: set) -> None:
+        if row.id in done:
+            return
+        parent = by_id.get(key_parent(row))
+        if parent is not None and parent.id not in chain:
+            visit(parent, chain | {parent.id})
+        done.add(row.id)
+        out.append(row)
+
+    for row in rows:
+        visit(row, {row.id})
+    return out
+
+
+def enumerate_backfill(session):
+    """Governance's §7.1 enumerator (see the section comment above). Read-only;
+    the SDK walker runs it inside one snapshot."""
+    from sqlalchemy import select
+
+    from snowline_governance.contract import (
+        EVENT_ARTIFACT_REGISTERED,
+        EVENT_ARTIFACT_RESOLVED,
+        EVENT_ARTIFACT_REVISED,
+        EVENT_DECISION_MARKED_COMPATIBLE,
+        EVENT_DECISION_RECORDED,
+        EVENT_DECISION_SUPERSEDED,
+        EVENT_SHADOW_BRANCH_ARCHIVED,
+        EVENT_SHADOW_BRANCH_CREATED,
+        EVENT_SHADOW_CITATION_ADDED,
+        EVENT_SHADOW_CONVERSATION_APPENDED,
+        EVENT_SHADOW_NODE_ADDED,
+    )
+    from snowline_governance.models import (
+        SHADOW_BRANCH_STATUS_ARCHIVED,
+        Artifact,
+        ArtifactVersion,
+        Decision,
+        DecisionConcurrence,
+        ShadowBranch,
+        ShadowConversationEvent,
+        ShadowNode,
+        ShadowNodeCitation,
+    )
+
+    def registers(kind: str) -> dict:
+        return {
+            (r.object_id, r.field): r
+            for r in session.scalars(
+                select(LwwRegister).where(LwwRegister.object_kind == kind)
+            )
+        }
+
+    # 1. Decisions — supersession parents first (the child's edge is its
+    #    `decision.superseded` append half).
+    decisions = _parents_first(
+        list(
+            session.scalars(select(Decision).order_by(Decision.recorded_at, Decision.id))
+        ),
+        lambda d: d.supersedes_id,
+    )
+    for d in decisions:
+        event = EVENT_DECISION_SUPERSEDED if d.supersedes_id else EVENT_DECISION_RECORDED
+        yield event, _replay(decision_payload(d), event, d.id, d.recorded_at)
+
+    # 2. §6.1 compatibility judgments (the flags themselves are detection-
+    #    derived on each side and never replicate; the explicit marks do).
+    for c in session.scalars(
+        select(DecisionConcurrence)
+        .where(DecisionConcurrence.marked_compatible_at.is_not(None))
+        .order_by(DecisionConcurrence.marked_compatible_at, DecisionConcurrence.decision_id)
+    ):
+        payload = marked_compatible_payload(
+            c.decision_id, c.concurrent_with_id, "backfill", c.marked_compatible_at
+        )
+        yield EVENT_DECISION_MARKED_COMPATIBLE, _replay(
+            payload,
+            EVENT_DECISION_MARKED_COMPATIBLE,
+            f"{c.decision_id}:{c.concurrent_with_id}",
+            c.marked_compatible_at,
+        )
+
+    # 3. Shadow branches: creation, the notes register, archival.
+    branch_regs = registers("shadow_branch")
+    branches = list(
+        session.scalars(select(ShadowBranch).order_by(ShadowBranch.created_at, ShadowBranch.id))
+    )
+    for b in branches:
+        yield EVENT_SHADOW_BRANCH_CREATED, _replay(
+            branch_created_payload(b), EVENT_SHADOW_BRANCH_CREATED, b.id, b.created_at
+        )
+        reg = branch_regs.get((b.id, "narrative_notes"))
+        if reg is not None:
+            yield EVENT_SHADOW_NOTES_SET, _replay_register(notes_set_payload(b), reg)
+        if b.status == SHADOW_BRANCH_STATUS_ARCHIVED:
+            yield EVENT_SHADOW_BRANCH_ARCHIVED, _replay(
+                branch_archived_payload(b),
+                EVENT_SHADOW_BRANCH_ARCHIVED,
+                b.id,
+                b.archived_at,
+            )
+
+    # 4. Nodes, then citations (a citation may name any node), then the
+    #    conversation log (seq is presentation-local — apply re-allocates it).
+    for n in session.scalars(select(ShadowNode).order_by(ShadowNode.created_at, ShadowNode.id)):
+        yield EVENT_SHADOW_NODE_ADDED, _replay(
+            node_added_payload(n), EVENT_SHADOW_NODE_ADDED, n.id, n.created_at
+        )
+    for c in session.scalars(
+        select(ShadowNodeCitation).order_by(ShadowNodeCitation.created_at, ShadowNodeCitation.id)
+    ):
+        yield EVENT_SHADOW_CITATION_ADDED, _replay(
+            citation_added_payload(c), EVENT_SHADOW_CITATION_ADDED, c.id, c.created_at
+        )
+    for e in session.scalars(
+        select(ShadowConversationEvent).order_by(
+            ShadowConversationEvent.branch_id, ShadowConversationEvent.seq
+        )
+    ):
+        yield EVENT_SHADOW_CONVERSATION_APPENDED, _replay(
+            conversation_appended_payload(e),
+            EVENT_SHADOW_CONVERSATION_APPENDED,
+            e.id,
+            e.created_at,
+        )
+
+    # 5. Graduation stamps — after their decisions and nodes. A node's CURRENT
+    #    pointer replays its register coordinate; every other stamp (a
+    #    branch-level graduation, or a node-level one whose pointer lost a
+    #    race) replays at its decision's authoring time — its append half
+    #    always lands, its pointer mutation yields to the register.
+    node_regs = registers("shadow_node")
+    nodes = {n.id: n for n in session.scalars(select(ShadowNode))}
+    stamps = []
+    for d in decisions:
+        if d.shadow_origin_label is None:
+            continue
+        node_id = uuid.UUID(d.shadow_origin_node_id) if d.shadow_origin_node_id else None
+        payload = graduated_payload(
+            str(d.id),
+            str(node_id) if node_id else None,
+            d.shadow_origin_label,
+            d.shadow_origin_kind,
+        )
+        node = nodes.get(node_id) if node_id else None
+        reg = node_regs.get((node_id, "graduated_decision_id")) if node_id else None
+        if node is not None and node.graduated_decision_id == d.id and reg is not None:
+            _replay_register(payload, reg)
+        else:
+            _replay(payload, EVENT_SHADOW_GRADUATED, d.id, d.recorded_at)
+        stamps.append(payload)
+    for payload in sorted(stamps, key=lambda p: (p["at"], p["decision_id"])):
+        yield EVENT_SHADOW_GRADUATED, payload
+
+    # 6. Artifacts: registration (with the ROOT version), revisions (parents
+    #    first), resolutions, then the register-class state.
+    artifact_regs = registers("artifact")
+    artifacts_ = list(
+        session.scalars(select(Artifact).order_by(Artifact.created_at, Artifact.id))
+    )
+    versions = list(
+        session.scalars(
+            select(ArtifactVersion).order_by(ArtifactVersion.created_at, ArtifactVersion.id)
+        )
+    )
+    by_artifact: dict = {}
+    for v in versions:
+        by_artifact.setdefault(v.artifact_id, []).append(v)
+    roots: dict = {}
+    for a in artifacts_:
+        vs = by_artifact.get(a.id, [])
+        if not vs:
+            continue  # an artifact without a version can't be registered on the wire
+        root = next((v for v in vs if v.supersedes_id is None), vs[0])
+        roots[a.id] = root.id
+        yield EVENT_ARTIFACT_REGISTERED, _replay(
+            artifact_registered_payload(session, a, root),
+            EVENT_ARTIFACT_REGISTERED,
+            a.id,
+            a.created_at,
+        )
+    root_ids = set(roots.values())
+    for v in _parents_first(versions, lambda v: v.supersedes_id):
+        if v.id in root_ids or v.artifact_id not in roots:
+            continue
+        yield EVENT_ARTIFACT_REVISED, _replay(
+            artifact_revised_payload(v), EVENT_ARTIFACT_REVISED, v.id, v.created_at
+        )
+    for v in versions:
+        if v.status == "superseded" and v.artifact_id in roots:
+            yield EVENT_ARTIFACT_RESOLVED, _replay(
+                artifact_resolved_payload(v.artifact_id, v.id),
+                EVENT_ARTIFACT_RESOLVED,
+                v.id,
+                v.created_at,
+            )
+    builders = (
+        ("maturity", EVENT_ARTIFACT_MATURITY_SET, lambda a: maturity_set_payload(a)),
+        ("governs", EVENT_ARTIFACT_GOVERNS_SET, lambda a: governs_set_payload(session, a)),
+        ("code_refs", EVENT_ARTIFACT_CODE_REFS_SET, lambda a: code_refs_set_payload(a)),
+        ("superseded_by", EVENT_ARTIFACT_SUPERSEDED, lambda a: artifact_superseded_payload(a)),
+    )
+    for a in artifacts_:
+        if a.id not in roots:
+            continue
+        for field, event, build in builders:
+            reg = artifact_regs.get((a.id, field))
+            if reg is not None:
+                yield event, _replay_register(build(a), reg)
+            elif field == "code_refs" and a.code_refs:
+                # Pre-register data: replayed at the artifact's creation time,
+                # so any registered (later) write on the peer still wins.
+                yield event, _replay(build(a), event, f"{a.id}:{field}", a.created_at)
+            elif field == "superseded_by" and a.superseded_at is not None:
+                yield event, _replay(build(a), event, f"{a.id}:{field}", a.superseded_at)

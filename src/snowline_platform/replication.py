@@ -115,6 +115,16 @@ def apply_platform_event(session: Session, envelope: dict) -> None:
         )
 
 
+def enumerate_backfill(session: Session):
+    """The platform stream's §7.1 enumerator: the scope namespace FIRST
+    (`scopes.enumerate_backfill`, parents first), then the milestone namespace
+    (`milestones.enumerate_backfill`) — one stream, so a milestone's anchor
+    slug always resolves on the receiver before the milestone arrives, and the
+    plugin backfills that follow (§7.1 step 3) find every scope present."""
+    yield from scopes.enumerate_backfill(session)
+    yield from milestones.enumerate_backfill(session)
+
+
 def manifest_payload() -> dict:
     """The platform stream's self-manifest, same shape as a plugin's `replication`
     block. `events` is the FULL platform vocabulary — scopes AND milestones (§9) —
@@ -154,6 +164,10 @@ def build_router(
         apply_platform_event,
         ingest_path=INGEST_PATH,
         admin_prefix=ADMIN_PREFIX,
+        # §7.1: the platform's union half is BOTH namespaces the stream carries
+        # — scopes first (parents first), then milestones (whose anchors are
+        # then already on the receiver).
+        enumerator=enumerate_backfill,
     )
 
     @router.get(MANIFEST_PATH)
