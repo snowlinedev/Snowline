@@ -743,3 +743,63 @@ def test_refuses_a_peer_without_the_backfill_surface(union_pair):
     assert pair.client.get("http://spoke/replication-admin/inbound").json() == []
     assert pair.client.get("http://hub/replication-admin/inbound").json() == []
     assert set(pair.scopes_of(pair.spoke)) == set()
+
+
+def _alias_of(inst, addr):
+    with inst.sessionmaker() as s:
+        m = milestones.get(s, addr)
+        if m.merged_into_id is None:
+            return None
+        return milestones.address_of(m.merged_into)
+
+
+def test_competing_merges_of_the_same_tombstone_converge(platform_stores):
+    """Review of #98 round 2: both sides merged `old` during the partition, to
+    different targets. The later merge must win on BOTH instances even though
+    the backfilled `created(old)` already carried the tombstone's clock."""
+    pair = _Pair(platform_stores)
+
+    def hub(s):
+        scopes.create(s, slug="acme", name="Acme", kind="org")
+        milestones.create(s, "acme", "v2")
+        milestones.create(s, "acme", "old")
+        milestones.merge(s, "acme/old", "acme/v2")  # earlier
+
+    def spoke(s):
+        scopes.create(s, slug="acme", name="Acme", kind="org")
+        milestones.create(s, "acme", "v3")
+        milestones.create(s, "acme", "old")
+        milestones.merge(s, "acme/old", "acme/v3")  # later: wins LWW
+
+    _write(pair.hub, hub)
+    _write(pair.spoke, spoke)
+    pair.union()
+    assert pair.parked(pair.hub) == [] and pair.parked(pair.spoke) == []
+    assert _alias_of(pair.hub, "acme/old") == "acme/v3"
+    assert _alias_of(pair.spoke, "acme/old") == "acme/v3"
+
+
+def test_rows_without_any_lww_clock_do_not_swap(platform_stores):
+    """Review of #98 round 2: pre-replication rows (NULL clocks) on BOTH sides
+    have no LWW coordinate; each side keeps its own value instead of taking
+    the peer's (which would swap, not converge)."""
+    pair = _Pair(platform_stores)
+
+    def mk(outcome):
+        def fn(s):
+            scopes.create(s, slug="acme", name="Acme", kind="org")
+            m = milestones.create(s, "acme", "v1", outcome=outcome)
+            s.flush()
+            m.lww_authored_at = None
+            m.lww_source_id = None
+            m.lifecycle_authored_at = None
+            m.lifecycle_source_id = None
+        return fn
+
+    _write(pair.hub, mk("hub outcome"))
+    _write(pair.spoke, mk("spoke outcome"))
+    pair.union()
+    hub_rows, _ = _milestones_of(pair.hub)
+    spoke_rows, _ = _milestones_of(pair.spoke)
+    assert hub_rows["acme/v1"][0] == "hub outcome"
+    assert spoke_rows["acme/v1"][0] == "spoke outcome"

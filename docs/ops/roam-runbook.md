@@ -335,6 +335,15 @@ After it completes:
   on both afterwards, a same-address edit resolves per register by LWW, and
   both sides' transition logs merge — check `milestone_unreconciled` on both
   instances for any illegal converged move (§9), as after live replication.
+- **Milestones with no LWW clock on EITHER side keep their local value.** Rows
+  that predate milestone replication (`lww_authored_at` / `lifecycle_authored_at`
+  NULL) carry no coordinate, so the union does not pick a winner between two
+  such rows — each instance keeps its own and logs a WARNING. Vacuous for a
+  cold-start (the empty side's rows are all stamped); for a previously-paired
+  reunion with pre-migration rows on both sides, stamp them first if a
+  deterministic outcome is wanted:
+  `UPDATE milestones SET lww_authored_at = COALESCE(updated_at, created_at) WHERE lww_authored_at IS NULL`
+  (and the same for `lifecycle_authored_at`), on the side whose values should win.
 - **Shared-slug scopes: re-check `isolated` / `status` / `name` afterwards.**
   The cold-start side's re-creation of a shared slug is the NEWER write, so
   its defaults (`isolated=False`, default name) win the LWW on both sides —

@@ -441,7 +441,9 @@ def _apply_branch_created(session, client, envelope: dict) -> None:
     try:
         session.flush()
     except IntegrityError as exc:
-        if is_backfill_envelope(envelope):
+        if is_backfill_envelope(envelope) and "uq_shadow_branch_scope_name" in str(
+            getattr(exc, "orig", exc)
+        ):
             raise ParkNow(
                 f"shadow branch {p['scope']}:{p['name']} already exists locally "
                 f"under another id — a branch authored on both sides across the "

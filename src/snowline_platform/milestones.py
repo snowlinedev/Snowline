@@ -34,6 +34,7 @@ increments: replication emission (§9), the governance consumer (§6.1), and the
 
 from __future__ import annotations
 
+import logging
 import difflib
 import os
 import re
@@ -63,6 +64,8 @@ from snowline_plugin_sdk.contract import (
 )
 from snowline_plugin_sdk.replication import ParkNow, emit_event
 from snowline_plugin_sdk.replication.envelope import live_source_id
+
+log = logging.getLogger(__name__)
 
 # --- name / status contract (§2) --------------------------------------------
 
@@ -1644,14 +1647,30 @@ def _upsert_row(session: Session, envelope: dict) -> Milestone:
         return m
     descriptive, lifecycle = _REGISTERS[envelope["event_type"]]
     changed = False
-    incoming = _register_stamp(payload, "descriptive_authored_at") or datetime.min
+    stamp = _register_stamp(payload, "descriptive_authored_at")
     source = _event_source(envelope, payload, "descriptive_source_id") or ""
-    if descriptive and (incoming, source) > _lww_local(m):
+    if descriptive and stamp is None and m.lww_authored_at is None:
+        # No coordinate on EITHER side (both pre-replication rows, backfilled):
+        # there is no LWW to run, and comparing (min, peer) > (min, "") on
+        # both instances would make each take the other's value — a swap, not
+        # a convergence (review of #98 round 2). Keep local; the runbook's
+        # pre-union data fix stamps such rows when a deterministic outcome
+        # is wanted.
+        log.warning(
+            "milestone %s: descriptive register has no LWW clock on either "
+            "side — keeping the local value", payload["address"],
+        )
+    elif descriptive and (stamp or datetime.min, source) > _lww_local(m):
         _write_descriptive(m, payload, envelope)
         changed = True
-    incoming = _register_stamp(payload, "lifecycle_authored_at") or datetime.min
+    stamp = _register_stamp(payload, "lifecycle_authored_at")
     source = _event_source(envelope, payload, "lifecycle_source_id") or ""
-    if lifecycle and (incoming, source) > _lifecycle_local(m):
+    if lifecycle and stamp is None and m.lifecycle_authored_at is None:
+        log.warning(
+            "milestone %s: lifecycle register has no LWW clock on either "
+            "side — keeping the local value", payload["address"],
+        )
+    elif lifecycle and (stamp or datetime.min, source) > _lifecycle_local(m):
         _write_lifecycle(m, payload, envelope)
         changed = True
     if changed:
@@ -1682,6 +1701,11 @@ def _append_transition_idempotent(
             MilestoneTransition.from_status == from_status,
             MilestoneTransition.to_status == to_status,
             MilestoneTransition.authored_at == authored_at,
+            # The NULL arm: a log row written while replication was unconfigured
+            # carries no source; its own copy returning with the learned author
+            # must not land twice. The false positive — a DISTINCT transition
+            # from the other side with the same move at the same microsecond —
+            # is accepted (review of #98 round 2).
             or_(
                 MilestoneTransition.source_id == source_id,
                 MilestoneTransition.source_id.is_(None),
@@ -1884,7 +1908,12 @@ def _apply_merged(session: Session, envelope: dict) -> None:
     if frm.merged_into_id is not None:
         if frm.merged_into_id == into.id:
             return  # idempotent replay — already aliased to this target
-        if incoming <= _lww_local(frm):
+        # STRICT `<`: a backfilled `created(from)` carries the tombstone's merge
+        # clock and may already have advanced the local clock to the sender's
+        # (review of #98 round 2); a tie with a DIFFERENT target can only mean
+        # that, so the later merge must still land. Two distinct merges from
+        # one source at the same microsecond cannot exist.
+        if incoming < _lww_local(frm):
             return  # a competing local merge wins by LWW — keep it (§9)
     if into.id == frm.id:
         raise ParkNow(

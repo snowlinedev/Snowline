@@ -48,6 +48,7 @@ targets the same URL. Never run `replicate seed` while a union is in flight.
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -67,6 +68,8 @@ from snowline_platform.replication_pairing import (
 )
 
 Report = Callable[[str], None]
+
+log = logging.getLogger(__name__)
 
 
 class UnionError(PairingError):
@@ -294,17 +297,26 @@ def open_backfill(
         },
     )
     if resp.status_code >= 400:
-        # Undo the receiver's half FIRST, whatever the failure — a dangling
+        # Undo the receiver's half FIRST on any HTTP failure — a dangling
         # `#backfill` inbound would stop the next run on "half-open backfill"
         # (review of #98). 501 = no enumerator, 404 = a participant predating
         # the backfill surface: both are "skip, loudly" for the caller; any
         # other status (a 409 from a concurrent open, an enumerator raising on
-        # a bad row) is an error.
-        _post_json(
-            client,
-            f"{receiver.admin_base}/inbound/retire",
-            {"source_id": bf_source, "epoch": epoch},
-        )
+        # a bad row) is an error. A TRANSPORT failure (connection drop, read
+        # timeout on a long walk) is deliberately NOT undone here: the sender
+        # may have committed the open after the client gave up, and the next
+        # run resumes it or stops on the half-open message with instructions.
+        try:
+            _post_json(
+                client,
+                f"{receiver.admin_base}/inbound/retire",
+                {"source_id": bf_source, "epoch": epoch},
+            )
+        except Exception as retire_exc:  # noqa: BLE001 — never mask the open failure
+            log.warning(
+                "backfill open failed (%s) and retiring the receiver's inbound "
+                "%s also failed: %s", resp.status_code, bf_source, retire_exc,
+            )
         if resp.status_code in (404, 501):
             return None
         _raise_for_status(resp, f"POST {sender.admin_base}/backfill/open")
