@@ -240,3 +240,11 @@ def _isolate_standby_reports(tmp_path, monkeypatch):
     # ...nor the checkout's release/train.json as the hub's latest cut.
     monkeypatch.setenv("SNOWLINE_TRAIN_MANIFEST", str(tmp_path / "_no_train.json"))
     monkeypatch.delenv("SNOWLINE_FRONT_HEALTH_URL", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_autocut_host(tmp_path, monkeypatch):
+    """Every test app's lifespan starts the in-process auto-cut host
+    (release/autocut_host.py); point it at an empty home so a developer's (or
+    the hub's) real ~/.config/snowline/autocut.enabled can never arm it."""
+    monkeypatch.setenv("SNOWLINE_AUTOCUT_HOME", str(tmp_path / "_autocut_home"))

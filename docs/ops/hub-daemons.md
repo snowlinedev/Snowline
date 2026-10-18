@@ -90,6 +90,19 @@ This is the restart an agent session uses after `git pull --ff-only`; the
 `sudo launchctl kickstart -k` form is equivalent and also covers a daemon
 whose process is not currently running.
 
+**Before restarting the platform, check for a cut in flight:**
+`.venv/bin/snowline release autocut --status`. If it prints `lock: HELD`, an
+auto-cut is running (about 6 minutes), and the pid shown is the cut's child
+process, not uvicorn. A `kill -TERM` then makes the platform wait for the
+cut, up to 10 minutes, then kill it and exit (see "Auto-cut" below).
+A `launchctl kickstart -k` or `bootout` does not wait that long: launchd
+SIGKILLs the job after its exit timeout (20 seconds by default). The cut runs
+in its own process group, so that kill is not aimed at it — but its output
+pipe leads to the dead platform, so the orphan dies with a broken pipe at its
+next log line, half-done, and releases the lock. Do not expect it to finish:
+the train is left half-published until the next tick recovers it. Wait for
+`lock: free` instead.
+
 ## Stack-sync guard
 
 `check_not_source_hub` (`src/snowline_platform/stack/sync.py`) refuses to
@@ -103,11 +116,89 @@ The MBP spoke is a warm standby. It is only worth switching to if it carries
 the code the hub has been running, so the hub cuts a train on its own whenever
 main moves, and the spoke's `stack sync --auto` timer picks it up.
 
-**What fires.** `dev.snowline.autocut` is a system LaunchDaemon (runs as
+**How it runs: inside the platform daemon (the default).** The hub's
+platform process hosts the auto-cut as a background task
+(`src/snowline_platform/release/autocut_host.py`, item a25fa809). There is
+nothing to install and no launchd job to register. Decision 9ce14c69 makes
+the hub a seat that agents deploy continuously, and registering a new launchd
+job is the one deploy step an agent session cannot take. So enabling the
+auto-cut is a pull, a restart, and one marker file:
+
+- **Enable:** `touch ~/.config/snowline/autocut.enabled`. The host re-reads
+  the marker on every tick, so a running platform picks it up at the next
+  tick. Restart the platform to start counting from now.
+- **Disable:** `rm ~/.config/snowline/autocut.enabled`, or
+  `touch ~/.config/snowline/autocut.disabled`. The kill switch wins over the
+  marker, and the launchd timer below honours it too.
+- **Cadence:** the first tick is 3 minutes after the platform starts, then
+  every hour after that.
+- **Log:** one line per tick in `~/Library/Logs/snowline-platform.log`
+  (`autocut host tick: noop`, `ok`, `gated`, `failed`, `locked`, ...), plus
+  the cut's own output prefixed `autocut:`. A platform without the marker
+  logs `autocut host idle: no enable marker (...)` once at startup and never
+  cuts.
+
+The host refuses to cut, whatever the switches say, when:
+
+- `~/.config/snowline/stack.json` says `role=spoke` (a packaged spoke never
+  cuts trains);
+- the `SNOWLINE_PLATFORM_URL` the gates would use is not this platform's own
+  address and port, or its host is not an address of this machine (the
+  gates must judge the hub that cuts);
+- the platform is not running from a git checkout (the hub runs from source,
+  and a wheel has no checkouts to cut from).
+
+A refusal is logged as a WARNING once each time the reason changes, not on
+every tick.
+
+The cut runs as a **child process**, the platform venv's own
+`snowline release autocut`, in its own process group. Its output goes to the
+platform log prefixed `autocut:`, and `/health` and the gateway keep serving
+during the ~6 minutes. The child and its subprocesses get a **clean**
+environment, built
+like the launchd timer's: `HOME`, `USER` and locale, `SNOWLINE_PLATFORM_URL`,
+and a `PATH` that starts with `~/.local/bin:/opt/homebrew/bin` (uv, gh, npm)
+and ends with the platform venv's `bin`. `~/.config/snowline/autocut.env` is
+layered on top. The host parses it as `KEY=VALUE` lines and never executes
+it. The daemon's own environment is **not** passed on. It holds the live
+`SNOWLINE_*_DATABASE_URL`s, and the cut's test runs must never see those.
+
+**Shutdown during a cut.** Stopping the platform cancels the host's sleep at
+once. A cut in flight is different. The platform waits up to 10 minutes for
+it to finish, so it is not killed half-published (tags pushed, releases
+missing). After that it kills the cut's whole process group: SIGTERM, then
+SIGKILL 10 seconds later. The platform then exits, and launchd relaunches it.
+The kernel releases the lock when the child dies. The cutter is safe to
+re-run: the next tick lands any uncommitted record and skips tags and
+releases that already exist. A platform restart during a cut can therefore
+take up to about 10 minutes, and that includes the deploy chain's
+`kill -TERM`. Check `snowline release autocut --status` first (see "Deploy
+routine change" above). launchd's own stop (`kickstart -k`, `bootout`)
+SIGKILLs after about 20 seconds and does not get the full wait.
+
+`GET /standby` (`hub.autocut`) shows the live host state next to the last
+report: `running` (a cut is running right now), `next_tick_at`, and
+`host_enabled`.
+
+**`snowline release autocut --status`** prints the switches, whether the
+run lock is held (a cut is running, with the holder's pid: the cut's child
+process for the in-process host), and the latest
+report's outcome, time and last cut. It is read-only, and it needs no release
+config.
+
+**Alternative: the launchd timer.** `dev.snowline.autocut` (below) is still
+supported, for a hub whose platform does **not** run from source. Both may be
+installed at once. The run lock serialises them: whichever fires second
+records `locked` and exits. The in-process host is the hub's default and
+needs no launchd registration.
+
+**The launchd timer.** `dev.snowline.autocut` is a system LaunchDaemon (runs as
 `seanlynch`, no login needed) with `StartInterval` 3600 and `RunAtLoad`
 false. It runs `ops/hub/launchdaemons/run-autocut.sh`, which execs
 `.venv/bin/snowline release autocut` from the platform checkout. Not
-`uv run`: that would re-sync the venv the running services import. One run:
+`uv run`: that would re-sync the venv the running services import.
+
+**One run** (either way):
 
 1. Takes a lock (`~/Library/Application Support/Snowline/autocut.lock`). If a
    cut is already running, this fire does nothing and exits 0.
@@ -178,13 +269,17 @@ passes `--force`.
   redacted, at `GET /stack/report`. If the platform runs as a different
   account from the autocut, point `SNOWLINE_STANDBY_HOME` at the home that
   owns the report.
-- Log: `~/Library/Logs/snowline-autocut.log`.
+- Log: the platform's log for the in-process host;
+  `~/Library/Logs/snowline-autocut.log` for the launchd timer.
 - Exit codes: 0 noop/ok/locked, 2 gated, 1 failed or published_unrecorded.
 
-**Environment.** The plist sets `SNOWLINE_PLATFORM_URL`. Autocut uses it for
+**Environment.** The in-process host passes `SNOWLINE_PLATFORM_URL` (from
+`autocut.env` when set there, else the platform's own); the plist sets it for
+the timer. Autocut uses it for
 the health gate and for the milestone gate, which skips without it, and
-autocut refuses a skipped gate. `--platform-url` overrides it. The wrapper
-also sources `~/.config/snowline/autocut.env` if the file exists. The
+autocut refuses a skipped gate. `--platform-url` overrides it. Both read
+`~/.config/snowline/autocut.env` if the file exists (the timer's wrapper
+sources it; the host parses it into the cut's environment). The
 cutter runs each component's tests in its throwaway build tree (its own
 `.venv-test` beside the build tree, never the live checkout's `.venv`) against scratch databases it
 provisions and drops (`snowline_cut_test_<name>`). Set
@@ -202,8 +297,9 @@ chance to cut is an hour later.
 
 **Disable.**
 
-- Without sudo: `touch ~/.config/snowline/autocut.disabled`. The wrapper then
-  exits 0 on every fire. `rm` the file to re-enable.
+- Without sudo: `touch ~/.config/snowline/autocut.disabled`. The in-process
+  host then skips every tick and the timer's wrapper exits 0 on every fire.
+  `rm` the file to re-enable.
 - Fully: `sudo launchctl bootout system/dev.snowline.autocut`, or
   `sudo ops/hub/uninstall-daemons.sh`, which also removes the services'
   daemons. A bootout SIGTERMs a cut that is in flight. Check
@@ -217,9 +313,15 @@ not the keychain), and git's github.com credential helper is
 reach both without a login session. If gh is ever re-authenticated into the
 keychain, the `gh_auth` gate refuses every run (exit 2, in the report). The
 fix is `gh auth login --insecure-storage`, or moving the plist to a gui/501
-LaunchAgent.
+LaunchAgent. Check the helper in each checkout
+(`git -C <checkout> config credential.helper`). If it is `osxkeychain`, a
+daemon cut can fail at its first `git push origin <tag>`. That is the first
+publishing step, so nothing is published before it. The fix is
+`git config credential.helper '!gh auth git-credential'` in both checkouts,
+so pushes use `hosts.yml` the way `gh` does.
 
-**Install.** `sudo ops/hub/install-daemons.sh` (idempotent) copies the plist
+**Install (launchd timer only; the in-process host needs none).**
+`sudo ops/hub/install-daemons.sh` (idempotent) copies the plist
 to `/Library/LaunchDaemons` and runs `launchctl bootstrap` on it. It does
 **not** kickstart it, because a kickstart would start a cut immediately. The
 first run happens up to an hour later. To cut now, run
