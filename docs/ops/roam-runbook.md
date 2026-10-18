@@ -637,11 +637,16 @@ its `sync-report.json` through `GET /stack/report`), the hub's last
 auto-cut, and where the spoke's failover front (§6e) is routing. That last
 row reads the front's `/front/health` (§6e "Reading `/front/health`":
 `upstream`, `hub_healthy`, `last_flip_at`, `flips`). The spoke's platform
-fetches it only when `SNOWLINE_FRONT_HEALTH_URL` is set in its environment,
-e.g. `SNOWLINE_FRONT_HEALTH_URL=http://127.0.0.1:8850/front/health` in
-`~/.config/snowline/platform.env`. `stack sync` does not render this
-variable yet, so add it by hand. Without it the front row is absent. If the
-front shows `upstream: spoke`, the row carries the note "the failover front
+fetches it only when `SNOWLINE_FRONT_HEALTH_URL` is set in its environment.
+`stack sync` templates it into `~/.config/snowline/platform.env` on the spoke
+(`SNOWLINE_FRONT_HEALTH_URL=http://127.0.0.1:8850/front/health`, derived from
+the front's loopback bind), appending it to an existing file that lacks it
+and restarting the platform so it takes effect; there is nothing to add by
+hand. To override it, edit the value in `platform.env`: sync never rewrites an
+existing assignment and only reports the difference as template drift. To
+turn the row off, set it to an empty value (`SNOWLINE_FRONT_HEALTH_URL=`)
+rather than deleting the line, since a missing key is added back on the next
+sync. If the front shows `upstream: spoke`, the row carries the note "the failover front
 is routing to the spoke".
 
 Thresholds can be changed per instance:

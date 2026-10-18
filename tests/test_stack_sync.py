@@ -251,6 +251,7 @@ def test_apply_env_file_writes_a_fresh_file_from_the_template(tmp_path):
         "primary_tailnet_address": "mini.ts.net", "platform_port": "8848",
         "governance_port": "8801", "memory_port": "8802", "pm_port": "8803",
         "dashboard_dist": str(tmp_path / "dash"),
+        "front_health_url": m.front_health_url(),
     }
     result = s.apply_env_file(home, "platform", variables=variables, dry_run=False)
     assert result.action == "written"
@@ -270,6 +271,7 @@ def test_apply_env_file_never_clobbers_an_operator_edit(tmp_path):
         "primary_tailnet_address": "mini.ts.net", "platform_port": "8848",
         "governance_port": "8801", "memory_port": "8802", "pm_port": "8803",
         "dashboard_dist": str(tmp_path / "dash"),
+        "front_health_url": m.front_health_url(),
     }
     result = s.apply_env_file(home, "platform", variables=variables, dry_run=False)
     assert result.action == "drifted"
@@ -282,7 +284,7 @@ def test_apply_env_file_dry_run_never_writes(tmp_path):
         "instance_id": "roam", "trusted_cidrs": m.TRUSTED_CIDRS,
         "primary_tailnet_address": "mini.ts.net", "platform_port": "8848",
         "governance_port": "8801", "memory_port": "8802", "pm_port": "8803",
-        "dashboard_dist": "x",
+        "dashboard_dist": "x", "front_health_url": m.front_health_url(),
     }
     result = s.apply_env_file(home, "platform", variables=variables, dry_run=True)
     assert result.action == "written"
@@ -909,3 +911,147 @@ def test_apply_front_plist_is_idempotent(tmp_path):
     assert not m.plist_path(tmp_path, m.FRONT_SERVICE).exists()
     assert s.apply_front_plist(tmp_path, dry_run=False) is True
     assert s.apply_front_plist(tmp_path, dry_run=False) is False
+
+
+# --- SNOWLINE_FRONT_HEALTH_URL in the spoke platform.env (issue #296) --------
+
+FRONT_URL_LINE = 'export SNOWLINE_FRONT_HEALTH_URL="http://127.0.0.1:8850/front/health"'
+
+
+def _platform_kicks(runner):
+    return [a[-1] for a in runner.ran("launchctl", "kickstart") if a[-1].endswith("/dev.snowline.platform")]
+
+
+def _sync(home, runner=None):
+    return s.run_sync(home=home, train="v0.1.0", runner=runner or FakeRunner(_full_fake_handler),
+                      health_sleep=lambda _s: None, report=lambda _: None)
+
+
+def test_platform_env_renders_the_front_health_url_when_absent(tmp_path):
+    home = tmp_path / "home"
+    _stack_config(home)
+    _seed_train_assets(home)
+    _sync(home)
+    env = m.parse_env_exports(m.env_file_path(home, "platform").read_text())
+    assert env["SNOWLINE_FRONT_HEALTH_URL"] == m.front_health_url() == "http://127.0.0.1:8850/front/health"
+    # only the platform carries it
+    assert "SNOWLINE_FRONT_HEALTH_URL" not in m.env_file_path(home, "pm").read_text()
+
+
+def test_existing_platform_env_without_the_key_gets_it_appended_and_platform_kicked(tmp_path):
+    home = tmp_path / "home"
+    _stack_config(home)
+    _seed_train_assets(home)
+    _sync(home)
+    path = m.env_file_path(home, "platform")
+    # an older platform.env (pre-#296): the key's block removed, operator edit above kept
+    old = path.read_text().replace(s.load_platform_front_block().replace(
+        "$front_health_url", m.front_health_url()), "")
+    assert "SNOWLINE_FRONT_HEALTH_URL" not in old
+    path.write_text(old.replace("SNOWLINE_REPLICATION_INTERVAL=30", "SNOWLINE_REPLICATION_INTERVAL=5"))
+
+    runner = FakeRunner(_full_fake_handler)
+    rpt = _sync(home, runner)  # already on the train: a no-op run
+    text = path.read_text()
+    assert FRONT_URL_LINE in text
+    assert "SNOWLINE_REPLICATION_INTERVAL=5" in text  # nothing above was rewritten
+    assert len(_platform_kicks(runner)) == 1
+    assert rpt.noop is True
+    assert "SNOWLINE_FRONT_HEALTH_URL" in rpt.detail
+
+
+def test_failed_platform_kick_for_the_key_is_needs_attention_not_noop(tmp_path):
+    """The key is appended but `launchctl kickstart` fails: the OLD platform
+    keeps answering /health, so the health check passes — the run must still
+    say needs_attention and name the manual kick, because the key is present
+    now and no later run will retry it (review of #297)."""
+    home = tmp_path / "home"
+    _stack_config(home)
+    _seed_train_assets(home)
+    _sync(home)
+    path = m.env_file_path(home, "platform")
+    old = path.read_text().replace(s.load_platform_front_block().replace(
+        "$front_health_url", m.front_health_url()), "")
+    assert "SNOWLINE_FRONT_HEALTH_URL" not in old
+    path.write_text(old)
+
+    def failing_platform_kick(argv, cwd):
+        if argv[:2] == ["launchctl", "kickstart"] and argv[-1].endswith("dev.snowline.platform"):
+            return CommandError(argv, 1, "no such process")
+        return _full_fake_handler(argv, cwd)
+
+    runner = FakeRunner(failing_platform_kick)
+    rpt = _sync(home, runner)
+    assert FRONT_URL_LINE in path.read_text()  # the key did land
+    assert len(_platform_kicks(runner)) == 1  # one attempt, which failed
+    assert rpt.noop is True
+    assert rpt.outcome == "needs_attention"
+    assert "kickstart FAILED" in rpt.detail and "launchctl kickstart" in rpt.detail
+    assert "restarted the platform" not in rpt.detail
+
+    # a second run: key present, nothing re-attempted, plain no-op
+    runner2 = FakeRunner(_full_fake_handler)
+    rpt2 = _sync(home, runner2)
+    assert _platform_kicks(runner2) == [] and rpt2.outcome == "noop"
+
+
+def test_existing_operator_value_is_kept_and_reported_as_drift(tmp_path):
+    home = tmp_path / "home"
+    cfg = _stack_config(home)
+    variables = s.env_variables(cfg, dashboard_dist="/d")
+    path = m.env_file_path(home, "platform")
+    s.apply_env_file(home, "platform", variables=variables, dry_run=False)
+    path.write_text(path.read_text().replace(
+        "http://127.0.0.1:8850/front/health", "http://127.0.0.1:9999/front/health"))
+    before = path.read_text()
+    # the key is present, so ensure adds nothing...
+    assert s.ensure_platform_front_key(home, variables=variables, front_installed=True, dry_run=False) is False
+    # ...and the regular drift pass reports the difference without writing
+    result = s.apply_env_file(home, "platform", variables=variables, dry_run=False)
+    assert result.action == "drifted"
+    assert path.read_text() == before
+
+
+def test_operator_value_in_existing_file_is_not_re_added_or_kicked_on_noop(tmp_path):
+    home = tmp_path / "home"
+    _stack_config(home)
+    _seed_train_assets(home)
+    _sync(home)
+    path = m.env_file_path(home, "platform")
+    path.write_text(path.read_text().replace(
+        "http://127.0.0.1:8850/front/health", "http://127.0.0.1:9999/front/health"))
+    before = path.read_text()
+    runner = FakeRunner(_full_fake_handler)
+    rpt = _sync(home, runner)
+    assert rpt.noop is True and rpt.outcome == "noop"
+    assert path.read_text() == before
+    assert runner.runs == []  # not kicked on a no-op
+
+
+def test_ensure_key_is_a_noop_without_the_front_or_without_a_file(tmp_path):
+    home = tmp_path / "home"
+    variables = {"front_health_url": m.front_health_url()}
+    # no platform.env at all -> apply_env_file's job, not ours
+    assert s.ensure_platform_front_key(home, variables=variables, front_installed=True, dry_run=False) is False
+    path = m.env_file_path(home, "platform")
+    path.parent.mkdir(parents=True)
+    path.write_text("export SNOWLINE_INSTANCE_ID=roam")
+    # front not installed -> untouched
+    assert s.ensure_platform_front_key(home, variables=variables, front_installed=False, dry_run=False) is False
+    assert path.read_text() == "export SNOWLINE_INSTANCE_ID=roam"
+    # dry run reports but does not write
+    assert s.ensure_platform_front_key(home, variables=variables, front_installed=True, dry_run=True) is True
+    assert path.read_text() == "export SNOWLINE_INSTANCE_ID=roam"
+    # real run appends after the missing trailing newline
+    assert s.ensure_platform_front_key(home, variables=variables, front_installed=True, dry_run=False) is True
+    assert path.read_text().startswith("export SNOWLINE_INSTANCE_ID=roam\n")
+    assert FRONT_URL_LINE in path.read_text()
+
+
+def test_hub_role_never_touches_platform_env(tmp_path):
+    home = tmp_path / "home"
+    _stack_config(home)
+    rpt = s.run_sync(home=home, role="primary", runner=FakeRunner(_full_fake_handler),
+                     health_sleep=lambda _s: None, report=lambda _: None)
+    assert rpt.outcome == "failed"
+    assert not m.env_file_path(home, "platform").exists()
