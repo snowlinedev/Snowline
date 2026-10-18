@@ -123,22 +123,31 @@ false. It runs `ops/hub/launchdaemons/run-autocut.sh`, which execs
    - `gh auth status` is OK.
    - `SNOWLINE_PLATFORM_URL/health` answers 200.
    - every train service (platform, pm, governance, memory) is registered on
-     `/plugins`. Each one must be `up` or self-reported `degraded`. `degraded`
-     is accepted because the usual hub cause is pm replication lag to the
-     standby while it is powered off, and that is exactly the state this
-     timer fixes. Pass `--strict-health` to require `up`.
+     `/plugins` and `up`. One exception: `degraded` is accepted when **every**
+     reason in its `degraded_reason` (joined with `; `) is
+     `peer X not delivering for …`. That reason means the standby is
+     powered off, and that is exactly the state this timer fixes. A
+     `delivery tick raised N consecutive times` reason means the replication
+     loop on the hub is crash-looping, and it refuses the cut. So does any
+     reason it doesn't recognise, or `degraded` with no reason. Pass
+     `--strict-health` to require `up` with no exceptions.
    - the train's milestone gate answers ok. Autocut refuses if the gate
      *skipped* (could not judge), where `release cut` would only warn.
-4. Version: the next **patch** of the recorded train (v0.5.1 to v0.5.2). It
+4. Version: the next **patch** of the recorded train (v0.5.1 to v0.5.2). The
+   version pattern only covers `v0.x.y`. A future `v1.x` train needs the
+   pattern extended (`_PATCH_RE` in `release/autocut.py`, mirroring
+   `release/model.py`); until then autocut fails loudly instead of guessing. It
    never bumps the minor. The current minor's milestone is achieved and the
    next one is open, so a patch is the only train a timer may cut. If a tag is
    already taken at a different sha, autocut skips that version.
 5. Runs the ordinary `cut()` in-process, about 6 minutes: tests, builds,
    smoke, tag, publish.
 6. Only after the cut succeeds, it commits `release/train.json` (only that
-   path) on main as `release: train vX.Y.Z (autocut)` and pushes. If the push
-   is rejected (main moved during the cut), it undoes the commit and leaves
-   the file uncommitted. The next run lands it as
+   path) on main as `release: train vX.Y.Z (autocut)` and pushes.
+   `--no-commit-manifest` skips this step. If the push is rejected (main
+   moved during the cut), it undoes the commit, leaves the file uncommitted,
+   and reports `published_unrecorded` (exit 1). The train is live on GitHub
+   at that point; only the record on main is missing. The next run lands it as
    `... (autocut: record recovered)`, and does the same for a record left by
    a manual `release cut` run without `--commit-manifest`.
 
@@ -149,17 +158,36 @@ passes `--force`.
 
 - Report: `~/Library/Application Support/Snowline/autocut-report.json`, next to
   the spoke's `sync-report.json` and `bootstrap-report.json`. It holds the
-  latest run's `outcome` (`noop` / `ok` / `gated` / `failed`), `detail`,
+  latest run's `outcome` (`noop` / `ok` / `gated` / `failed` /
+  `published_unrecorded`), `detail`,
   per-component `recorded_sha` / `origin_sha` / `moved`, the `gates`, and
   `last_cut` (`version`, `shas`, `at`, `outcome`). `last_cut` carries over
-  across noop runs, so it always answers "last cut".
-- History: `autocut-history/` gets one entry per run that wasn't a noop.
+  across noop and gated runs, so it always answers "last cut". A run that
+  only landed a leftover record sets `last_cut` to that train, with outcome
+  `recorded`.
+- History: `autocut-history/` gets an entry for each run that is not a noop
+  and whose outcome or detail differs from the previous run. A hub that stays
+  gated ("behind origin/main") until someone deploys therefore leaves one
+  entry, not one per hour.
 - Log: `~/Library/Logs/snowline-autocut.log`.
-- Exit codes: 0 noop/ok/locked, 2 gated, 1 failed.
+- Exit codes: 0 noop/ok/locked, 2 gated, 1 failed or published_unrecorded.
+
+**Environment.** The plist sets `SNOWLINE_PLATFORM_URL`. Autocut uses it for
+the health gate and for the milestone gate, which skips without it, and
+autocut refuses a skipped gate. `--platform-url` overrides it. The wrapper
+also sources `~/.config/snowline/autocut.env` if the file exists. Put
+`SNOWLINE_PLATFORM_TEST_DATABASE_URL`, `SNOWLINE_GOVERNANCE_TEST_DATABASE_URL`
+and `SNOWLINE_MEMORY_TEST_DATABASE_URL` there, as
+`postgresql+psycopg:///<scratch db>`. **Without them the cut's platform test
+step skips every DB-backed test**, which leaves only the wheel smoke tests to
+guard the train.
 
 **Try it by hand:**
 `SNOWLINE_PLATFORM_URL=http://100.81.176.75:8850 .venv/bin/snowline release autocut --dry-run`.
 A dry run decides, gates, and plans. It builds, commits, and reports nothing.
+A dry run also holds the lock. If the hourly fire lands while a manual
+`--dry-run` is running, that fire exits silently as `locked` and the next
+chance to cut is an hour later.
 
 **Disable.**
 
@@ -167,7 +195,9 @@ A dry run decides, gates, and plans. It builds, commits, and reports nothing.
   exits 0 on every fire. `rm` the file to re-enable.
 - Fully: `sudo launchctl bootout system/dev.snowline.autocut`, or
   `sudo ops/hub/uninstall-daemons.sh`, which also removes the services'
-  daemons.
+  daemons. A bootout SIGTERMs a cut that is in flight. Check
+  `~/Library/Logs/snowline-autocut.log` first, or use the scripts, which
+  check for you (below).
 
 **Credentials.** The cut pushes tags, creates releases, and pushes the record
 commit. On the hub, `gh`'s token lives in `~/.config/gh/hosts.yml` (mode 600,
@@ -183,3 +213,10 @@ to `/Library/LaunchDaemons` and runs `launchctl bootstrap` on it. It does
 **not** kickstart it, because a kickstart would start a cut immediately. The
 first run happens up to an hour later. To cut now, run
 `sudo launchctl kickstart system/dev.snowline.autocut`.
+
+Re-running install (the deploy path) boots the timer out first, and so does
+uninstall. A bootout would kill a cut that is in flight, so both scripts
+first test the flock on `~/Library/Application Support/Snowline/autocut.lock`.
+While a cut holds it they refuse with exit 75, naming the lock and the log.
+`--wait` polls every 15s for up to 15 minutes instead. A fire that starts in
+the few seconds between the check and the bootout is not covered.

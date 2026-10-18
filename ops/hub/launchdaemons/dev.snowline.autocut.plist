@@ -18,7 +18,9 @@
      Re-auth with `gh auth login --insecure-storage` or move this plist to
      ~/Library/LaunchAgents (gui/501) to fix.
 
-     RunAtLoad is false: loading the timer must never start a ~6-minute cut. -->
+     RunAtLoad is false: loading the timer must never start a ~6-minute cut.
+     No ProcessType: the run executes two test suites, builds wheels and runs
+     `npm ci`; Background throttling could push it past the hour. -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
@@ -49,8 +51,6 @@
     <integer>3600</integer>
     <key>RunAtLoad</key>
     <false/>
-    <key>ProcessType</key>
-    <string>Background</string>
     <key>StandardOutPath</key>
     <string>/Users/seanlynch/Library/Logs/snowline-autocut.log</string>
     <key>StandardErrorPath</key>
