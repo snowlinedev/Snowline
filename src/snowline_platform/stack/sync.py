@@ -17,6 +17,7 @@ no swap, no env/plist write, no createdb, no kickstart. This mirrors
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -138,6 +139,46 @@ def check_not_source_hub(
         )
 
 
+AUTO_NEEDS_STACK_JSON = (
+    "`stack sync --auto` needs ~/.config/snowline/stack.json (written by "
+    "bootstrap-spoke / setup); --auto never prompts; nothing was changed"
+)
+
+
+class SyncLock:
+    """Non-blocking flock on sync.lock under Application Support (mirrors
+    autocut's): held for the whole run, dropped by the kernel if the process
+    dies. A timer fire during a manual sync (or vice versa) loses the race
+    and exits 0 `locked`."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.fd: int | None = None
+
+    def acquire(self) -> bool:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return False
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode())
+        self.fd = fd
+        return True
+
+    def release(self) -> None:
+        if self.fd is not None:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            os.close(self.fd)
+            self.fd = None
+
+
+def _no_prompt(message: str) -> str:
+    raise m.StackError(f"{AUTO_NEEDS_STACK_JSON} (would have asked: {message.strip()})")
+
+
 def ensure_stack_config(
     home: Path,
     *,
@@ -150,9 +191,7 @@ def ensure_stack_config(
         return existing
     if auto:
         raise m.StackError(
-            "~/.config/snowline/stack.json is not set up — --auto never "
-            "prompts (missing config = report + fail, work item body); run "
-            "`snowline stack sync` once interactively first"
+            AUTO_NEEDS_STACK_JSON
         )
     if prompt is None:
         raise m.StackError("stack.json is missing and no prompt function was supplied")
@@ -478,6 +517,98 @@ def apply_front_plist(home: Path, *, dry_run: bool) -> bool:
     return True
 
 
+def apply_autoupgrade_plist(home: Path, *, dry_run: bool) -> str:
+    """The hourly auto-upgrade timer's plist (#208): sync-owned like the
+    front's. Returns "installed" (no file before), "updated" (content
+    changed) or "unchanged"."""
+    rendered = m.render_autoupgrade_plist(
+        home=home,
+        platform_venv_current=m.service_current_link(home, m.FRONT_VENV_SERVICE),
+        logs=m.log_dir(home),
+    )
+    path = m.plist_path(home, m.AUTOUPGRADE_UNIT)
+    existing = _read_optional(path)
+    if existing == rendered:
+        return "unchanged"
+    if not dry_run:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        m.log_dir(home).mkdir(parents=True, exist_ok=True)
+        path.write_text(rendered)
+    return "installed" if existing is None else "updated"
+
+
+def install_autoupgrade_timer(runner: Runner, home: Path, *, dry_run: bool) -> str:
+    """Render the timer plist and load it. NEVER kickstarted (RunAtLoad is
+    false — loading must not start a sync inside a sync). launchctl calls are
+    best-effort (check=False): a failed load must not fail an upgrade.
+
+    Returns "installed" | "updated" | "reloaded" | "healed" | "deferred" | "reload-failed" |
+    "unchanged". When this very process IS the timer job, `bootout` would
+    SIGTERM the running sync mid-upgrade, so a changed plist is only written
+    and `autoupgrade.reload-pending` is touched ("deferred"); the next
+    non-timer sync (or bootstrap-spoke) does the bootout+bootstrap and clears
+    the marker. An unchanged plist that is not loaded (operator bootout) is
+    re-bootstrapped."""
+    action = apply_autoupgrade_plist(home, dry_run=dry_run)
+    if dry_run:
+        return action
+    uid = os.getuid()
+    label = m.plist_label(m.AUTOUPGRADE_UNIT)
+    domain, target = f"gui/{uid}", m.gui_target(label, uid)
+    plist = str(m.plist_path(home, m.AUTOUPGRADE_UNIT))
+    marker = m.autoupgrade_reload_pending_path(home)
+    if os.environ.get("XPC_SERVICE_NAME") == label:
+        if action == "unchanged":
+            return action
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+        return "deferred"
+    pending = marker.exists()
+    if action == "installed":
+        runner.run(["launchctl", "bootout", target], check=False)  # replace a stale loaded config
+        runner.run(["launchctl", "bootstrap", domain, plist], check=False)
+    elif action == "updated" or pending:
+        runner.run(["launchctl", "bootout", target], check=False)
+        # Clear the reload-pending marker only once the bootstrap really
+        # succeeded: a failed bootstrap leaves the job unloaded, and the
+        # marker keeps the next non-timer sync retrying (the heal path would
+        # too, but the marker says WHY).
+        try:
+            runner.run(["launchctl", "bootstrap", domain, plist])
+        except CommandError:
+            return action if action != "unchanged" else "reload-failed"
+        if action == "unchanged":
+            action = "reloaded"
+    else:
+        try:
+            runner.read(["launchctl", "print", target])
+        except CommandError:
+            runner.run(["launchctl", "bootstrap", domain, plist], check=False)
+            action = "healed"
+    if pending:
+        marker.unlink(missing_ok=True)
+    return action
+
+
+def _timer_note(action: str, *, dry_run: bool) -> str | None:
+    if action == "unchanged":
+        return None
+    label = m.plist_label(m.AUTOUPGRADE_UNIT)
+    if action == "deferred":
+        return "timer plist updated; reload on the next manual `stack sync` or login"
+    if dry_run:
+        return f"would {'install' if action == 'installed' else 'update'} the hourly auto-upgrade timer ({label})"
+    if action == "healed":
+        return f"re-loaded the hourly auto-upgrade timer ({label}), which was not loaded"
+    if action == "reload-failed":
+        return (
+            f"the hourly auto-upgrade timer ({label}) was booted out but `launchctl "
+            f"bootstrap` FAILED — it is not loaded; reload-pending kept, the next "
+            f"manual `stack sync` retries (check the plist with plutil -lint)"
+        )
+    return f"{action} the hourly auto-upgrade timer ({label})"
+
+
 # --------------------------------------------------------------------------
 # createdb (spec §3 — sync's only DB job; alembic is boot-migrate's).
 # --------------------------------------------------------------------------
@@ -627,14 +758,50 @@ def run_sync(
     health_sleep: Callable[[float], None] = time.sleep,
     report: Report = print,
 ) -> m.RunReport:
+    """Serialised by sync.lock (#208), acquired once the posture/hub checks
+    pass (a sync on the hub leaves no lock file): a concurrent run (the hourly
+    timer during a manual sync, or the reverse) exits 0 `locked` with a
+    one-line report and touches nothing. Dry runs skip the lock."""
     started_at = _now_iso()
     resolved_train = train or "unknown"
     instance_id = "unknown"
+    lock: SyncLock | None = None
     try:
         existing_cfg = read_stack_config(home)
         m.check_spoke_posture(requested_role=role, existing=existing_cfg)
         m.check_no_primary_env(read_existing_env_texts(home))
         check_not_source_hub(home)
+        if not dry_run:
+            lock = SyncLock(m.sync_lock_path(home))
+            if not lock.acquire():
+                lock = None
+                detail = "another stack sync is running (sync.lock held) — skipped"
+                report(f"stack sync: {detail}")
+                return m.RunReport(
+                    train=resolved_train, role=role, instance_id=instance_id,
+                    started_at=started_at, finished_at=_now_iso(), auto=auto, dry_run=dry_run,
+                    noop=False, services=(), health_ok=None, outcome="locked", detail=detail,
+                )
+        if auto:
+            # Kill switch (#208): pause upgrades without touching launchd.
+            marker = m.autoupgrade_disabled_path(home)
+            if marker.exists():
+                detail = f"auto-upgrade disabled by marker ({marker}) — nothing was changed"
+                rpt = m.RunReport(
+                    train=resolved_train, role=existing_cfg.role if existing_cfg else role,
+                    instance_id=existing_cfg.instance_id if existing_cfg else instance_id,
+                    started_at=started_at, finished_at=_now_iso(), auto=True, dry_run=dry_run,
+                    noop=True, services=(), health_ok=None, outcome="noop", detail=detail,
+                )
+                write_report(home, rpt, dry_run=dry_run)
+                report(f"stack sync: {detail}")
+                return rpt
+            # --auto never prompts: refuse BEFORE anything else (a gh error
+            # would otherwise mask the real problem) and make any prompt
+            # call a hard failure rather than a tty read.
+            if existing_cfg is None:
+                raise m.StackError(AUTO_NEEDS_STACK_JSON)
+            prompt = _no_prompt
         preflight_gh_auth(runner)
         cfg = ensure_stack_config(home, existing=existing_cfg, auto=auto, dry_run=dry_run, prompt=prompt)
         instance_id = cfg.instance_id
@@ -660,6 +827,7 @@ def run_sync(
                 front_installed=m.plist_path(home, m.FRONT_SERVICE).exists(),
                 dry_run=dry_run,
             )
+            timer_action = install_autoupgrade_timer(runner, home, dry_run=dry_run)
             key_kicked: bool | None = None
             if key_added and not dry_run:
                 key_kicked = kickstart_service(runner, home, "platform")
@@ -686,6 +854,8 @@ def run_sync(
                     f"{'; would add' if dry_run else '; added'} {_FRONT_KEY} to platform.env"
                     f"{'' if dry_run else ' and restarted the platform'}"
                 )
+            if (note := _timer_note(timer_action, dry_run=dry_run)):
+                detail += "; " + note
             rpt = m.RunReport(
                 train=resolved_train, role=cfg.role, instance_id=cfg.instance_id,
                 started_at=started_at, finished_at=_now_iso(), auto=auto, dry_run=dry_run,
@@ -731,6 +901,11 @@ def run_sync(
                     if plans[m.FRONT_VENV_SERVICE].changes or not front_env_exists
                     else " (kickstart only if the plist changed)"
                 )
+            )
+            report(
+                f"  {m.AUTOUPGRADE_UNIT:<12} "
+                + (_timer_note(apply_autoupgrade_plist(home, dry_run=True), dry_run=True)
+                   or "timer plist unchanged")
             )
             rpt = m.RunReport(
                 train=resolved_train, role=cfg.role, instance_id=cfg.instance_id,
@@ -835,6 +1010,8 @@ def run_sync(
             or plans[m.FRONT_VENV_SERVICE].changes
         )
 
+        timer_action = install_autoupgrade_timer(runner, home, dry_run=False)
+
         ensure_databases(runner, report)
 
         platform_key_kick_pending = platform_front_key_added
@@ -928,6 +1105,8 @@ def run_sync(
             else:
                 detail = (detail + "; " if detail else "") + FRONT_KEY_KICK_FAILED_DETAIL
 
+        if (note := _timer_note(timer_action, dry_run=False)):
+            detail = (detail + "; " if detail else "") + note
         rpt = m.RunReport(
             train=resolved_train, role=cfg.role, instance_id=cfg.instance_id,
             started_at=started_at, finished_at=_now_iso(), auto=auto, dry_run=False,
@@ -946,3 +1125,6 @@ def run_sync(
         )
         write_report(home, rpt, dry_run=dry_run)
         return rpt
+    finally:
+        if lock is not None:
+            lock.release()

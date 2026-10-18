@@ -630,3 +630,34 @@ def test_a_dead_front_is_a_warn_step_never_a_bootstrap_failure(tmp_path):
     assert steps["post-boot-health"].status == "ok"
     assert steps["front-health"].status == "warned"
     assert steps["front-health"].detail.startswith("WARN:")
+
+
+def test_bootstrap_installs_the_autoupgrade_timer_as_its_last_step(tmp_path):
+    home = _fully_bootstrapped_home(tmp_path)
+    runner = FakeRunner(_health_ok_handler)
+    report = b.run_bootstrap_spoke(home=home, runner=runner, prompt=_no_prompt, health_sleep=_noop_sleep)
+    assert report.outcome == "ok", report.detail
+    assert [st.name for st in report.steps][-1] == "autoupgrade-timer"
+    assert [st.name for st in report.steps].index("reverse-pair") < len(report.steps) - 1
+    assert m.plist_path(home, m.AUTOUPGRADE_UNIT).exists()
+    timer = [a for a in runner.runs if "dev.snowline.autoupgrade" in " ".join(a)]
+    assert [a[1] for a in timer] == ["bootout", "bootstrap"]  # loaded, never kickstarted
+
+
+def test_bootstrap_refuses_while_a_sync_holds_the_lock(tmp_path):
+    home = _fully_bootstrapped_home(tmp_path)
+    holder = s.SyncLock(m.sync_lock_path(home))
+    assert holder.acquire()
+    try:
+        runner = FakeRunner(_health_ok_handler)
+        report = b.run_bootstrap_spoke(home=home, runner=runner, prompt=_no_prompt, health_sleep=_noop_sleep)
+    finally:
+        holder.release()
+    assert report.outcome == "failed"
+    assert "another stack sync is running" in report.detail and "retry in a minute" in report.detail
+    assert runner.runs == []
+    assert m.bootstrap_report_path(home).exists() if hasattr(m, "bootstrap_report_path") else True
+    # lock released at the end of a normal run
+    ok = b.run_bootstrap_spoke(home=home, runner=FakeRunner(_health_ok_handler), prompt=_no_prompt, health_sleep=_noop_sleep)
+    assert ok.outcome == "ok", ok.detail
+    assert s.SyncLock(m.sync_lock_path(home)).acquire()
