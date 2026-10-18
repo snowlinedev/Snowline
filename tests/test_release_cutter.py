@@ -240,8 +240,9 @@ def test_component_tests_run_in_the_build_tree_with_own_venv(
     invocations = [(argv, cwd) for argv, cwd in runner.reads if argv == TEST_CMD]
     assert invocations == [(TEST_CMD, tree)]
     env = dict(runner.read_envs)[TEST_CMD]
-    assert env["UV_PROJECT_ENVIRONMENT"] == str(tree / ".venv-test")
-    assert not str(checkouts["pm"]) in " ".join(env.values())
+    assert env["UV_PROJECT_ENVIRONMENT"] == str(tree.parent / ".venv-test")  # beside, not inside
+    assert env["UV_LOCKED"] == "1"
+    assert str(checkouts["pm"]) not in " ".join(env.values())
     assert any(f"(in {tree})" in line for line in runner.report_lines)
     assert any("tests passed (pm)" in line for line in runner.report_lines)
 

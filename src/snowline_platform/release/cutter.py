@@ -136,7 +136,13 @@ class Cutter:
             return
         self.report(f"  tests: {' '.join(comp.test)} (in {tree})")
         env = dict(comp.test_env)
-        env["UV_PROJECT_ENVIRONMENT"] = str(tree / TEST_VENV)
+        # The test venv lives BESIDE the tree (in the same throwaway tempdir,
+        # removed with it), never inside it: hatchling packs an in-tree venv
+        # into the sdist and `uv build` then fails on its absolute symlinks —
+        # no wheel, every cut dead at _prune. UV_LOCKED keeps `uv run` from
+        # rewriting the committed uv.lock before `uv export --frozen` reads it.
+        env["UV_PROJECT_ENVIRONMENT"] = str(tree.parent / TEST_VENV)
+        env["UV_LOCKED"] = "1"
         # An operator-provided URL (autocut.env) always wins: that is the
         # escape hatch for pointing the suites at a different Postgres.
         scratch: list[str] = []
@@ -150,7 +156,9 @@ class Cutter:
             scratch.append(db)
         try:
             for db in scratch:
-                self.runner.read(["dropdb", "--if-exists", db])
+                # --force: a leftover from a crashed cut may still hold a
+                # backend (a hung pytest); PG13+ terminates it.
+                self.runner.read(["dropdb", "--force", "--if-exists", db])
                 self.runner.read(["createdb", db])
             self.runner.read(list(comp.test), cwd=tree, env=env)
         finally:

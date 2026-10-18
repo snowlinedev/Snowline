@@ -186,7 +186,7 @@ the health gate and for the milestone gate, which skips without it, and
 autocut refuses a skipped gate. `--platform-url` overrides it. The wrapper
 also sources `~/.config/snowline/autocut.env` if the file exists. The
 cutter runs each component's tests in its throwaway build tree (its own
-`.venv-test`, never the live checkout's `.venv`) against scratch databases it
+`.venv-test` beside the build tree, never the live checkout's `.venv`) against scratch databases it
 provisions and drops (`snowline_cut_test_<name>`). Set
 `SNOWLINE_PLATFORM_TEST_DATABASE_URL`, `SNOWLINE_GOVERNANCE_TEST_DATABASE_URL`,
 `SNOWLINE_MEMORY_TEST_DATABASE_URL` or `SNOWLINE_PM_TEST_DATABASE_URL` there
