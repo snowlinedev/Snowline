@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Hourly hub auto-cut timer (#258): `snowline release autocut` cuts the next
+     PATCH train whenever a component's origin/main moved since the last
+     recorded cut. Installed by ops/hub/install-daemons.sh (bootstrapped, never
+     kickstarted); see docs/ops/hub-daemons.md "Auto-cut".
+
+     Why a system LaunchDaemon (like the four services) and not a per-user
+     LaunchAgent: the cut pushes tags, publishes GitHub releases with `gh`, and
+     pushes the release/train.json record commit. On the hub `gh` stores its
+     token in ~/.config/gh/hosts.yml (mode 600, not the login keychain) and
+     git's github.com credential helper is `gh auth git-credential`, so a
+     daemon running as UserName=seanlynch with HOME set reaches both with NO
+     login session — which is the point after a power loss. Trade-off: if gh
+     is ever re-authenticated into the macOS keychain, a daemon outside a
+     login session can no longer read it; autocut's gh_auth gate then refuses
+     every run (exit 2, reason in autocut-report.json) rather than half-cutting.
+     Re-auth with `gh auth login --insecure-storage` or move this plist to
+     ~/Library/LaunchAgents (gui/501) to fix.
+
+     RunAtLoad is false: loading the timer must never start a ~6-minute cut. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.snowline.autocut</string>
+    <key>UserName</key>
+    <string>seanlynch</string>
+    <key>GroupName</key>
+    <string>staff</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>/Users/seanlynch/Projects/snowline-platform/ops/hub/launchdaemons/run-autocut.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/seanlynch/Projects/snowline-platform</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/seanlynch</string>
+        <key>PATH</key>
+        <string>/Users/seanlynch/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- The hub gateway: the health gate, and the milestone gate (which
+             SKIPS without it — and autocut refuses a skipped gate). -->
+        <key>SNOWLINE_PLATFORM_URL</key>
+        <string>http://100.81.176.75:8850</string>
+    </dict>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>/Users/seanlynch/Library/Logs/snowline-autocut.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/seanlynch/Library/Logs/snowline-autocut.log</string>
+</dict>
+</plist>

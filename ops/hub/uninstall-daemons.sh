@@ -5,10 +5,18 @@
 [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
 
 SERVICES="platform pm governance memory"
+TIMERS="autocut"  # system-only; no LaunchAgent predecessor to restore
 OWNER_UID=501
 OWNER_HOME=/Users/seanlynch
 DEST=/Library/LaunchDaemons
 AGENTS="$OWNER_HOME/Library/LaunchAgents"
+
+for timer in $TIMERS; do
+  label="dev.snowline.$timer"
+  echo "== $label"
+  launchctl bootout "system/$label" 2>/dev/null || true
+  rm -f "$DEST/$label.plist"
+done
 
 for svc in $SERVICES; do
   label="dev.snowline.$svc"

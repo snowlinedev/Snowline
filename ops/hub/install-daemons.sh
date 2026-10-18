@@ -8,6 +8,9 @@
 [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
 
 SERVICES="platform pm governance memory"
+# Interval timers (#258): installed + bootstrapped, never kickstarted — a
+# kickstart would fire an immediate run (for autocut, a ~6-minute cut).
+TIMERS="autocut"
 OWNER_UID=501
 OWNER_HOME=/Users/seanlynch
 SRC="$(cd "$(dirname "$0")" && pwd)/launchdaemons"
@@ -32,6 +35,16 @@ for svc in $SERVICES; do
   chmod 644 "$DEST/$label.plist"
   launchctl bootstrap system "$DEST/$label.plist"
   launchctl kickstart -k "system/$label"
+done
+
+for timer in $TIMERS; do
+  label="dev.snowline.$timer"
+  echo "== $label (timer; not kickstarted)"
+  launchctl bootout "system/$label" 2>/dev/null || true
+  cp "$SRC/$label.plist" "$DEST/$label.plist"
+  chown root:wheel "$DEST/$label.plist"
+  chmod 644 "$DEST/$label.plist"
+  launchctl bootstrap system "$DEST/$label.plist"
 done
 
 echo "== waiting up to 60s for /health"
