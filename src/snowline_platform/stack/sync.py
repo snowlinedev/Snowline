@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import re
 import shutil
@@ -971,6 +972,7 @@ def check_health(
 # hanging gateway cannot stretch it). Override: SNOWLINE_SYNC_HEALTH_BUDGET_S.
 UPGRADE_HEALTH_BUDGET_S = 120.0
 HEALTH_BUDGET_ENV = "SNOWLINE_SYNC_HEALTH_BUDGET_S"
+HEALTH_BUDGET_CEILING_S = 1800.0  # the timer fires hourly; a poll must never outlast it
 DIAG_LOG_TAIL_BYTES = 64 * 1024
 
 
@@ -978,7 +980,10 @@ def upgrade_health_budget_s() -> float:
     raw = os.environ.get(HEALTH_BUDGET_ENV, "").strip()
     if raw:
         try:
-            return max(1.0, float(raw))
+            value = float(raw)
+            if not math.isfinite(value):
+                return UPGRADE_HEALTH_BUDGET_S  # "inf" would loop until the gateway answers
+            return min(HEALTH_BUDGET_CEILING_S, max(1.0, value))
         except ValueError:
             pass
     return UPGRADE_HEALTH_BUDGET_S
@@ -1313,6 +1318,7 @@ def run_sync(
             if not dry_run:
                 noop_health, noop_front, nprobes, npolls = stack_health(
                     runner, health_url, sleep=health_sleep,
+                    front_attempts=30 if kicked_any else 3,
                     **({"budget_s": 30.0} if kicked_any else {"attempts": 3}),
                 )
                 if noop_health is False:
@@ -1405,19 +1411,25 @@ def run_sync(
                 skip_health, skip_diag = None, None
                 if not dry_run:
                     kicked_any = any(u.kicked is not None for u in units)
-                    skip_health, _skip_front, sprobes, spolls = stack_health(
+                    skip_health, skip_front, sprobes, spolls = stack_health(
                         runner, health_url, sleep=health_sleep,
+                        front_attempts=30 if kicked_any else 3,
                         **({"budget_s": 30.0} if kicked_any else {"attempts": 3}),
                     )
                     if skip_health is False:
                         skip_diag = capture_health_diagnostic(
                             runner, home, sprobes, budget_s=30.0 if kicked_any else 3.0, polls=spolls)
-                skip_outcome = "needs_attention" if skip_health is False else "skipped"
-                if skip_outcome == "needs_attention":
+                skip_front_down = skip_health is True and skip_front is False
+                skip_outcome = (
+                    "needs_attention" if skip_health is False or skip_front_down else "skipped"
+                )
+                if skip_health is False:
                     detail += (
                         "; the gateway health check FAILED on the running train — "
                         "services may be down; check launchctl and the service logs"
                     )
+                elif skip_front_down:
+                    detail += "; " + FRONT_DOWN_DETAIL
                 for note in _unit_notes(units):
                     detail += "; " + note
                 rpt = m.RunReport(
@@ -1425,6 +1437,7 @@ def run_sync(
                     started_at=started_at, finished_at=_now_iso(), auto=True, dry_run=dry_run,
                     noop=True, services=(), health_ok=skip_health, outcome=skip_outcome,
                     detail=detail, units=tuple(units), health_diagnostic=skip_diag,
+                    front_ok=skip_front,
                 )
                 write_report(home, rpt, dry_run=dry_run)
                 report(f"stack sync: {detail}")
