@@ -1092,8 +1092,7 @@ def test_run_sync_full_path_installs_and_bootstraps_the_timer_never_kickstarts(t
     rpt = s.run_sync(home=home, train="v0.1.0", runner=runner, health_sleep=lambda _s: None, report=lambda _: None)
     assert rpt.outcome == "ok"
     assert m.plist_path(home, m.AUTOUPGRADE_UNIT).exists()
-    assert len(_timer_calls(runner, "bootstrap")) == 1
-    assert not _timer_calls(runner, "bootout")  # first install: nothing to unload
+    assert [a[1] for a in _timer_runs(runner)] == ["bootout", "bootstrap"]  # stale-config bootout first
     assert not _timer_calls(runner, "kickstart")
     assert "hourly auto-upgrade timer" in rpt.detail
 
@@ -1206,13 +1205,93 @@ def test_auto_missing_stack_json_says_so_and_changes_nothing(tmp_path):
     rpt = s.run_sync(home=home, auto=True, runner=runner, health_sleep=lambda _s: None,
                      prompt=lambda _m: pytest.fail("prompted"), report=lambda _: None)
     assert rpt.outcome == "failed" and m.exit_code(rpt.outcome) == 1
+    assert runner.reads == []  # failed before the gh preflight
     assert "needs ~/.config/snowline/stack.json" in rpt.detail
     assert "bootstrap-spoke" in rpt.detail and "nothing was changed" in rpt.detail
     assert not m.stack_config_path(home).exists()
     assert runner.runs == []
 
 
-def test_auto_replaces_any_supplied_prompt_with_a_hard_failure(tmp_path):
-    """Even if a caller hands --auto a real prompt, it can never be reached."""
+def test_no_prompt_guard_raises_instead_of_reading_a_tty():
     with pytest.raises(m.StackError, match="--auto never prompts"):
         s._no_prompt("the primary's tailnet address: ")
+
+
+def test_run_sync_auto_never_calls_a_supplied_prompt_even_with_config_present(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    _stack_config(home)
+    _seed_train_assets(home)
+    monkeypatch.setattr(s, "_no_prompt", lambda msg: pytest.fail("reached"), raising=True)
+    rpt = s.run_sync(home=home, train="v0.1.0", auto=True, runner=FakeRunner(_full_fake_handler),
+                     health_sleep=lambda _s: None, prompt=lambda _m: pytest.fail("prompted"),
+                     report=lambda _: None)
+    assert rpt.outcome == "ok"
+
+
+def test_timer_run_sync_defers_the_reload_and_touches_the_marker(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    _stack_config(home)
+    _seed_train_assets(home)
+    _sync(home)
+    path = m.plist_path(home, m.AUTOUPGRADE_UNIT)
+    path.write_text(path.read_text().replace("3600", "60"))
+    monkeypatch.setenv("XPC_SERVICE_NAME", TIMER_LABEL)
+    runner = FakeRunner(_full_fake_handler)
+    rpt = _sync(home, runner)
+    assert "3600" in path.read_text()
+    assert _timer_runs(runner) == [] and not [a for a in runner.reads if TIMER_LABEL in " ".join(a)]
+    assert m.autoupgrade_reload_pending_path(home).exists()
+    assert "reload on the next manual `stack sync`" in rpt.detail
+
+    # next manual sync: plist unchanged, but the marker forces bootout+bootstrap, then clears it
+    monkeypatch.delenv("XPC_SERVICE_NAME")
+    runner2 = FakeRunner(_full_fake_handler)
+    _sync(home, runner2)
+    assert [a[1] for a in _timer_runs(runner2)] == ["bootout", "bootstrap"]
+    assert not m.autoupgrade_reload_pending_path(home).exists()
+
+
+def test_unloaded_timer_is_healed_and_a_loaded_one_is_left_alone(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    _stack_config(home)
+    _seed_train_assets(home)
+    _sync(home)
+    monkeypatch.delenv("XPC_SERVICE_NAME", raising=False)
+
+    def not_loaded(argv, cwd):
+        if argv[:2] == ["launchctl", "print"]:
+            return CommandError(argv, 113, "Could not find service")
+        return _full_fake_handler(argv, cwd)
+
+    runner = FakeRunner(not_loaded)
+    rpt = _sync(home, runner)
+    assert [a[1] for a in _timer_runs(runner)] == ["bootstrap"]
+    assert "re-loaded" in rpt.detail
+
+    runner2 = FakeRunner(_full_fake_handler)
+    _sync(home, runner2)
+    assert _timer_runs(runner2) == []
+
+
+def test_fresh_install_boots_out_a_stale_loaded_config_first(tmp_path):
+    home = tmp_path / "home"
+    _stack_config(home)
+    _seed_train_assets(home)
+    runner = FakeRunner(_full_fake_handler)
+    _sync(home, runner)
+    assert [a[1] for a in _timer_runs(runner)] == ["bootout", "bootstrap"]
+
+
+def test_hub_sync_leaves_no_lock_file(tmp_path):
+    home = tmp_path / "home"
+    _stack_config(home)
+    s.run_sync(home=home, role="primary", runner=FakeRunner(_full_fake_handler),
+               health_sleep=lambda _s: None, report=lambda _: None)
+    assert not m.sync_lock_path(home).exists()
+
+
+def test_plist_path_has_local_bin_and_keg_only_postgres(tmp_path):
+    text = m.render_autoupgrade_plist(
+        home=tmp_path, platform_venv_current=tmp_path / "v", logs=tmp_path)
+    assert f"{tmp_path}/.local/bin" in text and "postgresql@16/bin" in text
+    assert "AbandonProcessGroup" not in text

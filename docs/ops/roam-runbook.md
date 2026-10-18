@@ -395,7 +395,10 @@ and retire) the union first.
 
 `snowline stack sync --train vPrev` is the rollback command for a spoke
 installed via the packaged channel (item b70b0359) — same code path as an
-ordinary sync, just naming an older train. Two cases:
+ordinary sync, just naming an older train. **With the hourly auto-upgrade
+timer installed, a rollback is undone within the hour**: run
+`touch ~/.config/snowline/autoupgrade.disabled` BEFORE rolling back, and
+`rm` it when done. Two cases:
 
 - **Code-only rollback (no schema migration in the delta being undone).**
   The symlink swap IS the rollback: `current` repoints at `vPrev`'s venv,
@@ -461,12 +464,16 @@ this ships installs it. The hub role never gets it (sync refuses the hub).
   coalesces onto the next wake.
 - **Command:** `~/Library/Application Support/Snowline/venvs/platform/current/bin/snowline stack sync --auto`
   (via the `current` symlink, so a train swap never strands it on an old venv).
-  PATH includes the venv bin and `/opt/homebrew/bin` for gh/uv.
+  PATH includes the venv bin, `~/.local/bin` (where `install.sh` puts uv), `/opt/homebrew/bin` and the keg-only `/opt/homebrew/opt/postgresql@16/bin` (createdb/psql).
 - **Reload rule:** written only when the content changed; first install is
   `launchctl bootstrap`, a change is `bootout` + `bootstrap`; never
   kickstarted (loading must not start a sync inside a sync). If the plist
-  changes during a timer-run sync, the reload is handed to a detached shell
-  (bootout of the running job would kill the sync itself).
+  changes during a timer-run sync, it is only written and
+  `~/.config/snowline/autoupgrade.reload-pending` is touched (a `bootout` of
+  the running job would kill the sync mid-upgrade); the next manual
+  `stack sync` / `bootstrap-spoke` does the reload and clears the marker. An
+  unchanged but not-loaded timer (e.g. an operator `bootout`) is re-bootstrapped
+  by the next manual sync.
 - **Log:** `~/Library/Application Support/Snowline/logs/snowline-autoupgrade.log`
   (stdout and stderr). The machine-readable result is still
   `sync-report.json` / `sync-history/`.
@@ -475,13 +482,13 @@ this ships installs it. The hub role never gets it (sync refuses the hub).
   `rm` it to resume. No launchctl needed. Manual (non-`--auto`) sync ignores it.
 - **Lock:** every sync (manual or `--auto`) takes a non-blocking flock on
   `~/Library/Application Support/Snowline/sync.lock`. A second run exits 0 with
-  a one-line `locked` message and does not overwrite the running sync's report.
+  a one-line `locked` message and does not overwrite the running sync's report. `bootstrap-spoke` holds the same lock for its whole run and refuses ("retry in a minute") if a sync is running.
 - **Never prompts:** `--auto` cannot ask anything. With no
   `~/.config/snowline/stack.json` it fails (exit 1) with "`stack sync --auto`
   needs ~/.config/snowline/stack.json (written by bootstrap-spoke / setup)";
   nothing was changed.
 - **Remove the timer:** `launchctl bootout gui/$(id -u)/dev.snowline.autoupgrade`
-  and touch the disabled marker (sync re-installs the plist otherwise).
+  and touch the disabled marker (the next manual sync re-installs and re-loads it otherwise; the timer never reloads itself).
 
 ### Failure modes
 

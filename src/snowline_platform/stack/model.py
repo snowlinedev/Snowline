@@ -647,12 +647,18 @@ def _render_uvicorn_plist(
 # runs `snowline stack sync --auto` hourly. Rendered/installed by sync itself.
 AUTOUPGRADE_UNIT = "autoupgrade"
 AUTOUPGRADE_INTERVAL_S = 3600
-AUTOUPGRADE_PATH_EXTRAS = ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin")
+AUTOUPGRADE_PATH_EXTRAS = ("/opt/homebrew/opt/postgresql@16/bin", "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin")
 
 
 def autoupgrade_disabled_path(home: Path) -> Path:
     """Kill switch: while this file exists `stack sync --auto` is a no-op."""
     return config_dir(home) / "autoupgrade.disabled"
+
+
+def autoupgrade_reload_pending_path(home: Path) -> Path:
+    """Set when the timer plist changed during a timer-run sync (which must
+    not reload itself); the next non-timer sync reloads and clears it."""
+    return config_dir(home) / "autoupgrade.reload-pending"
 
 
 def sync_lock_path(home: Path) -> Path:
@@ -671,7 +677,10 @@ def render_autoupgrade_plist(*, home: Path, platform_venv_current: Path, logs: P
     prompts: `--auto` has no prompt path and launchd gives no tty."""
     label = plist_label(AUTOUPGRADE_UNIT)
     snowline_bin = platform_venv_current / "bin" / "snowline"
-    path_value = ":".join([str(platform_venv_current / "bin"), *AUTOUPGRADE_PATH_EXTRAS])
+    # ~/.local/bin: where release/install.sh puts uv when it is not on PATH.
+    path_value = ":".join(
+        [str(platform_venv_current / "bin"), str(home / ".local" / "bin"), *AUTOUPGRADE_PATH_EXTRAS]
+    )
     log = logs / "snowline-autoupgrade.log"
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -696,8 +705,6 @@ def render_autoupgrade_plist(*, home: Path, platform_venv_current: Path, logs: P
     <integer>{AUTOUPGRADE_INTERVAL_S}</integer>
     <key>RunAtLoad</key>
     <false/>
-    <key>AbandonProcessGroup</key>
-    <true/>
     <key>EnvironmentVariables</key>
     <dict>
         <key>HOME</key>

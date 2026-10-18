@@ -46,6 +46,7 @@ from .sync import (
     FRONT_DOWN_DETAIL,
     PromptFn,
     Report,
+    SyncLock,
     check_health,
     check_stack_health,
     install_autoupgrade_timer,
@@ -283,6 +284,7 @@ def run_bootstrap_spoke(
     primary_gateway_url: str | None = None
     pm_role_ok: bool | None = None
     health_ok: bool | None = None
+    lock: SyncLock | None = None
 
     def ok(name: str, detail: str | None = None) -> None:
         steps.append(m.BootstrapStep(name=name, status="ok", detail=detail))
@@ -301,6 +303,18 @@ def run_bootstrap_spoke(
         m.check_spoke_posture(requested_role="spoke", existing=cfg)
         instance_id = cfg.instance_id
         ok("stack-config", f"instance_id={cfg.instance_id} role={cfg.role}")
+
+        # -- precondition 1a: no sync underneath us (#208) --------------------
+        # The hourly timer must not run a sync mid-bootstrap (seed, kickstarts,
+        # registration wait, reverse-pair). Held for the whole run.
+        if not dry_run:
+            lock = SyncLock(m.sync_lock_path(home))
+            if not lock.acquire():
+                lock = None
+                raise m.StackError(
+                    "another stack sync is running (sync.lock held) — retry in a minute"
+                )
+            ok("sync-lock", "held for the whole bootstrap")
 
         # -- precondition 1b: pm.env declares SNOWLINE_PM_ROLE=spoke ---------
         # Checked BEFORE any mutation (#212 review: this guard previously ran
@@ -551,3 +565,6 @@ def run_bootstrap_spoke(
         )
         write_bootstrap_report(home, rpt, dry_run=dry_run)
         return rpt
+    finally:
+        if lock is not None:
+            lock.release()

@@ -22,7 +22,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping
@@ -539,30 +538,48 @@ def apply_autoupgrade_plist(home: Path, *, dry_run: bool) -> str:
 
 
 def install_autoupgrade_timer(runner: Runner, home: Path, *, dry_run: bool) -> str:
-    """Render the timer plist and load it: `launchctl bootstrap` on first
-    install, `bootout` + `bootstrap` on change. NEVER kickstarted (RunAtLoad
-    is false — loading must not start a sync inside a sync). Best-effort
-    launchctl calls (check=False): a failed load must not fail an upgrade.
-    When this very process IS the timer job, `bootout` would kill us (and
-    skip the bootstrap), so the reload is handed to a detached shell."""
+    """Render the timer plist and load it. NEVER kickstarted (RunAtLoad is
+    false — loading must not start a sync inside a sync). launchctl calls are
+    best-effort (check=False): a failed load must not fail an upgrade.
+
+    Returns "installed" | "updated" | "reloaded" | "healed" | "deferred" |
+    "unchanged". When this very process IS the timer job, `bootout` would
+    SIGTERM the running sync mid-upgrade, so a changed plist is only written
+    and `autoupgrade.reload-pending` is touched ("deferred"); the next
+    non-timer sync (or bootstrap-spoke) does the bootout+bootstrap and clears
+    the marker. An unchanged plist that is not loaded (operator bootout) is
+    re-bootstrapped."""
     action = apply_autoupgrade_plist(home, dry_run=dry_run)
-    if action == "unchanged" or dry_run:
+    if dry_run:
         return action
     uid = os.getuid()
     label = m.plist_label(m.AUTOUPGRADE_UNIT)
     domain, target = f"gui/{uid}", m.gui_target(label, uid)
     plist = str(m.plist_path(home, m.AUTOUPGRADE_UNIT))
-    if action == "updated" and os.environ.get("XPC_SERVICE_NAME") == label:
-        subprocess.Popen(
-            ["/bin/sh", "-c",
-             f"sleep 5; launchctl bootout {target}; launchctl bootstrap {domain} '{plist}'"],
-            start_new_session=True,
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        return "updated"
-    if action == "updated":
+    marker = m.autoupgrade_reload_pending_path(home)
+    if os.environ.get("XPC_SERVICE_NAME") == label:
+        if action == "unchanged":
+            return action
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+        return "deferred"
+    pending = marker.exists()
+    if action == "installed":
+        runner.run(["launchctl", "bootout", target], check=False)  # replace a stale loaded config
+        runner.run(["launchctl", "bootstrap", domain, plist], check=False)
+    elif action == "updated" or pending:
         runner.run(["launchctl", "bootout", target], check=False)
-    runner.run(["launchctl", "bootstrap", domain, plist], check=False)
+        runner.run(["launchctl", "bootstrap", domain, plist], check=False)
+        if action == "unchanged":
+            action = "reloaded"
+    else:
+        try:
+            runner.read(["launchctl", "print", target])
+        except CommandError:
+            runner.run(["launchctl", "bootstrap", domain, plist], check=False)
+            action = "healed"
+    if pending:
+        marker.unlink(missing_ok=True)
     return action
 
 
@@ -570,8 +587,12 @@ def _timer_note(action: str, *, dry_run: bool) -> str | None:
     if action == "unchanged":
         return None
     label = m.plist_label(m.AUTOUPGRADE_UNIT)
+    if action == "deferred":
+        return "timer plist updated; reload on the next manual `stack sync` or login"
     if dry_run:
         return f"would {'install' if action == 'installed' else 'update'} the hourly auto-upgrade timer ({label})"
+    if action == "healed":
+        return f"re-loaded the hourly auto-upgrade timer ({label}), which was not loaded"
     return f"{action} the hourly auto-upgrade timer ({label})"
 
 
@@ -724,51 +745,30 @@ def run_sync(
     health_sleep: Callable[[float], None] = time.sleep,
     report: Report = print,
 ) -> m.RunReport:
-    """Serialised by sync.lock (#208): a second concurrent run (the hourly
-    timer firing during a manual sync, or the reverse) exits 0 `locked` with
-    a one-line report and touches nothing. Dry runs mutate nothing and skip
-    the lock."""
-    lock = None if dry_run else SyncLock(m.sync_lock_path(home))
-    if lock is not None and not lock.acquire():
-        now = _now_iso()
-        detail = "another stack sync is running (sync.lock held) — skipped"
-        report(f"stack sync: {detail}")
-        return m.RunReport(
-            train=train or "unknown", role=role, instance_id="unknown",
-            started_at=now, finished_at=now, auto=auto, dry_run=dry_run,
-            noop=False, services=(), health_ok=None, outcome="locked", detail=detail,
-        )
-    try:
-        return _run_sync_locked(
-            home=home, role=role, train=train, auto=auto, dry_run=dry_run, runner=runner,
-            prompt=prompt, health_url=health_url, health_sleep=health_sleep, report=report,
-        )
-    finally:
-        if lock is not None:
-            lock.release()
-
-
-def _run_sync_locked(
-    *,
-    home: Path,
-    role: str = "spoke",
-    train: str | None = None,
-    auto: bool = False,
-    dry_run: bool = False,
-    runner: Runner,
-    prompt: PromptFn | None = None,
-    health_url: str = DEFAULT_HEALTH_URL,
-    health_sleep: Callable[[float], None] = time.sleep,
-    report: Report = print,
-) -> m.RunReport:
+    """Serialised by sync.lock (#208), acquired once the posture/hub checks
+    pass (a sync on the hub leaves no lock file): a concurrent run (the hourly
+    timer during a manual sync, or the reverse) exits 0 `locked` with a
+    one-line report and touches nothing. Dry runs skip the lock."""
     started_at = _now_iso()
     resolved_train = train or "unknown"
     instance_id = "unknown"
+    lock: SyncLock | None = None
     try:
         existing_cfg = read_stack_config(home)
         m.check_spoke_posture(requested_role=role, existing=existing_cfg)
         m.check_no_primary_env(read_existing_env_texts(home))
         check_not_source_hub(home)
+        if not dry_run:
+            lock = SyncLock(m.sync_lock_path(home))
+            if not lock.acquire():
+                lock = None
+                detail = "another stack sync is running (sync.lock held) — skipped"
+                report(f"stack sync: {detail}")
+                return m.RunReport(
+                    train=resolved_train, role=role, instance_id=instance_id,
+                    started_at=started_at, finished_at=_now_iso(), auto=auto, dry_run=dry_run,
+                    noop=False, services=(), health_ok=None, outcome="locked", detail=detail,
+                )
         if auto:
             # Kill switch (#208): pause upgrades without touching launchd.
             marker = m.autoupgrade_disabled_path(home)
@@ -1112,3 +1112,6 @@ def _run_sync_locked(
         )
         write_report(home, rpt, dry_run=dry_run)
         return rpt
+    finally:
+        if lock is not None:
+            lock.release()
