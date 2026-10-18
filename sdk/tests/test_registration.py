@@ -109,6 +109,42 @@ def test_register_logs_manifest_keys_not_values_at_debug(caplog):
     assert not any("http://plugin.example:8899" in m for m in debug)
 
 
+def test_register_422_detail_drops_the_input_echo(caplog):
+    # A pydantic "missing" error carries the ENTIRE remaining manifest as
+    # `input`; the WARNING keeps loc/msg/type per error so the manifest's values
+    # never reach the log and a second error's loc still fits the 500 chars.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            422,
+            json={
+                "detail": [
+                    {
+                        "type": "missing",
+                        "loc": ["body", "name"],
+                        "msg": "Field required",
+                        "input": {"base_url": "http://plugin.example:8899", "ui": {"x": "y" * 600}},
+                    },
+                    {
+                        "type": "value_error",
+                        "loc": ["body", "surfaces"],
+                        "msg": "Value error, surfaces must not be empty",
+                        "input": {},
+                        "ctx": {"error": {}},
+                    },
+                ]
+            },
+        )
+
+    with caplog.at_level(logging.WARNING, logger="snowline_plugin_sdk.registration"):
+        assert _register(handler) is False
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(messages) == 1
+    assert "http://plugin.example:8899" not in messages[0]
+    assert "'input'" not in messages[0] and "'ctx'" not in messages[0]
+    assert "'name'" in messages[0] and "'surfaces'" in messages[0]
+    assert "version skew" in messages[0]
+
+
 def test_register_logs_500_non_json_body_without_raising(caplog):
     # A non-JSON error body (e.g. a proxy HTML page) falls back to the raw text
     # and never raises; no shape hint on a non-422.

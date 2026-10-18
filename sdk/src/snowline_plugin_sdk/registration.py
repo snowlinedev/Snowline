@@ -136,13 +136,31 @@ def install_heartbeat_httpx_filter() -> None:
 _DETAIL_LOG_LIMIT = 500
 
 
-def _detail(resp: httpx.Response) -> str:
+_VALIDATION_ERROR_KEYS = ("loc", "msg", "type")
+
+
+def _detail(resp: httpx.Response) -> object:
     """The platform's error `detail` from a response body (FastAPI/pydantic
-    shape), falling back to the raw text when the body is not a JSON object."""
+    shape), falling back to the raw text when the body is not a JSON object.
+
+    A pydantic 422 lists one dict per error and each carries `input` — for a
+    missing field that is the ENTIRE remaining manifest, which would both eat
+    the log's 500-char budget before the second error's `loc`/`msg` and echo
+    values the keys-only DEBUG line deliberately withholds. Keep only
+    `loc`/`msg`/`type` per error; anything that is not that shape passes
+    through unchanged (the callers `str()` it)."""
     try:
-        return resp.json().get("detail", resp.text)
+        detail = resp.json().get("detail", resp.text)
     except (ValueError, AttributeError):
         return resp.text
+    if isinstance(detail, list):
+        return [
+            {k: v for k, v in item.items() if k in _VALIDATION_ERROR_KEYS}
+            if isinstance(item, dict)
+            else item
+            for item in detail
+        ]
+    return detail
 
 
 def register_with_platform(
