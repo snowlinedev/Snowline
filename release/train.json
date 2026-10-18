@@ -1,39 +1,39 @@
 {
-  "version": "v0.5.3",
+  "version": "v0.5.4",
   "components": {
     "platform": {
       "repo": "snowlinedev/Snowline",
-      "tag": "v0.5.3",
-      "sha": "76d364b44d944698591d77ce24095933a3216a5c",
-      "wheel": "snowline_platform-0.5.3-py3-none-any.whl",
+      "tag": "v0.5.4",
+      "sha": "eba38a97ab3217f9ad59d566e16bc232a1370f45",
+      "wheel": "snowline_platform-0.5.4-py3-none-any.whl",
       "kind": "service"
     },
     "governance": {
       "repo": "snowlinedev/Snowline",
-      "tag": "v0.5.3",
-      "sha": "76d364b44d944698591d77ce24095933a3216a5c",
-      "wheel": "snowline_governance-0.5.3-py3-none-any.whl",
+      "tag": "v0.5.4",
+      "sha": "eba38a97ab3217f9ad59d566e16bc232a1370f45",
+      "wheel": "snowline_governance-0.5.4-py3-none-any.whl",
       "kind": "service"
     },
     "memory": {
       "repo": "snowlinedev/Snowline",
-      "tag": "v0.5.3",
-      "sha": "76d364b44d944698591d77ce24095933a3216a5c",
-      "wheel": "snowline_memory-0.5.3-py3-none-any.whl",
+      "tag": "v0.5.4",
+      "sha": "eba38a97ab3217f9ad59d566e16bc232a1370f45",
+      "wheel": "snowline_memory-0.5.4-py3-none-any.whl",
       "kind": "service"
     },
     "sdk": {
       "repo": "snowlinedev/Snowline",
-      "tag": "v0.5.3",
-      "sha": "76d364b44d944698591d77ce24095933a3216a5c",
-      "wheel": "snowline_plugin_sdk-0.5.3-py3-none-any.whl",
+      "tag": "v0.5.4",
+      "sha": "eba38a97ab3217f9ad59d566e16bc232a1370f45",
+      "wheel": "snowline_plugin_sdk-0.5.4-py3-none-any.whl",
       "kind": "library"
     },
     "pm": {
       "repo": "snowlinedev/snowline-pm",
-      "tag": "v0.5.3",
+      "tag": "v0.5.4",
       "sha": "7e01718445424e0ac1f5653f02ae5d8678bfbdb8",
-      "wheel": "snowline_pm-0.5.3-py3-none-any.whl",
+      "wheel": "snowline_pm-0.5.4-py3-none-any.whl",
       "kind": "service"
     }
   },
