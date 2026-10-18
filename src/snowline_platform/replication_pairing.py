@@ -557,7 +557,8 @@ class VocabularyDirection:
     `status` is one of: `widened` (the admin route appended `added`),
     `would-widen` (dry run), `current` (already carries the whole target),
     `unpaired` (no live outbound toward the receiver — run `pair`), or
-    `refused` (contract_version mismatch). `target` is sender.events ∩
+    `refused` (contract_version mismatch, or the sender's SDK predates the
+    vocabulary route). `target` is sender.events ∩
     receiver.events in the sender's declared order; `held_back` is what the
     sender declares but the receiver does not (left out on purpose)."""
 
@@ -602,7 +603,10 @@ def refresh_direction(
     """Widen ONE already-paired direction sender→receiver to
     `vocabulary_target(sender, receiver)` (see the module docstring). Every
     active live outbound subscription the sender holds toward the receiver is
-    widened (normally exactly one). Reads only on `dry_run`."""
+    widened (normally exactly one). Reads only on `dry_run`. A direction is
+    REFUSED (status "refused", never raised) on a contract_version mismatch or
+    when the sender's SDK predates the vocabulary route, so the remaining
+    directions still refresh and the operator sees the whole picture."""
     label = f"{sender.source_id} -> {receiver.source_id}"
     direction = VocabularyDirection(
         participant=sender.name,
@@ -624,10 +628,18 @@ def refresh_direction(
     subs = live_outbound(client, sender, receiver)
     if not subs:
         direction.status = "unpaired"
-        report(
-            f"  {label}: no live outbound stream toward the receiver — not "
-            f"paired; run `snowline replicate pair` first (nothing to widen)"
-        )
+        strays = _active_live_outbound_elsewhere(client, sender, receiver)
+        if strays:
+            report(
+                f"  {label}: {len(strays)} active live stream(s) from the sender "
+                f"carry an unrecognised peer_source_id ({sorted(strays)}) — not "
+                f"widened; they were not opened by `snowline replicate pair`"
+            )
+        else:
+            report(
+                f"  {label}: no live outbound stream toward the receiver — not "
+                f"paired; run `snowline replicate pair` first (nothing to widen)"
+            )
         return direction
 
     for sub in subs:
@@ -644,11 +656,15 @@ def refresh_direction(
             json={"subscription_id": sub["id"], "event_types": direction.target},
         )
         if resp.status_code in (404, 405) and _is_unmounted(resp):
-            raise PairingError(
-                f"{sender.name} at {sender.admin_base} has no "
-                f"{VOCABULARY_ROUTE} route — its SDK predates refresh-vocabulary "
-                f"(pm#133); upgrade that side first, then re-run"
+            # Same shape as a contract_version mismatch: THIS direction is
+            # refused, the others still widen, the CLI exits non-zero.
+            direction.status = "refused"
+            report(
+                f"  {label}: REFUSE — {sender.name} at {sender.admin_base} has no "
+                f"{VOCABULARY_ROUTE} route; its SDK predates refresh-vocabulary "
+                f"(pm#133). Upgrade that side first, then re-run"
             )
+            return direction
         _raise_for_status(resp, f"POST {sender.admin_base}{VOCABULARY_ROUTE}")
         for e in resp.json().get("added", []):
             if e not in direction.added:
@@ -666,6 +682,26 @@ def refresh_direction(
             f"not declare them yet; upgrade it and re-run"
         )
     return direction
+
+
+def _active_live_outbound_elsewhere(client, sender, receiver) -> set[str]:
+    """The `peer_source_id`s (as strings; None → "null") of the sender's
+    ACTIVE live outbound streams that do NOT point at the receiver — the
+    programmatic `create_outbound_subscription` defaults `peer_source_id` to
+    None, and such a stream is invisible to `live_outbound` yet blocks a
+    re-`pair` (the receiver already holds an active inbound). Reported, never
+    widened."""
+    resp = client.get(f"{sender.admin_base}/outbound")
+    _raise_for_status(resp, f"GET {sender.admin_base}/outbound")
+    rows = resp.json()
+    return {
+        str(r.get("peer_source_id"))
+        for r in rows
+        if r.get("active")
+        and r.get("source_id") == sender.source_id
+        and not is_backfill_source(r["source_id"])
+        and r.get("peer_source_id") != receiver.source_id
+    }
 
 
 def _is_unmounted(resp) -> bool:

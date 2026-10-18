@@ -283,6 +283,9 @@ def test_widen_outbound_vocabulary_over_http(app_and_applied):
         app, "POST", path, json={"subscription_id": sub["id"], "event_types": [1]}
     ).status_code == 400
     assert _request(
+        app, "POST", path, json={"subscription_id": sub["id"], "event_types": [""]}
+    ).status_code == 400
+    assert _request(
         app, "POST", path,
         json={
             "subscription_id": "00000000-0000-0000-0000-000000000000",

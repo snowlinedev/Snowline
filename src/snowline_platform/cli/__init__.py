@@ -206,10 +206,10 @@ def _add_pair_addressing(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--local-instance",
         default=os.environ.get("SNOWLINE_INSTANCE_ID"),
-        help="this instance's SNOWLINE_INSTANCE_ID; defaults to the env",
+        help="this instance's SNOWLINE_INSTANCE_ID (e.g. 'roam'); defaults to the env",
     )
     p.add_argument("--peer-instance", required=True,
-                   help="the peer instance's SNOWLINE_INSTANCE_ID")
+                   help="the peer instance's SNOWLINE_INSTANCE_ID (e.g. 'primary')")
     p.add_argument(
         "--local-peer-url",
         default=os.environ.get("SNOWLINE_LOCAL_PEER_URL"),

@@ -260,15 +260,22 @@ When an upgrade adds one, do NOT re-seed (the never-queued writes cannot be
 replayed); widen the live streams instead, after BOTH sides run the new build:
 
 ```bash
-uv run snowline replicate refresh-vocabulary http://<primary-tailnet>:8848 \
-  --peer-instance primary --dry-run    # per-direction plan: added / already current
-uv run snowline replicate refresh-vocabulary http://<primary-tailnet>:8848 \
-  --peer-instance primary
+# Both instances UP, on the new build. From either box (here roam):
+uv run snowline replicate refresh-vocabulary http://mini.CHANGEME.ts.net:8850 \
+    --local-url http://127.0.0.1:8848 \
+    --local-peer-url http://roam.CHANGEME.ts.net:8848 \
+    --local-instance roam --peer-instance primary --dry-run   # plan: added / current
+uv run snowline replicate refresh-vocabulary http://mini.CHANGEME.ts.net:8850 \
+    --local-url http://127.0.0.1:8848 \
+    --local-peer-url http://roam.CHANGEME.ts.net:8848 \
+    --local-instance roam --peer-instance primary
 ```
 
 Each direction widens to what the sender emits AND the receiver declares; a type
 only one side knows is held back (re-run after upgrading the other side). The
 verb only widens, refuses a `contract_version` mismatch, and is safe to re-run.
+A sender whose SDK predates the route is reported as REFUSED for that direction
+(the others still widen; the verb exits 1) — upgrade it and re-run.
 Then `…/parked/reapply` any events the receiver parked during the skew window.
 
 ## 6c. Stood up EMPTY — the cold-start union merge (§7.1, #98)

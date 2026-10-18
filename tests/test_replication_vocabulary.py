@@ -7,7 +7,6 @@ and the CLI library are exercised together.
 
 from __future__ import annotations
 
-import pytest
 from fastapi import FastAPI
 from snowline_plugin_sdk.replication import emit as emit_mod
 from snowline_plugin_sdk.replication.models import (
@@ -215,9 +214,11 @@ def test_one_sided_participant_is_skipped():
     assert all(d.participant != "memory" for d in plan.directions)
 
 
-def test_sender_sdk_predating_the_route_raises_a_labeled_error():
+def test_sender_sdk_predating_the_route_is_a_refused_direction():
     """A sender whose SDK has no `/outbound/vocabulary` route answers the
-    framework 404 — surfaced as an upgrade-first PairingError, not a raw 404."""
+    framework 404 — reported as a REFUSED direction naming the upgrade-first
+    remedy (same shape as a contract_version mismatch: the other directions
+    still refresh, the CLI exits non-zero), never a raw 404 or an abort."""
     old = FastAPI()
     sub = {
         "id": "00000000-0000-0000-0000-000000000001",
@@ -249,5 +250,51 @@ def test_sender_sdk_predating_the_route_raises_a_labeled_error():
         events=(*V1, NEW),
         contract_version=2,
     )
-    with pytest.raises(pairing.PairingError, match="predates refresh-vocabulary"):
-        pairing.refresh_direction(client, sender, receiver)
+    lines: list[str] = []
+    direction = pairing.refresh_direction(client, sender, receiver, report=lines.append)
+    assert direction.status == "refused"
+    assert direction.added == []
+    assert any("predates refresh-vocabulary" in line for line in lines)
+
+
+def test_unpaired_with_a_stray_stream_names_the_unrecognised_peer():
+    """An active live outbound from the sender whose `peer_source_id` is NULL
+    (programmatic `create_outbound_subscription`) is not widened and is not
+    reported as "run pair" (pair would refuse — the receiver's inbound is
+    live); the report names the unrecognised peer instead."""
+    app = FastAPI()
+    stray = {
+        "id": "00000000-0000-0000-0000-000000000002",
+        "active": True,
+        "source_id": "roam.governance",
+        "peer_source_id": None,
+        "event_types": list(V1),
+        "target_url": "http://prim-gov/events/ingest",
+    }
+
+    @app.get("/replication-admin/outbound")
+    async def list_outbound() -> list[dict]:
+        return [stray]
+
+    client = RoutedClient({"roam-gov": app})
+    sender = pairing.Participant(
+        name="governance",
+        admin_base="http://roam-gov/replication-admin",
+        ingest_url="http://roam-gov/events/ingest",
+        source_id="roam.governance",
+        events=(*V1, NEW),
+        contract_version=2,
+    )
+    receiver = pairing.Participant(
+        name="governance",
+        admin_base="http://prim-gov/replication-admin",
+        ingest_url="http://prim-gov/events/ingest",
+        source_id="primary.governance",
+        events=(*V1, NEW),
+        contract_version=2,
+    )
+    lines: list[str] = []
+    direction = pairing.refresh_direction(client, sender, receiver, report=lines.append)
+    assert direction.status == "unpaired"
+    assert any("unrecognised peer_source_id" in line and "None" in line for line in lines)
+    assert not any("run `snowline replicate pair`" in line for line in lines)

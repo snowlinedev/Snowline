@@ -291,10 +291,11 @@ def build_replication_router(
         _require_trusted(request)
         subscription_id, event_types = _required(data, "subscription_id", "event_types")
         if not isinstance(event_types, list) or not all(
-            isinstance(t, str) for t in event_types
+            isinstance(t, str) and t.strip() for t in event_types
         ):
             raise HTTPException(
-                status_code=400, detail="event_types must be a list of event names"
+                status_code=400,
+                detail="event_types must be a list of non-empty event names",
             )
         with session_scope() as session:
             try:
