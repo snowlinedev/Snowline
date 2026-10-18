@@ -13,7 +13,8 @@ embedded as `health.standby` on `/health`:
 
     {"computed_at", "instance": <this instance id>,
      "hub": {"train": <running train>, "latest_cut": {version, source},
-             "autocut": {last_outcome, at, detail, last_cut} | None},
+             "autocut": {last_outcome, at, detail, last_cut,
+                         running, next_tick_at, host_enabled} | None},
      "thresholds": {"data_behind_after_s", "code_behind_max_trains"},
      "peers": [{
         "peer": "MBP", "platform_url", "reachable", "error",
@@ -269,6 +270,22 @@ def autocut_summary(report: dict | None) -> dict | None:
         "detail": report.get("detail"),
         "last_cut": last if isinstance(last, dict) else None,
     }
+
+
+def with_live_host(autocut: dict | None, host: object | None) -> dict | None:
+    """Merge the in-process auto-cut host's LIVE state (app.state.autocut_host,
+    release/autocut_host.py) into the report summary: `running` answers "is a
+    cut running right now?", which the on-disk report cannot (it is written
+    when a run ends). No host (a test app, an older platform) -> unchanged."""
+    to_dict = getattr(host, "to_dict", None)
+    if to_dict is None:
+        return autocut
+    live = to_dict()
+    merged = dict(autocut or {"last_outcome": None, "at": None, "detail": None, "last_cut": None})
+    merged["running"] = bool(live.get("running"))
+    merged["next_tick_at"] = live.get("next_tick_at")
+    merged["host_enabled"] = bool(live.get("enabled"))
+    return merged
 
 
 def _fmt(t: tuple[int, int, int]) -> str:
@@ -804,7 +821,10 @@ async def compute(
         block = await anyio.to_thread.run_sync(replication_health_from_scope, session_scope)
     hub_streams = local_streams(block, app.state.registry)
     own_reports = await anyio.to_thread.run_sync(read_reports, home)
-    autocut = autocut_summary(own_reports.get("autocut"))
+    autocut = with_live_host(
+        autocut_summary(own_reports.get("autocut")),
+        getattr(app.state, "autocut_host", None),
+    )
     running = platform_train()
     cut = hub_latest_cut(own_reports.get("autocut"), running=running)
     hub_instance = next((p["self"] for p in peers if p.get("self")), None) or instance_id()

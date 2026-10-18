@@ -41,6 +41,7 @@ from snowline_platform.gateway_app import (
     mount_gateway,
 )
 from snowline_platform.health import health_poll_loop
+from snowline_platform.release import autocut_host
 from starlette.routing import Mount, Route
 
 from snowline_platform.middleware import TrustMiddleware
@@ -173,23 +174,31 @@ async def _lifespan(app: FastAPI):
             # it's started at all — see below.
             poll_health = getattr(app.state, "poll_health", False)
             replicate = getattr(app.state, "replicate", False)
-            if poll_health or replicate:
-                async with anyio.create_task_group() as tg:
-                    if poll_health:
-                        tg.start_soon(
-                            partial(
-                                health_poll_loop,
-                                app.state.registry,
-                                interval=config.health_poll_interval(),
-                                timeout=config.health_poll_timeout(),
-                            )
+            # The in-process auto-cut host (item a25fa809) runs on EVERY
+            # platform: its switch is ~/.config/snowline/autocut.enabled,
+            # re-read each tick, not a flag here — a platform without the
+            # marker logs "idle" once and never cuts. Its state rides on
+            # app.state.autocut_host (GET /standby: "a cut is running").
+            # `autocut_host_options` is the test seam (fake run/clock).
+            host_state = autocut_host.HostState()
+            app.state.autocut_host = host_state
+            host_options = dict(getattr(app.state, "autocut_host_options", None) or {})
+            async with anyio.create_task_group() as tg:
+                if poll_health:
+                    tg.start_soon(
+                        partial(
+                            health_poll_loop,
+                            app.state.registry,
+                            interval=config.health_poll_interval(),
+                            timeout=config.health_poll_timeout(),
                         )
+                    )
+                if poll_health or replicate:
                     # Drains the platform's OWN scope.created/scope.updated
                     # outbox on a timer, same as any opted-in plugin (§3.1) —
                     # harmless with zero subscriptions (the common case
-                    # before pairing, #82, lands). Always started; `enabled`
-                    # is the SDK's own defer/gate seam (issue #91), so
-                    # `replicate=False` (the test-friendly default) makes
+                    # before pairing, #82, lands). `enabled` is the SDK's own
+                    # defer/gate seam (issue #91), so `replicate=False` makes
                     # this an immediate no-op instead of the platform
                     # hand-rolling the gate around whether to start it.
                     tg.start_soon(
@@ -197,15 +206,24 @@ async def _lifespan(app: FastAPI):
                             replication_delivery_loop, session_scope, enabled=replicate
                         )
                     )
-                    try:
-                        yield
-                    finally:
-                        # Cancel even if serving raised; the task group
-                        # absorbs its own-scope cancellation, so shutdown
-                        # stays clean.
-                        tg.cancel_scope.cancel()
-            else:
-                yield
+                tg.start_soon(
+                    partial(
+                        autocut_host.autocut_host_loop,
+                        app,
+                        state=host_state,
+                        **host_options,
+                    )
+                )
+                try:
+                    yield
+                finally:
+                    # Cancel even if serving raised; the task group absorbs
+                    # its own-scope cancellation, so shutdown stays clean.
+                    # A cut in flight is the one thing that does NOT stop at
+                    # once: the host waits for it (bounded, 10 min default)
+                    # rather than leave a train half-published — see
+                    # release/autocut_host.py and docs/ops/hub-daemons.md.
+                    tg.cancel_scope.cancel()
     finally:
         # The standby readiness refresh (#259) runs as a background task off
         # /health; cancel an in-flight one so shutdown doesn't leave it
