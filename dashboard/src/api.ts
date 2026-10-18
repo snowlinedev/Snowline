@@ -123,6 +123,54 @@ export const fetchMilestoneConflicts = (): Promise<number> =>
     .then((b) => b.milestones?.conflicts ?? 0)
     .catch(() => 0);
 
+/** The standby readiness block (`GET /standby`, issue #259): "can I fail
+ * over right now?" per paired peer. Mirrors src/snowline_platform/standby.py;
+ * only the fields the System panel renders are typed. */
+export type StandbyRollup = "READY" | "DEGRADED" | "UNKNOWN";
+
+export type StandbyStream = {
+  participant: string;
+  direction: "hub->peer" | "peer->hub";
+  pending: number | null;
+  oldest_pending_age_s: number | null;
+  last_success_at: string | null;
+  version_hold: number;
+  flag: "current" | "lagging" | "behind" | "unknown";
+};
+
+export type StandbyPeer = {
+  peer: string;
+  platform_url: string | null;
+  reachable: boolean;
+  error?: string | null;
+  code: {
+    peer_train: string | null;
+    hub_train: string | null;
+    behind_by_trains: number | null;
+    behind_by_minor: number | null;
+    flag: "current" | "behind" | "ahead" | "unknown";
+  };
+  data: { streams: StandbyStream[] };
+  sync: { last_outcome: string | null; at: string | null; version: string | null } | null;
+  front: { reachable?: boolean; upstream?: string | null; hub_healthy?: boolean | null; last_flip_at?: string | null } | null;
+  rollup: StandbyRollup;
+  reasons: string[];
+  notes?: string[];
+};
+
+export type Standby = {
+  computed_at?: string;
+  hub?: {
+    latest_cut?: { version: string | null } | null;
+    autocut?: { last_outcome: string | null; at: string | null } | null;
+  };
+  peers: StandbyPeer[];
+  rollup: StandbyRollup;
+  reasons: string[];
+};
+
+export const fetchStandby = () => get<Standby>("/standby");
+
 export const fetchPlugins = () =>
   get<{ plugins: PluginEntry[] }>("/plugins").then((b) => b.plugins);
 export const fetchSurfaces = () =>

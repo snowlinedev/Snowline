@@ -472,6 +472,25 @@ export const FIXTURES: Record<string, unknown> = {
     ],
   },
   "/health": { status: "ok", milestones: { conflicts: 0 } },
+  // The standby readiness block (#259) the System panel renders.
+  "/standby": {
+    rollup: "READY",
+    reasons: [],
+    hub: { latest_cut: { version: "v0.5.1" }, autocut: { last_outcome: "noop", at: null } },
+    peers: [
+      {
+        peer: "MBP",
+        platform_url: "http://mbp.tail:8850",
+        reachable: true,
+        code: { peer_train: "v0.5.1", hub_train: "v0.5.1", behind_by_trains: 0, behind_by_minor: 0, flag: "current" },
+        data: { streams: [] },
+        sync: { last_outcome: "ok", at: "2026-10-18T10:00:00Z", version: "v0.5.1" },
+        front: null,
+        rollup: "READY",
+        reasons: [],
+      },
+    ],
+  },
   "/scopes/tree": {
     tree: [
       {

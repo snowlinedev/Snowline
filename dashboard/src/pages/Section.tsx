@@ -20,6 +20,7 @@ import { usePlugins } from "../plugins-context";
 import { sectionNavEntries, type SectionDef } from "../registry";
 import { Layout } from "../shell/Layout";
 import { useData } from "../useData";
+import { StandbyCard } from "./Standby";
 
 function SectionTenants(props: { section: SectionDef; plugins: PluginEntry[] }) {
   const entries = sectionNavEntries(props.plugins, props.section);
@@ -40,6 +41,8 @@ function SystemHealth() {
   const surfaces = useData(fetchSurfaces, 30);
   return (
     <div className="grid">
+      {/* "Can I fail over right now?" (#259) — first, so it is the glance. */}
+      <StandbyCard />
       <LoadableCard title="Plugins up" loadable={plugins}>
         {(data) => (
           <Stat
