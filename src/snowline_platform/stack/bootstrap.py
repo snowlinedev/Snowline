@@ -46,6 +46,7 @@ from .sync import (
     PromptFn,
     Report,
     check_health,
+    check_stack_health,
     kickstart_service,
     read_current_train,
     read_stack_config,
@@ -416,7 +417,8 @@ def run_bootstrap_spoke(
         if dry_run:
             skipped("post-boot-health", "dry-run: nothing was booted")
         else:
-            health_ok = check_health(runner, health_url, sleep=health_sleep)
+            # the gateway AND the failover front's own /front/health (#260)
+            health_ok = check_stack_health(runner, health_url, sleep=health_sleep)
             steps.append(
                 m.BootstrapStep(name="post-boot-health", status="ok" if health_ok else "failed")
             )

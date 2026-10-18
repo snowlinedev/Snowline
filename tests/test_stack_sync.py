@@ -752,3 +752,110 @@ def test_fresh_install_health_failure_detail_never_claims_a_migration(tmp_path):
     assert rpt.outcome == "needs_attention"
     assert "no previous train" in (rpt.detail or "")
     assert "migration crossed" not in (rpt.detail or "").split("No migration crossed")[0]
+
+
+# -- the failover front (issue #260) -----------------------------------------
+
+
+def test_front_env_template_renders_the_hub_url_from_stack_json(tmp_path):
+    cfg = m.StackConfig(
+        role="spoke", instance_id="roam", primary_tailnet_address="mini.ts.net",
+        primary_gateway_url="http://100.81.176.75:8850",
+    )
+    variables = s.env_variables(cfg, dashboard_dist="/d")
+    result = s.apply_env_file(tmp_path, m.FRONT_SERVICE, variables=variables, dry_run=False)
+    assert result.action == "written"
+    exports = m.parse_env_exports(result.path.read_text())
+    assert exports["SNOWLINE_FRONT_HUB_URL"] == "http://100.81.176.75:8850"
+    assert exports["SNOWLINE_FRONT_SPOKE_URL"] == "http://127.0.0.1:8848"
+    assert "SNOWLINE_FRONT_FORCE_UPSTREAM" not in exports  # documented, commented out
+    assert "gui/$(id -u)/dev.snowline.front" in result.path.read_text()
+
+
+def test_run_sync_installs_and_kickstarts_the_front_and_health_checks_it(tmp_path):
+    home = tmp_path / "home"
+    _stack_config(home)
+    _seed_train_assets(home)
+    runner = FakeRunner(_full_fake_handler)
+
+    report = s.run_sync(home=home, train="v0.1.0", runner=runner, health_sleep=lambda _s: None, report=lambda _: None)
+
+    assert report.outcome == "ok"
+    assert report.front_kickstarted is True
+    assert len(report.services) == 4  # the front is not a service entry
+    plist = m.plist_path(home, m.FRONT_SERVICE)
+    assert plist.exists()
+    assert "venvs/platform/current/bin/uvicorn" in plist.read_text()
+    env = m.parse_env_exports(m.env_file_path(home, m.FRONT_SERVICE).read_text())
+    assert env["SNOWLINE_FRONT_HUB_URL"] == "http://mini.ts.net:8850"  # default, no gateway url yet
+    kicks = [a[-1] for a in runner.ran("launchctl", "kickstart")]
+    assert kicks[-1].endswith("/dev.snowline.front")  # after the services it runs from
+    curls = [a[-1] for a in runner.reads if a[:1] == ("curl",)]
+    assert s.FRONT_HEALTH_URL in curls
+    assert s.DEFAULT_HEALTH_URL in curls
+
+
+def test_run_sync_front_unhealthy_fails_the_health_check_and_reverts(tmp_path):
+    home = tmp_path / "home"
+    _stack_config(home)
+    _seed_train_assets(home)
+    first = s.run_sync(home=home, train="v0.1.0", runner=FakeRunner(_full_fake_handler),
+                       health_sleep=lambda _s: None, report=lambda _: None)
+    assert first.outcome == "ok"
+
+    v2 = json.loads(json.dumps(TRAIN_V1).replace("v0.1.0", "v0.2.0"))
+    manifest_dir = m.app_support_dir(home) / "downloads" / "v0.2.0" / "_manifest"
+    manifest_dir.mkdir(parents=True)
+    (manifest_dir / "train.json").write_text(json.dumps(v2))
+
+    def dead_front(argv, cwd):
+        if argv and argv[0] == "curl" and argv[-1] == s.FRONT_HEALTH_URL:
+            return CommandError(argv, 7, "connection refused")
+        return _full_fake_handler(argv, cwd)
+
+    runner2 = FakeRunner(dead_front)
+    second = s.run_sync(home=home, train="v0.2.0", runner=runner2, health_sleep=lambda _s: None, report=lambda _: None)
+    assert second.health_ok is False
+    assert second.outcome == "reverted"
+    # the front followed the platform venv back
+    kicks = [a[-1] for a in runner2.ran("launchctl", "kickstart")]
+    assert sum(k.endswith("/dev.snowline.front") for k in kicks) == 2
+
+
+def test_run_sync_noop_touches_nothing_but_still_checks_the_front(tmp_path):
+    home = tmp_path / "home"
+    _stack_config(home)
+    _seed_train_assets(home)
+    s.run_sync(home=home, train="v0.1.0", runner=FakeRunner(_full_fake_handler),
+               health_sleep=lambda _s: None, report=lambda _: None)
+
+    def dead_front(argv, cwd):
+        if argv and argv[0] == "curl" and argv[-1] == s.FRONT_HEALTH_URL:
+            return CommandError(argv, 7, "connection refused")
+        return _full_fake_handler(argv, cwd)
+
+    runner = FakeRunner(dead_front)
+    rpt = s.run_sync(home=home, train="v0.1.0", runner=runner, health_sleep=lambda _s: None, report=lambda _: None)
+    assert rpt.noop is True
+    assert rpt.outcome == "needs_attention"
+    assert runner.runs == []
+    assert rpt.front_kickstarted is None
+
+
+def test_run_sync_refuses_the_hub_role_before_rendering_the_front(tmp_path):
+    """The hub never gets a front: sync is spoke-only (decision 54447516), and
+    the refusal lands before any plist is written."""
+    home = tmp_path / "home"
+    _stack_config(home)
+    rpt = s.run_sync(home=home, role="primary", runner=FakeRunner(_full_fake_handler),
+                     health_sleep=lambda _s: None, report=lambda _: None)
+    assert rpt.outcome == "failed"
+    assert not m.plist_path(home, m.FRONT_SERVICE).exists()
+    assert not m.env_file_path(home, m.FRONT_SERVICE).exists()
+
+
+def test_apply_front_plist_is_idempotent(tmp_path):
+    assert s.apply_front_plist(tmp_path, dry_run=True) is True
+    assert not m.plist_path(tmp_path, m.FRONT_SERVICE).exists()
+    assert s.apply_front_plist(tmp_path, dry_run=False) is True
+    assert s.apply_front_plist(tmp_path, dry_run=False) is False

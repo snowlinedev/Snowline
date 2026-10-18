@@ -87,6 +87,28 @@ SERVICE_ASGI_APP: Mapping[str, str] = {
 
 DB_NAME: Mapping[str, str] = {svc: f"snowline_{svc}" for svc in SERVICE_PACKAGE}
 
+# The spoke's loopback failover front (issue #260, `snowline_platform.front`).
+# Deliberately NOT in SERVICE_PORTS: SERVICE_ORDER (and with it the venv
+# builds, the seed participants, the DBs, the env-posture guards) derives from
+# that map, and the front is none of those things — no wheel of its own (it
+# runs from the PLATFORM's venv), no database, no replication stream, never
+# registers with the platform. It is a stack-managed launchd unit beside the
+# services: its plist is rendered by the same renderer, `stack sync` installs
+# and kickstarts it, and the post-boot health checks probe its own
+# `/front/health`. It takes the hub gateway's port (8850) on loopback so the
+# MBP's Claude Code MCP entry reads the same path as the hub's. Spoke-only by
+# construction: `stack sync` refuses anything but role=spoke (decision
+# 54447516), so the hub never renders or loads it.
+FRONT_SERVICE = "front"
+FRONT_PORT = 8850
+FRONT_VENV_SERVICE = "platform"
+FRONT_ASGI_FACTORY = "snowline_platform.front:create_app"
+FRONT_HEALTH_PATH = "/front/health"
+
+
+def front_health_url(port: int = FRONT_PORT) -> str:
+    return f"http://127.0.0.1:{port}{FRONT_HEALTH_PATH}"
+
 KEEP_TRAINS = 2
 
 
@@ -541,22 +563,56 @@ def render_plist(
     world-readable location (`launchctl print` included), and forced a
     shell-semantics reimplementation in `parse_env_exports`. Sourcing keeps
     the env file the single, live source of truth."""
-    label = plist_label(service)
     app_target = SERVICE_ASGI_APP.get(service)
     if app_target is None:
         raise StackError(f"no ASGI target for service {service!r}")
-    uvicorn_bin = venv_current / "bin" / "uvicorn"
-    out_log = logs / f"snowline-{service}.out.log"
-    err_log = logs / f"snowline-{service}.err.log"
+    return _render_uvicorn_plist(
+        unit=service,
+        uvicorn_bin=venv_current / "bin" / "uvicorn",
+        app_args=_sh_quote(app_target),
+        port=port,
+        env_file=env_file,
+        logs=logs,
+    )
+
+
+def render_front_plist(
+    *,
+    platform_venv_current: Path,
+    port: int = FRONT_PORT,
+    env_file: Path,
+    logs: Path,
+) -> str:
+    """The failover front's plist (issue #260) — the SAME renderer and posture
+    as every service (env file sourced at exec time, loopback `--host`,
+    KeepAlive), exec'ing the PLATFORM venv's uvicorn with the front's app
+    factory. It follows the platform's `current` symlink, so a platform train
+    swap is a front upgrade too (sync kickstarts it alongside)."""
+    return _render_uvicorn_plist(
+        unit=FRONT_SERVICE,
+        uvicorn_bin=platform_venv_current / "bin" / "uvicorn",
+        app_args=f"--factory {_sh_quote(FRONT_ASGI_FACTORY)}",
+        port=port,
+        env_file=env_file,
+        logs=logs,
+    )
+
+
+def _render_uvicorn_plist(
+    *, unit: str, uvicorn_bin: Path, app_args: str, port: int, env_file: Path, logs: Path
+) -> str:
+    label = plist_label(unit)
+    out_log = logs / f"snowline-{unit}.out.log"
+    err_log = logs / f"snowline-{unit}.err.log"
     launch = (
         f"set -a; . {_sh_quote(str(env_file))}; set +a; "
-        f"exec {_sh_quote(str(uvicorn_bin))} {_sh_quote(app_target)} "
+        f"exec {_sh_quote(str(uvicorn_bin))} {app_args} "
         f"--host 127.0.0.1 --port {port}"
     )
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  launchd agent for the packaged spoke's {service} (macOS distribution spec
+  launchd agent for the packaged spoke's {unit} (macOS distribution spec
   §5 step 4). Rendered by `snowline stack sync` from a packaged template —
   regenerated every run, never hand-edited (contrast the *.env files, which
   sync never clobbers and which this plist SOURCES at exec time, so operator
@@ -642,6 +698,9 @@ class RunReport:
     outcome: str
     detail: str | None = None
     env_drift: tuple[str, ...] = field(default_factory=tuple)
+    # The failover front (issue #260): None = not attempted (no-op/dry-run,
+    # or nothing it depends on changed); True/False = kickstart result.
+    front_kickstarted: bool | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -657,6 +716,7 @@ class RunReport:
             "detail": self.detail,
             "health_ok": self.health_ok,
             "env_drift": list(self.env_drift),
+            "front_kickstarted": self.front_kickstarted,
             "services": [
                 {
                     "service": s.service,
@@ -762,6 +822,13 @@ PARTICIPANT_INGEST_PATH: Mapping[str, str] = {
 
 def default_primary_gateway_url(primary_tailnet_address: str) -> str:
     return f"http://{primary_tailnet_address}:{DEFAULT_PRIMARY_GATEWAY_PORT}"
+
+
+def front_hub_url(cfg: StackConfig) -> str:
+    """The hub gateway the failover front forwards to while it is healthy:
+    stack.json's `primary_gateway_url` when bootstrap-spoke recorded one,
+    else the same default bootstrap-spoke would have prompted with."""
+    return cfg.primary_gateway_url or default_primary_gateway_url(cfg.primary_tailnet_address)
 
 
 def check_bootstrap_stack_config(cfg: StackConfig | None) -> StackConfig:

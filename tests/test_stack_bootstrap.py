@@ -597,3 +597,34 @@ def test_second_bootstrap_rerun_reverse_pairs_again_without_failing(tmp_path):
         report = b.run_bootstrap_spoke(home=home, runner=runner, prompt=_no_prompt, health_sleep=_noop_sleep)
         assert report.outcome == "ok", report.detail
         assert _reverse_argv(home) in runner.runs
+
+
+# -- the failover front (issue #260) -----------------------------------------
+
+
+def test_post_boot_health_also_probes_the_failover_front(tmp_path):
+    home = _fully_bootstrapped_home(tmp_path)
+    runner = FakeRunner(_health_ok_handler)
+    report = b.run_bootstrap_spoke(home=home, runner=runner, prompt=_no_prompt, health_sleep=_noop_sleep)
+    assert report.outcome == "ok", report.detail
+    curls = [a[-1] for a in runner.reads if a[:1] == ("curl",)]
+    assert s.FRONT_HEALTH_URL in curls
+    # bootstrap does not kickstart the front — sync owns it
+    kicked = [a[-1] for a in runner.runs if a[:2] == ("launchctl", "kickstart")]
+    assert not any(k.endswith("/dev.snowline.front") for k in kicked)
+
+
+def test_post_boot_health_fails_when_the_front_is_down(tmp_path):
+    home = _fully_bootstrapped_home(tmp_path)
+
+    def dead_front(argv, cwd):
+        if argv[:1] == ["curl"] and argv[-1] == s.FRONT_HEALTH_URL:
+            return CommandError(argv, 7, "connection refused")
+        return _health_ok_handler(argv, cwd)
+
+    report = b.run_bootstrap_spoke(
+        home=home, runner=FakeRunner(dead_front), prompt=_no_prompt, health_sleep=_noop_sleep
+    )
+    assert report.outcome == "failed"
+    step = next(st for st in report.steps if st.name == "post-boot-health")
+    assert step.status == "failed"
