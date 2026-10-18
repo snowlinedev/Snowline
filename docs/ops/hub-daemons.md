@@ -169,6 +169,14 @@ passes `--force`.
   and whose outcome or detail differs from the previous run. A hub that stays
   gated ("behind origin/main") until someone deploys therefore leaves one
   entry, not one per hour.
+- Readiness: the hub platform reads this report from disk to fill the
+  `hub.autocut` and `hub.latest_cut` fields of `GET /standby` / `health.standby`
+  and the dashboard's Standby panel (#259). `latest_cut` is the newest of
+  `release/train.json` and a published `last_cut`, and is what the spoke's
+  running train gets compared against. Any peer can also read the report,
+  redacted, at `GET /stack/report`. If the platform runs as a different
+  account from the autocut, point `SNOWLINE_STANDBY_HOME` at the home that
+  owns the report.
 - Log: `~/Library/Logs/snowline-autocut.log`.
 - Exit codes: 0 noop/ok/locked, 2 gated, 1 failed or published_unrecorded.
 
