@@ -22,6 +22,7 @@ All three are thin argparse shells over pure libraries — `replication_pairing`
 from __future__ import annotations
 
 import argparse
+import functools
 import os
 import sys
 from pathlib import Path
@@ -269,12 +270,55 @@ def _build_release(p: argparse.ArgumentParser) -> None:
         "--dry-run", action="store_true",
         help="preflight + plan + milestone-gate verdict only; builds, tags, releases and databases are untouched",
     )
+    cut.add_argument(
+        "--commit-manifest", action="store_true",
+        help="after a successful publish, commit release/train.json (only that "
+        "path) on main and push it — the train record (#258)",
+    )
     _add_release_common(cut)
     cut.add_argument(
         "--out", default=None,
         help="build directory (default: <platform checkout>/.release-build/<version>)",
     )
     cut.set_defaults(handler=_cmd_release_cut)
+
+    autocut = rsub.add_parser(
+        "autocut",
+        help="unattended: cut the next PATCH train when main moved since the last cut",
+        description=(
+            "The hub's hourly timer (#258, ops/hub/launchdaemons/"
+            "dev.snowline.autocut.plist). Compares every component's origin/main "
+            "with the sha release/train.json recorded; exits 0 when nothing "
+            "moved. Otherwise gates on every checkout being clean and AT "
+            "origin/main, gh auth, the hub /health + every train service "
+            "registered on /plugins, and the milestone gate answering ok — any "
+            "failure exits 2 with nothing cut. Then cuts the next PATCH of the "
+            "recorded train in-process and commits + pushes release/train.json. "
+            "Never prompts; a lock makes overlapping fires a no-op; every run "
+            "writes ~/Library/Application Support/Snowline/autocut-report.json. "
+            "Exit: 0 noop/ok/locked, 2 gated, 1 failed."
+        ),
+    )
+    autocut.add_argument(
+        "--dry-run", action="store_true",
+        help="decide + gate + plan only; nothing is built, tagged, committed, or reported",
+    )
+    autocut.add_argument(
+        "--no-commit-manifest", dest="commit_manifest", action="store_false",
+        help="leave release/train.json uncommitted after the cut (default: commit + push it)",
+    )
+    autocut.add_argument(
+        "--strict-health", action="store_true",
+        help="require every train service `up` on /plugins (default also "
+        "accepts self-reported `degraded`, e.g. replication to an offline standby)",
+    )
+    autocut.add_argument(
+        "--platform-url", default=os.environ.get("SNOWLINE_PLATFORM_URL"),
+        help="the hub gateway for the health + milestone gates (default: "
+        "$SNOWLINE_PLATFORM_URL; refuses when neither is set)",
+    )
+    _add_release_common(autocut)
+    autocut.set_defaults(handler=_cmd_release_autocut)
 
     status = rsub.add_parser(
         "status",
@@ -490,8 +534,42 @@ def _cmd_release_cut(args) -> int:
         skip_smoke=args.skip_smoke,
         report=print,
         force=args.force,
+        commit_manifest=args.commit_manifest,
     )
     return 0
+
+
+def _cmd_release_autocut(args) -> int:
+    from snowline_platform.release import autocut as autocut_lib
+    from snowline_platform.release import runner as release_runner
+
+    config, checkouts = _release_context(args)
+    if args.platform_url:
+        # The milestone gate reaches pm through config.platform_self_url(),
+        # which reads this env — without it the gate asks the loopback default
+        # and SKIPS (which autocut then refuses).
+        os.environ["SNOWLINE_PLATFORM_URL"] = args.platform_url
+    # flush=True on every report line: stdout and stderr share one launchd
+    # log file, and a block-buffered stdout would land the run's lines AFTER
+    # its final stderr error line.
+    report = functools.partial(print, flush=True)
+    runner = release_runner.Runner(report=report, dry_run=args.dry_run, verbose=args.verbose)
+    rpt = autocut_lib.run_autocut(
+        config,
+        checkouts=checkouts,
+        home=Path.home(),
+        runner=runner,
+        platform_url=args.platform_url,
+        dry_run=args.dry_run,
+        commit_manifest=args.commit_manifest,
+        strict_health=args.strict_health,
+        report=report,
+    )
+    code = autocut_lib.exit_code(rpt.outcome)
+    if code != 0:
+        sys.stdout.flush()
+        print(f"error: autocut {rpt.outcome}: {rpt.detail}", file=sys.stderr, flush=True)
+    return code
 
 
 def _cmd_release_status(args) -> int:

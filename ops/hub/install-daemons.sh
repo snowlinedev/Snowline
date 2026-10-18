@@ -1,19 +1,57 @@
 #!/bin/sh
 # Move the hub's four services from per-user LaunchAgents to system
 # LaunchDaemons so they start at boot without a login (#239 / 239ec238).
-# Idempotent. Run:  sudo ops/hub/install-daemons.sh
+# Idempotent. Run:  sudo ops/hub/install-daemons.sh [--wait]
+# Refuses (exit 75) while an autocut is running; --wait waits up to 15 min.
 # Rollback:        sudo ops/hub/uninstall-daemons.sh
 # See docs/ops/hub-daemons.md.
 
 [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
 
 SERVICES="platform pm governance memory"
+# Interval timers (#258): installed + bootstrapped, never kickstarted — a
+# kickstart would fire an immediate run (for autocut, a ~6-minute cut).
+TIMERS="autocut"
 OWNER_UID=501
 OWNER_HOME=/Users/seanlynch
 SRC="$(cd "$(dirname "$0")" && pwd)/launchdaemons"
 DEST=/Library/LaunchDaemons
 AGENTS="$OWNER_HOME/Library/LaunchAgents"
 STAMP="$(date +%Y%m%d)"
+
+# --- autocut in-flight guard (#258) ---
+# `launchctl bootout system/dev.snowline.autocut` SIGTERMs a running cut (~6
+# min, hourly). The cut holds a flock on AUTOCUT_LOCK for its whole run, so
+# test it first and refuse while it is held. `--wait` polls up to 15 min
+# instead. (A fire that starts between this check and the bootout is not
+# covered; the window is a few seconds.)
+AUTOCUT_LOCK="$OWNER_HOME/Library/Application Support/Snowline/autocut.lock"
+AUTOCUT_LOG="$OWNER_HOME/Library/Logs/snowline-autocut.log"
+autocut_lock_held() {
+  [ -e "$AUTOCUT_LOCK" ] || return 1
+  /usr/bin/python3 -c 'import fcntl, os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(0)
+sys.exit(1)' "$AUTOCUT_LOCK"
+}
+autocut_guard() {
+  waited=0
+  while autocut_lock_held; do
+    if [ "${1:-}" != "--wait" ] || [ "$waited" -ge 900 ]; then
+      echo "refusing: an autocut is running (lock held: $AUTOCUT_LOCK)." >&2
+      echo "  booting the timer out now would kill the cut mid-publish." >&2
+      echo "  follow it in $AUTOCUT_LOG, then re-run (or pass --wait)." >&2
+      exit 75
+    fi
+    echo "   autocut running (lock held); waiting (${waited}s)"
+    sleep 15
+    waited=$((waited + 15))
+  done
+}
+autocut_guard "$@"
 
 for svc in $SERVICES; do
   label="dev.snowline.$svc"
@@ -32,6 +70,16 @@ for svc in $SERVICES; do
   chmod 644 "$DEST/$label.plist"
   launchctl bootstrap system "$DEST/$label.plist"
   launchctl kickstart -k "system/$label"
+done
+
+for timer in $TIMERS; do
+  label="dev.snowline.$timer"
+  echo "== $label (timer; not kickstarted)"
+  launchctl bootout "system/$label" 2>/dev/null || true
+  cp "$SRC/$label.plist" "$DEST/$label.plist"
+  chown root:wheel "$DEST/$label.plist"
+  chmod 644 "$DEST/$label.plist"
+  launchctl bootstrap system "$DEST/$label.plist"
 done
 
 echo "== waiting up to 60s for /health"
