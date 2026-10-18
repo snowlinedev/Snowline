@@ -561,7 +561,7 @@ def test_run_reverse_pair_refuses_version_mismatch(tmp_path):
 # --- #228: resumable, per-participant reverse-pair ---------------------------
 
 
-def _reverse_pair_world(tmp_path, *, spoke_plugins=("governance", "pm")):
+def _reverse_pair_world(tmp_path, *, spoke_plugins=("governance", "pm"), spoke_versions=None):
     """Two participants (governance, pm), each a primary + spoke app; the
     spoke platform's `/plugins` lists only `spoke_plugins` (mutable, to
     simulate a late registration)."""
@@ -584,15 +584,18 @@ def _reverse_pair_world(tmp_path, *, spoke_plugins=("governance", "pm")):
         )
 
     entries = {
-        n: plugin_entry(n, f"http://roam-{n}", events=[f"{n}.recorded"])
+        n: plugin_entry(n, f"http://roam-{n}", events=[f"{n}.recorded"],
+                        contract_version=(spoke_versions or {}).get(n, 2))
         for n in ("governance", "pm")
     }
     listed = [entries[n] for n in spoke_plugins]
     apps = {
         "prim-governance": make_participant(),
         "prim-pm": make_participant(),
-        "roam-governance": make_participant(),
-        "roam-pm": make_participant(),
+        # The spoke apps sit on the SAME file DB the SeedParticipant names, so
+        # the heal's direct outbox read sees what the spoke's admin surface does.
+        "roam-governance": make_participant(db_url=f"sqlite:///{tmp_path}/governance-spoke.db"),
+        "roam-pm": make_participant(db_url=f"sqlite:///{tmp_path}/pm-spoke.db"),
     }
     roam_platform = make_platform(plugins=listed)
     client = RoutedClient({"roam-platform": roam_platform.app,
@@ -691,6 +694,126 @@ def test_reverse_pair_heals_a_half_pair_left_by_a_reseeded_spoke(tmp_path):
     assert new.epoch != old.epoch
     (out,) = _active_live_outbound(apps["roam-governance"], "roam.governance")
     assert out.epoch == new.epoch
+
+
+def _drop_primary_inbound(client, name):
+    """Retire the primary's inbound from the spoke — the 'primary inbound
+    missing' half-pair shape (spoke outbound still active)."""
+    base = f"http://prim-{name}/replication-admin"
+    for st in client.get(f"{base}/inbound").json():
+        if st["source_id"] == f"roam.{name}" and st["active"]:
+            r = client.post(f"{base}/inbound/retire",
+                            json={"source_id": st["source_id"], "epoch": st["epoch"]})
+            assert r.status_code < 400
+
+
+def test_heal_refuses_to_strand_undelivered_spoke_writes(tmp_path):
+    """Review must-fix: spoke outbound active, primary inbound gone, ONE
+    pending spoke-authored row. Retiring the outbound would strand it for
+    good (retired streams neither drain nor requeue), so the heal refuses —
+    nothing retired — unless --force."""
+    cfg, apps, _listed, _entries, client = _reverse_pair_world(tmp_path)
+    seed.run_reverse_pair(client, cfg, participants=["governance"], report=lambda _m: None)
+    _emit(apps["roam-governance"], "roam.governance", 1, "governance.recorded")
+    _drop_primary_inbound(client, "governance")
+    (old_sub,) = _active_live_outbound(apps["roam-governance"], "roam.governance")
+
+    with pytest.raises(seed.SeedError) as exc:
+        seed.run_reverse_pair(client, cfg, participants=["governance"], report=lambda _m: None)
+    msg = str(exc.value)
+    assert "1 pending + 0 rejected" in msg and str(old_sub.id) in msg and "--force" in msg
+    # nothing retired, nothing opened.
+    (still,) = _active_live_outbound(apps["roam-governance"], "roam.governance")
+    assert still.id == old_sub.id
+    assert _active_inbound(apps["prim-governance"], "roam.governance") == []
+
+    lines: list[str] = []
+    streams = seed.run_reverse_pair(
+        client, cfg, participants=["governance"], force=True, report=lines.append
+    )
+    assert [st["participant"] for st in streams] == ["governance"]
+    assert any("--force" in ln and "DESPITE 1 pending" in ln for ln in lines)
+    (new_sub,) = _active_live_outbound(apps["roam-governance"], "roam.governance")
+    assert new_sub.id != old_sub.id
+    assert len(_active_inbound(apps["prim-governance"], "roam.governance")) == 1
+
+
+def test_heal_proceeds_when_the_orphan_outbound_is_fully_delivered(tmp_path):
+    """No undelivered rows under the orphan → no --force needed."""
+    cfg, apps, _listed, _entries, client = _reverse_pair_world(tmp_path)
+    seed.run_reverse_pair(client, cfg, participants=["governance"], report=lambda _m: None)
+    _drop_primary_inbound(client, "governance")
+    (old_sub,) = _active_live_outbound(apps["roam-governance"], "roam.governance")
+    seed.run_reverse_pair(client, cfg, participants=["governance"], report=lambda _m: None)
+    (new_sub,) = _active_live_outbound(apps["roam-governance"], "roam.governance")
+    assert new_sub.id != old_sub.id
+
+
+class _FailingRetireClient:
+    """Delegates to a RoutedClient but answers 500 to one retire route."""
+
+    def __init__(self, inner, fail_suffix):
+        self.inner, self.fail_suffix = inner, fail_suffix
+
+    def get(self, url, **kw):
+        return self.inner.get(url, **kw)
+
+    def post(self, url, **kw):
+        if url.endswith(self.fail_suffix):
+            import httpx
+            return httpx.Response(500, json={"detail": "boom"})
+        return self.inner.post(url, **kw)
+
+
+def test_heal_surfaces_a_failed_spoke_outbound_retire(tmp_path):
+    cfg, apps, _listed, _entries, client = _reverse_pair_world(tmp_path)
+    seed.run_reverse_pair(client, cfg, participants=["governance"], report=lambda _m: None)
+    _drop_primary_inbound(client, "governance")
+    failing = _FailingRetireClient(client, "/outbound/retire")
+    with pytest.raises(seed.SeedError, match=r"retiring orphaned spoke outbound .* HTTP 500"):
+        seed.run_reverse_pair(failing, cfg, participants=["governance"], report=lambda _m: None)
+    # no second stream was opened alongside the un-retired orphan.
+    assert len(_active_live_outbound(apps["roam-governance"], "roam.governance")) == 1
+    assert _active_inbound(apps["prim-governance"], "roam.governance") == []
+
+
+def test_heal_surfaces_a_failed_primary_inbound_retire(tmp_path):
+    cfg, apps, _listed, _entries, client = _reverse_pair_world(tmp_path)
+    seed.run_reverse_pair(client, cfg, participants=["governance"], report=lambda _m: None)
+    with apps["roam-governance"].scope() as s:  # re-seed scrub: spoke half gone
+        for sub in s.scalars(select(ReplicationSubscription)).all():
+            s.delete(sub)
+    failing = _FailingRetireClient(client, "/inbound/retire")
+    with pytest.raises(seed.SeedError, match=r"retiring the primary inbound .* HTTP 500"):
+        seed.run_reverse_pair(failing, cfg, participants=["governance"], report=lambda _m: None)
+
+
+def test_heal_refuses_version_mismatch_before_destroying_the_half_pair(tmp_path):
+    cfg, apps, _listed, _entries, client = _reverse_pair_world(
+        tmp_path, spoke_versions={"governance": 3}
+    )
+    # A primary-side inbound half from the spoke (an interrupted handshake).
+    r = client.post("http://prim-governance/replication-admin/inbound",
+                    json={"source_id": "roam.governance", "epoch": "e-half"})
+    assert r.status_code < 400
+    with pytest.raises(seed.SeedError, match="contract_version mismatch"):
+        seed.run_reverse_pair(client, cfg, participants=["governance"], report=lambda _m: None)
+    (half,) = _active_inbound(apps["prim-governance"], "roam.governance")
+    assert half.epoch == "e-half"  # refused WITHOUT retiring it
+
+
+def test_version_mismatch_on_one_participant_still_pairs_the_others(tmp_path):
+    cfg, apps, _listed, _entries, client = _reverse_pair_world(
+        tmp_path, spoke_versions={"governance": 3}
+    )
+    with pytest.raises(seed.SeedError) as exc:
+        seed.run_reverse_pair(client, cfg, report=lambda _m: None)
+    assert "contract_version mismatch" in str(exc.value) and "'governance'" in str(exc.value)
+    assert "'pm':" not in str(exc.value)
+    assert len(_active_inbound(apps["prim-pm"], "roam.pm")) == 1
+    assert len(_active_live_outbound(apps["roam-pm"], "roam.pm")) == 1
+    assert _active_inbound(apps["prim-governance"], "roam.governance") == []
+    assert _active_live_outbound(apps["roam-governance"], "roam.governance") == []
 
 
 def test_select_participants_none_is_everything(tmp_path):

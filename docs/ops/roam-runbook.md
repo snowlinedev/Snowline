@@ -467,8 +467,14 @@ command for why it is a parallel report rather than a reuse of `sync`'s
   attempts every participant, pairs what it can, and only then fails naming
   every participant it could not pair. It is idempotent: a participant whose
   spoke→primary stream is already live on both halves is reported "already
-  paired" and skipped (a half-pair — primary inbound with no matching spoke
-  outbound, e.g. after a plain re-seed — is retired and re-paired). So fix the
+  paired" and skipped. A half-pair (primary inbound with no matching spoke
+  outbound, e.g. after a plain re-seed, or a spoke outbound with no matching
+  primary inbound) is retired and re-paired — EXCEPT that it refuses to
+  retire a spoke outbound still holding undelivered (pending/rejected) outbox
+  rows, since a retired stream never delivers or requeues them: let the
+  outbox drain or resolve the spoke's `/rejected` rows first, or pass
+  `--force` to retire anyway and accept losing those writes (bootstrap-spoke
+  never passes `--force`). So fix the
   named plugin (its err.log), kickstart it, and re-run
   `snowline replicate seed --config ~/.config/snowline/seed.json --reverse-pair`,
   or restrict it with `--participants pm` (comma-separated). Re-running

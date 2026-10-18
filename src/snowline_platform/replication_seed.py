@@ -55,11 +55,13 @@ import os
 import secrets
 import subprocess
 import tempfile
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from sqlalchemy import create_engine, delete, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from snowline_platform.replication import via_base
@@ -71,6 +73,7 @@ from snowline_platform.replication_pairing import (
     handshake_direction,
     live_outbound,
     mint_epoch,
+    refuse_on_version_mismatch,
 )
 from snowline_plugin_sdk.replication.envelope import sign_body
 from snowline_plugin_sdk.replication.models import (
@@ -492,7 +495,12 @@ def select_participants(cfg: SeedConfig, names: list[str] | None) -> SeedConfig:
 
 
 def _reverse_already_paired(
-    client, sp: SeedParticipant, spoke_p: Participant, *, report: Report
+    client,
+    sp: SeedParticipant,
+    spoke_p: Participant,
+    *,
+    force: bool = False,
+    report: Report,
 ) -> bool:
     """Is the spoke→primary stream for `sp` already live?
 
@@ -510,8 +518,22 @@ def _reverse_already_paired(
     primary-only check would report "already paired" and the spoke's writes
     would never flow back. A half-pair (primary inbound without a matching
     spoke outbound, or vice versa — also what a handshake that died between
-    its two steps leaves) can receive/deliver nothing, so it is retired on
-    both sides and the direction re-paired fresh. Returns True iff paired."""
+    its two steps leaves) is retired on both sides and the direction
+    re-paired fresh — with two guards, both checked BEFORE anything is
+    retired:
+
+    - contract_version (§10): a mismatched participant is refused without
+      first destroying its half-pair;
+    - UNDELIVERED SPOKE WRITES: retiring a spoke outbound strands its
+      pending/rejected outbox rows for good (delivery drains only ACTIVE
+      subscriptions, a retired stream's rows can't be requeued, and the
+      fresh-epoch stream starts with an empty outbox). So if any outbound
+      about to be retired still holds undelivered rows, refuse unless
+      `force` — today that state is a LOUD wedge (rejected rows, degraded
+      /health); a silent heal would turn it into silent loss.
+
+    Any failed retire is raised (never ignored: an un-retired orphan keeps
+    delivering under a dead epoch). Returns True iff already paired."""
     resp = client.get(f"{sp.primary.admin_base}/inbound")
     if resp.status_code >= 400:
         raise SeedError(
@@ -526,6 +548,35 @@ def _reverse_already_paired(
     outbound = live_outbound(client, spoke_p, sp.primary)
     if inbound_epochs & {s.get("epoch") for s in outbound}:
         return True
+    if not inbound_epochs and not outbound:
+        return False  # never paired: nothing to heal
+    refuse_on_version_mismatch(spoke_p, sp.primary)
+    if outbound:
+        sub_ids = [str(sub["id"]) for sub in outbound]
+        try:
+            pending, rejected = _spoke_undelivered_counts(sp, subscription_ids=sub_ids)
+        except SQLAlchemyError as exc:
+            raise SeedError(
+                f"half-pair heal refused: could not read the spoke's outbox at "
+                f"{sp.spoke_db_url} to prove outbound(s) {sub_ids} hold no "
+                f"undelivered rows ({exc.__class__.__name__}: {exc})"
+            ) from exc
+        if pending or rejected:
+            if not force:
+                raise SeedError(
+                    f"half-pair heal refused: the spoke outbound(s) {sub_ids} "
+                    f"toward {sp.primary.source_id} have no matching primary "
+                    f"inbound but still hold {pending} pending + {rejected} "
+                    "rejected outbox row(s) — retiring them would strand those "
+                    "spoke-authored writes for good. Let the outbox drain or "
+                    "resolve the spoke's /rejected rows first, or pass --force "
+                    "to retire anyway and accept the loss"
+                )
+            report(
+                f"[reverse] {sp.name}: --force: retiring spoke outbound(s) "
+                f"{sub_ids} DESPITE {pending} pending + {rejected} rejected "
+                "undelivered row(s) — those writes will not reach the primary"
+            )
     if inbound_epochs:
         report(
             f"[reverse] {sp.name}: primary holds an active inbound from "
@@ -533,9 +584,15 @@ def _reverse_already_paired(
             "half-pair: re-seeded spoke or an interrupted handshake) — "
             "retiring it before re-pairing"
         )
-        _retire_primary_inbound_from_spoke(client, sp, report=report)
+        _retire_primary_inbound_from_spoke(client, sp, report=report, strict=True)
     for sub in outbound:
-        client.post(f"{spoke_p.admin_base}/outbound/retire", json={"id": sub["id"]})
+        r = client.post(f"{spoke_p.admin_base}/outbound/retire", json={"id": sub["id"]})
+        if r.status_code >= 400:
+            raise SeedError(
+                f"retiring orphaned spoke outbound {sub['id']} failed: POST "
+                f"{spoke_p.admin_base}/outbound/retire -> HTTP {r.status_code} "
+                f"{_safe_body(r)}"
+            )
         report(
             f"[reverse] {sp.name}: retired orphaned spoke outbound {sub['id']} "
             f"(epoch {sub.get('epoch')}) with no matching primary inbound"
@@ -548,6 +605,7 @@ def run_reverse_pair(
     cfg: SeedConfig,
     *,
     participants: list[str] | None = None,
+    force: bool = False,
     report: Report = print,
 ) -> list[dict]:
     """§7 step 4: with the spoke now booted, pair the spoke→primary direction by
@@ -564,8 +622,10 @@ def run_reverse_pair(
     everything pairable is paired first, then ONE `SeedError` names every
     participant left unpaired. A second run over a fully-paired spoke reports
     each participant "already paired" and returns normally. `participants`
-    (`--participants NAME[,NAME]`) restricts the run to those names. Returns
-    the records of the streams opened by THIS run."""
+    (`--participants NAME[,NAME]`) restricts the run to those names; `force`
+    (`--force`) lets a half-pair heal retire a spoke outbound that still holds
+    undelivered rows (see `_reverse_already_paired`). Returns the records of
+    the streams opened by THIS run."""
     cfg = select_participants(cfg, participants)
     spoke = discover_participants(
         client, cfg.spoke_platform_url, cfg.spoke_instance, include_platform=True
@@ -584,7 +644,9 @@ def run_reverse_pair(
             )
             continue
         try:
-            if _reverse_already_paired(client, sp, spoke_p, report=report):
+            if _reverse_already_paired(
+                client, sp, spoke_p, force=force, report=report
+            ):
                 report(
                     f"[reverse] {sp.name}: already paired "
                     f"({sp.spoke_source_id} -> {sp.primary.source_id})"
@@ -691,7 +753,9 @@ def retire_old_streams(
 # --- helpers ------------------------------------------------------------------
 
 
-def _spoke_undelivered_counts(sp: SeedParticipant) -> tuple[int, int]:
+def _spoke_undelivered_counts(
+    sp: SeedParticipant, *, subscription_ids: list[str] | None = None
+) -> tuple[int, int]:
     """`(pending, rejected)` outbox-row counts on the spoke. Anything not
     `delivered` blocks a re-seed: `pending` is in flight, `rejected` is
     dead-lettered and will never apply — both mean the spoke holds the only copy
@@ -700,15 +764,26 @@ def _spoke_undelivered_counts(sp: SeedParticipant) -> tuple[int, int]:
     try:
         with Session(engine) as session:
             rows = session.scalars(
-                select(ReplicationOutboxRow).where(
-                    ReplicationOutboxRow.status != "delivered"
-                )
+                _undelivered_query(subscription_ids)
             ).all()
             pending = sum(1 for r in rows if r.status == "pending")
             rejected = sum(1 for r in rows if r.status == "rejected")
             return pending, rejected
     finally:
         engine.dispose()
+
+
+def _undelivered_query(subscription_ids: list[str] | None):
+    """Non-delivered outbox rows, optionally narrowed to the given outbound
+    subscription ids (the half-pair heal's about-to-be-retired set)."""
+    q = select(ReplicationOutboxRow).where(ReplicationOutboxRow.status != "delivered")
+    if subscription_ids is not None:
+        q = q.where(
+            ReplicationOutboxRow.subscription_id.in_(
+                [uuid.UUID(i) for i in subscription_ids]
+            )
+        )
+    return q
 
 
 def _primary_parked_for_spoke(client, sp: SeedParticipant) -> int:
@@ -764,17 +839,33 @@ def _retire_primary_outbound(client, sp: SeedParticipant, *, report: Report) -> 
 
 
 def _retire_primary_inbound_from_spoke(
-    client, sp: SeedParticipant, *, report: Report
+    client, sp: SeedParticipant, *, report: Report, strict: bool = False
 ) -> None:
+    """Retire the primary's active inbound stream(s) from the spoke. `strict`
+    (the reverse-pair heal) raises on a failed list/retire instead of
+    skipping — a silent failure there trips the handshake's run-once guard
+    right after reporting the retire."""
     listed = client.get(f"{sp.primary.admin_base}/inbound")
     if listed.status_code >= 400:
+        if strict:
+            raise SeedError(
+                f"GET {sp.primary.admin_base}/inbound -> HTTP "
+                f"{listed.status_code} {_safe_body(listed)}"
+            )
         return
     for stream in listed.json():
         if stream.get("source_id") == sp.spoke_source_id and stream.get("active"):
-            client.post(
+            r = client.post(
                 f"{sp.primary.admin_base}/inbound/retire",
                 json={"source_id": stream["source_id"], "epoch": stream["epoch"]},
             )
+            if strict and r.status_code >= 400:
+                raise SeedError(
+                    f"retiring the primary inbound from {sp.spoke_source_id} "
+                    f"(epoch {stream.get('epoch')}) failed: POST "
+                    f"{sp.primary.admin_base}/inbound/retire -> HTTP "
+                    f"{r.status_code} {_safe_body(r)}"
+                )
             report(f"[retire] {sp.name}: primary inbound from {sp.spoke_source_id} "
                    f"(epoch {stream.get('epoch')})")
 

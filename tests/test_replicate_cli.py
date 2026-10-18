@@ -279,3 +279,26 @@ def test_seed_participants_requires_reverse_pair(two_instances, tmp_path, capsys
     rc = cli.main(["replicate", "seed", "--config", cfg, "--participants", "governance"])
     assert rc == 1
     assert "only with --reverse-pair" in capsys.readouterr().err
+
+
+def test_seed_participants_list_tolerates_spaces(two_instances, tmp_path, monkeypatch):
+    from snowline_platform import replication_seed as seed_mod
+
+    seen = {}
+
+    def fake_reverse_pair(client, cfg, *, participants=None, force=False, report=print):
+        seen["participants"], seen["force"] = participants, force
+        return []
+
+    monkeypatch.setattr(seed_mod, "run_reverse_pair", fake_reverse_pair)
+    cfg = _reverse_seed_config(tmp_path)
+    rc = cli.main(["replicate", "seed", "--config", cfg, "--reverse-pair",
+                   "--participants", "governance, pm", "--force"])
+    assert rc == 0
+    assert seen == {"participants": ["governance", "pm"], "force": True}
+
+
+def test_seed_force_requires_reverse_pair(two_instances, tmp_path, capsys):
+    cfg = _reverse_seed_config(tmp_path)
+    assert cli.main(["replicate", "seed", "--config", cfg, "--force"]) == 1
+    assert "--force applies only with --reverse-pair" in capsys.readouterr().err
