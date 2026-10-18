@@ -283,6 +283,28 @@ def build_replication_router(
                 peer_source_id=data.get("peer_source_id"),
             )
 
+    @router.post(f"{admin_prefix}/outbound/vocabulary")
+    async def widen_outbound_vocabulary(request: Request, data: dict) -> dict:
+        """Set-union `event_types` into an ACTIVE live outbound stream (pm#133)
+        — driven by `snowline replicate refresh-vocabulary`. Only ever widens;
+        404 for an unknown id, 409 for a retired or backfill stream."""
+        _require_trusted(request)
+        subscription_id, event_types = _required(data, "subscription_id", "event_types")
+        if not isinstance(event_types, list) or not all(
+            isinstance(t, str) for t in event_types
+        ):
+            raise HTTPException(
+                status_code=400, detail="event_types must be a list of event names"
+            )
+        with session_scope() as session:
+            try:
+                return _emit.widen_outbound_vocabulary(
+                    session, subscription_id, event_types
+                )
+            except ValueError as exc:
+                status = 404 if "no replication subscription" in str(exc) else 409
+                raise HTTPException(status_code=status, detail=str(exc)) from None
+
     @router.get(f"{admin_prefix}/outbound")
     async def list_outbound(request: Request) -> list[dict]:
         _require_trusted(request)

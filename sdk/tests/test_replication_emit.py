@@ -156,3 +156,124 @@ def test_subscription_listing_never_leaks_secrets(session):
     listed = emit.list_outbound_subscriptions(session)
     assert len(listed) == 1
     assert "secret" not in listed[0]
+
+
+# --- widening a paired stream's vocabulary (pm#133) ---------------------------
+
+
+def test_widen_vocabulary_set_union_preserves_order(session):
+    """Existing types first in their order, then the new ones in GIVEN order;
+    duplicates (already-carried and repeated) collapse; `added` names only the
+    types actually appended."""
+    sub = _sub(session, event_types=["a.one", "b.two"])
+    widened = emit.widen_outbound_vocabulary(
+        session, sub["id"], ["c.three", "a.one", "d.four", "c.three"]
+    )
+    assert widened["event_types"] == ["a.one", "b.two", "c.three", "d.four"]
+    assert widened["added"] == ["c.three", "d.four"]
+    assert widened["id"] == sub["id"] and widened["epoch"] == sub["epoch"]
+    # Persisted (the JSON column was reassigned, not mutated in place).
+    session.commit()
+    (listed,) = emit.list_outbound_subscriptions(session)
+    assert listed["event_types"] == ["a.one", "b.two", "c.three", "d.four"]
+
+
+def test_widen_vocabulary_is_idempotent_and_never_narrows(session):
+    sub = _sub(session, event_types=["a.one", "b.two"])
+    emit.widen_outbound_vocabulary(session, sub["id"], ["c.three"])
+    again = emit.widen_outbound_vocabulary(session, sub["id"], ["c.three"])
+    assert again["added"] == []
+    assert again["event_types"] == ["a.one", "b.two", "c.three"]
+    # A SUBSET (or empty) target never removes anything.
+    subset = emit.widen_outbound_vocabulary(session, sub["id"], ["a.one"])
+    assert subset["added"] == []
+    assert subset["event_types"] == ["a.one", "b.two", "c.three"]
+    assert emit.widen_outbound_vocabulary(session, sub["id"], [])["added"] == []
+
+
+def test_widen_vocabulary_refuses_unknown_retired_and_backfill(session):
+    with pytest.raises(ValueError, match="no replication subscription"):
+        emit.widen_outbound_vocabulary(
+            session, "00000000-0000-0000-0000-000000000000", ["x"]
+        )
+    with pytest.raises(ValueError, match="no replication subscription"):
+        emit.widen_outbound_vocabulary(session, "not-a-uuid", ["x"])
+
+    retired = _sub(session)
+    emit.retire_outbound_subscription(session, retired["id"])
+    with pytest.raises(ValueError, match="retired"):
+        emit.widen_outbound_vocabulary(session, retired["id"], ["new.type"])
+
+    backfill = emit.open_backfill_subscription(
+        session,
+        "http://peer.example/events/ingest",
+        "bf-secret",
+        epoch="bf-epoch",
+        live_source_id="test.plugin",
+        enumerator=lambda _s: iter(()),
+    )
+    with pytest.raises(ValueError, match="backfill"):
+        emit.widen_outbound_vocabulary(session, backfill["id"], ["thing.recorded"])
+
+
+def test_widened_type_now_produces_an_outbox_row(session):
+    """The bug itself: a type absent from the pairing-time vocabulary is never
+    queued; after the widen the SAME stream (same epoch, next seq) carries it."""
+    sub = _sub(session, event_types=["thing.recorded"])
+    emit.emit_event(session, "thing.recorded", {"n": 1})
+    assert emit.emit_event(session, "thing.added_later", {"n": 2}) == []
+    assert [r.event_type for r in _rows(session)] == ["thing.recorded"]
+
+    emit.widen_outbound_vocabulary(session, sub["id"], ["thing.added_later"])
+    (env,) = emit.emit_event(session, "thing.added_later", {"n": 3})
+    assert env["epoch"] == "epoch-1" and env["seq"] == 2
+    assert [r.event_type for r in _rows(session)] == [
+        "thing.recorded",
+        "thing.added_later",
+    ]
+
+
+def test_emit_warns_once_per_stream_lacking_the_type(session, caplog):
+    """The generic RE-PAIR note (pm's `_warn_pairings_lacking`, now SDK-wide):
+    an emit whose type an ACTIVE live stream lacks logs one warning naming the
+    remedy, once per (source_id, epoch, event_type) — not per write."""
+    _sub(session, event_types=["thing.recorded"])
+    _sub(
+        session,
+        event_types=["thing.recorded", "thing.added_later"],
+        epoch="epoch-2",
+        target_url="http://o.example/ingest",
+    )
+    with caplog.at_level("WARNING", logger="snowline_plugin_sdk.replication.emit"):
+        # Carried by one stream, lacked by the other: still queued where carried.
+        assert len(emit.emit_event(session, "thing.added_later", {})) == 1
+        assert len(emit.emit_event(session, "thing.added_later", {})) == 1
+        # A type EVERY stream carries warns nothing.
+        emit.emit_event(session, "thing.recorded", {})
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    msg = warnings[0].getMessage()
+    assert "epoch-1" in msg and "thing.added_later" in msg
+    assert emit.REFRESH_VOCABULARY_REMEDY in msg
+
+    # A different type on the same stream is its own first warning.
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="snowline_plugin_sdk.replication.emit"):
+        emit.emit_event(session, "thing.third", {})
+    assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 2
+
+
+def test_emit_warning_ignores_retired_and_backfill_streams(session, caplog):
+    retired = _sub(session, event_types=["thing.recorded"])
+    emit.retire_outbound_subscription(session, retired["id"])
+    emit.open_backfill_subscription(
+        session,
+        "http://peer.example/events/ingest",
+        "bf-secret",
+        epoch="bf-epoch",
+        live_source_id="test.plugin",
+        enumerator=lambda _s: iter(()),
+    )
+    with caplog.at_level("WARNING", logger="snowline_plugin_sdk.replication.emit"):
+        assert emit.emit_event(session, "thing.added_later", {}) == []
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
