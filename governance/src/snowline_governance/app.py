@@ -55,8 +55,10 @@ def _migrate_to_head() -> None:
 
     migrations = Path(__file__).resolve().parent / "migrations"
     cfg = Config()
-    cfg.set_main_option("script_location", str(migrations))
-    cfg.set_main_option("sqlalchemy.url", config.database_url())
+    cfg.set_main_option("script_location", config.escape_for_config(str(migrations)))
+    cfg.set_main_option(
+        "sqlalchemy.url", config.escape_for_config(config.database_url())
+    )
     command.upgrade(cfg, "head")
 
 

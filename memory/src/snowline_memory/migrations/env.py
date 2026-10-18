@@ -2,11 +2,11 @@ from alembic import context
 from snowline_plugin_sdk.replication.models import ReplicationBase
 from sqlalchemy import engine_from_config, pool
 
-from snowline_memory.config import database_url
+from snowline_memory.config import database_url, escape_for_config
 from snowline_memory.models import Base
 
 config = context.config
-config.set_main_option("sqlalchemy.url", database_url())
+config.set_main_option("sqlalchemy.url", escape_for_config(database_url()))
 
 # Both memory's domain metadata AND the SDK-owned replication metadata (adopted
 # in the c3d4e5f6a7b8 migration, #80) — so an autogenerate diff sees the
