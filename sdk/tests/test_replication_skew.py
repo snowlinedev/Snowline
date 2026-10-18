@@ -81,3 +81,47 @@ def test_inventory_rejects_overlap_and_unknown_types():
         KeyInventory(payload_keys={"a": {"x"}}, widened_keys={"a": {"x"}})
     with pytest.raises(ValueError, match="absent"):
         KeyInventory(payload_keys={"a": {"x"}}, widened_keys={"b": {"y"}})
+
+
+OPT = KeyInventory(
+    payload_keys={"thing.set": {"id"}},
+    widened_keys={"thing.set": {"color"}},
+    optional_keys={"thing.set": {"author"}},
+)
+
+
+def test_optional_key_is_allowed_when_present_and_not_required():
+    base = {"id": 1, "color": "r"}
+    assert check_emitted_keys(OPT, "thing.set", base) == []  # absent: not stale
+    assert check_emitted_keys(OPT, "thing.set", {**base, "author": "x"}) == []
+    out = check_emitted_keys(OPT, "thing.set", {**base, "other": 1})
+    assert len(out) == 1 and "`other`" in out[0]
+    assert check_emitted_payloads(OPT, {"thing.set": [base, {**base, "author": "x"}]}) == []
+
+
+def test_optional_key_overlap_is_rejected():
+    with pytest.raises(ValueError, match="payload_keys and optional_keys"):
+        KeyInventory(payload_keys={"a": {"x"}}, optional_keys={"a": {"x"}})
+    with pytest.raises(ValueError, match="widened_keys and optional_keys"):
+        KeyInventory(
+            payload_keys={"a": {"x"}}, widened_keys={"a": {"y"}}, optional_keys={"a": {"y"}}
+        )
+    with pytest.raises(ValueError, match="absent"):
+        KeyInventory(payload_keys={"a": {"x"}}, optional_keys={"b": {"y"}})
+
+
+def test_optional_key_needs_an_apply_guard_too():
+    src = 'if "color" in p: pass'
+    out = find_unguarded_widened_keys(OPT, src)
+    assert len(out) == 1 and "`author`" in out[0]
+    assert find_unguarded_widened_keys(OPT, src + '\nz = p.get("author")') == []
+
+
+def test_get_on_a_non_payload_name_does_not_count():
+    out = find_unguarded_widened_keys(INV, 'x = settings.get("color")\n"color" in other')
+    assert len(out) == 1 and "`color`" in out[0]
+    assert find_unguarded_widened_keys(INV, 'x = envelope["payload"].get("color")')
+    assert (
+        find_unguarded_widened_keys(INV, 'x = row.get("color")', payload_names=("row",))
+        == []
+    )
