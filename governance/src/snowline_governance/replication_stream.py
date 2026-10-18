@@ -50,18 +50,81 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from snowline_plugin_sdk.replication import emit as sdk_emit
+from snowline_plugin_sdk.replication.skew import KeyInventory
 
 from snowline_governance.contract import (
     EVENT_ARTIFACT_CODE_REFS_SET,
     EVENT_ARTIFACT_GOVERNS_SET,
     EVENT_ARTIFACT_MATURITY_SET,
+    EVENT_ARTIFACT_REGISTERED,
+    EVENT_ARTIFACT_RESOLVED,
+    EVENT_ARTIFACT_REVISED,
     EVENT_ARTIFACT_SUPERSEDED,
+    EVENT_DECISION_MARKED_COMPATIBLE,
+    EVENT_DECISION_RECORDED,
+    EVENT_DECISION_SUPERSEDED,
+    EVENT_SHADOW_BRANCH_ARCHIVED,
+    EVENT_SHADOW_BRANCH_CREATED,
+    EVENT_SHADOW_CITATION_ADDED,
+    EVENT_SHADOW_CONVERSATION_APPENDED,
     EVENT_SHADOW_GRADUATED,
+    EVENT_SHADOW_NODE_ADDED,
     EVENT_SHADOW_NOTES_SET,
 )
 from snowline_governance.models import LwwRegister
 
 log = logging.getLogger("snowline.governance.replication_stream")
+
+# N-1 skew guard (decision 54447516, #216): the top-level payload-key inventory
+# of every governance-owned event. PAYLOAD_KEYS = the baseline every N-1 peer
+# sends; WIDENED_KEYS = keys added since, applied only on presence in
+# `replication_apply` (declare the key here, guard it there, fold it into
+# PAYLOAD_KEYS after one train). Nothing is inside the window today, so every
+# widening is empty - the tripwire in tests/test_replication_stream.py stays
+# armed for the next one. Nested objects (artifact `version`) are not inventoried.
+_ENVELOPE_BODY = {"event_id", "at"}  # stamped on every governance payload
+_DECISION_KEYS = {
+    "id", "decision", "rationale", "scope", "scope_id", "supersedes_id", "recorded_at",
+}
+PAYLOAD_KEYS: dict[str, frozenset[str]] = {
+    t: frozenset(_ENVELOPE_BODY | keys)
+    for t, keys in {
+        EVENT_DECISION_RECORDED: _DECISION_KEYS,
+        EVENT_DECISION_SUPERSEDED: _DECISION_KEYS,
+        EVENT_DECISION_MARKED_COMPATIBLE: {
+            "decision_id", "concurrent_with_id", "actor", "marked_compatible_at",
+        },
+        EVENT_SHADOW_BRANCH_CREATED: {
+            "id", "name", "scope", "scope_id", "narrative_notes", "created_at",
+        },
+        EVENT_SHADOW_BRANCH_ARCHIVED: {"branch_id", "archived_at"},
+        EVENT_SHADOW_NOTES_SET: {"branch_id", "narrative_notes"},
+        EVENT_SHADOW_NODE_ADDED: {
+            "id", "branch_id", "statement", "rationale", "created_at",
+        },
+        EVENT_SHADOW_CITATION_ADDED: {
+            "id", "node_id", "cited_node_id", "cited_decision_id", "created_at",
+        },
+        EVENT_SHADOW_CONVERSATION_APPENDED: {
+            "id", "branch_id", "kind", "payload", "created_at",
+        },
+        EVENT_SHADOW_GRADUATED: {"decision_id", "node_id", "kind", "label"},
+        EVENT_ARTIFACT_REGISTERED: {
+            "id", "backend", "doc_kind", "maturity", "governs", "governs_all",
+            "created_at", "version",
+        },
+        EVENT_ARTIFACT_REVISED: {"artifact_id", "version"},
+        EVENT_ARTIFACT_RESOLVED: {"artifact_id", "version_id"},
+        EVENT_ARTIFACT_MATURITY_SET: {"artifact_id", "maturity"},
+        EVENT_ARTIFACT_GOVERNS_SET: {"artifact_id", "governs", "governs_all"},
+        EVENT_ARTIFACT_SUPERSEDED: {
+            "artifact_id", "superseded_by_id", "superseded_at", "retirement_reason",
+        },
+        EVENT_ARTIFACT_CODE_REFS_SET: {"artifact_id", "code_refs"},
+    }.items()
+}
+WIDENED_KEYS: dict[str, frozenset[str]] = {t: frozenset() for t in PAYLOAD_KEYS}
+KEY_INVENTORY = KeyInventory(PAYLOAD_KEYS, WIDENED_KEYS)
 
 # The manifest's declared ingest route (§4) — the SDK router serves it and
 # `registration.build_manifest` advertises it; one constant so they can't skew.
