@@ -45,6 +45,7 @@ from contextlib import AbstractContextManager
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -366,6 +367,9 @@ def build_replication_router(
         # this coroutine (the streaming generator below owns its cleanup), and
         # pg_dump writes the file itself.
         tmpdir = tempfile.mkdtemp(prefix="snowline-snapshot-")
+        # The dump holds the whole store (replication secrets included): the
+        # directory must be owner-only. mkdtemp guarantees 0700; assert it.
+        assert os.stat(tmpdir).st_mode & 0o777 == 0o700
         dest = os.path.join(tmpdir, "snapshot.dump")
         try:
             # pg_dump is blocking and can run for a while — off the event loop.
@@ -385,7 +389,15 @@ def build_replication_router(
             finally:
                 shutil.rmtree(tmpdir, ignore_errors=True)
 
-        return StreamingResponse(_chunks(), media_type="application/octet-stream")
+        # Starlette cancels the response task on client disconnect without
+        # closing a sync generator, so the generator's `finally` alone could be
+        # left to GC. The BackgroundTask runs after completion OR cancellation;
+        # the `finally` stays as belt-and-braces (rmtree twice is harmless).
+        return StreamingResponse(
+            _chunks(),
+            media_type="application/octet-stream",
+            background=BackgroundTask(shutil.rmtree, tmpdir, ignore_errors=True),
+        )
 
     # --- parking: the loud read (§8.1) ---------------------------------------
 

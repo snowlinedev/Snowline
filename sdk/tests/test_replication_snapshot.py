@@ -24,6 +24,7 @@ argv).
 from __future__ import annotations
 
 import json
+import tempfile
 from contextlib import contextmanager
 
 import anyio
@@ -32,6 +33,7 @@ import pytest
 from fastapi import FastAPI
 from sqlalchemy.engine import make_url
 
+from snowline_plugin_sdk.replication import admin as admin_mod
 from snowline_plugin_sdk.replication import emit as emit_mod
 from snowline_plugin_sdk.replication import snapshot as snapshot_mod
 from snowline_plugin_sdk.replication.admin import build_replication_router
@@ -376,3 +378,94 @@ def test_sqlalchemy_url_query_is_percent_encoded_not_quote_plus(tmp_path):
     assert env == {}
     argv = snapshot_mod.pg_dump_argv(rendered, tmp_path / "x.dump")
     assert argv[-1] == rendered
+
+
+# --- temp-dump cleanup (#227) ---------------------------------------------------
+
+
+def _snapshot_dirs(root):
+    return [p for p in root.iterdir() if p.name.startswith("snowline-snapshot-")]
+
+
+async def _drive_asgi(app, body: bytes, secret: str, *, disconnect_after: int | None):
+    """Call the app as a raw ASGI server: httpx's ASGITransport buffers the
+    whole response, so it cannot model a client that goes away mid-stream."""
+    sent_body = 0
+    disconnected = anyio.Event()
+    request_sent = False
+
+    async def receive():
+        nonlocal request_sent
+        if not request_sent:
+            request_sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        await disconnected.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        nonlocal sent_body
+        if message["type"] == "http.response.body" and message.get("body"):
+            sent_body += 1
+            if disconnect_after is not None and sent_body >= disconnect_after:
+                disconnected.set()
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "path": SNAPSHOT_PATH,
+        "raw_path": SNAPSHOT_PATH.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "scheme": "http",
+        "server": ("plugin", 80),
+        "client": (TAILNET_PEER, 4242),
+        "headers": [
+            (b"host", b"plugin"),
+            (b"content-length", str(len(body)).encode()),
+            (b"x-snowline-signature", sign_body(secret, body).encode()),
+        ],
+    }
+    await app(scope, receive, send)
+    return sent_body
+
+
+def test_temp_dump_is_removed_after_a_full_read(
+    app_and_sessions, fake_pg_dump, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    app, sessions = app_and_sessions
+    _prime(sessions)
+
+    resp = _signed(app, _body(), "s3cret-stream-key")
+
+    assert resp.content == ARCHIVE
+    assert _snapshot_dirs(tmp_path) == []
+
+
+def test_temp_dump_is_removed_when_the_client_disconnects_mid_stream(
+    app_and_sessions, fake_pg_dump, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(admin_mod, "SNAPSHOT_CHUNK_BYTES", 4)  # several chunks
+    # Keep the abandoned generator alive: cleanup must not depend on its
+    # finalisation (the point of the BackgroundTask).
+    keep = []
+    real_chunks = admin_mod.StreamingResponse
+
+    def capturing(content, *a, **kw):
+        keep.append(content)
+        return real_chunks(content, *a, **kw)
+
+    monkeypatch.setattr(admin_mod, "StreamingResponse", capturing)
+    app, sessions = app_and_sessions
+    _prime(sessions)
+
+    sent = anyio.run(
+        lambda: _drive_asgi(app, _body(), "s3cret-stream-key", disconnect_after=1)
+    )
+
+    assert keep, "the route should have streamed"
+    assert sent < len(ARCHIVE) // 4 + 1  # the stream really was cut short
+    assert _snapshot_dirs(tmp_path) == []
