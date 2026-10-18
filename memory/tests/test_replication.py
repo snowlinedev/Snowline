@@ -510,3 +510,36 @@ def test_memory_app_serves_the_backfill_open_verb(db_session):
     resp = anyio.run(call)
     assert resp.status_code == 200, resp.text
     assert resp.json()["enumerated"] == {EVENT_MEMORY_SET: 1}
+
+
+# --- N-1 skew guard (decision 54447516, #216) ---------------------------------
+
+
+def test_emitted_payload_keys_match_declared(hub_spoke):
+    """A: both memory events carry exactly the declared baseline + widened keys
+    (a `remember` with every optional field, an update, and a `forget`)."""
+    from snowline_plugin_sdk.replication.skew import check_emitted_payloads
+
+    hub, spoke = hub_spoke
+    _pair(hub, spoke)
+    hub.remember("k1", "body", _t(1), description="d", kind="note")
+    hub.remember("k1", "body 2", _t(2))
+    hub.forget("k1", _t(3))
+    driven: dict[str, list[dict]] = {}
+    for row in hub.outbox():
+        driven.setdefault(row.event_type, []).append(row.payload["payload"])
+    errors = check_emitted_payloads(memory.KEY_INVENTORY, driven)
+    assert not errors, "\n".join(errors)
+
+
+def test_every_widened_key_has_an_apply_side_presence_guard():
+    """B: ast tripwire over memory.py's apply (armed even while the widened sets
+    are empty)."""
+    import inspect
+
+    from snowline_plugin_sdk.replication.skew import find_unguarded_widened_keys
+
+    errors = find_unguarded_widened_keys(
+        memory.KEY_INVENTORY, inspect.getsource(memory)
+    )
+    assert not errors, "\n".join(errors)

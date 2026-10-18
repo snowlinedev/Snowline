@@ -29,7 +29,12 @@ from snowline_governance.contract import (
     EVENT_TYPES,
     GOVERNANCE_EVENT_TYPES,
 )
+from snowline_governance import replication_apply, replication_stream
 from snowline_governance.models import LwwRegister
+from snowline_plugin_sdk.replication.skew import (
+    check_emitted_payloads,
+    find_unguarded_widened_keys,
+)
 
 SOURCE = "primary.governance"
 PEER = "roam.governance"
@@ -96,13 +101,11 @@ def test_decision_writes_emit_v2_stream_envelopes(db_session):
     assert rows[1].payload["payload"]["supersedes_id"] == v1["id"]
 
 
-def test_full_write_surface_emits_every_registry_event_type(db_session):
-    """§4 coverage, pinned against the drift-guarded registry: exercising the
-    whole write surface (shadow graph, artifacts, graduation, decisions)
-    produces EVERY member of GOVERNANCE_EVENT_TYPES — a new lifecycle write
-    can't ship without landing in the registry, and vice versa. Pinned to the
-    GOVERNANCE-OWNED subset (#117): EVENT_TYPES is the whole platform's
-    vocabulary and includes scope/memory events governance never emits."""
+def _drive_full_write_surface(db_session) -> None:
+    """Exercise the whole governance write surface (shadow graph, artifacts,
+    graduation, decisions) under a full-vocabulary subscription. Shared by the
+    §4 coverage test and the N-1 skew guard (#216), so the key inventory is
+    checked against exactly the payloads the coverage test proves complete."""
     _subscribe(db_session)
     scope, sid = "acme/widget", _sid("acme/widget")
 
@@ -157,6 +160,15 @@ def test_full_write_surface_emits_every_registry_event_type(db_session):
     # Structured code anchors (#172).
     artifacts.set_code_refs(db_session, art["id"], [{"path": "lib/spec.dart"}])
 
+
+def test_full_write_surface_emits_every_registry_event_type(db_session):
+    """§4 coverage, pinned against the drift-guarded registry: exercising the
+    whole write surface (shadow graph, artifacts, graduation, decisions)
+    produces EVERY member of GOVERNANCE_EVENT_TYPES — a new lifecycle write
+    can't ship without landing in the registry, and vice versa. Pinned to the
+    GOVERNANCE-OWNED subset (#117): EVENT_TYPES is the whole platform's
+    vocabulary and includes scope/memory events governance never emits."""
+    _drive_full_write_surface(db_session)
     emitted = {r.event_type for r in _outbox(db_session)}
     assert emitted == set(GOVERNANCE_EVENT_TYPES)
     # …and the stream stayed contiguous through all of it.
@@ -276,3 +288,53 @@ def test_milestone_rides_the_artifact_version_payloads(db_session):
     by_type = {r.event_type: r.payload["payload"] for r in _outbox(db_session)}
     assert by_type[EVENT_ARTIFACT_REGISTERED]["version"]["milestone"] == "v1-launch"
     assert by_type[EVENT_ARTIFACT_REVISED]["version"]["milestone"] == "v2-launch"
+
+
+
+# --- N-1 skew guard (decision 54447516, #216) ---------------------------------
+
+
+def test_key_inventory_covers_exactly_the_governance_vocabulary():
+    assert replication_stream.KEY_INVENTORY.event_types == set(
+        GOVERNANCE_EVENT_TYPES
+    )
+
+
+def test_full_write_surface_payload_keys_match_declared(db_session):
+    """A: every payload the full write surface emits carries exactly the
+    declared baseline + widened keys for its event type."""
+    _drive_full_write_surface(db_session)
+    driven: dict[str, list[dict]] = {}
+    for row in _outbox(db_session):
+        driven.setdefault(row.event_type, []).append(row.payload["payload"])
+    errors = check_emitted_payloads(replication_stream.KEY_INVENTORY, driven)
+    assert not errors, "\n".join(errors)
+
+
+def test_backfill_enumerator_payload_keys_match_declared(db_session):
+    """A (backfill path): the §7.1 enumerator replays the live-driven state and
+    adds `lww_source` on the register-class events; it must be declared
+    OPTIONAL. Coverage of every type is not required, but the optional key must
+    actually appear or this variant guards nothing."""
+    _drive_full_write_surface(db_session)
+    driven: dict[str, list[dict]] = {}
+    for event_type, payload in replication_stream.enumerate_backfill(db_session):
+        driven.setdefault(event_type, []).append(payload)
+    errors = check_emitted_payloads(
+        replication_stream.KEY_INVENTORY, driven, require_all_types=False
+    )
+    assert not errors, "\n".join(errors)
+    opt = replication_stream.KEY_INVENTORY.optional_keys
+    assert {t for t, ks in opt.items() if ks} == set(replication_stream.LWW_REGISTERS)
+    assert any("lww_source" in p for ps in driven.values() for p in ps)
+
+
+def test_every_widened_key_has_an_apply_side_presence_guard():
+    """B: ast tripwire over `replication_apply` (armed even while the widened
+    sets are empty)."""
+    import inspect
+
+    errors = find_unguarded_widened_keys(
+        replication_stream.KEY_INVENTORY, inspect.getsource(replication_apply)
+    )
+    assert not errors, "\n".join(errors)

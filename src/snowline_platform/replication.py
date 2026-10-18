@@ -39,6 +39,67 @@ from snowline_plugin_sdk.contract import (
     EVENT_SCOPE_UPDATED,
 )
 from snowline_plugin_sdk.replication.admin import _require_trusted, build_replication_router
+from snowline_plugin_sdk.replication.skew import KeyInventory
+
+# N-1 skew guard (decision 54447516, #216): the payload-key inventory of the
+# platform's own stream - scope.* (spec §8) and milestone.* (milestones.md §9).
+# PAYLOAD_KEYS = the baseline every N-1 peer sends; WIDENED_KEYS = keys added
+# since, which apply reads ONLY on presence (`"k" in payload` / `.get`);
+# OPTIONAL_KEYS = conditional keys (the §7.1 backfill enumerator's per-register
+# author stamps), allowed but never required, also read only on presence. A new
+# payload key lands in WIDENED_KEYS with its guard and folds into PAYLOAD_KEYS
+# only after one train ships. Enforced by tests/test_replication_skew.py
+# (emitted keys == declared; every widened/optional key guarded in scopes.py /
+# milestones.py apply). Helper: snowline_plugin_sdk.replication.skew.
+#
+# Provenance: the baseline is train v0.4.0 (tag 85e7858, 2026-09-13). The
+# widened milestone keys first shipped in v0.5.0 - line_rank (#266), title
+# (#278), descriptive_authored_at / lifecycle_authored_at (#270) - so they are
+# foldable after the NEXT train ships and the spoke has moved off v0.4.0. Scope
+# created_at / updated_at (#284) are unreleased.
+_SCOPE_BASE = {"id", "slug", "name", "kind", "parent", "isolated", "status"}
+_MILESTONE_ROW = {
+    "address", "anchor", "name", "outcome", "status", "target_date",
+    "activated_at", "achieved_at", "cancelled_at", "merged_into", "authored_at",
+}
+_MILESTONE_ROW_WIDENED = {
+    "line_rank", "title", "descriptive_authored_at", "lifecycle_authored_at",
+}
+PAYLOAD_KEYS: dict[str, frozenset[str]] = {
+    EVENT_SCOPE_CREATED: frozenset(_SCOPE_BASE),
+    EVENT_SCOPE_UPDATED: frozenset(_SCOPE_BASE),
+    EVENT_MILESTONE_CREATED: frozenset(_MILESTONE_ROW),
+    EVENT_MILESTONE_UPDATED: frozenset(_MILESTONE_ROW),
+    # `warnings`: persisted transition warnings (#159), baseline since v0.4.0.
+    EVENT_MILESTONE_TRANSITIONED: frozenset(
+        _MILESTONE_ROW | {"from_status", "to_status", "reason", "warnings"}
+    ),
+    EVENT_MILESTONE_DEPENDENCY_CHANGED: frozenset(
+        {"op", "dependent", "dependency", "authored_at"}
+    ),
+    EVENT_MILESTONE_MERGED: frozenset({"from", "into", "authored_at"}),
+}
+WIDENED_KEYS: dict[str, frozenset[str]] = {
+    # created_at / updated_at: the scope LWW clock (spec §7.1, additive).
+    EVENT_SCOPE_CREATED: frozenset({"created_at", "updated_at"}),
+    EVENT_SCOPE_UPDATED: frozenset({"created_at", "updated_at"}),
+    EVENT_MILESTONE_CREATED: frozenset(_MILESTONE_ROW_WIDENED),
+    EVENT_MILESTONE_UPDATED: frozenset(_MILESTONE_ROW_WIDENED),
+    EVENT_MILESTONE_TRANSITIONED: frozenset(_MILESTONE_ROW_WIDENED),
+    EVENT_MILESTONE_DEPENDENCY_CHANGED: frozenset(),
+    EVENT_MILESTONE_MERGED: frozenset(),
+}
+# Conditional keys added ONLY by `milestones.enumerate_backfill` (§7.1
+# cold-start union, #284), where the row stores a per-register author; apply
+# reads them through `_event_source` -> `payload.get(key)`.
+OPTIONAL_KEYS: dict[str, frozenset[str]] = {
+    EVENT_MILESTONE_CREATED: frozenset({"descriptive_source_id", "lifecycle_source_id"}),
+    EVENT_MILESTONE_TRANSITIONED: frozenset(
+        {"descriptive_source_id", "lifecycle_source_id", "transition_source_id"}
+    ),
+    EVENT_MILESTONE_MERGED: frozenset({"source_id"}),
+}
+KEY_INVENTORY = KeyInventory(PAYLOAD_KEYS, WIDENED_KEYS, OPTIONAL_KEYS)
 
 # Where the platform receives PEER instances' signed scope events, and the §5
 # admin surface (pairing CLI target, #82) — distinct from the plugin registry's

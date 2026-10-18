@@ -41,11 +41,29 @@ from datetime import datetime, timedelta, timezone
 
 from snowline_plugin_sdk.contract import EVENT_MEMORY_FORGOTTEN, EVENT_MEMORY_SET
 from snowline_plugin_sdk.replication import emit_event, live_source_id
+from snowline_plugin_sdk.replication.skew import KeyInventory
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from snowline_memory import config
 from snowline_memory.models import Memory
+
+# N-1 skew guard (decision 54447516, #216): the payload-key inventory of memory's
+# replication vocabulary. PAYLOAD_KEYS = the baseline every N-1 peer sends;
+# WIDENED_KEYS = keys added since, applied only on presence in `apply_event`
+# (declare the key here, guard it there, fold it into PAYLOAD_KEYS after one
+# train). Nothing is inside the window today, so the widened sets are empty and
+# the tripwire in tests/test_replication.py stays armed for the next widening.
+# Provenance: baseline = train v0.4.0; no widening since.
+PAYLOAD_KEYS: dict[str, frozenset[str]] = {
+    EVENT_MEMORY_SET: frozenset(
+        {"id", "name", "description", "content", "kind", "scope_slug",
+         "event_at", "source_id"}
+    ),
+    EVENT_MEMORY_FORGOTTEN: frozenset({"id", "name", "event_at", "source_id"}),
+}
+WIDENED_KEYS: dict[str, frozenset[str]] = {t: frozenset() for t in PAYLOAD_KEYS}
+KEY_INVENTORY = KeyInventory(PAYLOAD_KEYS, WIDENED_KEYS)
 
 # --- soft enum + defaults ---------------------------------------------------
 

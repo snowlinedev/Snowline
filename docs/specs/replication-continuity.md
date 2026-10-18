@@ -257,6 +257,26 @@ v1 therefore pins the following envelope semantics (all SDK-owned):
   forever. With it, the two-instance mesh needs no forwarding rules at all —
   every author delivers to every peer directly.
 
+**Payload changes are additive, and the rule is test-enforced (decision
+54447516, N−1 train compatibility; #216).** A peer one train behind keeps
+emitting the old payload shape, so every payload change is ADDITIVE and the
+apply side reads a new key only on presence (`"k" in p` / `p.get("k", …)`),
+or an in-flight old-shape event nulls the replica's field on an LWW win. Each
+package declares a `snowline_plugin_sdk.replication.skew.KeyInventory`
+beside its event vocabulary — `PAYLOAD_KEYS[event_type]` (the baseline every
+N−1 peer sends), `WIDENED_KEYS[event_type]` (keys added since, applied only
+on presence) and `OPTIONAL_KEYS[event_type]` (conditional keys such as the
+§7.1 backfill enumerator's author stamps: allowed, never required) — and two
+tests hold it: (A) the payloads that package's emit drive produces (and, where
+it has one, its backfill enumerator) carry exactly the declared keys, so no
+key widens a register undeclared and no declaration goes stale; (B) an ast
+tripwire checks that every widened or optional key has a guard-shaped read of
+the payload in the apply module (it checks the read exists, not that it is
+correct). Fold a widened key into the baseline only after one train has
+shipped with it emitted; a breaking change instead needs a contract-version
+bump. The platform's scope/milestone stream, governance, and memory are
+covered; pm keeps its own copy until it switches to the shared helper.
+
 ## 4. Plugin opt-in — the replication contract
 
 Replication is a **plugin capability, not a platform service** — plugins own
