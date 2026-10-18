@@ -434,6 +434,7 @@ Mapping the manual drill to the command:
 | Fill `seed-config.example.json` → `seed.json` by hand | Built automatically from `stack.json` (`primary_gateway_url`, `local_tailnet_address` — prompted once if missing, same posture as `sync`'s own prompts); written to `~/.config/snowline/seed.json`. No credential prompt: since item 0ebe6a70 the primary serves its own snapshot, so there is no primary-side Postgres user to ask for. |
 | `snowline replicate seed --config seed.json` (§5 steps 1-3) | Run as a subprocess through the same argv, unmodified. |
 | "boot the spoke" (§5, between steps 3 and 4) | Kickstarts all four services via `launchctl kickstart`, in the same order as §2's by-hand commands (platform, governance, memory, pm), then re-polls local health. |
+| (not previously machine-checked) | Registration gate (#228): polls the spoke platform's `/plugins` (default 60 s, every 2 s) until every plugin is listed WITH a `replication` block — `/health` answering is not registration — and refuses naming each missing plugin and its `~/Library/Application Support/Snowline/logs/snowline-<svc>.err.log`. Then a best-effort probe of each spoke ingest URL over this box's tailnet address: an unreachable port or a gateway 502/503/504 is a WARN (likely a `tailscale serve` mirror predating the plugin — `stack sync` does not manage it), never a refusal. |
 | `snowline replicate seed --config seed.json --reverse-pair` (§5 step 4) | Run as a subprocess through the same argv, unmodified. |
 | (not previously machine-checked) | Verifies `~/.config/snowline/pm.env` declares `SNOWLINE_PM_ROLE=spoke` — refuses loudly (without undoing the seed) if it says anything else. |
 | §6 re-seed (`reseed-check` then `seed --config … --reseed`) | `--reseed`: runs `reseed-check` first (its failure — either precondition, outbox or parked-set — surfaces verbatim in the command's output/report, never swallowed), then `seed --config seed.json --reseed`, then boots + reverse-pairs exactly as the fresh path. |
@@ -461,6 +462,17 @@ command for why it is a parallel report rather than a reuse of `sync`'s
   only reaches that point once the spoke is confirmed healthy), do not
   re-run the fresh path; use `--reseed` instead (see §6 above) rather than
   re-seeding over a partially-live pairing.
+- **Reverse-pair failed part-way** (#228 — e.g. `participant 'pm' is not
+  opted-in on the booted spoke`). `snowline replicate seed --reverse-pair`
+  attempts every participant, pairs what it can, and only then fails naming
+  every participant it could not pair. It is idempotent: a participant whose
+  spoke→primary stream is already live on both halves is reported "already
+  paired" and skipped (a half-pair — primary inbound with no matching spoke
+  outbound, e.g. after a plain re-seed — is retired and re-paired). So fix the
+  named plugin (its err.log), kickstart it, and re-run
+  `snowline replicate seed --config ~/.config/snowline/seed.json --reverse-pair`,
+  or restrict it with `--participants pm` (comma-separated). Re-running
+  `bootstrap-spoke` also works, but re-seeds first.
 - **Re-pairing.** A live pair refuses a second `pair`/plain-`seed` run by
   design (§4: "pairing runs once per pair"). To rotate a secret, use the
   ordinary rotation path (not covered by `bootstrap-spoke` — it is a
