@@ -456,6 +456,26 @@ each opted-in plugin covers its write surface with events:
   replication surfaces by the §4.1 rule: the participant's declared
   `advertised_base_url` if present, else through the peer's gateway at
   `<platform_url>/via/<name>` (decision 0b8390f7).
+- **Widening the vocabulary after an upgrade (pm#133).** A stream's event
+  vocabulary is fixed at pairing: the handshake writes the sender's
+  then-declared `events` into the outbound subscription, and the emit hook
+  queues only those types. An event type a plugin gains in a later upgrade is
+  therefore never queued toward an existing pairing — no outbox row, so a
+  fresh-epoch re-seed cannot replay it either (the SDK logs one warning per
+  stream and type naming the remedy). The remedy is an explicit operator step,
+  never automatic: **upgrade both sides, then run
+  `snowline replicate refresh-vocabulary <peer-platform-url>`** (the same
+  addressing flags as `pair`; `--dry-run` prints the plan). For each
+  already-paired direction it widens the live subscription in place — same
+  epoch, same seq counter — to `sender.events ∩ receiver.events` via the
+  admin route `POST <admin>/outbound/vocabulary`. It only ever set-unions
+  (never narrows), refuses a direction whose declared `contract_version`s
+  differ, holds back (and names) any type the receiver does not declare yet
+  so a sender never emits what its peer would only park (decision 54447516,
+  N−1 skew), and is idempotent — a direction already current says so. Writes
+  of the new type made between the upgrade and the refresh are not replayed;
+  if the receiver parked any events in the window (an unknown type, §8.1),
+  `reapply` them from its parked view once it can apply them.
 - **Secrets, concretely.** A secret authenticates one stream for one epoch.
   Storage is a row in each plugin's own store, same posture as the bus today
   (both stores live on owner boxes; at-rest encryption is the host's

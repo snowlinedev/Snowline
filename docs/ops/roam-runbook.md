@@ -253,6 +253,24 @@ does *not* imply the spoke's writes were applied on the primary. Re-seeding over
 an unresolved park would overwrite the spoke's only applied copy of that write.
 Resolve parks (fix the cause, re-apply from the parked view) before re-seeding.
 
+## 6d. After an upgrade adds an event type — refresh the vocabulary (pm#133)
+
+A paired stream carries only the event types the sender declared at pairing.
+When an upgrade adds one, do NOT re-seed (the never-queued writes cannot be
+replayed); widen the live streams instead, after BOTH sides run the new build:
+
+```bash
+uv run snowline replicate refresh-vocabulary http://<primary-tailnet>:8848 \
+  --peer-instance primary --dry-run    # per-direction plan: added / already current
+uv run snowline replicate refresh-vocabulary http://<primary-tailnet>:8848 \
+  --peer-instance primary
+```
+
+Each direction widens to what the sender emits AND the receiver declares; a type
+only one side knows is held back (re-run after upgrading the other side). The
+verb only widens, refuses a `contract_version` mismatch, and is safe to re-run.
+Then `…/parked/reapply` any events the receiver parked during the skew window.
+
 ## 6c. Stood up EMPTY — the cold-start union merge (§7.1, #98)
 
 The scenario §5/§6 cannot cover: the mini went down, `roam` was stood up
