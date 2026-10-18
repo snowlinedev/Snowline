@@ -95,8 +95,28 @@ def _fully_bootstrapped_home(tmp_path: Path, *, pm_env: str = PM_ENV_SPOKE) -> P
     return home
 
 
+def _plugins_json(names) -> str:
+    """The spoke platform's `GET /plugins` body with `names` registered WITH a
+    replication block (what the #228 registration gate reads)."""
+    return json.dumps({
+        "plugins": [
+            {"name": n, "status": "up",
+             "manifest": {"name": n, "base_url": f"http://127.0.0.1/{n}",
+                          "replication": {"contract_version": 2,
+                                          "ingest_path": "/events/ingest",
+                                          "events": [f"{n}.recorded"]}}}
+            for n in names
+        ]
+    })
+
+
+ALL_PLUGINS = [svc for svc in m.SEED_PARTICIPANTS if svc != "platform"]
+
+
 def _health_ok_handler(argv, cwd):
     if argv[:1] == ["curl"]:
+        if argv[-1].endswith("/plugins"):
+            return _plugins_json(ALL_PLUGINS)
         return ""  # exit 0 == healthy
     return ""
 
@@ -397,3 +417,183 @@ def test_ensure_bootstrap_config_does_not_write_under_dry_run(tmp_path):
 
     b.ensure_bootstrap_config(home, cfg, dry_run=True, prompt=prompt)
     assert not m.stack_config_path(home).exists()
+
+
+# -- #228: registration gate before reverse-pair -----------------------------
+
+
+def _reverse_argv(home):
+    return ("snowline", "replicate", "seed", "--config", str(m.seed_config_path(home)),
+            "--reverse-pair")
+
+
+def test_registration_gate_waits_until_every_plugin_registers(tmp_path):
+    """/health answering is not registration: the gate polls the spoke's
+    /plugins until pm (the laggard) appears, and only THEN reverse-pairs."""
+    home = _fully_bootstrapped_home(tmp_path)
+    polls = {"n": 0}
+
+    def handler(argv, cwd):
+        if argv[:1] == ["curl"] and argv[-1].endswith("/plugins"):
+            polls["n"] += 1
+            names = ALL_PLUGINS if polls["n"] >= 3 else ["governance", "memory"]
+            return _plugins_json(names)
+        return ""
+
+    runner = FakeRunner(handler)
+    sleeps: list[float] = []
+    report = b.run_bootstrap_spoke(
+        home=home, runner=runner, prompt=_no_prompt, health_sleep=sleeps.append
+    )
+    assert report.outcome == "ok", report.detail
+    assert polls["n"] == 3
+    assert sleeps.count(b.REGISTRATION_POLL_S) == 2
+    assert _reverse_argv(home) in runner.runs
+    # the gate ran BEFORE the reverse-pair, against the spoke's own platform.
+    plugins_reads = [a for a in runner.reads if a[-1].endswith("/plugins")]
+    assert plugins_reads[-1][-1] == "http://127.0.0.1:8848/plugins"
+    step_names = [st.name for st in report.steps]
+    assert step_names.index("participants-registered") < step_names.index("reverse-pair")
+
+
+def test_registration_gate_times_out_naming_the_missing_plugin_and_its_err_log(tmp_path):
+    home = _fully_bootstrapped_home(tmp_path)
+
+    def handler(argv, cwd):
+        if argv[:1] == ["curl"] and argv[-1].endswith("/plugins"):
+            return _plugins_json(["governance", "memory"])  # pm never registers
+        return ""
+
+    runner = FakeRunner(handler)
+    report = b.run_bootstrap_spoke(
+        home=home, runner=runner, prompt=_no_prompt, health_sleep=_noop_sleep,
+        registration_timeout=6.0, registration_poll=2.0,
+    )
+    assert report.outcome == "failed"
+    assert "pm (see " in report.detail
+    assert str(m.service_err_log_path(home, "pm")) in report.detail
+    assert "governance (see" not in report.detail
+    # bounded: ceil(6/2)+1 polls, then refusal — and NO reverse-pair attempted.
+    assert len([a for a in runner.reads if a[-1].endswith("/plugins")]) == 4
+    assert _reverse_argv(home) not in runner.runs
+
+
+def test_registration_gate_ignores_a_plugin_listed_without_replication(tmp_path):
+    """A plugin registered WITHOUT a replication block is invisible to
+    reverse-pair's discovery, so it does not satisfy the gate either."""
+    home = _fully_bootstrapped_home(tmp_path)
+    body = json.loads(_plugins_json(["governance", "memory"]))
+    body["plugins"].append({"name": "pm", "status": "up",
+                            "manifest": {"name": "pm", "base_url": "http://x", "replication": None}})
+
+    def handler(argv, cwd):
+        if argv[:1] == ["curl"] and argv[-1].endswith("/plugins"):
+            return json.dumps(body)
+        return ""
+
+    runner = FakeRunner(handler)
+    report = b.run_bootstrap_spoke(
+        home=home, runner=runner, prompt=_no_prompt, health_sleep=_noop_sleep,
+        registration_timeout=2.0, registration_poll=2.0,
+    )
+    assert report.outcome == "failed"
+    assert "pm (see " in report.detail
+
+
+def test_registration_gate_refuses_when_plugins_never_answers(tmp_path):
+    home = _fully_bootstrapped_home(tmp_path)
+
+    def handler(argv, cwd):
+        if argv[:1] == ["curl"] and argv[-1].endswith("/plugins"):
+            return CommandError(argv, 22, "HTTP 500")
+        return ""
+
+    runner = FakeRunner(handler)
+    report = b.run_bootstrap_spoke(
+        home=home, runner=runner, prompt=_no_prompt, health_sleep=_noop_sleep,
+        registration_timeout=2.0, registration_poll=2.0,
+    )
+    assert report.outcome == "failed"
+    assert "/plugins never answered" in report.detail
+    assert _reverse_argv(home) not in runner.runs
+
+
+def test_dry_run_skips_the_registration_gate_and_probe(tmp_path):
+    home = _fully_bootstrapped_home(tmp_path)
+    runner = FakeRunner(_health_ok_handler, dry_run=True)
+    report = b.run_bootstrap_spoke(
+        home=home, runner=runner, prompt=_no_prompt, dry_run=True, health_sleep=_noop_sleep
+    )
+    status = {st.name: st.status for st in report.steps}
+    assert status["participants-registered"] == "skipped"
+    assert status["ingest-reachability"] == "skipped"
+    assert not [a for a in runner.reads if a[-1].endswith("/plugins")]
+
+
+# -- #228: ingest reachability precheck (WARN, never refuse) ----------------
+
+
+def test_ingest_probe_warns_on_unreachable_port_but_still_reverse_pairs(tmp_path):
+    home = _fully_bootstrapped_home(tmp_path)
+    lines: list[str] = []
+
+    def handler(argv, cwd):
+        if argv[:1] == ["curl"]:
+            url = argv[-1]
+            if url.endswith("/plugins"):
+                return _plugins_json(ALL_PLUGINS)
+            if "-w" in argv and "/via/pm/" in url:
+                return CommandError(argv, 7, "Failed to connect")
+            if "-w" in argv and "/via/memory/" in url:
+                return "502"
+            if "-w" in argv:
+                return "405"
+        return ""
+
+    runner = FakeRunner(handler)
+    report = b.run_bootstrap_spoke(
+        home=home, runner=runner, prompt=_no_prompt, health_sleep=_noop_sleep,
+        report=lines.append,
+    )
+    assert report.outcome == "ok", report.detail
+    warns = [ln for ln in lines if ln.startswith("[ingest-reachability] WARN ")]
+    assert len(warns) == 2
+    pm_warn = next(w for w in warns if "pm:" in w)
+    assert "roam.ts.net:8848" in pm_warn and "tailscale serve" in pm_warn
+    assert any("memory:" in w and "HTTP 502" in w for w in warns)
+    probe = next(st for st in report.steps if st.name == "ingest-reachability")
+    assert probe.detail.startswith("WARN")
+    assert _reverse_argv(home) in runner.runs  # a warning, not a refusal
+
+
+def test_ingest_probe_hits_every_participants_tailnet_ingest_url(tmp_path):
+    home = _fully_bootstrapped_home(tmp_path)
+    runner = FakeRunner(_health_ok_handler)
+    report = b.run_bootstrap_spoke(home=home, runner=runner, prompt=_no_prompt, health_sleep=_noop_sleep)
+    assert report.outcome == "ok", report.detail
+    probed = [a[-1] for a in runner.reads if a[:1] == ("curl",) and "-w" in a]
+    seed_cfg = json.loads(m.seed_config_path(home).read_text())
+    assert probed == [p["spoke_ingest_url"] for p in seed_cfg["participants"].values()]
+    assert all(u.startswith("http://roam.ts.net:8848") for u in probed)
+
+
+def test_probe_ingest_reachability_unit():
+    runner = FakeRunner(lambda argv, cwd: "404")
+    assert b.probe_ingest_reachability(
+        runner, {"pm": {"spoke_ingest_url": "http://roam.ts.net:8848/via/pm/events/ingest"}}
+    ) == []
+
+
+# -- #228: a re-run reverse-pairs idempotently -------------------------------
+
+
+def test_second_bootstrap_rerun_reverse_pairs_again_without_failing(tmp_path):
+    """bootstrap-spoke always delegates to `replicate seed --reverse-pair`,
+    which is idempotent since #228 (already-paired participants skip) — so a
+    second run after fixing one plugin reaches reverse-pair and succeeds."""
+    home = _fully_bootstrapped_home(tmp_path)
+    for _ in range(2):
+        runner = FakeRunner(_health_ok_handler)
+        report = b.run_bootstrap_spoke(home=home, runner=runner, prompt=_no_prompt, health_sleep=_noop_sleep)
+        assert report.outcome == "ok", report.detail
+        assert _reverse_argv(home) in runner.runs

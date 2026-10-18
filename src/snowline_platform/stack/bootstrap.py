@@ -19,7 +19,9 @@ never reimplements a byte of replication logic (`replication_seed.py`,
   `replication_seed`'s functions directly, so bootstrap-spoke's own process
   never touches Postgres or the wire itself;
 - kickstarts the local services per the runbook's boot order (§2) and
-  verifies the result (health, `SNOWLINE_PM_ROLE=spoke`).
+  verifies the result (health, every plugin REGISTERED with replication on
+  the spoke platform before reverse-pair — #228 — and
+  `SNOWLINE_PM_ROLE=spoke`).
 
 Deliberately NOT fused with `sync` (spec §6: "software install and data
 topology are deliberately not fused") and deliberately NEVER offers an
@@ -31,6 +33,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import time
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -58,9 +61,27 @@ def _read_optional(path: Path) -> str | None:
     return path.read_text() if path.exists() else None
 
 
+# The registration gate (#228): how long to wait, after post-boot-health,
+# for every plugin's registration heartbeat to land in the spoke platform's
+# `/plugins`, and how often to look. A plugin's first beat is a task started
+# in its lifespan, so it trails `/health` by moments on a good boot; a minute
+# is "it is not coming", not a real bound.
+REGISTRATION_TIMEOUT_S = 60.0
+REGISTRATION_POLL_S = 2.0
+
+# HTTP statuses from the spoke's gateway that mean "the gateway answered but
+# the plugin behind `/via/<name>` did not" — reachable port, dead upstream.
+_UPSTREAM_DOWN_CODES = frozenset({"502", "503", "504"})
+
+
 __all__ = [
+    "REGISTRATION_POLL_S",
+    "REGISTRATION_TIMEOUT_S",
     "ensure_bootstrap_config",
+    "probe_ingest_reachability",
+    "registered_replicating_plugins",
     "run_bootstrap_spoke",
+    "wait_for_registration",
     "write_bootstrap_report",
     "write_seed_config",
 ]
@@ -126,6 +147,96 @@ def ensure_bootstrap_config(
     return updated
 
 
+def registered_replicating_plugins(runner: Runner, platform_url: str) -> set[str] | None:
+    """Names of the plugins the platform at `platform_url` lists in `/plugins`
+    WITH a `replication` block — the exact set `discover_participants` (and so
+    `replicate seed --reverse-pair`) will see. `None` when `/plugins` did not
+    answer or did not parse."""
+    url = platform_url.rstrip("/") + "/plugins"
+    try:
+        out = runner.read(["curl", "-fsS", "--max-time", "5", url])
+    except CommandError:
+        return None
+    try:
+        doc = json.loads(out)
+    except ValueError:
+        return None
+    if not isinstance(doc, dict):
+        return None
+    names: set[str] = set()
+    for entry in doc.get("plugins") or []:
+        manifest = (entry or {}).get("manifest") or {}
+        if manifest.get("replication") and manifest.get("name"):
+            names.add(manifest["name"])
+    return names
+
+
+def wait_for_registration(
+    runner: Runner,
+    platform_url: str,
+    expected: list[str],
+    *,
+    timeout: float = REGISTRATION_TIMEOUT_S,
+    poll: float = REGISTRATION_POLL_S,
+    sleep: Callable[[float], None] = time.sleep,
+) -> set[str] | None:
+    """Poll the spoke's `/plugins` until every name in `expected` is
+    registered with replication, or `timeout` runs out (bounded by attempt
+    count, `ceil(timeout / poll) + 1`, so a fake sleep makes it instant in
+    tests). Returns the LAST observed registered set (`None` if `/plugins`
+    never answered) — the caller decides whether that is a refusal."""
+    attempts = max(1, math.ceil(timeout / poll) + 1) if poll > 0 else 1
+    seen: set[str] | None = None
+    for i in range(attempts):
+        got = registered_replicating_plugins(runner, platform_url)
+        if got is not None:
+            seen = got
+            if all(name in got for name in expected):
+                return got
+        if i + 1 < attempts:
+            sleep(poll)
+    return seen
+
+
+def probe_ingest_reachability(runner: Runner, participants: dict) -> list[str]:
+    """Best-effort precheck (#228) before reverse-pair: probe each
+    participant's `spoke_ingest_url` (the address the PRIMARY delivers to —
+    this machine's tailnet host + the gateway port, `/via/<plugin>` for
+    plugins) with one bounded HTTP request. Any HTTP answer counts as
+    reachable (the ingest route is POST-only, so a GET's 404/405 is fine),
+    EXCEPT a gateway 502/503/504, which means the plugin behind `/via` is not
+    answering. Returns one WARN line per problem; never refuses — this box's
+    view of its own tailnet address is a proxy for the primary's, not proof."""
+    warnings: list[str] = []
+    for name, pcfg in participants.items():
+        url = pcfg.get("spoke_ingest_url")
+        if not url:
+            continue
+        hostport = url.split("://", 1)[-1].split("/", 1)[0]
+        try:
+            code = runner.read(
+                [
+                    "curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
+                    "--max-time", "5", url,
+                ]
+            ).strip()
+        except CommandError:
+            warnings.append(
+                f"{name}: ingest {url} unreachable ({hostport} did not answer) "
+                "— the primary will not be able to deliver to it. Likely "
+                "cause: a `tailscale serve` mirror that predates this "
+                "plugin/port (`stack sync` does not manage it; check "
+                "`tailscale serve status`), or tailscaled down"
+            )
+            continue
+        if code in _UPSTREAM_DOWN_CODES:
+            warnings.append(
+                f"{name}: ingest {url} answered HTTP {code} — {hostport} is "
+                f"reachable but the {name} service behind it is not answering"
+            )
+    return warnings
+
+
 def write_seed_config(home: Path, seed_dict: dict, *, dry_run: bool) -> Path:
     """Regenerated every bootstrap-spoke run (unlike the operator-owned
     `*.env` files) — it is derived wholly from `stack.json`, carries no
@@ -160,6 +271,8 @@ def run_bootstrap_spoke(
     health_url: str = DEFAULT_HEALTH_URL,
     health_sleep: Callable[[float], None] = time.sleep,
     report: Report = print,
+    registration_timeout: float = REGISTRATION_TIMEOUT_S,
+    registration_poll: float = REGISTRATION_POLL_S,
 ) -> m.BootstrapReport:
     started_at = _now_iso()
     steps: list[m.BootstrapStep] = []
@@ -316,7 +429,49 @@ def run_bootstrap_spoke(
                     "section, 'seed interrupted/restarted')"
                 )
 
+        # -- registration gate (#228): /health answering != registered ------
+        # `--reverse-pair` discovers participants from the spoke platform's
+        # `/plugins`, which a plugin populates only from its registration
+        # heartbeat's first beat — so wait for every plugin to be listed with
+        # a replication block BEFORE pairing, and refuse naming the laggard.
+        if dry_run:
+            skipped("participants-registered", "dry-run: nothing was booted")
+        else:
+            expected = [svc for svc in m.SEED_PARTICIPANTS if svc != "platform"]
+            spoke_platform_url = seed_dict["spoke"]["platform_url"]
+            registered = wait_for_registration(
+                runner,
+                spoke_platform_url,
+                expected,
+                timeout=registration_timeout,
+                poll=registration_poll,
+                sleep=health_sleep,
+            )
+            m.check_participants_registered(
+                home,
+                registered,
+                spoke_platform_url=spoke_platform_url,
+                waited_s=registration_timeout,
+            )
+            ok("participants-registered", ", ".join(expected))
+
+        # -- ingest reachability precheck (#228): WARN, never refuse ----------
+        if dry_run:
+            skipped("ingest-reachability", "dry-run: nothing was booted")
+        else:
+            warnings = probe_ingest_reachability(runner, seed_dict["participants"])
+            for line in warnings:
+                report(f"[ingest-reachability] WARN {line}")
+            ok(
+                "ingest-reachability",
+                "WARN: " + " | ".join(warnings)
+                if warnings
+                else "every spoke ingest URL answered",
+            )
+
         # -- §7 step 4: pair the reverse (spoke->primary) direction -----------
+        # Idempotent since #228: already-paired participants are skipped, so a
+        # re-run after fixing one plugin does not fail on the others.
         runner.run(m.seed_cli_argv(seed_path, reverse_pair=True))
         ok(
             "reverse-pair",
