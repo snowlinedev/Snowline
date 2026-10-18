@@ -92,11 +92,15 @@ whose process is not currently running.
 
 **Before restarting the platform, check for a cut in flight:**
 `.venv/bin/snowline release autocut --status`. If it prints `lock: HELD`, an
-auto-cut is running (about 6 minutes). A `kill -TERM` then makes the platform
-wait for the cut, up to 10 minutes, before it exits (see "Auto-cut" below).
+auto-cut is running (about 6 minutes), and the pid shown is the cut's child
+process, not uvicorn. A `kill -TERM` then makes the platform wait for the
+cut, up to 10 minutes, then kill it and exit (see "Auto-cut" below).
 A `launchctl kickstart -k` or `bootout` does not wait that long: launchd
-SIGKILLs the job after its exit timeout (20 seconds by default), which can
-leave a train half-published. Wait for `lock: free` instead.
+SIGKILLs the job after its exit timeout (20 seconds by default). The cut runs
+in its own process group, so that kill is not aimed at it, but whether launchd
+also tears it down with the job is not verified. Either way the train can be
+left half-published until the next tick recovers it. Wait for `lock: free`
+instead.
 
 ## Stack-sync guard
 
@@ -146,8 +150,11 @@ The host refuses to cut, whatever the switches say, when:
 A refusal is logged as a WARNING once each time the reason changes, not on
 every tick.
 
-The cut runs in a worker thread, so `/health` and the gateway keep serving
-during the ~6 minutes. Its subprocesses get a **clean** environment, built
+The cut runs as a **child process**, the platform venv's own
+`snowline release autocut`, in its own process group. Its output goes to the
+platform log prefixed `autocut:`, and `/health` and the gateway keep serving
+during the ~6 minutes. The child and its subprocesses get a **clean**
+environment, built
 like the launchd timer's: `HOME`, `USER` and locale, `SNOWLINE_PLATFORM_URL`,
 and a `PATH` that starts with `~/.local/bin:/opt/homebrew/bin` (uv, gh, npm)
 and ends with the platform venv's `bin`. `~/.config/snowline/autocut.env` is
@@ -156,20 +163,25 @@ it. The daemon's own environment is **not** passed on. It holds the live
 `SNOWLINE_*_DATABASE_URL`s, and the cut's test runs must never see those.
 
 **Shutdown during a cut.** Stopping the platform cancels the host's sleep at
-once. A cut in flight is different: the platform waits for it, for up to 10
-minutes, rather than leave a train half-published (tags pushed, releases
-missing). A platform restart during a cut can therefore take up to 10
-minutes, and that includes the deploy chain's `kill -TERM`. Check
-`snowline release autocut --status` first (see "Deploy routine change"
-above). launchd's own stop (`kickstart -k`, `bootout`) SIGKILLs after about
-20 seconds and does not get the full wait.
+once. A cut in flight is different. The platform waits up to 10 minutes for
+it to finish, so it is not killed half-published (tags pushed, releases
+missing). After that it kills the cut's whole process group: SIGTERM, then
+SIGKILL 10 seconds later. The platform then exits, and launchd relaunches it.
+The kernel releases the lock when the child dies. The cutter is safe to
+re-run: the next tick lands any uncommitted record and skips tags and
+releases that already exist. A platform restart during a cut can therefore
+take up to about 10 minutes, and that includes the deploy chain's
+`kill -TERM`. Check `snowline release autocut --status` first (see "Deploy
+routine change" above). launchd's own stop (`kickstart -k`, `bootout`)
+SIGKILLs after about 20 seconds and does not get the full wait.
 
 `GET /standby` (`hub.autocut`) shows the live host state next to the last
 report: `running` (a cut is running right now), `next_tick_at`, and
 `host_enabled`.
 
 **`snowline release autocut --status`** prints the switches, whether the
-run lock is held (a cut is running, with the holder's pid), and the latest
+run lock is held (a cut is running, with the holder's pid: the cut's child
+process for the in-process host), and the latest
 report's outcome, time and last cut. It is read-only, and it needs no release
 config.
 
@@ -300,7 +312,12 @@ not the keychain), and git's github.com credential helper is
 reach both without a login session. If gh is ever re-authenticated into the
 keychain, the `gh_auth` gate refuses every run (exit 2, in the report). The
 fix is `gh auth login --insecure-storage`, or moving the plist to a gui/501
-LaunchAgent.
+LaunchAgent. Check the helper in each checkout
+(`git -C <checkout> config credential.helper`). If it is `osxkeychain`, a
+daemon cut can fail at its first `git push origin <tag>`. That is the first
+publishing step, so nothing is published before it. The fix is
+`git config credential.helper '!gh auth git-credential'` in both checkouts,
+so pushes use `hosts.yml` the way `gh` does.
 
 **Install (launchd timer only; the in-process host needs none).**
 `sudo ops/hub/install-daemons.sh` (idempotent) copies the plist

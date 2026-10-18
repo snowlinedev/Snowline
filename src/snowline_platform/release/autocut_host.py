@@ -25,27 +25,36 @@ One tick (hourly, after a startup delay):
              like the launchd timer's (HOME/USER/PATH + SNOWLINE_PLATFORM_URL),
              with ~/.config/snowline/autocut.env (KEY=VALUE lines, never
              executed) layered on top and PATH extended for uv/gh/npm.
-  run        `autocut.run_autocut` in a worker thread (the cut is ~6 minutes
-             of blocking subprocesses; the event loop keeps serving). Its
-             flock makes a coexisting launchd timer harmless: whichever fires
-             second records `locked`.
+  run        `snowline release autocut` as a CHILD PROCESS in its own process
+             group (the cut is ~6 minutes of blocking subprocesses; the event
+             loop keeps serving), its output streamed into the platform log
+             prefixed `autocut:`. Its flock makes a coexisting launchd timer
+             harmless: whichever fires second records `locked`.
   outcome    one INFO line per run (noop/ok/gated/failed/locked/...); the
              report stays where #292 writes it (autocut-report.json).
 
 The loop never dies: anything a tick raises is logged and the next tick runs.
-Shutdown cancels the sleep at once; a cut in flight is WAITED FOR (bounded by
-`shutdown_wait_s`, default 10 minutes) rather than abandoned half-published —
-so a platform restart during a cut takes up to that long. `snowline release
-autocut --status` says whether a cut is running before you restart.
+Shutdown cancels the sleep at once; a cut in flight is WAITED FOR, up to
+`shutdown_wait_s` (default 10 minutes), rather than killed half-published.
+Past that bound the child's whole process group gets SIGTERM, then SIGKILL
+after `kill_grace_s`, so the bound is real and the platform exits (a thread
+could not be killed: anyio's worker threads are non-daemon, and an abandoned
+one held the dead platform's pid open). The kernel drops the flock with the
+child, and the cutter is safe to re-run: the next tick recovers (an
+uncommitted record is landed; existing tags/releases are skipped).
+`snowline release autocut --status` says whether a cut is running before you
+restart.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
+import signal
 import socket
+import subprocess
 import sys
-import threading
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -61,6 +70,7 @@ log = logging.getLogger("snowline_platform.autocut_host")
 DEFAULT_INTERVAL_S = 3600.0
 DEFAULT_STARTUP_DELAY_S = 180.0
 DEFAULT_SHUTDOWN_WAIT_S = 600.0
+DEFAULT_KILL_GRACE_S = 10.0
 
 # Host-level tick outcomes, beside run_autocut's own (noop/ok/gated/...).
 OUTCOME_DISABLED = "disabled"
@@ -77,7 +87,7 @@ _INHERITED_ENV = (
     "__CF_USER_TEXT_ENCODING", "SSH_AUTH_SOCK",
 )
 
-Run = Callable[["TickSettings"], object]
+Command = Callable[["TickSettings"], list[str]]
 Sleep = Callable[[float], Awaitable[None]]
 
 
@@ -141,7 +151,7 @@ def subprocess_env(
     home: Path,
     venv_bin: Path | None = None,
 ) -> dict[str, str]:
-    """The env every cut subprocess starts from (Runner.base_env).
+    """The autocut child's whole environment (and so every cut subprocess's).
 
     PATH: ~/.local/bin and Homebrew first (uv, gh, node/npm — the launchd
     timer's PATH), then the daemon's own PATH, the system dirs, and the
@@ -183,7 +193,9 @@ def _host_port(url: str) -> tuple[str, int] | None:
 
 def is_local_address(host: str) -> bool:
     """True when `host` resolves only to addresses this machine can bind —
-    i.e. it names this machine (loopback or one of its own interfaces)."""
+    i.e. it names this machine (loopback or one of its own interfaces).
+    Blocking (getaddrinfo + bind): the host calls it off the event loop.
+    The hub's URL is an IP literal, so resolution is immediate there."""
     try:
         infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
     except OSError:
@@ -232,6 +244,10 @@ def refusal(
     own = _host_port(self_url)
     if target is None:
         return f"SNOWLINE_PLATFORM_URL {platform_url!r} is not an http(s) URL"
+    # NOTE: without an autocut.env override, `platform_url` and `self_url`
+    # both come from the platform's own SNOWLINE_PLATFORM_URL, so this
+    # comparison only bites on an override. The real guards are `is_local`
+    # below plus the spoke and source-run checks above.
     if own is None or target != own:
         return (
             f"SNOWLINE_PLATFORM_URL {platform_url} is not this platform's own "
@@ -255,26 +271,28 @@ class TickSettings:
     env: dict[str, str]
 
 
-def run_once(settings: TickSettings) -> a.AutocutReport:
-    """Production `run`: exactly what `snowline release autocut` does, from
-    the checkout this platform runs from, with the clean env. Blocking."""
-    from . import model as m
-    from . import runner as r
+def default_command(settings: TickSettings, *, venv_bin: Path | None = None) -> list[str]:
+    """The child: this platform venv's own `snowline release autocut`, against
+    the checkout the platform runs from. SNOWLINE_PLATFORM_URL rides in env."""
+    venv = venv_bin if venv_bin is not None else Path(sys.prefix) / "bin"
+    return [
+        str(venv / "snowline"), "release", "autocut",
+        "--config", str(settings.root / "release" / "components.json"),
+    ]
 
-    def report(line: str) -> None:
-        for part in str(line).splitlines() or [""]:
-            log.info("autocut: %s", part)
 
-    config = m.load_config(settings.root / "release" / "components.json")
-    checkouts = {comp.name: m.resolve_checkout(config, comp, {}) for comp in config.components}
-    runner = r.Runner(report=report, base_env=settings.env)
-    return a.run_autocut(
-        config,
-        checkouts=checkouts,
-        home=settings.home,
-        runner=runner,
-        platform_url=settings.platform_url,
-        report=report,
+# run_autocut's final line: "autocut <finished_at>: <outcome>[ — <detail>]".
+_FINAL_RE = re.compile(r"^autocut \S+: ([a-z_]+)(?: — (.*))?$")
+
+
+def parse_outcome(lines: list[str], returncode: int | None) -> tuple[str, str | None]:
+    for line in reversed(lines):
+        m = _FINAL_RE.match(line.strip())
+        if m:
+            return m.group(1), m.group(2)
+    tail = lines[-1].strip() if lines else ""
+    return a.OUTCOME_FAILED, f"autocut child exited {returncode} without a final line" + (
+        f" (last: {tail})" if tail else ""
     )
 
 
@@ -285,6 +303,7 @@ class HostState:
     alive: bool = False
     enabled: bool = False
     running: bool = False
+    child_pid: int | None = None
     last_tick_at: str | None = None
     last_outcome: str | None = None
     last_detail: str | None = None
@@ -295,6 +314,7 @@ class HostState:
             "alive": self.alive,
             "enabled": self.enabled,
             "running": self.running,
+            "child_pid": self.child_pid,
             "last_tick_at": self.last_tick_at,
             "last_outcome": self.last_outcome,
             "last_detail": self.last_detail,
@@ -308,12 +328,13 @@ class AutocutHost:
         *,
         home: Path | None = None,
         state: HostState | None = None,
-        run: Run = run_once,
+        command: Command | None = None,
         self_url: Callable[[], str] | None = None,
         root: Path | None | object = ...,
         is_local: Callable[[str], bool] = is_local_address,
         environ: Mapping[str, str] | None = None,
         shutdown_wait_s: float = DEFAULT_SHUTDOWN_WAIT_S,
+        kill_grace_s: float = DEFAULT_KILL_GRACE_S,
         now: Callable[[], datetime] = _utcnow,
         venv_bin: Path | None = None,
     ):
@@ -321,12 +342,13 @@ class AutocutHost:
 
         self.home = home if home is not None else host_home()
         self.state = state or HostState()
-        self.run = run
+        self.command = command or (lambda s: default_command(s, venv_bin=venv_bin))
         self.self_url = self_url or config.platform_self_url
         self.root = source_root() if root is ... else root
         self.is_local = is_local
         self.environ = environ
         self.shutdown_wait_s = shutdown_wait_s
+        self.kill_grace_s = kill_grace_s
         self.now = now
         self.venv_bin = venv_bin
         self._announced: tuple[str, str] | None = None
@@ -348,6 +370,7 @@ class AutocutHost:
         self._announce("enabled" if enabled else "disabled", why, logging.INFO)
 
     def prepare(self) -> tuple[TickSettings | None, str | None]:
+        """Blocking (file reads, getaddrinfo + bind): run off the loop."""
         environ = self.environ if self.environ is not None else os.environ
         file_env = load_env_file(self.home)
         platform_url = file_env.get("SNOWLINE_PLATFORM_URL") or environ.get("SNOWLINE_PLATFORM_URL")
@@ -374,18 +397,17 @@ class AutocutHost:
             if not enabled:
                 self._announce("disabled", why, logging.INFO)
                 return self._record(OUTCOME_DISABLED, why)
-            settings, refused = self.prepare()
+            settings, refused = await anyio.to_thread.run_sync(self.prepare)
             if refused:
                 self._announce("refused", refused, logging.WARNING)
                 return self._record(OUTCOME_REFUSED, refused)
             self._announce("enabled", why, logging.INFO)
             state.running = True
             try:
-                result = await self._run_in_thread(settings)
+                outcome, detail = await self._run_child(settings)
             finally:
                 state.running = False
-            outcome = str(getattr(result, "outcome", result))
-            detail = getattr(result, "detail", None)
+                state.child_pid = None
         except anyio.get_cancelled_exc_class():
             raise
         except Exception as exc:  # the loop must never die (logged below)
@@ -399,37 +421,82 @@ class AutocutHost:
         self.state.last_detail = detail
         return outcome
 
-    async def _run_in_thread(self, settings: TickSettings) -> object:
-        finished = threading.Event()
+    async def _run_child(self, settings: TickSettings) -> tuple[str, str | None]:
+        argv = self.command(settings)
+        proc = await anyio.open_process(
+            argv,
+            env=settings.env,
+            cwd=str(settings.root),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            # Its own process group: the cut's git/gh/uv/npm grandchildren
+            # are killed WITH it past the shutdown bound, and a signal aimed
+            # at the platform's group does not reach them.
+            start_new_session=True,
+        )
+        self.state.child_pid = proc.pid
+        lines: list[str] = []
+        pending = bytearray()
 
-        def call() -> object:
-            try:
-                return self.run(settings)
-            finally:
-                finished.set()
+        async def pump() -> None:
+            assert proc.stdout is not None
+            async for chunk in proc.stdout:
+                pending.extend(chunk)
+                while b"\n" in pending:
+                    raw, _, rest = bytes(pending).partition(b"\n")
+                    pending[:] = rest
+                    line = raw.decode(errors="replace")
+                    log.info("autocut: %s", line)
+                    lines.append(line)
+                    del lines[:-200]
+
+        async def supervise() -> int:
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(pump)
+                code = await proc.wait()
+            return code
 
         try:
-            return await anyio.to_thread.run_sync(call, abandon_on_cancel=True)
+            code = await supervise()
         except anyio.get_cancelled_exc_class():
-            # Shutdown mid-cut: killing it could leave a train half-published
-            # (tags pushed, releases missing). Wait — bounded — for it.
-            if not finished.is_set():
-                log.warning(
-                    "autocut host: platform shutting down DURING a cut — waiting "
-                    "up to %.0fs for it to finish before exiting",
-                    self.shutdown_wait_s,
-                )
-                with anyio.CancelScope(shield=True):
-                    await anyio.to_thread.run_sync(finished.wait, self.shutdown_wait_s)
-                if finished.is_set():
-                    log.info("autocut host: the in-flight cut finished; shutdown continues")
-                else:
-                    log.error(
-                        "autocut host: cut still running after %.0fs — abandoning it "
-                        "to shutdown (check autocut-report.json and the train's tags)",
-                        self.shutdown_wait_s,
-                    )
+            with anyio.CancelScope(shield=True):
+                await self._stop_child(proc, supervise)
             raise
+        if pending:
+            lines.append(pending.decode(errors="replace"))
+        return parse_outcome(lines, code)
+
+    async def _stop_child(self, proc, supervise) -> None:
+        """Shutdown mid-cut: wait (bounded) for the child, then kill its
+        process group — SIGTERM, `kill_grace_s`, SIGKILL."""
+        if proc.returncode is not None:
+            return
+        log.warning(
+            "autocut host: platform shutting down DURING a cut (pid %s) — waiting "
+            "up to %.0fs for it to finish, then killing it",
+            proc.pid, self.shutdown_wait_s,
+        )
+        with anyio.move_on_after(self.shutdown_wait_s):
+            await supervise()
+            log.info("autocut host: the in-flight cut finished; shutdown continues")
+            return
+        for sig, grace in ((signal.SIGTERM, self.kill_grace_s), (signal.SIGKILL, None)):
+            log.error(
+                "autocut host: cut still running after the shutdown bound — sending "
+                "%s to process group %s (the next tick recovers)",
+                sig.name, proc.pid,
+            )
+            try:
+                os.killpg(proc.pid, sig)
+            except ProcessLookupError:
+                return
+            if grace is None:
+                await proc.wait()
+                return
+            with anyio.move_on_after(grace):
+                await proc.wait()
+                return
 
     async def loop(
         self,

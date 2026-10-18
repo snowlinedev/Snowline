@@ -585,9 +585,11 @@ def _cmd_release_cut(args) -> int:
 def _cmd_release_autocut(args) -> int:
     from snowline_platform.release import autocut as autocut_lib
     from snowline_platform.release import runner as release_runner
+    from snowline_platform.release.autocut_host import host_home
 
+    home = host_home()  # $SNOWLINE_AUTOCUT_HOME, else ~ — the host's own rule
     if args.status:
-        for line in autocut_lib.status_lines(Path.home()):
+        for line in autocut_lib.status_lines(home):
             print(line)
         return 0
     config, checkouts = _release_context(args)
@@ -604,7 +606,7 @@ def _cmd_release_autocut(args) -> int:
     rpt = autocut_lib.run_autocut(
         config,
         checkouts=checkouts,
-        home=Path.home(),
+        home=home,
         runner=runner,
         platform_url=args.platform_url,
         dry_run=args.dry_run,

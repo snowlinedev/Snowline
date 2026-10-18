@@ -751,8 +751,9 @@ class LockState:
 def lock_state(home: Path) -> LockState:
     """Probe the run lock WITHOUT creating it: a shared non-blocking flock
     fails exactly while a run holds its exclusive one. flock locks belong to
-    the open file description, so this sees a holder in this same process
-    too (the in-process host) — not only another process."""
+    the open file description, so this works from any process. The pid is
+    the one the holder wrote: for the in-process host that is its CHILD
+    `snowline release autocut` process, not the platform's uvicorn."""
     path = lock_path(home)
     try:
         fd = os.open(path, os.O_RDONLY)

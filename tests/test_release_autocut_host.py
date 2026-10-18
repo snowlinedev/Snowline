@@ -1,10 +1,11 @@
 """The in-process auto-cut host (item a25fa809): release/autocut_host.py.
 
 The cut itself (`run_autocut`) has its own suite (test_release_autocut.py);
-here a fake `run` callable stands in for it and a fake sleep/clock drives the
-loop — what is under test is the HOST: the marker switch, the non-configurable
-refusals, the clean env, the loop's survival, and shutdown behaviour (cancel a
-sleep at once, wait — bounded — for a cut in flight). Plus `--status` against a
+here a tiny python CHILD stands in for `snowline release autocut` and a fake
+sleep/clock drives the loop — what is under test is the HOST: the marker
+switch, the non-configurable refusals, the clean env reaching the child, the
+loop's survival, and shutdown behaviour (cancel a sleep at once; wait —
+bounded — for a cut in flight, then kill its whole process group). Plus `--status` against a
 real flock, and the platform lifespan starting/stopping the host.
 """
 
@@ -12,6 +13,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import sys
+import textwrap
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -24,7 +28,6 @@ from starlette.testclient import TestClient
 from snowline_platform import standby
 from snowline_platform.release import autocut as a
 from snowline_platform.release import autocut_host as h
-from snowline_platform.release import runner as runner_mod
 
 HUB = "http://127.0.0.1:8850"
 
@@ -49,11 +52,24 @@ def enable(home: Path) -> None:
     a.enable_marker_path(home).touch()
 
 
+def child(code: str) -> list[str]:
+    return [sys.executable, "-c", textwrap.dedent(code)]
+
+
+def final(outcome: str, detail: str | None = None) -> str:
+    tail = f" — {detail}" if detail else ""
+    return f"print('autocut 2026-10-18T12:00:00+00:00: {outcome}{tail}', flush=True)"
+
+
 class FakeRun:
-    def __init__(self, outcomes=("noop",), *, raises=None):
+    """The host's `command` seam: records each tick's settings and returns
+    the argv of a python child that prints run_autocut's final line."""
+
+    def __init__(self, outcomes=("noop",), *, raises=None, body=""):
         self.calls: list[h.TickSettings] = []
         self.outcomes = list(outcomes)
         self.raises = list(raises or [])
+        self.body = body
 
     def __call__(self, settings):
         self.calls.append(settings)
@@ -61,13 +77,14 @@ class FakeRun:
             exc = self.raises.pop(0)
             if exc is not None:
                 raise exc
-        return self.outcomes.pop(0) if len(self.outcomes) > 1 else self.outcomes[0]
+        outcome = self.outcomes.pop(0) if len(self.outcomes) > 1 else self.outcomes[0]
+        return child("import os\nprint('autocut: working', flush=True)\n" + self.body + final(outcome))
 
 
 def make_host(home, root, run, *, environ=None, is_local=lambda _h: True, **kw):
     return h.AutocutHost(
         home=home,
-        run=run,
+        command=run,
         self_url=lambda: HUB,
         root=root,
         is_local=is_local,
@@ -296,63 +313,128 @@ def test_shutdown_during_the_sleep_cancels_promptly(home, root):
     assert host.state.alive is False
 
 
-class BlockingRun:
-    def __init__(self, seconds):
-        self.seconds = seconds
-        self.release = threading.Event()
-        self.finished = threading.Event()
-
-    def __call__(self, settings):
-        self.release.wait(self.seconds)
-        self.finished.set()
-        return "ok"
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
 
 
-def _cancel_mid_run(host, run):
+def _cancel_mid_run(host, ready: Path):
+    """Run the loop, cancel it once the child wrote `ready`; returns
+    (elapsed seconds from the cancel, the child's pid)."""
+    seen = {}
+
     async def main():
         async with anyio.create_task_group() as tg:
             tg.start_soon(lambda: host.loop(interval_s=3600, startup_delay_s=0))
-            while not host.state.running:
+            deadline = time.monotonic() + 10
+            while not ready.exists():
+                assert time.monotonic() < deadline, "child never got ready"
                 await anyio.sleep(0.01)
+            seen["pid"] = host.state.child_pid
+            seen["t"] = time.monotonic()
             tg.cancel_scope.cancel()
 
-    started = time.monotonic()
     anyio.run(main)
-    return time.monotonic() - started
+    return time.monotonic() - seen["t"], seen["pid"]
 
 
-def test_shutdown_during_a_run_waits_for_it(home, root):
+def test_shutdown_during_a_run_waits_for_it(home, root, tmp_path):
     enable(home)
-    run = BlockingRun(0.5)
+    ready, done = tmp_path / "ready", tmp_path / "done"
+    run = FakeRun(body=(
+        "import time, pathlib\n"
+        f"pathlib.Path({str(ready)!r}).touch()\n"
+        "time.sleep(0.5)\n"
+        f"pathlib.Path({str(done)!r}).touch()\n"
+    ))
     host = make_host(home, root, run, shutdown_wait_s=30)
-    elapsed = _cancel_mid_run(host, run)
-    assert run.finished.is_set(), "shutdown returned before the cut finished"
-    assert 0.4 <= elapsed < 10
-    assert host.state.running is False
+    elapsed, pid = _cancel_mid_run(host, ready)
+    assert done.exists(), "shutdown returned before the cut finished"
+    assert 0.3 <= elapsed < 10
+    assert not _pid_alive(pid)
+    assert host.state.running is False and host.state.child_pid is None
 
 
-def test_shutdown_wait_is_bounded(home, root):
+def test_past_the_bound_the_whole_process_group_is_killed(home, root, tmp_path):
+    """SIGTERM reaches the child AND its grandchildren (own process group)."""
     enable(home)
-    run = BlockingRun(30)
-    host = make_host(home, root, run, shutdown_wait_s=0.3)
-    try:
-        elapsed = _cancel_mid_run(host, run)
-        assert not run.finished.is_set()
-        assert elapsed < 5
-    finally:
-        run.release.set()  # free the abandoned worker thread
+    ready, grand = tmp_path / "ready", tmp_path / "grandchild.pid"
+    run = FakeRun(body=(
+        "import subprocess, time, pathlib\n"
+        "g = subprocess.Popen(['sleep', '60'])\n"
+        f"pathlib.Path({str(grand)!r}).write_text(str(g.pid))\n"
+        f"pathlib.Path({str(ready)!r}).touch()\n"
+        "time.sleep(60)\n"
+    ))
+    host = make_host(home, root, run, shutdown_wait_s=0.3, kill_grace_s=5)
+    elapsed, pid = _cancel_mid_run(host, ready)
+    assert elapsed < 4
+    assert not _pid_alive(pid)
+    grandchild = int(grand.read_text())
+    deadline = time.monotonic() + 3
+    while _pid_alive(grandchild) and time.monotonic() < deadline:
+        time.sleep(0.05)  # orphaned `sleep` is reaped by init
+    assert not _pid_alive(grandchild), "grandchild survived the group kill"
 
 
-# --------------------------------------------------------------------------
-# Runner.base_env (the clean env reaches the subprocesses)
-# --------------------------------------------------------------------------
+def test_a_child_ignoring_sigterm_is_sigkilled(home, root, tmp_path):
+    enable(home)
+    ready = tmp_path / "ready"
+    run = FakeRun(body=(
+        "import signal, time, pathlib\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        f"pathlib.Path({str(ready)!r}).touch()\n"
+        "time.sleep(60)\n"
+    ))
+    host = make_host(home, root, run, shutdown_wait_s=0.2, kill_grace_s=0.3)
+    elapsed, pid = _cancel_mid_run(host, ready)
+    assert elapsed < 4
+    assert not _pid_alive(pid)
 
 
-def test_runner_base_env_replaces_the_process_env(monkeypatch):
-    monkeypatch.setenv("SNOWLINE_LEAK", "live")
-    runner = runner_mod.Runner(base_env={"PATH": "/usr/bin:/bin", "ONLY": "1"})
-    out = runner.read(["/bin/sh", "-c", 'echo "${ONLY}:${SNOWLINE_LEAK:-none}:${X}"'], env={"X": "2"})
-    assert out.strip() == "1:none:2"
+def test_operator_test_db_url_from_autocut_env_reaches_the_childs_environ(home, root, caplog):
+    """cutter.run_tests (#299) decides "operator-provided test DB" from
+    os.environ.get(var) — in the child, which is exactly the env built here."""
+    enable(home)
+    a.env_file_path(home).write_text(
+        "SNOWLINE_PLATFORM_TEST_DATABASE_URL=postgresql+psycopg://other-pg/x\n"
+    )
+    run = FakeRun(body=(
+        "print('db=' + str(os.environ.get('SNOWLINE_PLATFORM_TEST_DATABASE_URL')), flush=True)\n"
+        "print('live=' + str(os.environ.get('SNOWLINE_PLATFORM_DATABASE_URL')), flush=True)\n"
+    ))
+    host = make_host(home, root, run)
+    with caplog.at_level(logging.INFO, logger="snowline_platform.autocut_host"):
+        assert tick(host) == "noop"
+    messages = [r.getMessage() for r in caplog.records]
+    assert "autocut: db=postgresql+psycopg://other-pg/x" in messages
+    assert "autocut: live=None" in messages
+
+
+def test_child_without_a_final_line_is_failed(home, root):
+    enable(home)
+    host = make_host(home, root, lambda s: child("import sys; print('boom'); sys.exit(3)"))
+    assert tick(host) == a.OUTCOME_FAILED
+    assert "exited 3" in host.state.last_detail and "boom" in host.state.last_detail
+
+
+def test_parse_outcome_reads_run_autocuts_final_line():
+    assert h.parse_outcome(["x", "autocut 2026-10-18T12:00:00+00:00: gated — gh_auth: no"], 2) == (
+        "gated", "gh_auth: no",
+    )
+    assert h.parse_outcome(["autocut 2026-10-18T12:00:00+00:00: noop"], 0) == ("noop", None)
+
+
+def test_default_command_is_this_venvs_snowline(root):
+    settings = h.TickSettings(home=Path("/h"), root=root, platform_url=HUB, env={})
+    argv = h.default_command(settings, venv_bin=Path("/repo/.venv/bin"))
+    assert argv == [
+        "/repo/.venv/bin/snowline", "release", "autocut",
+        "--config", str(root / "release" / "components.json"),
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -363,7 +445,7 @@ def test_runner_base_env_replaces_the_process_env(monkeypatch):
 def _status(monkeypatch, capsys, home) -> str:
     from snowline_platform.cli import main
 
-    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("SNOWLINE_AUTOCUT_HOME", str(home))
     assert main(["release", "autocut", "--status"]) == 0
     return capsys.readouterr().out
 
@@ -427,11 +509,11 @@ def test_lifespan_starts_and_stops_the_host(tmp_path, monkeypatch):
 
     def fake_run(settings):
         ran.set()
-        return "noop"
+        return child(final("noop"))
 
     app = create_app(resolver=TrustResolver([_Trust()]), migrate_on_startup=False)
     app.state.autocut_host_options = {
-        "run": fake_run,
+        "command": fake_run,
         "startup_delay_s": 0,
         "root": tmp_path,
         "self_url": lambda: HUB,
@@ -447,19 +529,3 @@ def test_lifespan_starts_and_stops_the_host(tmp_path, monkeypatch):
             time.sleep(0.01)
         assert state.last_outcome == "noop"
     assert state.alive is False
-
-
-def test_run_once_drives_run_autocut_with_the_clean_env(monkeypatch, home):
-    seen = {}
-
-    def fake_run_autocut(config, *, checkouts, home, runner, platform_url, report):
-        seen.update(checkouts=checkouts, home=home, env=runner.base_env, url=platform_url)
-        return a.AutocutReport(started_at="t", outcome="noop")
-
-    monkeypatch.setattr(a, "run_autocut", fake_run_autocut)
-    repo = Path(__file__).resolve().parents[1]
-    settings = h.TickSettings(home=home, root=repo, platform_url=HUB, env={"PATH": "/usr/bin", "ONLY": "1"})
-    assert h.run_once(settings).outcome == "noop"
-    assert seen["env"] == {"PATH": "/usr/bin", "ONLY": "1"}
-    assert seen["url"] == HUB and seen["home"] == home
-    assert seen["checkouts"]["platform"] == repo

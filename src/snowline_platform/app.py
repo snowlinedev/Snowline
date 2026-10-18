@@ -220,9 +220,11 @@ async def _lifespan(app: FastAPI):
                     # Cancel even if serving raised; the task group absorbs
                     # its own-scope cancellation, so shutdown stays clean.
                     # A cut in flight is the one thing that does NOT stop at
-                    # once: the host waits for it (bounded, 10 min default)
-                    # rather than leave a train half-published — see
-                    # release/autocut_host.py and docs/ops/hub-daemons.md.
+                    # once: the host waits for its child process up to 10
+                    # min, then kills the child's process group, so the
+                    # platform always exits and launchd can relaunch it; the
+                    # next tick recovers. See release/autocut_host.py and
+                    # docs/ops/hub-daemons.md.
                     tg.cancel_scope.cancel()
     finally:
         # The standby readiness refresh (#259) runs as a background task off
