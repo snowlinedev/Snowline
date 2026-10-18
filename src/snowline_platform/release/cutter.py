@@ -536,6 +536,7 @@ def cut(
     report: r.Report = print,
     force: bool = False,
     fetch_status: g.StatusFetcher | None = None,
+    commit_manifest: bool = False,
 ) -> TrainPlan:
     m.validate_version(version)
     manifest_comp = config.manifest_component
@@ -608,11 +609,76 @@ def cut(
     # The checkout train record is written ONLY once everything published —
     # a failed cut must not arm plan_train's immutability check (#207 review).
     cutter.record_manifest(plan)
+    if commit_manifest:
+        # `--commit-manifest` (#258): the record is committed + pushed as part
+        # of the cut, so a train never again goes unrecorded on main the way
+        # v0.4.0's did. Only after everything published — a failed cut never
+        # leaves a committed record behind.
+        report("\nrecord")
+        commit_train_record(
+            runner, checkouts[manifest_comp.name], version, report=report
+        )
+        cutter.notes = [n for n in cutter.notes if not n.startswith(f"commit {MANIFEST_RELPATH}")]
 
     report(f"\ncut {version} complete.")
     for note in cutter.notes:
         report(f"  next: {note}")
     return plan
+
+
+class ManifestCommitError(ReleaseError):
+    """The train published, but its record could not be committed/pushed.
+
+    Distinct from a cut failure: everything a target needs is on the release,
+    and `release/train.json` is left UNCOMMITTED in the checkout (the cutter's
+    preflight ignores it), so a later `commit_train_record` — or the next
+    `snowline release autocut` run — can still land it."""
+
+
+def commit_train_record(
+    runner: r.Runner,
+    checkout: Path,
+    version: str,
+    *,
+    message: str | None = None,
+    report: r.Report = print,
+) -> str | None:
+    """Commit `release/train.json` — and ONLY that path — on main, then push.
+
+    Returns the new commit sha, or None when the record is already committed
+    (nothing to do). `git commit --only -- <path>` keeps anything else the
+    operator happened to stage out of the record commit. A rejected push (main
+    moved during the cut) is undone with `reset --soft HEAD~1`: a local commit
+    that origin does not have would leave the checkout ahead of origin/main
+    and fail every later preflight, while an uncommitted record is exactly
+    the state a re-run knows how to finish (#258).
+    """
+    rel = str(MANIFEST_RELPATH)
+    branch = runner.read(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=checkout).strip()
+    if branch != "main":
+        raise ManifestCommitError(
+            f"cannot commit the train record: {checkout} is on {branch or '(detached)'}, "
+            "not main"
+        )
+    pending = runner.read(["git", "status", "--porcelain", "--", rel], cwd=checkout).strip()
+    if not pending:
+        report(f"  {rel} already committed — nothing to record")
+        return None
+    msg = message or f"release: train {version}"
+    runner.run(["git", "add", "--", rel], cwd=checkout)
+    runner.run(["git", "commit", "--only", "-m", msg, "--", rel], cwd=checkout)
+    sha = runner.read(["git", "rev-parse", "HEAD"], cwd=checkout).strip()
+    try:
+        runner.run(["git", "push", "origin", "HEAD:main"], cwd=checkout)
+    except r.CommandError as exc:
+        runner.run(["git", "reset", "--soft", "HEAD~1"], cwd=checkout, check=False)
+        raise ManifestCommitError(
+            f"train {version} is published, but pushing its record commit failed "
+            f"({exc.returncode}); the commit was undone and {rel} is left "
+            "uncommitted for a re-run to land"
+        ) from exc
+    report(f"  committed + pushed {rel} as {sha[:12]} ({msg!r})")
+    return sha
 
 
 def _milestone_gate(version, force, fetch, dry_run, report) -> dict:
