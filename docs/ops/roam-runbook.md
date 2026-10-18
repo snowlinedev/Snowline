@@ -504,8 +504,22 @@ platform train swap upgrades it too and sync kickstarts it alongside) and
 reported like the other env files). `SNOWLINE_FRONT_HUB_URL` comes from
 `stack.json`'s `primary_gateway_url` (or the `http://<primary>:8850` default
 bootstrap-spoke would prompt with). Post-sync and post-boot health checks
-probe `http://127.0.0.1:8850/front/health` alongside the gateway's `/health`.
+probe `http://127.0.0.1:8850/front/health` after the gateway's `/health` —
+but only the gateway decides a train's fate. A dead front (port 8850 already
+taken, a bad `front.env` value) is REPORTED, never a revert trigger: sync
+ends `needs_attention` with a front-specific detail (`front_ok: false` in
+the run report) and keeps the train; bootstrap-spoke records a WARN
+`front-health` step and carries on.
 The hub never gets one: `stack sync` is spoke-only (decision 54447516).
+
+**Timeouts.** A request whose `Accept` names `text/event-stream` — every MCP
+request, GET and POST — has NO read timeout: Claude Code holds the standalone
+`GET /mcp/` SSE stream open, silent, for the whole session, and a read timeout
+would cut it every N seconds. Everything else (dashboard, plain HTTP) keeps a
+600 s per-read timeout (`SNOWLINE_FRONT_READ_TIMEOUT`, 0 = none). The connect
+timeout (5 s) always applies. An upstream that breaks mid-stream, after the
+headers went out, just ends the stream with one `stream broke after headers`
+WARNING.
 
 **Routing.** Every request is forwarded verbatim (method, raw path, query,
 body, headers minus hop-by-hop; responses stream unbuffered, so MCP's
@@ -517,7 +531,8 @@ body, headers minus hop-by-hop; responses stream unbuffered, so MCP's
 - the **local spoke platform** (`http://127.0.0.1:8848`) otherwise.
 
 Probes run every 5 s. Hysteresis: flip hub→spoke after **2** consecutive
-failures (~10 s), back spoke→hub only after **6** consecutive successes (~30 s
+failures — ~10 s when the hub refuses connections outright, ~14 s when each
+probe has to wait out its 2 s timeout (interval + timeout per probe) — back spoke→hub only after **6** consecutive successes (~30 s
 stable) — a flapping hub keeps you on the spoke rather than flapping with it.
 At boot the first probe picks the starting upstream directly. The choice is
 per request, at request start; a request in flight when a flip happens finishes
