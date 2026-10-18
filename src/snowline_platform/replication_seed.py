@@ -65,9 +65,11 @@ from sqlalchemy.orm import Session
 from snowline_platform.replication import via_base
 from snowline_plugin_sdk.replication.envelope import is_backfill_source
 from snowline_platform.replication_pairing import (
+    PairingError,
     Participant,
     discover_participants,
     handshake_direction,
+    live_outbound,
     mint_epoch,
 )
 from snowline_plugin_sdk.replication.envelope import sign_body
@@ -466,30 +468,152 @@ def run_seed(
 # --- step 4: pair the reverse direction ---------------------------------------
 
 
+def select_participants(cfg: SeedConfig, names: list[str] | None) -> SeedConfig:
+    """Restrict `cfg` to the named participants (`--participants NAME[,NAME]`),
+    in the config's own order. `None` = all. An unknown name is refused with
+    the known list — a typo must never silently pair nothing."""
+    if names is None:
+        return cfg
+    known = [sp.name for sp in cfg.participants]
+    unknown = [n for n in names if n not in known]
+    if unknown:
+        raise SeedError(
+            f"--participants: unknown participant(s) {unknown} — the seed "
+            f"config knows {known}"
+        )
+    wanted = set(names)
+    return SeedConfig(
+        primary_platform_url=cfg.primary_platform_url,
+        primary_instance=cfg.primary_instance,
+        spoke_platform_url=cfg.spoke_platform_url,
+        spoke_instance=cfg.spoke_instance,
+        participants=tuple(sp for sp in cfg.participants if sp.name in wanted),
+    )
+
+
+def _reverse_already_paired(
+    client, sp: SeedParticipant, spoke_p: Participant, *, report: Report
+) -> bool:
+    """Is the spoke→primary stream for `sp` already live?
+
+    "Already paired" means BOTH halves of the §5 handshake are live under ONE
+    epoch: the PRIMARY (receiver) holds an ACTIVE inbound stream from the
+    spoke's source_id — exactly what `handshake_direction`'s run-once guard
+    keys on — AND the SPOKE (sender) holds a live outbound subscription with
+    that stream identity (`live_outbound`) at the same epoch. Both are read
+    with the one client `run_reverse_pair` already holds (the primary's admin
+    surface through its gateway, the spoke's on loopback).
+
+    The primary half alone is NOT enough: a plain re-seed (bootstrap-spoke
+    re-run) wipes the spoke's cloned replication tables, so the primary keeps
+    an active inbound from the spoke that NO sender holds the secret for — a
+    primary-only check would report "already paired" and the spoke's writes
+    would never flow back. A half-pair (primary inbound without a matching
+    spoke outbound, or vice versa — also what a handshake that died between
+    its two steps leaves) can receive/deliver nothing, so it is retired on
+    both sides and the direction re-paired fresh. Returns True iff paired."""
+    resp = client.get(f"{sp.primary.admin_base}/inbound")
+    if resp.status_code >= 400:
+        raise SeedError(
+            f"reading {sp.primary.admin_base}/inbound failed: HTTP "
+            f"{resp.status_code} {_safe_body(resp)}"
+        )
+    inbound_epochs = {
+        s.get("epoch")
+        for s in resp.json()
+        if s.get("source_id") == sp.spoke_source_id and s.get("active")
+    }
+    outbound = live_outbound(client, spoke_p, sp.primary)
+    if inbound_epochs & {s.get("epoch") for s in outbound}:
+        return True
+    if inbound_epochs:
+        report(
+            f"[reverse] {sp.name}: primary holds an active inbound from "
+            f"{sp.spoke_source_id} with no matching live spoke outbound (a "
+            "half-pair: re-seeded spoke or an interrupted handshake) — "
+            "retiring it before re-pairing"
+        )
+        _retire_primary_inbound_from_spoke(client, sp, report=report)
+    for sub in outbound:
+        client.post(f"{spoke_p.admin_base}/outbound/retire", json={"id": sub["id"]})
+        report(
+            f"[reverse] {sp.name}: retired orphaned spoke outbound {sub['id']} "
+            f"(epoch {sub.get('epoch')}) with no matching primary inbound"
+        )
+    return False
+
+
 def run_reverse_pair(
-    client, cfg: SeedConfig, *, report: Report = print
+    client,
+    cfg: SeedConfig,
+    *,
+    participants: list[str] | None = None,
+    report: Report = print,
 ) -> list[dict]:
     """§7 step 4: with the spoke now booted, pair the spoke→primary direction by
     the ORDINARY §5 handshake (the primary mints, as receiver) — the spoke
     authored nothing before boot, so this stream needs no pre-dump half. The
     forward (primary→spoke) direction is already live from steps 1–3. Discovers
-    the now-up spoke to resolve each participant's spoke-side admin surface."""
+    the now-up spoke to resolve each participant's spoke-side admin surface.
+
+    RESUMABLE + IDEMPOTENT (#228): every participant is attempted. One whose
+    reverse stream is already live (`_reverse_already_paired`) is reported
+    "already paired" and skipped — so a re-run never trips
+    `handshake_direction`'s run-once guard — and a participant that is missing
+    on the spoke or fails its handshake is COLLECTED, not raised on the spot:
+    everything pairable is paired first, then ONE `SeedError` names every
+    participant left unpaired. A second run over a fully-paired spoke reports
+    each participant "already paired" and returns normally. `participants`
+    (`--participants NAME[,NAME]`) restricts the run to those names. Returns
+    the records of the streams opened by THIS run."""
+    cfg = select_participants(cfg, participants)
     spoke = discover_participants(
         client, cfg.spoke_platform_url, cfg.spoke_instance, include_platform=True
     )
     streams: list[dict] = []
+    already: list[str] = []
+    failures: list[str] = []
     for sp in cfg.participants:
         spoke_p = spoke.get(sp.name)
         if spoke_p is None:
-            raise SeedError(
-                f"reverse-pair: participant {sp.name!r} is not opted-in on the "
-                f"booted spoke at {cfg.spoke_platform_url} (discovered: "
-                f"{sorted(spoke)}) — did the spoke boot with replication enabled?"
+            failures.append(
+                f"{sp.name!r} is not opted-in on the booted spoke at "
+                f"{cfg.spoke_platform_url} (discovered: {sorted(spoke)}) — did it "
+                "boot with replication enabled, and has its registration "
+                "heartbeat landed?"
             )
-        report(f"[reverse] pairing {sp.name}: {sp.spoke_source_id} -> {sp.primary.source_id}")
-        streams.append(handshake_direction(client, spoke_p, sp.primary, report=report))
-    report(f"reverse direction paired for {len(streams)} participant(s); "
-           "the spoke now converges by events alone (§7 step 5).")
+            continue
+        try:
+            if _reverse_already_paired(client, sp, spoke_p, report=report):
+                report(
+                    f"[reverse] {sp.name}: already paired "
+                    f"({sp.spoke_source_id} -> {sp.primary.source_id})"
+                )
+                already.append(sp.name)
+                continue
+            report(
+                f"[reverse] pairing {sp.name}: {sp.spoke_source_id} -> "
+                f"{sp.primary.source_id}"
+            )
+            streams.append(
+                handshake_direction(client, spoke_p, sp.primary, report=report)
+            )
+        except (PairingError, SeedError) as exc:
+            failures.append(f"{sp.name!r}: {exc}")
+    report(
+        f"reverse direction: paired {len(streams)}, already paired "
+        f"{len(already)}, failed {len(failures)} participant(s)."
+    )
+    if failures:
+        raise SeedError(
+            "reverse-pair incomplete — "
+            + "; ".join(failures)
+            + ". Everything else was paired; fix the above and re-run "
+            "`snowline replicate seed --reverse-pair` (idempotent: paired "
+            "participants are skipped), or restrict it with `--participants "
+            "NAME[,NAME]`."
+        )
+    report("the spoke now converges by events alone (§7 step 5).")
     return streams
 
 

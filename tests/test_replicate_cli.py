@@ -230,3 +230,52 @@ def test_refresh_vocabulary_command(two_instances, capsys):
 
     assert cli.main(["replicate", "refresh-vocabulary", *args]) == 0
     assert "already current" in capsys.readouterr().out
+
+
+# -- #228: `seed --reverse-pair` is idempotent and takes --participants ------
+
+
+def _reverse_seed_config(tmp_path):
+    import json
+
+    path = tmp_path / "seed.json"
+    path.write_text(json.dumps({
+        "primary": {"platform_url": "http://prim-platform", "instance": "primary"},
+        "spoke": {"platform_url": "http://roam-platform", "instance": "roam"},
+        "participants": {
+            "governance": {
+                "spoke_ingest_url": "http://roam-gov/events/ingest",
+                "spoke_db_url": f"sqlite:///{tmp_path}/gov.db",
+            },
+        },
+    }))
+    return str(path)
+
+
+def test_seed_reverse_pair_rerun_is_idempotent(two_instances, tmp_path, capsys):
+    cfg = _reverse_seed_config(tmp_path)
+    argv = ["replicate", "seed", "--config", cfg, "--reverse-pair"]
+    assert cli.main(argv) == 0
+    capsys.readouterr()
+    assert cli.main(argv) == 0  # previously: PairingError from the run-once guard
+    assert "governance: already paired" in capsys.readouterr().out
+    with two_instances["prim-gov"].scope() as s:
+        active = [i for i in s.scalars(select(ReplicationInboundStream)).all()
+                  if i.source_id == "roam.governance" and i.active]
+    assert len(active) == 1
+
+
+def test_seed_reverse_pair_participants_unknown_name_refused(two_instances, tmp_path, capsys):
+    cfg = _reverse_seed_config(tmp_path)
+    rc = cli.main(["replicate", "seed", "--config", cfg, "--reverse-pair",
+                   "--participants", "governance,nope"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "unknown participant(s) ['nope']" in err and "['governance']" in err
+
+
+def test_seed_participants_requires_reverse_pair(two_instances, tmp_path, capsys):
+    cfg = _reverse_seed_config(tmp_path)
+    rc = cli.main(["replicate", "seed", "--config", cfg, "--participants", "governance"])
+    assert rc == 1
+    assert "only with --reverse-pair" in capsys.readouterr().err

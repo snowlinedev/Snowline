@@ -128,6 +128,12 @@ def _build_replicate(p: argparse.ArgumentParser) -> None:
         help="§7 step 4: pair the reverse (spoke->primary) direction after boot",
     )
     seed_p.add_argument(
+        "--participants", metavar="NAME[,NAME]", default=None,
+        help="with --reverse-pair: pair only these participants (comma-separated); "
+        "already-paired participants are skipped either way, so a plain re-run "
+        "is idempotent",
+    )
+    seed_p.add_argument(
         "--reseed", action="store_true",
         help="re-seed under a fresh epoch: check preconditions + retire old streams first",
     )
@@ -608,10 +614,17 @@ def _cmd_union(args) -> int:
 
 
 def _cmd_seed(args) -> int:
+    names = None
+    if args.participants is not None:
+        if not args.reverse_pair:
+            raise seed.SeedError("--participants applies only with --reverse-pair")
+        names = [n.strip() for n in args.participants.split(",") if n.strip()]
+        if not names:
+            raise seed.SeedError("--participants needs at least one NAME")
     with _client() as client:
         cfg = seed.load_seed_config(client, args.config)
         if args.reverse_pair:
-            seed.run_reverse_pair(client, cfg, report=print)
+            seed.run_reverse_pair(client, cfg, participants=names, report=print)
             return 0
         if args.reseed:
             print("re-seed: checking §7 step-5 preconditions before touching state")
