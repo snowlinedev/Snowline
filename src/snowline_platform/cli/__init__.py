@@ -388,6 +388,10 @@ def _build_stack(p: argparse.ArgumentParser) -> None:
     sync_p.add_argument(
         "-v", "--verbose", action="store_true", help="echo every command as it runs"
     )
+    # Internal (#303): set by sync itself when it re-execs the NEW train's CLI
+    # after a platform swap, naming the train the old process ran. Stops a
+    # second re-exec; the resumed run writes the single report.
+    sync_p.add_argument("--resumed-from", default=None, metavar="vX.Y.Z", help=argparse.SUPPRESS)
     sync_p.set_defaults(handler=_cmd_stack_sync)
 
     bootstrap_p = ssub.add_parser(
@@ -473,6 +477,8 @@ def _cmd_stack_sync(args) -> int:
         prompt=(None if args.auto else stack_lib.tty_prompt),
         health_url=args.health_url,
         report=print,
+        resumed_from=args.resumed_from,
+        verbose=args.verbose,
     )
     code = stack_model.exit_code(report.outcome)
     if report.detail:
