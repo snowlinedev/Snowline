@@ -233,7 +233,10 @@ def _isolate_system_launch_daemons(tmp_path, monkeypatch):
 @pytest.fixture(autouse=True)
 def _isolate_standby_reports(tmp_path, monkeypatch):
     """The standby readiness surface (#259) reads sync/bootstrap/autocut
-    reports from the home's app-support dir and an optional front URL — never
-    let a developer's real reports (or front) leak into `/health` in tests."""
+    reports from the home's app-support dir, the hub's train.json and an
+    optional front URL — never let a developer's real reports, checkout
+    train record (or front) leak into `/health` in tests."""
     monkeypatch.setenv("SNOWLINE_STANDBY_HOME", str(tmp_path / "_standby_home"))
+    # ...nor the checkout's release/train.json as the hub's latest cut.
+    monkeypatch.setenv("SNOWLINE_TRAIN_MANIFEST", str(tmp_path / "_no_train.json"))
     monkeypatch.delenv("SNOWLINE_FRONT_HEALTH_URL", raising=False)

@@ -389,10 +389,11 @@ def create_app(
             )
         # The standby readiness rollup (#259) rides as its OWN field, set
         # AFTER `status` is final: a lagging/unreachable peer is visible
-        # here but can never turn this instance's own health red (and the
-        # computation is cached + time-bounded, never raising).
+        # here but can never turn this instance's own health red. Served
+        # from cache, refreshed in the background: /health never awaits a
+        # peer (stale-while-revalidate, standby.for_health).
         body["train"] = standby.platform_train()
-        body["standby"] = await standby.for_health(app)
+        body["standby"] = await standby.for_health(app, block=block)
         return body
 
     @app.get("/whoami")

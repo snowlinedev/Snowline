@@ -47,10 +47,15 @@ The standby rollup NEVER feeds `/health`'s own `status` — that stays truthful
 about this instance alone — but it is its own top-level field there so a
 lagging peer cannot be missed either.
 
-Cost: computed on request, cached for `CACHE_SECONDS`, and every peer fetch is
-bounded by one `PEER_BUDGET_SECONDS` deadline (peers concurrently), so a slow
-or powered-down peer costs `/health` at most ~2 s once per cache window and
-reads as UNKNOWN, never as a hang.
+Cost: STALE-WHILE-REVALIDATE. `/health` (and `/standby`) answer at once
+from the last computed block — an UNKNOWN placeholder before the first — and,
+when it is older than `CACHE_SECONDS`, start ONE background refresh. `/health`
+never awaits a peer: the spoke failover front probes the hub's `/health` with
+a 2 s timeout, and a sleeping standby must not be able to trip it. The
+background refresh bounds all peer fetches by one `PEER_BUDGET_SECONDS`
+deadline (each GET by its own slightly shorter one), so a slow or powered-down
+peer reads as UNKNOWN; a raising computation is cached as an UNKNOWN block for
+the window too, never retried per caller.
 
 The peer side of the relay is two tailnet-gated, read-only routes every
 platform serves: `GET /standby/local` (this instance's train, per-service
@@ -61,6 +66,7 @@ anything secret-shaped redacted).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -177,7 +183,7 @@ def platform_train() -> dict:
 
 _SECRET_KEY_RE = re.compile(
     r"(secret|token|password|passwd|credential|api[_-]?key|private[_-]?key"
-    r"|authorization|(^|_)auth($|_))",
+    r"|authorization|(^|_)auth($|_)|dsn|database_url|seed|cookie|session)",
     re.IGNORECASE,
 )
 _SECRET_VALUE_RE = re.compile(
@@ -197,7 +203,12 @@ def redact(value):
     if isinstance(value, dict):
         out = {}
         for k, v in value.items():
-            if isinstance(k, str) and _SECRET_KEY_RE.search(k) and v not in (None, "", [], {}):
+            if (
+                isinstance(k, str)
+                and _SECRET_KEY_RE.search(k)
+                and not isinstance(v, bool)  # a flag (`reseed`) is no secret
+                and v not in (None, "", [], {})
+            ):
                 out[k] = REDACTED
             else:
                 out[k] = redact(v)
@@ -348,6 +359,7 @@ def assess(
     snapshot_available: bool,
     code_behind_max: int,
     error: str | None = None,
+    snapshot_missing: str | None = None,
 ) -> tuple[str, list[str]]:
     """The per-peer rollup + its reasons (rules in the module docstring)."""
     degraded: list[str] = []
@@ -388,7 +400,8 @@ def assess(
             unknown.append(f"data unknown: {s['participant']} {s['direction']} outbox unreadable")
     if reachable and not snapshot_available:
         unknown.append(
-            "peer does not report its outbox/train (predates the readiness "
+            snapshot_missing
+            or "peer does not report its outbox/train (predates the readiness "
             "surface, #259) — peer->hub data unknown"
         )
     if not reachable:
@@ -605,13 +618,20 @@ async def _get_json(client: httpx.AsyncClient, url: str) -> tuple[int | None, ob
     return resp.status_code, body, None
 
 
-async def fetch_peer(client: httpx.AsyncClient, platform_url: str) -> dict:
-    """Read one peer's relay routes concurrently. reachable = its platform
-    answered HTTP at all (a 404 is an older peer, not an outage)."""
+async def fetch_peer(
+    client: httpx.AsyncClient, platform_url: str, *, per_get: float = PEER_BUDGET_SECONDS * 0.8
+) -> dict:
+    """Read one peer's relay routes concurrently, EACH under its own
+    `per_get` deadline (kept inside the caller's overall budget), so one
+    hanging route (`/stack/report`) costs only its own field, never the
+    answers that did land. reachable = its platform answered HTTP at all (a
+    404 is an older peer, not an outage)."""
     results: dict[str, tuple] = {}
 
     async def one(key: str, path: str) -> None:
-        results[key] = await _get_json(client, f"{platform_url}{path}")
+        results[key] = (None, None, f"no answer within {per_get:g}s")
+        with anyio.move_on_after(per_get):
+            results[key] = await _get_json(client, f"{platform_url}{path}")
 
     async with anyio.create_task_group() as tg:
         tg.start_soon(one, "local", LOCAL_PATH)
@@ -629,6 +649,7 @@ async def fetch_peer(client: httpx.AsyncClient, platform_url: str) -> dict:
         "snapshot": local[1] if local[0] == 200 and isinstance(local[1], dict) else None,
         "reports": report[1] if report[0] == 200 and isinstance(report[1], dict) else None,
         "manifest": manifest[1] if manifest[0] == 200 and isinstance(manifest[1], dict) else None,
+        "local_status": local[0],
     }
 
 
@@ -665,16 +686,26 @@ def assess_peer(
     platform_url = peer.get("platform_url")
     fetched = fetched or {"reachable": False, "error": "no platform stream to this peer"}
     snapshot = fetched.get("snapshot")
-    manifest = fetched.get("manifest") or {}
-    reports = fetched.get("reports") or {}
+    snapshot = snapshot if isinstance(snapshot, dict) else None
+    manifest = fetched.get("manifest")
+    manifest = manifest if isinstance(manifest, dict) else {}
+    reports = fetched.get("reports")
+    reports = reports if isinstance(reports, dict) else {}
 
+    # A peer's JSON is untrusted shape: every field is type-checked before
+    # use, so a malformed snapshot degrades to "unknown", never a raise.
     peer_train = None
     services = None
-    if isinstance(snapshot, dict):
-        peer_train = (snapshot.get("train") or {}).get("version")
-        services = snapshot.get("services")
-    if peer_train is None:
-        peer_train = manifest.get("train_version")
+    if snapshot is not None:
+        train = snapshot.get("train")
+        if isinstance(train, dict) and isinstance(train.get("version"), str):
+            peer_train = train["version"]
+        elif isinstance(train, str):
+            peer_train = train
+        raw_services = snapshot.get("services")
+        services = raw_services if isinstance(raw_services, dict) else None
+    if peer_train is None and isinstance(manifest.get("train_version"), str):
+        peer_train = manifest["train_version"]
     code = compare_trains(peer_train, hub_cut)
     code["services"] = services
 
@@ -688,24 +719,34 @@ def assess_peer(
             and str(r.get("peer_key", "")).startswith(platform_url)
         )
     ]
-    if isinstance(snapshot, dict):
-        for r in snapshot.get("streams") or []:
+    if snapshot is not None:
+        raw_streams = snapshot.get("streams")
+        for r in raw_streams if isinstance(raw_streams, list) else []:
             if not isinstance(r, dict) or "participant" not in r:
                 continue
             inst = peer_instance(r.get("peer_key"))
             if inst is None or hub_instance is None or inst == hub_instance:
                 streams.append(_stream_out(r, PEER_TO_HUB, data_threshold))
 
+    snapshot_missing = None
+    if fetched.get("local_status") in (401, 403):
+        snapshot_missing = (
+            f"peer refused {LOCAL_PATH} (HTTP {fetched['local_status']}): untrusted "
+            "source IP — the peer's SNOWLINE_TRUSTED_CIDRS must admit this "
+            "instance's tailnet address"
+        )
     rollup, reasons = assess(
         reachable=bool(fetched.get("reachable")),
         code=code,
         streams=streams,
-        snapshot_available=isinstance(snapshot, dict),
+        snapshot_available=snapshot is not None,
         code_behind_max=code_max,
         error=fetched.get("error"),
+        snapshot_missing=snapshot_missing,
     )
-    sync = sync_summary(reports.get("sync"))
-    front = snapshot.get("front") if isinstance(snapshot, dict) else None
+    sync = sync_summary(reports.get("sync") if isinstance(reports.get("sync"), dict) else None)
+    front = snapshot.get("front") if snapshot is not None else None
+    front = front if isinstance(front, dict) else None
     notes: list[str] = []
     if sync and sync.get("last_outcome") in _SYNC_TROUBLE:
         notes.append(
@@ -714,6 +755,11 @@ def assess_peer(
         )
     if isinstance(front, dict) and front.get("upstream") == "spoke":
         notes.append("the failover front is routing to the spoke")
+    if code["flag"] == "ahead":
+        notes.append(
+            f"peer runs {peer_train}, newer than the hub's latest cut "
+            f"{hub_cut} — the hub's cut record may be stale"
+        )
     if peer_train == SOURCE:
         notes.append("peer runs from a source checkout — no train to compare")
     return {
@@ -742,12 +788,16 @@ async def compute(
     client: httpx.AsyncClient | None = None,
     budget: float = PEER_BUDGET_SECONDS,
     home: Path | None = None,
+    block: dict | None = None,
 ) -> dict:
-    """The full `standby` block for this instance (shape in the docstring)."""
+    """The full `standby` block for this instance (shape in the docstring).
+    `block` is this platform's own replication health block when the caller
+    (`/health`) already computed it — not re-queried then."""
     from snowline_platform.db import session_scope
 
     peers, discover_error = await anyio.to_thread.run_sync(_discover_from_scope)
-    block = await anyio.to_thread.run_sync(replication_health_from_scope, session_scope)
+    if block is None:
+        block = await anyio.to_thread.run_sync(replication_health_from_scope, session_scope)
     hub_streams = local_streams(block, app.state.registry)
     own_reports = await anyio.to_thread.run_sync(read_reports, home)
     autocut = autocut_summary(own_reports.get("autocut"))
@@ -773,7 +823,9 @@ async def compute(
                 async with anyio.create_task_group() as tg:
                     for p in targets:
                         async def _one(p=p) -> None:
-                            fetched[p["peer"]] = await fetch_peer(client, p["platform_url"])
+                            fetched[p["peer"]] = await fetch_peer(
+                                client, p["platform_url"], per_get=budget * 0.8
+                            )
 
                         tg.start_soon(_one)
         finally:
@@ -820,36 +872,90 @@ async def compute(
     }
 
 
-async def cached(app, **kwargs) -> dict:
-    """`compute`, memoized on the app for `CACHE_SECONDS`; concurrent callers
-    share one computation (a lock), so a burst of `/health` polls fans out to
-    the peer once."""
+def _failure_block(exc: BaseException) -> dict:
+    return {
+        "computed_at": _utc_iso(),
+        "rollup": UNKNOWN,
+        "reasons": [f"standby computation failed: {type(exc).__name__}: {exc}"[:300]],
+        "peers": [],
+    }
+
+
+PLACEHOLDER_REASON = "standby readiness is being computed — ask again in a few seconds"
+
+
+def _placeholder() -> dict:
+    return {"rollup": UNKNOWN, "reasons": [PLACEHOLDER_REASON], "peers": [], "pending": True}
+
+
+async def refresh(app, **kwargs) -> dict:
+    """Compute the block and cache it for `CACHE_SECONDS` — a FAILURE too (as
+    an UNKNOWN block naming the error), so a raising computation is retried
+    once per window, not on every caller. Never raises."""
     state = app.state
-    lock = getattr(state, "standby_lock", None)
-    if lock is None:
-        lock = state.standby_lock = anyio.Lock()
-    async with lock:
-        hit = getattr(state, "standby_cache", None)
-        now = time.monotonic()
-        if hit is not None and now - hit[0] < CACHE_SECONDS:
-            return hit[1]
-        result = await compute(app, **kwargs)
-        state.standby_cache = (time.monotonic(), result)
-        return result
-
-
-async def for_health(app) -> dict:
-    """The `health.standby` field: `cached`, but never raising — a failure is
-    an UNKNOWN rollup naming the error, and never touches `/health.status`."""
+    client = getattr(state, "standby_http_client", None)
+    if client is not None:
+        kwargs.setdefault("client", client)
     try:
-        return await cached(app)
+        result = await compute(app, **kwargs)
     except Exception as exc:  # liveness must not depend on this (logged with traceback)
         log.warning("standby: computation failed", exc_info=True)
-        return {
-            "rollup": UNKNOWN,
-            "reasons": [f"standby computation failed: {type(exc).__name__}: {exc}"[:300]],
-            "peers": [],
-        }
+        result = _failure_block(exc)
+    state.standby_cache = (time.monotonic(), result)
+    return result
+
+
+def _cache(app) -> tuple[float, dict] | None:
+    return getattr(app.state, "standby_cache", None)
+
+
+def _is_fresh(hit) -> bool:
+    return hit is not None and time.monotonic() - hit[0] < CACHE_SECONDS
+
+
+def schedule_refresh(app, **kwargs) -> asyncio.Task | None:
+    """Start ONE background refresh unless one is already in flight. The
+    task is held on `app.state` (a strong reference — an unreferenced task
+    can be garbage-collected mid-flight)."""
+    state = app.state
+    task = getattr(state, "standby_task", None)
+    if task is not None and not task.done():
+        return task
+    task = asyncio.get_running_loop().create_task(refresh(app, **kwargs))
+    state.standby_task = task
+    return task
+
+
+async def for_health(app, *, block: dict | None = None) -> dict:
+    """The `health.standby` field — STALE-WHILE-REVALIDATE: answers at once
+    with the last computed block (or an UNKNOWN placeholder before the first
+    one lands) and, when that is older than `CACHE_SECONDS`, schedules the
+    refresh in the background. `/health` therefore never awaits a peer, a
+    DB-heavy computation, or a lock: the failover front's 2 s probe of the
+    hub's `/health` can't be tripped by a sleeping standby. Never raises."""
+    hit = _cache(app)
+    if not _is_fresh(hit):
+        try:
+            schedule_refresh(app, block=block)
+        except Exception:  # scheduling must not fail /health (logged with traceback)
+            log.warning("standby: could not schedule a refresh", exc_info=True)
+    return hit[1] if hit is not None else _placeholder()
+
+
+async def for_route(app) -> dict:
+    """`GET /standby`: the same cache, but before the FIRST block exists it
+    waits (bounded) for the in-flight refresh, so the dashboard's first load
+    shows real data rather than the placeholder. Not used by `/health`."""
+    result = await for_health(app)
+    if _cache(app) is None:
+        task = getattr(app.state, "standby_task", None)
+        if task is not None:
+            with anyio.move_on_after(PEER_BUDGET_SECONDS + 1.0):
+                await asyncio.shield(task)
+        hit = _cache(app)
+        if hit is not None:
+            return hit[1]
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -862,7 +968,7 @@ router = APIRouter()
 @router.get("/standby")
 async def standby(request: Request) -> dict:
     """The readiness block (behind the trust middleware, like `/plugins`)."""
-    return await for_health(request.app)
+    return await for_route(request.app)
 
 
 @router.get(LOCAL_PATH)

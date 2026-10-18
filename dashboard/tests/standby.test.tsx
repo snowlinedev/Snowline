@@ -2,7 +2,7 @@
  * and reasons — UNKNOWN styled neutral, never as healthy. */
 import { render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "../src/App";
 import { FIXTURES } from "./setup";
@@ -106,5 +106,23 @@ describe("Standby panel", () => {
     const card = await panel();
     expect(card.getByText("no paired standby peer")).toBeTruthy();
     expect(card.getByText("Hub latest cut unknown")).toBeTruthy();
+  });
+});
+
+describe("Standby panel fetch failure", () => {
+  it("shows a visible error (not READY) when /standby is refused", async () => {
+    const stub = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (path: string) =>
+      path === "/standby" ? new Response("forbidden", { status: 403 }) : stub(path),
+    ) as typeof fetch;
+    try {
+      renderSystem();
+      const heading = await screen.findByRole("heading", { name: "Standby" });
+      const card = within(heading.closest("section") as HTMLElement);
+      expect(await card.findByText(/Failed to load: .*\/standby → 403/)).toBeTruthy();
+      expect(card.queryByText("READY")).toBeNull();
+    } finally {
+      globalThis.fetch = stub;
+    }
   });
 });

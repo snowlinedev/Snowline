@@ -172,8 +172,9 @@ passes `--force`.
 - Readiness: the hub platform reads this report from disk to fill the
   `hub.autocut` and `hub.latest_cut` fields of `GET /standby` / `health.standby`
   and the dashboard's Standby panel (#259). `latest_cut` is the newest of
-  `release/train.json` and a published `last_cut`, and is what the spoke's
-  running train gets compared against. Any peer can also read the report,
+  `release/train.json`, a published `last_cut`, and the running wheel's own
+  train version (when the platform runs from a wheel rather than source). It
+  is what the spoke's running train gets compared against. Any peer can also read the report,
   redacted, at `GET /stack/report`. If the platform runs as a different
   account from the autocut, point `SNOWLINE_STANDBY_HOME` at the home that
   owns the report.

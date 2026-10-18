@@ -421,7 +421,7 @@ def test_compute_slow_peer_is_bounded_and_unknown(paired):
     out = _compute(_app(), slow, budget=0.3)
     assert time.monotonic() - started < 3
     assert out["rollup"] == "UNKNOWN"
-    assert "no answer within 0.3s" in out["reasons"][0]
+    assert "no answer within" in out["reasons"][0]
 
 
 def test_compute_no_peers_is_unknown(clean_db):
@@ -444,7 +444,21 @@ def test_compute_peer_known_only_from_plugin_streams(clean_db, monkeypatch):
     assert peer["rollup"] == "UNKNOWN"
 
 
-def test_cached_computes_once_per_window(monkeypatch):
+def _in_one_loop(app, fn):
+    """Run `fn(get)` in ONE event loop over an ASGI client (`get(path)` →
+    response), so background refreshes scheduled by a request can finish."""
+    result = {}
+
+    async def main():
+        transport = httpx.ASGITransport(app=app, client=(TAILNET_PEER, 4242))
+        async with httpx.AsyncClient(transport=transport, base_url="http://platform") as c:
+            result["v"] = await fn(c.get)
+
+    anyio.run(main)
+    return result["v"]
+
+
+def test_refresh_is_cached_once_per_window(monkeypatch):
     calls = []
 
     async def fake(app, **kw):
@@ -454,20 +468,106 @@ def test_cached_computes_once_per_window(monkeypatch):
     monkeypatch.setattr(standby, "compute", fake)
     app = _app()
 
-    async def go():
-        await standby.cached(app)
-        await standby.cached(app)
+    async def go(get):
+        await standby.for_health(app)  # first: placeholder + schedules
+        await app.state.standby_task
+        first = await standby.for_health(app)
+        await standby.for_health(app)  # fresh: no new task
+        return first
 
-    anyio.run(go)
+    assert _in_one_loop(app, go)["rollup"] == "READY"
     assert len(calls) == 1
     app.state.standby_cache = (time.monotonic() - standby.CACHE_SECONDS - 1, {})
-    anyio.run(standby.cached, app)
+
+    async def stale(get):
+        await standby.for_health(app)
+        await app.state.standby_task
+
+    _in_one_loop(app, stale)
     assert len(calls) == 2
+
+
+def test_a_raising_compute_is_cached_for_the_window(monkeypatch):
+    calls = []
+
+    async def boom(app, **kw):
+        calls.append(1)
+        raise RuntimeError("nope")
+
+    monkeypatch.setattr(standby, "compute", boom)
+    app = _app()
+
+    async def go(get):
+        await standby.refresh(app)
+        second = await standby.for_health(app)  # cached failure: no recompute
+        return second
+
+    out = _in_one_loop(app, go)
+    assert len(calls) == 1
+    assert out["rollup"] == "UNKNOWN"
+    assert out["reasons"] == ["standby computation failed: RuntimeError: nope"]
+    assert getattr(app.state, "standby_task", None) is None
+
+
+def test_concurrent_health_callers_share_one_background_refresh(monkeypatch):
+    calls = []
+
+    async def slow(app, **kw):
+        calls.append(1)
+        await anyio.sleep(0.2)
+        return {"rollup": "READY", "peers": [], "reasons": []}
+
+    monkeypatch.setattr(standby, "compute", slow)
+    app = _app()
+
+    async def go(get):
+        for _ in range(5):
+            await get("/health")
+        await app.state.standby_task
+
+    _in_one_loop(app, go)
+    assert len(calls) == 1
 
 
 # --------------------------------------------------------------------------
 # Routes + /health embedding
 # --------------------------------------------------------------------------
+
+
+def test_health_never_awaits_a_hanging_peer_at_the_default_budget(paired):
+    """The spoke failover front probes the hub's /health with a 2 s timeout;
+    a sleeping standby must not slow /health at all (stale-while-revalidate),
+    at the DEFAULT 2 s peer budget."""
+    assert standby.PEER_BUDGET_SECONDS == 2.0
+
+    async def hang(request):
+        await anyio.sleep(30)
+        return httpx.Response(200, json={})
+
+    app = _app()
+    app.state.standby_http_client = httpx.AsyncClient(transport=httpx.MockTransport(hang))
+
+    async def go(get):
+        times, bodies = [], []
+        for _ in range(3):  # first (placeholder) and repeat calls mid-refresh
+            t = time.monotonic()
+            r = await get("/health")
+            times.append(time.monotonic() - t)
+            bodies.append(r.json())
+        await app.state.standby_task  # the background refresh: bounded ~2 s
+        t = time.monotonic()
+        after = (await get("/health")).json()
+        times.append(time.monotonic() - t)
+        await app.state.standby_http_client.aclose()
+        return times, bodies, after
+
+    times, bodies, after = _in_one_loop(app, go)
+    assert max(times) < 0.5, times
+    assert bodies[0]["status"] == "ok"
+    assert bodies[0]["standby"]["rollup"] == "UNKNOWN"
+    assert bodies[0]["standby"]["reasons"] == [standby.PLACEHOLDER_REASON]
+    assert after["standby"]["rollup"] == "UNKNOWN"
+    assert "no answer within" in after["standby"]["reasons"][0]
 
 
 def test_health_status_unchanged_when_standby_degraded(monkeypatch):
@@ -476,6 +576,7 @@ def test_health_status_unchanged_when_standby_degraded(monkeypatch):
 
     monkeypatch.setattr(standby, "compute", degraded)
     app = _app()
+    anyio.run(standby.refresh, app)
     r = _request(app, "/health")
     body = r.json()
     assert r.status_code == 200
@@ -486,19 +587,45 @@ def test_health_status_unchanged_when_standby_degraded(monkeypatch):
     assert set(body["train"]) >= {"version", "editable", "git_sha"}
 
 
+def test_health_passes_its_replication_block_to_compute(monkeypatch):
+    seen = {}
+
+    async def fake(app, **kw):
+        seen.update(kw)
+        return {"rollup": "READY", "peers": [], "reasons": []}
+
+    monkeypatch.setattr(standby, "compute", fake)
+    app = _app()
+
+    async def go(get):
+        await get("/health")
+        await app.state.standby_task
+
+    _in_one_loop(app, go)
+    assert isinstance(seen.get("block"), dict) and "outbox" in seen["block"]
+
+
 def test_health_survives_a_failing_standby(monkeypatch):
     async def boom(app, **kw):
         raise RuntimeError("nope")
 
     monkeypatch.setattr(standby, "compute", boom)
-    body = _request(_app(), "/health").json()
+    app = _app()
+
+    async def go(get):
+        await get("/health")
+        await app.state.standby_task
+        return (await get("/health")).json()
+
+    body = _in_one_loop(app, go)
     assert body["status"] == "ok"
     assert body["standby"]["rollup"] == "UNKNOWN"
     assert body["standby"]["reasons"] == ["standby computation failed: RuntimeError: nope"]
 
 
-def test_standby_route_serves_the_block(monkeypatch):
+def test_standby_route_waits_for_the_first_block(monkeypatch):
     async def ready(app, **kw):
+        await anyio.sleep(0.05)
         return {"rollup": "READY", "peers": [], "reasons": []}
 
     monkeypatch.setattr(standby, "compute", ready)
@@ -603,3 +730,99 @@ def test_poller_stores_health_detail_and_clears_it_on_down():
     anyio.run(go)
     assert reg.get("memory").status is PluginStatus.DOWN
     assert reg.get("memory").health_detail is None
+
+
+# --------------------------------------------------------------------------
+# Review follow-ons: partial peer answers, refusal vs old peer, bad shapes
+# --------------------------------------------------------------------------
+
+
+def test_a_hanging_stack_report_does_not_lose_the_snapshot(paired):
+    base = _peer_handler()
+
+    async def handler(request):
+        if request.url.path == standby.REPORT_PATH:
+            await anyio.sleep(30)
+        return base(request)
+
+    started = time.monotonic()
+    out = _compute(_app(), handler, budget=0.5)
+    assert time.monotonic() - started < 3
+    [peer] = out["peers"]
+    assert peer["rollup"] == "READY", peer["reasons"]
+    assert peer["sync"] is None
+    assert peer["code"]["flag"] == "current"
+
+
+def test_a_refusing_peer_is_named_as_refused_not_old(paired):
+    def handler(request):
+        if request.url.path == "/replication/manifest":
+            return httpx.Response(200, json={"train_version": "v0.5.1"})
+        return httpx.Response(403, json={"detail": "untrusted peer"})
+
+    [peer] = _compute(_app(), handler)["peers"]
+    assert peer["rollup"] == "UNKNOWN"
+    assert any("peer refused /standby/local (HTTP 403): untrusted source IP" in r
+               for r in peer["reasons"])
+    assert not any("predates" in r for r in peer["reasons"])
+
+
+def test_an_old_peer_404_says_predates(paired):
+    def handler(request):
+        if request.url.path == "/replication/manifest":
+            return httpx.Response(200, json={"train_version": "v0.5.1"})
+        return httpx.Response(404)
+
+    [peer] = _compute(_app(), handler)["peers"]
+    assert any("predates the readiness surface" in r for r in peer["reasons"])
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        {"train": "v0.5.1", "services": "x", "streams": "y", "front": "z"},
+        {"train": {"version": 5}, "streams": [1, "a", {"no": "participant"}]},
+        {"train": None, "streams": None},
+    ],
+)
+def test_malformed_peer_snapshot_never_raises(snapshot):
+    row = standby.assess_peer(
+        peer={"peer": "MBP", "platform_url": PEER_URL},
+        fetched={"reachable": True, "snapshot": snapshot, "manifest": "bad", "reports": ["x"]},
+        hub_streams=[], hub_instance="mini", hub_cut="v0.5.1",
+        autocut=None, data_threshold=900, code_max=0,
+    )
+    assert row["rollup"] in {"READY", "UNKNOWN"}
+    assert row["front"] is None and row["sync"] is None
+
+
+def test_string_train_is_read_as_the_version():
+    row = standby.assess_peer(
+        peer={"peer": "MBP", "platform_url": PEER_URL},
+        fetched={"reachable": True, "snapshot": {"train": "v0.5.1", "streams": []}},
+        hub_streams=[], hub_instance="mini", hub_cut="v0.5.1",
+        autocut=None, data_threshold=900, code_max=0,
+    )
+    assert row["code"]["flag"] == "current"
+
+
+def test_peer_ahead_of_the_cut_is_ready_with_a_note():
+    row = standby.assess_peer(
+        peer={"peer": "MBP", "platform_url": PEER_URL},
+        fetched={"reachable": True, "snapshot": {"train": {"version": "v0.5.2"}, "streams": []}},
+        hub_streams=[], hub_instance="mini", hub_cut="v0.5.1",
+        autocut=None, data_threshold=900, code_max=0,
+    )
+    assert row["rollup"] == "READY"
+    assert any("hub's cut record may be stale" in n for n in row["notes"])
+
+
+def test_redact_covers_connection_strings_and_keeps_flags():
+    out = standby.redact({
+        "dsn": "host=x password=y", "database_url": "postgresql:///x",
+        "seed_config": {"a": 1}, "cookie": "c", "session_id": "s",
+        "reseed": False, "outcome": "ok",
+    })
+    for k in ("dsn", "database_url", "seed_config", "cookie", "session_id"):
+        assert out[k] == standby.REDACTED, k
+    assert out["reseed"] is False and out["outcome"] == "ok"
