@@ -79,6 +79,62 @@ def test_register_treats_conflict_as_refusal():
     assert _register(handler) is False
 
 
+def test_register_logs_422_detail_with_shape_hint(caplog):
+    # A pydantic-style 422 names the rejected field. The warning must carry that
+    # detail (the operator's only clue in err.log) plus the 422 shape hint.
+    detail = [{"loc": ["body", "base_url"], "msg": "invalid URL"}]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(422, json={"detail": detail})
+
+    with caplog.at_level(logging.DEBUG, logger="snowline_plugin_sdk.registration"):
+        assert _register(handler) is False
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(messages) == 1
+    assert "returned 422 (will retry)" in messages[0]
+    assert "'loc': ['body', 'base_url']" in messages[0]
+    assert "version skew" in messages[0]
+    assert "malformed base_url" in messages[0]
+
+
+def test_register_logs_manifest_keys_not_values_at_debug(caplog):
+    # DEBUG shows the manifest's top-level KEYS only — values can carry URLs.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(422, json={"detail": "bad"})
+
+    with caplog.at_level(logging.DEBUG, logger="snowline_plugin_sdk.registration"):
+        _register(handler)
+    debug = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+    assert any("surfaces" in m and "name" in m for m in debug)
+    assert not any("http://plugin.example:8899" in m for m in debug)
+
+
+def test_register_logs_500_non_json_body_without_raising(caplog):
+    # A non-JSON error body (e.g. a proxy HTML page) falls back to the raw text
+    # and never raises; no shape hint on a non-422.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="<html>Bad Gateway</html>")
+
+    with caplog.at_level(logging.WARNING, logger="snowline_plugin_sdk.registration"):
+        assert _register(handler) is False
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(messages) == 1
+    assert "returned 500 (will retry)" in messages[0]
+    assert "<html>Bad Gateway</html>" in messages[0]
+    assert "version skew" not in messages[0]
+
+
+def test_register_truncates_logged_detail_to_500_chars(caplog):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"detail": "x" * 2000})
+
+    with caplog.at_level(logging.WARNING, logger="snowline_plugin_sdk.registration"):
+        _register(handler)
+    message = caplog.records[-1].getMessage()
+    assert "x" * 500 in message
+    assert "x" * 501 not in message
+
+
 def test_register_best_effort_when_platform_down():
     # Must NOT raise — a down platform can't crash the plugin.
     def handler(request: httpx.Request) -> httpx.Response:

@@ -133,6 +133,18 @@ def install_heartbeat_httpx_filter() -> None:
     logging.getLogger("httpx").addFilter(_HEARTBEAT_HTTPX_FILTER)
 
 
+_DETAIL_LOG_LIMIT = 500
+
+
+def _detail(resp: httpx.Response) -> str:
+    """The platform's error `detail` from a response body (FastAPI/pydantic
+    shape), falling back to the raw text when the body is not a JSON object."""
+    try:
+        return resp.json().get("detail", resp.text)
+    except (ValueError, AttributeError):
+        return resp.text
+
+
 def register_with_platform(
     manifest: dict,
     platform_url: str,
@@ -170,14 +182,10 @@ def register_with_platform(
         # gateway.md §3a). The plugin is NOT registered; returning True here
         # would log "confirmed" and run unregistered forever. WARNING every
         # beat is the intended loudness — the platform warns on its side too.
-        try:
-            detail = resp.json().get("detail", resp.text)
-        except ValueError:
-            detail = resp.text
         log.warning(
             "plugin %r registration REFUSED by the platform (409): %s",
             plugin_name,
-            detail,
+            _detail(resp),
         )
         return False
     if resp.status_code == httpx.codes.CREATED:
@@ -192,8 +200,19 @@ def register_with_platform(
             "re-asserted plugin %r with the platform at %s", plugin_name, platform
         )
         return True
+    # A rejected beat (422 on a malformed manifest, 5xx, …): surface the
+    # platform's `detail` body so the operator can see WHICH field was refused
+    # from the plugin's own err.log. Keys only at DEBUG — values can carry URLs.
+    log.debug("registration manifest keys posted to %s: %s", url, list(manifest))
+    hint = ""
+    if resp.status_code == httpx.codes.UNPROCESSABLE_ENTITY:
+        hint = " (the platform rejected this manifest's shape — usually a version skew between plugin and platform, or a malformed base_url from the env file)"
     log.warning(
-        "plugin registration to %s returned %s (will retry)", url, resp.status_code
+        "plugin registration to %s returned %s (will retry): %s%s",
+        url,
+        resp.status_code,
+        str(_detail(resp))[:_DETAIL_LOG_LIMIT],
+        hint,
     )
     return False
 
