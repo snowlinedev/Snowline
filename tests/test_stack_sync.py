@@ -795,31 +795,80 @@ def test_run_sync_installs_and_kickstarts_the_front_and_health_checks_it(tmp_pat
     assert s.DEFAULT_HEALTH_URL in curls
 
 
-def test_run_sync_front_unhealthy_fails_the_health_check_and_reverts(tmp_path):
-    home = tmp_path / "home"
-    _stack_config(home)
-    _seed_train_assets(home)
-    first = s.run_sync(home=home, train="v0.1.0", runner=FakeRunner(_full_fake_handler),
-                       health_sleep=lambda _s: None, report=lambda _: None)
-    assert first.outcome == "ok"
-
+def _seed_v2_manifest(home):
     v2 = json.loads(json.dumps(TRAIN_V1).replace("v0.1.0", "v0.2.0"))
     manifest_dir = m.app_support_dir(home) / "downloads" / "v0.2.0" / "_manifest"
     manifest_dir.mkdir(parents=True)
     (manifest_dir / "train.json").write_text(json.dumps(v2))
 
-    def dead_front(argv, cwd):
-        if argv and argv[0] == "curl" and argv[-1] == s.FRONT_HEALTH_URL:
+
+def _dead_front(argv, cwd):
+    if argv and argv[0] == "curl" and argv[-1] == s.FRONT_HEALTH_URL:
+        return CommandError(argv, 7, "connection refused")
+    return _full_fake_handler(argv, cwd)
+
+
+def test_run_sync_dead_front_is_reported_never_a_revert_trigger(tmp_path):
+    """A front can die for non-train reasons (port 8850 taken, a bad
+    front.env) — reverting for it would revert every later train forever."""
+    home = tmp_path / "home"
+    _stack_config(home)
+    _seed_train_assets(home)
+    first = s.run_sync(home=home, train="v0.1.0", runner=FakeRunner(_full_fake_handler),
+                       health_sleep=lambda _s: None, report=lambda _: None)
+    assert first.outcome == "ok" and first.front_ok is True
+    _seed_v2_manifest(home)
+
+    runner2 = FakeRunner(_dead_front)
+    second = s.run_sync(home=home, train="v0.2.0", runner=runner2, health_sleep=lambda _s: None, report=lambda _: None)
+    assert second.health_ok is True  # the gateway
+    assert second.front_ok is False
+    assert second.outcome == "needs_attention"
+    assert "failover front is NOT answering" in second.detail
+    assert "snowline-front.err.log" in second.detail and "8850" in second.detail
+    assert "post-upgrade health check failed" not in second.detail
+    # NOT reverted: every service stays on the new train, front kicked once
+    for svc in s.SERVICE_ORDER:
+        assert Path(os.readlink(m.service_current_link(home, svc))).name == "v0.2.0"
+    kicks = [a[-1] for a in runner2.ran("launchctl", "kickstart")]
+    assert sum(k.endswith("/dev.snowline.front") for k in kicks) == 1
+    assert m.report_path(home).exists()
+    assert json.loads(m.report_path(home).read_text())["front_ok"] is False
+
+
+def test_run_sync_dead_gateway_still_reverts_and_skips_the_front_probe(tmp_path):
+    home = tmp_path / "home"
+    _stack_config(home)
+    _seed_train_assets(home)
+    s.run_sync(home=home, train="v0.1.0", runner=FakeRunner(_full_fake_handler),
+               health_sleep=lambda _s: None, report=lambda _: None)
+    _seed_v2_manifest(home)
+
+    def dead_gateway(argv, cwd):
+        if argv and argv[0] == "curl" and argv[-1] == s.DEFAULT_HEALTH_URL:
             return CommandError(argv, 7, "connection refused")
         return _full_fake_handler(argv, cwd)
 
-    runner2 = FakeRunner(dead_front)
+    runner2 = FakeRunner(dead_gateway)
     second = s.run_sync(home=home, train="v0.2.0", runner=runner2, health_sleep=lambda _s: None, report=lambda _: None)
-    assert second.health_ok is False
     assert second.outcome == "reverted"
+    assert second.health_ok is False
+    assert second.front_ok is None  # not probed once the gateway failed
+    assert not any(a[-1] == s.FRONT_HEALTH_URL for a in runner2.reads if a[:1] == ("curl",))
     # the front followed the platform venv back
     kicks = [a[-1] for a in runner2.ran("launchctl", "kickstart")]
     assert sum(k.endswith("/dev.snowline.front") for k in kicks) == 2
+
+
+def test_run_sync_dry_run_mentions_the_front(tmp_path):
+    home = tmp_path / "home"
+    _stack_config(home)
+    lines = []
+    s.run_sync(home=home, train="v0.1.0", dry_run=True, runner=FakeRunner(_ok_gh_auth, dry_run=True),
+               health_sleep=lambda _s: None, report=lines.append)
+    (front,) = [ln for ln in lines if ln.strip().startswith("front")]
+    assert "dev.snowline.front.plist" in front and "front.env" in front and "kickstart" in front
+    assert not m.plist_path(home, m.FRONT_SERVICE).exists()
 
 
 def test_run_sync_noop_touches_nothing_but_still_checks_the_front(tmp_path):
@@ -829,15 +878,16 @@ def test_run_sync_noop_touches_nothing_but_still_checks_the_front(tmp_path):
     s.run_sync(home=home, train="v0.1.0", runner=FakeRunner(_full_fake_handler),
                health_sleep=lambda _s: None, report=lambda _: None)
 
-    def dead_front(argv, cwd):
-        if argv and argv[0] == "curl" and argv[-1] == s.FRONT_HEALTH_URL:
-            return CommandError(argv, 7, "connection refused")
-        return _full_fake_handler(argv, cwd)
-
-    runner = FakeRunner(dead_front)
-    rpt = s.run_sync(home=home, train="v0.1.0", runner=runner, health_sleep=lambda _s: None, report=lambda _: None)
+    runner = FakeRunner(_dead_front)
+    lines = []
+    rpt = s.run_sync(home=home, train="v0.1.0", runner=runner, health_sleep=lambda _s: None, report=lines.append)
     assert rpt.noop is True
     assert rpt.outcome == "needs_attention"
+    assert rpt.health_ok is True and rpt.front_ok is False
+    # front-specific detail, not the misleading "services may be down"
+    assert "failover front is NOT answering" in rpt.detail
+    assert "services may be down" not in rpt.detail
+    assert lines[-1].endswith("but the failover front is DOWN")
     assert runner.runs == []
     assert rpt.front_kickstarted is None
 

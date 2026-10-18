@@ -614,7 +614,7 @@ def test_post_boot_health_also_probes_the_failover_front(tmp_path):
     assert not any(k.endswith("/dev.snowline.front") for k in kicked)
 
 
-def test_post_boot_health_fails_when_the_front_is_down(tmp_path):
+def test_a_dead_front_is_a_warn_step_never_a_bootstrap_failure(tmp_path):
     home = _fully_bootstrapped_home(tmp_path)
 
     def dead_front(argv, cwd):
@@ -625,6 +625,8 @@ def test_post_boot_health_fails_when_the_front_is_down(tmp_path):
     report = b.run_bootstrap_spoke(
         home=home, runner=FakeRunner(dead_front), prompt=_no_prompt, health_sleep=_noop_sleep
     )
-    assert report.outcome == "failed"
-    step = next(st for st in report.steps if st.name == "post-boot-health")
-    assert step.status == "failed"
+    assert report.outcome == "ok", report.detail
+    steps = {st.name: st for st in report.steps}
+    assert steps["post-boot-health"].status == "ok"
+    assert steps["front-health"].status == "failed"
+    assert steps["front-health"].detail.startswith("WARN:")

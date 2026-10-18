@@ -43,6 +43,7 @@ from ..release.runner import CommandError, Runner
 from . import model as m
 from .sync import (
     DEFAULT_HEALTH_URL,
+    FRONT_DOWN_DETAIL,
     PromptFn,
     Report,
     check_health,
@@ -417,12 +418,21 @@ def run_bootstrap_spoke(
         if dry_run:
             skipped("post-boot-health", "dry-run: nothing was booted")
         else:
-            # the gateway AND the failover front's own /front/health (#260)
-            health_ok = check_stack_health(runner, health_url, sleep=health_sleep)
+            # the gateway gates; the failover front (#260) is reported as its
+            # own step and never blocks seeding — it is not on the
+            # replication path, and it can be down for non-bootstrap reasons.
+            health_ok, front_ok = check_stack_health(runner, health_url, sleep=health_sleep)
             steps.append(
                 m.BootstrapStep(name="post-boot-health", status="ok" if health_ok else "failed")
             )
             report(f"[post-boot-health] {'ok' if health_ok else 'FAILED'}")
+            if front_ok is not None:
+                steps.append(m.BootstrapStep(
+                    name="front-health",
+                    status="ok" if front_ok else "failed",
+                    detail=None if front_ok else "WARN: " + FRONT_DOWN_DETAIL,
+                ))
+                report(f"[front-health] {'ok' if front_ok else 'WARN: failover front not answering'}")
             if not health_ok:
                 raise m.StackError(
                     "the spoke did not come up healthy after seeding + "

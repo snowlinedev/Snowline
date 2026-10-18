@@ -701,6 +701,10 @@ class RunReport:
     # The failover front (issue #260): None = not attempted (no-op/dry-run,
     # or nothing it depends on changed); True/False = kickstart result.
     front_kickstarted: bool | None = None
+    # The front's `/front/health` — REPORTED, never a revert trigger (only
+    # the gateway decides a train's fate). None = not checked (dry-run, or
+    # the gateway itself failed first).
+    front_ok: bool | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -717,6 +721,7 @@ class RunReport:
             "health_ok": self.health_ok,
             "env_drift": list(self.env_drift),
             "front_kickstarted": self.front_kickstarted,
+            "front_ok": self.front_ok,
             "services": [
                 {
                     "service": s.service,
