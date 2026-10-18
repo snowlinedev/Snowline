@@ -623,3 +623,43 @@ def test_run_report_carries_front_kickstarted():
         front_kickstarted=True,
     )
     assert rpt.to_dict()["front_kickstarted"] is True
+
+
+# -- re-exec decision + unit report fields (#303) ---------------------------
+
+
+def _reexec(**kw):
+    base = {"outcome": "ok", "platform_swapped": True, "previous_platform_train": "v0.4.0",
+            "target_train": "v0.5.2", "running_under_target": False, "resumed": False}
+    base.update(kw)
+    return m.should_reexec(**base)
+
+
+def test_should_reexec_only_after_a_healthy_forward_platform_swap():
+    assert _reexec() is True
+    assert _reexec(previous_platform_train=None) is True  # first install
+    for outcome in ("reverted", "needs_attention", "failed", "noop"):
+        assert _reexec(outcome=outcome) is False
+    assert _reexec(platform_swapped=False) is False
+    assert _reexec(running_under_target=True) is False
+    assert _reexec(resumed=True) is False
+    assert _reexec(previous_platform_train="v0.6.0") is False  # rollback
+    assert _reexec(previous_platform_train="v0.5.10", target_train="v0.5.9") is False
+
+
+def test_train_key_orders_numerically():
+    assert m.train_key("v0.5.10") > m.train_key("v0.5.9")
+    with pytest.raises(m.StackError):
+        m.train_key("1.0")
+
+
+def test_run_report_serializes_units_and_resumed_from():
+    rpt = m.RunReport(
+        train="v0.5.2", role="spoke", instance_id="roam", started_at="a", finished_at="b",
+        auto=True, dry_run=False, noop=False, services=(), health_ok=True, outcome="ok",
+        units=(m.UnitAction(name="front", action="installed", kick="front", kicked=True, note="x"),),
+        resumed_from="v0.4.0",
+    )
+    data = rpt.to_dict()
+    assert data["resumed_from"] == "v0.4.0"
+    assert data["units"] == [{"name": "front", "action": "installed", "kicked": True}]

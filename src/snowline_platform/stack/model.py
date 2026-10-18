@@ -665,6 +665,13 @@ def sync_lock_path(home: Path) -> Path:
     return app_support_dir(home) / "sync.lock"
 
 
+def sync_handoff_path(home: Path) -> Path:
+    """The old train's partial run report, handed to the NEW train's CLI
+    when sync re-execs it after a platform swap (#303); consumed (and
+    removed) by the resumed run, which writes the run's single report."""
+    return app_support_dir(home) / "sync-handoff.json"
+
+
 def autoupgrade_log_path(home: Path) -> Path:
     return log_dir(home) / "snowline-autoupgrade.log"
 
@@ -761,6 +768,29 @@ class ServiceChange:
 
 
 @dataclass(frozen=True)
+class UnitAction:
+    """One stack-managed unit's outcome in a reconcile pass (#303): the
+    front, the platform's front-health key, the auto-upgrade timer, … —
+    every unit sync owns that is NOT a train-versioned service venv.
+
+    `action` is the unit's own verb ("installed" | "updated" | "unchanged" |
+    "added" | "deferred" | "healed" | …). `kick` names the launchd service
+    whose kickstart this change requires (None: none); `kicked` is that
+    kickstart's result (None: not attempted). `drift` = an operator-owned
+    env file differs from the template; `note` is the human detail line."""
+
+    name: str
+    action: str
+    kick: str | None = None
+    kicked: bool | None = None
+    drift: bool = False
+    note: str | None = None
+
+    def to_dict(self) -> dict:
+        return {"name": self.name, "action": self.action, "kicked": self.kicked}
+
+
+@dataclass(frozen=True)
 class RunReport:
     train: str
     role: str
@@ -783,6 +813,11 @@ class RunReport:
     # the gateway decides a train's fate). None = not checked (dry-run, or
     # the gateway itself failed first).
     front_ok: bool | None = None
+    # Every stack-managed unit the run reconciled (#303), in order.
+    units: tuple[UnitAction, ...] = field(default_factory=tuple)
+    # Set when this run is the NEW train's CLI finishing an upgrade the OLD
+    # train's CLI started (#303): the train that process was running.
+    resumed_from: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -800,6 +835,8 @@ class RunReport:
             "env_drift": list(self.env_drift),
             "front_kickstarted": self.front_kickstarted,
             "front_ok": self.front_ok,
+            "resumed_from": self.resumed_from,
+            "units": [u.to_dict() for u in self.units],
             "services": [
                 {
                     "service": s.service,
@@ -828,6 +865,45 @@ def exit_code(outcome: str) -> int:
 # --------------------------------------------------------------------------
 # Auto-mode semantics.
 # --------------------------------------------------------------------------
+
+
+def train_key(version: str) -> tuple[int, int]:
+    """`v0.MINOR.PATCH` -> (MINOR, PATCH), for ordering trains."""
+    match = _VERSION_RE.match(version)
+    if not match:
+        raise StackError(f"train {version!r} is not the v0.MINOR.PATCH scheme")
+    return int(match.group(1)), int(match.group(2))
+
+
+SYNC_RESUMED_ENV = "SNOWLINE_SYNC_RESUMED"
+
+
+def should_reexec(
+    *,
+    outcome: str,
+    platform_swapped: bool,
+    previous_platform_train: str | None,
+    target_train: str,
+    running_under_target: bool,
+    resumed: bool,
+) -> bool:
+    """Whether a full-path run hands the rest of the run to the NEW train's
+    CLI (#303). The running process's code only knows the units ITS train
+    manages, so an upgrade run by the old CLI can never install a unit the
+    new train introduces; re-exec'ing the new CLI (which then takes the
+    no-op path and reconciles every unit with the new unit list) fixes that
+    by construction.
+
+    Only after an `ok` run (a revert, or anything needing attention, is
+    finished by the code that started it); only when the platform venv was
+    swapped FORWARD (a rollback's target CLI is older code, which may not
+    know `--resumed-from` and has no newer units to add); never when this
+    process already runs from the target venv; and at most once."""
+    if outcome != "ok" or not platform_swapped or resumed or running_under_target:
+        return False
+    if previous_platform_train is None:
+        return True  # a first install: the target IS the newest code there is
+    return train_key(target_train) > train_key(previous_platform_train)
 
 
 def is_noop(*, resolved_train: str, current_trains: Mapping[str, str | None]) -> bool:

@@ -24,7 +24,8 @@ import re
 import shutil
 import sys
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -537,7 +538,14 @@ def apply_autoupgrade_plist(home: Path, *, dry_run: bool) -> str:
     return "installed" if existing is None else "updated"
 
 
-def install_autoupgrade_timer(runner: Runner, home: Path, *, dry_run: bool) -> str:
+def is_timer_run() -> bool:
+    """True when this process IS the auto-upgrade timer's launchd job."""
+    return os.environ.get("XPC_SERVICE_NAME") == m.plist_label(m.AUTOUPGRADE_UNIT)
+
+
+def install_autoupgrade_timer(
+    runner: Runner, home: Path, *, dry_run: bool, timer_run: bool | None = None
+) -> str:
     """Render the timer plist and load it. NEVER kickstarted (RunAtLoad is
     false — loading must not start a sync inside a sync). launchctl calls are
     best-effort (check=False): a failed load must not fail an upgrade.
@@ -557,7 +565,9 @@ def install_autoupgrade_timer(runner: Runner, home: Path, *, dry_run: bool) -> s
     domain, target = f"gui/{uid}", m.gui_target(label, uid)
     plist = str(m.plist_path(home, m.AUTOUPGRADE_UNIT))
     marker = m.autoupgrade_reload_pending_path(home)
-    if os.environ.get("XPC_SERVICE_NAME") == label:
+    if timer_run is None:
+        timer_run = is_timer_run()
+    if timer_run:
         if action == "unchanged":
             return action
         marker.parent.mkdir(parents=True, exist_ok=True)
@@ -607,6 +617,226 @@ def _timer_note(action: str, *, dry_run: bool) -> str | None:
             f"manual `stack sync` retries (check the plist with plutil -lint)"
         )
     return f"{action} the hourly auto-upgrade timer ({label})"
+
+
+# --------------------------------------------------------------------------
+# Stack-managed units (#303): ONE reconcile pass, run by BOTH the full path
+# and the no-op path, so no unit can ever be "installed only by an upgrade".
+# A unit is everything sync owns that is NOT a train-versioned service venv
+# (the front, the platform's front-health key, the auto-upgrade timer, …).
+# A future unit is one more entry in `UNITS` — never a branch in a path.
+# --------------------------------------------------------------------------
+
+UNIT_PLATFORM_FRONT_KEY = "platform-front-key"
+
+
+@dataclass(frozen=True)
+class UnitContext:
+    home: Path
+    runner: Runner
+    variables: Mapping[str, str]
+    dry_run: bool
+    # This process is the timer's own launchd job: a changed timer plist is
+    # written but its reload deferred (a bootout would kill this very run).
+    timer_run: bool
+    # The platform venv was just swapped: the front runs from it, so it is
+    # kicked even when its own files did not change.
+    platform_swapped: bool
+
+
+def _reconcile_platform_front_key(ctx: UnitContext) -> m.UnitAction:
+    # Ordered BEFORE the front and (on the full path) before the services'
+    # env drift pass, so a pre-#296 platform.env re-matches the template.
+    # `front_installed=True`: the front is reconciled in this same pass.
+    added = ensure_platform_front_key(
+        ctx.home, variables=ctx.variables, front_installed=True, dry_run=ctx.dry_run
+    )
+    if not added:
+        return m.UnitAction(name=UNIT_PLATFORM_FRONT_KEY, action="unchanged")
+    note = (
+        f"would add {_FRONT_KEY} to platform.env" if ctx.dry_run
+        else f"added {_FRONT_KEY} to platform.env and restarted the platform"
+    )
+    return m.UnitAction(name=UNIT_PLATFORM_FRONT_KEY, action="added", kick="platform", note=note)
+
+
+def _reconcile_front(ctx: UnitContext) -> m.UnitAction:
+    """The failover front (#260): front.env (operator-owned, drift reported)
+    + its plist (sync-owned); kicked when either was newly written or the
+    platform venv it runs from was swapped."""
+    env = apply_env_file(ctx.home, m.FRONT_SERVICE, variables=ctx.variables, dry_run=ctx.dry_run)
+    plist_existed = m.plist_path(ctx.home, m.FRONT_SERVICE).exists()
+    plist_changed = apply_front_plist(ctx.home, dry_run=ctx.dry_run)
+    if not plist_existed:
+        action = "installed"
+    elif plist_changed or env.action == "written":
+        action = "updated"
+    else:
+        action = "unchanged"
+    note = None
+    if action != "unchanged":
+        verb = {"installed": "install", "updated": "update"}[action]
+        note = (
+            f"{'would ' + verb if ctx.dry_run else action} the failover front "
+            f"({m.plist_label(m.FRONT_SERVICE)})"
+        )
+    return m.UnitAction(
+        name=m.FRONT_SERVICE, action=action,
+        kick=m.FRONT_SERVICE if action != "unchanged" or ctx.platform_swapped else None,
+        drift=env.action == "drifted", note=note,
+    )
+
+
+def _reconcile_autoupgrade_timer(ctx: UnitContext) -> m.UnitAction:
+    """The hourly auto-upgrade timer (#208): loaded, never kickstarted."""
+    action = install_autoupgrade_timer(
+        ctx.runner, ctx.home, dry_run=ctx.dry_run, timer_run=ctx.timer_run
+    )
+    return m.UnitAction(
+        name=m.AUTOUPGRADE_UNIT, action=action, note=_timer_note(action, dry_run=ctx.dry_run)
+    )
+
+
+# Order is load-bearing only for the front-health key (see above).
+UNITS: tuple[Callable[[UnitContext], m.UnitAction], ...] = (
+    _reconcile_platform_front_key,
+    _reconcile_front,
+    _reconcile_autoupgrade_timer,
+)
+
+
+def kick_units(
+    runner: Runner,
+    home: Path,
+    actions: Sequence[m.UnitAction],
+    *,
+    dry_run: bool,
+    already_kicked: Mapping[str, bool] | None = None,
+) -> list[m.UnitAction]:
+    """Kickstart every service the reconciled units asked for, once each,
+    in unit order. `already_kicked` = services this run already kickstarted
+    (their result is reused, never a second kick)."""
+    if dry_run:
+        return list(actions)
+    results: dict[str, bool] = dict(already_kicked or {})
+    out: list[m.UnitAction] = []
+    for action in actions:
+        if action.kick is None:
+            out.append(action)
+            continue
+        if action.kick not in results:
+            results[action.kick] = kickstart_service(runner, home, action.kick)
+        out.append(replace(action, kicked=results[action.kick]))
+    return out
+
+
+def reconcile_units(
+    home: Path,
+    cfg: m.StackConfig,
+    runner: Runner,
+    *,
+    dry_run: bool,
+    timer_run: bool,
+    platform_swapped: bool = False,
+    kick: bool = True,
+) -> list[m.UnitAction]:
+    """Bring every stack-managed unit to the state THIS train's code renders.
+    Idempotent: an unchanged unit is not written, not kicked, and gets no
+    launchctl call (the one exception is the timer's heal of an unloaded job
+    on a non-timer run). `kick=False` leaves the kickstarts to the caller
+    (`kick_units`) — the full path kicks units AFTER the services they run
+    from."""
+    ctx = UnitContext(
+        home=home, runner=runner,
+        variables=env_variables(cfg, dashboard_dist=str(m.dashboard_root(home) / "current")),
+        dry_run=dry_run, timer_run=timer_run, platform_swapped=platform_swapped,
+    )
+    actions = [unit(ctx) for unit in UNITS]
+    return kick_units(runner, home, actions, dry_run=dry_run) if kick else actions
+
+
+def _unit_notes(units: Sequence[m.UnitAction]) -> list[str]:
+    notes: list[str] = []
+    for u in units:
+        if u.name == UNIT_PLATFORM_FRONT_KEY and u.kicked is False:
+            notes.append(FRONT_KEY_KICK_FAILED_DETAIL)
+        elif u.note:
+            notes.append(u.note)
+    return notes
+
+
+def _key_kick_failed(units: Sequence[m.UnitAction]) -> bool:
+    return any(u.name == UNIT_PLATFORM_FRONT_KEY and u.kicked is False for u in units)
+
+
+def _front_kicked(units: Sequence[m.UnitAction]) -> bool | None:
+    return next((u.kicked for u in units if u.name == m.FRONT_SERVICE), None)
+
+
+# --------------------------------------------------------------------------
+# Re-exec the NEW train's CLI after a platform swap (#303).
+# --------------------------------------------------------------------------
+
+
+def new_cli_path(home: Path) -> Path:
+    return m.service_current_link(home, "platform") / "bin" / "snowline"
+
+
+def running_under(venv_dir: Path) -> bool:
+    """Whether this interpreter runs from `venv_dir` (sys.prefix is the venv
+    dir; sys.executable would resolve through to uv's shared interpreter)."""
+    try:
+        return Path(sys.prefix).resolve() == venv_dir.resolve()
+    except OSError:
+        return False
+
+
+def reexec_argv(
+    cli: Path, *, role: str, train: str, auto: bool, health_url: str, verbose: bool,
+    resumed_from: str,
+) -> list[str]:
+    """The SAME run's flags, with the train pinned to the one just installed
+    (so the new CLI cannot resolve a newer release mid-run) and
+    `--resumed-from` stopping a second re-exec."""
+    argv = [str(cli), "stack", "sync", "--role", role, "--train", train]
+    if auto:
+        argv.append("--auto")
+    if health_url != DEFAULT_HEALTH_URL:
+        argv += ["--health-url", health_url]
+    if verbose:
+        argv.append("-v")
+    return argv + ["--resumed-from", resumed_from]
+
+
+def write_handoff(home: Path, rpt: m.RunReport) -> None:
+    path = m.sync_handoff_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(rpt.to_json())
+
+
+def take_handoff(home: Path) -> dict | None:
+    """Read and remove the old process's partial report (its swap: services,
+    env drift, start time). None when absent or unreadable."""
+    path = m.sync_handoff_path(home)
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    finally:
+        path.unlink(missing_ok=True)
+    return data if isinstance(data, dict) else None
+
+
+def _handoff_services(data: Mapping[str, object]) -> tuple[m.ServiceChange, ...]:
+    out = []
+    for s in data.get("services") or ():
+        if isinstance(s, Mapping):
+            out.append(m.ServiceChange(
+                service=str(s.get("service")), previous_train=s.get("previous_train"),
+                target_train=str(s.get("target_train")), changed=bool(s.get("changed")),
+                migration_crossed=bool(s.get("migration_crossed")), kickstarted=s.get("kickstarted"),
+            ))
+    return tuple(out)
 
 
 # --------------------------------------------------------------------------
@@ -757,12 +987,22 @@ def run_sync(
     health_url: str = DEFAULT_HEALTH_URL,
     health_sleep: Callable[[float], None] = time.sleep,
     report: Report = print,
+    resumed_from: str | None = None,
+    verbose: bool = False,
 ) -> m.RunReport:
     """Serialised by sync.lock (#208), acquired once the posture/hub checks
     pass (a sync on the hub leaves no lock file): a concurrent run (the hourly
     timer during a manual sync, or the reverse) exits 0 `locked` with a
-    one-line report and touches nothing. Dry runs skip the lock."""
+    one-line report and touches nothing. Dry runs skip the lock.
+
+    After a successful forward platform swap, a process not running from the
+    new platform venv re-execs the NEW train's CLI (`--resumed-from`, #303)
+    so the run finishes under the new code's unit list; that resumed run
+    takes the no-op path, reconciles every unit, re-checks health and writes
+    the run's single report. `resumed_from` is set on that resumed run."""
     started_at = _now_iso()
+    resumed = resumed_from is not None or os.environ.get(m.SYNC_RESUMED_ENV) == "1"
+    timer_run = is_timer_run()
     resolved_train = train or "unknown"
     instance_id = "unknown"
     lock: SyncLock | None = None
@@ -776,6 +1016,19 @@ def run_sync(
             if not lock.acquire():
                 lock = None
                 detail = "another stack sync is running (sync.lock held) — skipped"
+                if resumed_from is not None:
+                    # The resumed pass lost the lock race (an hourly fire won):
+                    # that run reconciles the units itself; the swap record is
+                    # discarded here so it can never be mis-applied later.
+                    handoff = take_handoff(home)
+                    swapped = ", ".join(
+                        c.get("service", "?") for c in (handoff or {}).get("services", [])
+                        if isinstance(c, dict) and c.get("changed")
+                    )
+                    detail += (
+                        f"; the upgrade from {resumed_from} already swapped"
+                        f" {swapped or 'its services'} — the other run reconciles the units"
+                    )
                 report(f"stack sync: {detail}")
                 return m.RunReport(
                     train=resolved_train, role=role, instance_id=instance_id,
@@ -814,58 +1067,82 @@ def run_sync(
         if m.is_noop(resolved_train=resolved_train, current_trains=current_trains):
             # A no-op still health-checks (#210 review): the --auto timer's
             # exit code is the monitoring signal, and an up-to-date spoke with
-            # a dead gateway must not report success indefinitely. Normally one
-            # attempt only (nothing was kickstarted, a healthy stack answers
-            # immediately); the one exception is issue #296 below, where an
-            # up-to-date spoke gets the front-health key added to its
-            # platform.env (once) and the platform restarted to read it —
-            # otherwise it would wait for the next train — so that run waits
-            # out the boot like an upgrade does.
-            key_added = ensure_platform_front_key(
-                home,
-                variables=env_variables(cfg, dashboard_dist=str(m.dashboard_root(home) / "current")),
-                front_installed=m.plist_path(home, m.FRONT_SERVICE).exists(),
-                dry_run=dry_run,
-            )
-            timer_action = install_autoupgrade_timer(runner, home, dry_run=dry_run)
-            key_kicked: bool | None = None
-            if key_added and not dry_run:
-                key_kicked = kickstart_service(runner, home, "platform")
+            # a dead gateway must not report success indefinitely. And it
+            # reconciles EVERY stack-managed unit (#303) — the same pass the
+            # full path runs — so a unit a newer train introduced (or one an
+            # operator removed) is one `stack sync` away, never "wait for the
+            # next train". Normally one short health poll (nothing was
+            # kickstarted, a healthy stack answers immediately); when the
+            # reconcile kicked something (a newly installed front, the
+            # platform restarted for the #296 key) it waits out the boot like
+            # an upgrade does.
+            handoff = take_handoff(home) if resumed_from is not None and not dry_run else None
+            if handoff and handoff.get("train") != resolved_train:
+                handoff = None  # stale (a resumed run that lost the lock race)
+            resumed_note = None
+            if resumed_from is not None and handoff is None and not dry_run:
+                # No swap record to resume (hand-passed flag, or a stale file
+                # was discarded): this is an ordinary no-op reconcile — never
+                # claim an upgrade that this process cannot vouch for.
+                resumed_note = (
+                    f"`--resumed-from {resumed_from}` given but no swap record was "
+                    "found — treated as an ordinary no-op reconcile"
+                )
+                resumed_from = None
+            units = reconcile_units(home, cfg, runner, dry_run=dry_run, timer_run=timer_run)
+            kicked_any = any(u.kicked is not None for u in units)
             noop_health, noop_front = (None, None) if dry_run else check_stack_health(
-                runner, health_url, attempts=30 if key_added else 3, sleep=health_sleep
+                runner, health_url, attempts=30 if kicked_any else 3, sleep=health_sleep
             )
             unhealthy = noop_health is False
             front_down = noop_health is True and noop_front is False
-            key_kick_failed = key_kicked is False
+            key_kick_failed = _key_kick_failed(units)
+            if resumed_from is not None:
+                head = (
+                    f"upgrade from {resumed_from} finished under the {resolved_train} "
+                    "CLI (re-exec after the platform swap)"
+                )
+                if handoff and handoff.get("detail"):
+                    head += "; " + str(handoff["detail"])
+            else:
+                head = "already on the resolved train"
             if unhealthy:
                 detail = (
-                    "already on the resolved train, but the gateway health "
+                    f"{head}, but the gateway health "
                     "check FAILED — services may be down; check launchctl "
-                    "and the service logs (nothing was changed by sync)"
+                    "and the service logs"
+                    + ("" if resumed_from is not None else " (nothing was changed by sync)")
                 )
             elif front_down:
-                detail = "already on the resolved train; " + FRONT_DOWN_DETAIL
+                detail = f"{head}; " + FRONT_DOWN_DETAIL
+            elif resumed_from is not None:
+                detail = head
             else:
-                detail = "already on the resolved train — nothing to do"
-            if key_kick_failed:
-                detail += "; " + FRONT_KEY_KICK_FAILED_DETAIL
-            elif key_added:
-                detail += (
-                    f"{'; would add' if dry_run else '; added'} {_FRONT_KEY} to platform.env"
-                    f"{'' if dry_run else ' and restarted the platform'}"
-                )
-            if (note := _timer_note(timer_action, dry_run=dry_run)):
+                detail = f"{head} — nothing to do"
+            for note in _unit_notes(units):
                 detail += "; " + note
+            if resumed_note:
+                detail += "; " + resumed_note
+            env_drift = [u.name for u in units if u.drift]
+            if handoff:
+                env_drift = [*handoff.get("env_drift", ()), *(d for d in env_drift if d not in handoff.get("env_drift", ()))]
+            if unhealthy or front_down or key_kick_failed:
+                outcome = "needs_attention"
+            else:
+                # A resumed run IS the tail of an upgrade the old CLI applied.
+                outcome = "ok" if resumed_from is not None else "noop"
+            front_kicked = _front_kicked(units)
+            if front_kicked is None and handoff:
+                front_kicked = handoff.get("front_kickstarted")
             rpt = m.RunReport(
                 train=resolved_train, role=cfg.role, instance_id=cfg.instance_id,
-                started_at=started_at, finished_at=_now_iso(), auto=auto, dry_run=dry_run,
-                noop=True, services=(), health_ok=noop_health,
-                outcome=(
-                    "needs_attention"
-                    if unhealthy or front_down or key_kick_failed
-                    else "noop"
-                ),
-                detail=detail, front_ok=noop_front,
+                started_at=str(handoff.get("started_at") or started_at) if handoff else started_at,
+                finished_at=_now_iso(), auto=auto, dry_run=dry_run,
+                noop=resumed_from is None,
+                services=_handoff_services(handoff) if handoff else (),
+                health_ok=noop_health, outcome=outcome, detail=detail,
+                env_drift=tuple(env_drift), front_kickstarted=front_kicked,
+                front_ok=noop_front, units=tuple(units), resumed_from=resumed_from,
             )
             write_report(home, rpt, dry_run=dry_run)
             if unhealthy:
@@ -874,6 +1151,8 @@ def run_sync(
                 tail = "but the failover front is DOWN"
             elif key_kick_failed:
                 tail = "but the platform kickstart for the front-health key FAILED"
+            elif resumed_from is not None:
+                tail = f"upgrade from {resumed_from} finished under the new CLI"
             else:
                 tail = "nothing to do"
             report(f"stack sync: already on {resolved_train}, {tail}")
@@ -902,11 +1181,25 @@ def run_sync(
                     else " (kickstart only if the plist changed)"
                 )
             )
-            report(
-                f"  {m.AUTOUPGRADE_UNIT:<12} "
-                + (_timer_note(apply_autoupgrade_plist(home, dry_run=True), dry_run=True)
-                   or "timer plist unchanged")
+            units = reconcile_units(
+                home, cfg, runner, dry_run=True, timer_run=timer_run,
+                platform_swapped=plans[m.FRONT_VENV_SERVICE].changes,
             )
+            timer = next(u for u in units if u.name == m.AUTOUPGRADE_UNIT)
+            report(f"  {m.AUTOUPGRADE_UNIT:<12} " + (timer.note or "timer plist unchanged"))
+            platform_plan = plans["platform"]
+            if not resumed and m.should_reexec(
+                outcome="ok", platform_swapped=platform_plan.changes,
+                previous_platform_train=platform_plan.previous_train,
+                target_train=resolved_train,
+                running_under_target=running_under(
+                    m.service_venv_dir(home, "platform", resolved_train)),
+                resumed=False,
+            ):
+                report(
+                    f"  would re-exec {new_cli_path(home)} (the {resolved_train} CLI) "
+                    "after a healthy swap, to reconcile the new train's units"
+                )
             rpt = m.RunReport(
                 train=resolved_train, role=cfg.role, instance_id=cfg.instance_id,
                 started_at=started_at, finished_at=_now_iso(), auto=auto, dry_run=True,
@@ -918,6 +1211,7 @@ def run_sync(
                 ),
                 health_ok=None, outcome="ok",
                 detail="dry run: nothing downloaded, built, swapped, or kickstarted",
+                units=tuple(units),
             )
             return rpt
 
@@ -977,6 +1271,15 @@ def run_sync(
                                  migration_crossed=crossed)
             )
 
+        # Every stack-managed unit (#303) — rendered here, after the swap and
+        # BEFORE the services' env drift pass (the platform's front-health key
+        # must be appended first, so an old platform.env re-matches the new
+        # template), kicked below AFTER the services they run from.
+        units = reconcile_units(
+            home, cfg, runner, dry_run=False, timer_run=timer_run,
+            platform_swapped=plans[m.FRONT_VENV_SERVICE].changes, kick=False,
+        )
+
         # env + plist refresh — every service, every non-noop run (spec §5
         # step 3/4). The dashboard env value is the STABLE `dashboard/current`
         # symlink, never a train-versioned path (#210 review: env files are
@@ -986,53 +1289,36 @@ def run_sync(
             cfg, dashboard_dist=str(m.dashboard_root(home) / "current")
         )
         env_drift: list[str] = []
-        # Append the front-health key to a pre-existing platform.env BEFORE the
-        # drift pass (so an old file that matched the old template re-matches
-        # the new one); the front is always installed on this path.
-        platform_front_key_added = ensure_platform_front_key(
-            home, variables=variables, front_installed=True, dry_run=False
-        )
         for svc in SERVICE_ORDER:
             result = apply_env_file(home, svc, variables=variables, dry_run=False)
             if result.action == "drifted":
                 env_drift.append(svc)
             apply_plist(home, svc, dry_run=False)
-        # The failover front (issue #260): not a service (no venv/DB/seed), but
-        # a stack-managed unit all the same — env + plist rendered here, and
-        # kickstarted below whenever anything it runs from changed.
-        front_env = apply_env_file(home, m.FRONT_SERVICE, variables=variables, dry_run=False)
-        if front_env.action == "drifted":
-            env_drift.append(m.FRONT_SERVICE)
-        front_plist_changed = apply_front_plist(home, dry_run=False)
-        front_needs_kick = (
-            front_plist_changed
-            or front_env.action == "written"
-            or plans[m.FRONT_VENV_SERVICE].changes
-        )
-
-        timer_action = install_autoupgrade_timer(runner, home, dry_run=False)
+        env_drift += [u.name for u in units if u.drift]
 
         ensure_databases(runner, report)
 
-        platform_key_kick_pending = platform_front_key_added
+        kicked: dict[str, bool] = {}
         for i, change in enumerate(changes):
             if change.changed:
-                if change.service == "platform":
-                    platform_key_kick_pending = False  # this kick picks the key up
                 ok = kickstart_service(runner, home, change.service)
+                kicked[change.service] = ok
                 changes[i] = m.ServiceChange(
                     service=change.service, previous_train=change.previous_train,
                     target_train=change.target_train, changed=True,
                     migration_crossed=change.migration_crossed, kickstarted=ok,
                 )
-        key_kick_failed = False
-        if platform_key_kick_pending:
-            # Key newly written into an unchanged platform: restart it so the
-            # running process (env is sourced at exec time) picks it up. A
-            # failed kick is reported below — the key is present now, so no
-            # later run would retry it.
-            key_kick_failed = not kickstart_service(runner, home, "platform")
-        front_kicked = kickstart_service(runner, home, m.FRONT_SERVICE) if front_needs_kick else None
+        # A unit's kick reuses a service kick this run already made (a key
+        # newly written into a CHANGED platform is picked up by its upgrade
+        # kick); an unchanged platform is restarted so the running process
+        # (env is sourced at exec time) picks the key up.
+        units = kick_units(runner, home, units, dry_run=False, already_kicked=kicked)
+        # Attribute a failed platform kick honestly: when the platform was
+        # kicked for its own UPGRADE and that failed, it is the upgrade kick
+        # that failed (the service row carries kickstarted=False), not the key.
+        platform_upgrade_kick_failed = kicked.get("platform") is False
+        key_kick_failed = _key_kick_failed(units) and not platform_upgrade_kick_failed
+        front_kicked = _front_kicked(units)
 
         health_ok, front_ok = check_stack_health(runner, health_url, sleep=health_sleep)
         any_crossed = any(c.migration_crossed for c in changes if c.changed)
@@ -1098,22 +1384,76 @@ def run_sync(
             # is down — report it loudly, never revert for it.
             outcome = "needs_attention"
             detail = "upgrade applied; " + FRONT_DOWN_DETAIL
-        if key_kick_failed:
-            if outcome == "ok":
-                outcome = "needs_attention"
-                detail = "upgrade applied; " + FRONT_KEY_KICK_FAILED_DETAIL
-            else:
-                detail = (detail + "; " if detail else "") + FRONT_KEY_KICK_FAILED_DETAIL
+        if key_kick_failed and outcome == "ok":
+            outcome = "needs_attention"
+            detail = "upgrade applied"
+        elif platform_upgrade_kick_failed and outcome == "ok":
+            outcome = "needs_attention"
+            detail = (
+                "upgrade applied, but the platform's kickstart FAILED — the old "
+                "process is still serving; run `launchctl kickstart -k "
+                "gui/$(id -u)/dev.snowline.platform` and check its err.log"
+            )
 
-        if (note := _timer_note(timer_action, dry_run=False)):
+        for note in _unit_notes(units):
             detail = (detail + "; " if detail else "") + note
+
+        platform_plan = plans["platform"]
+        reexec_wanted = m.should_reexec(
+            outcome=outcome, platform_swapped=platform_plan.changes,
+            previous_platform_train=platform_plan.previous_train,
+            target_train=resolved_train,
+            running_under_target=running_under(
+                m.service_venv_dir(home, "platform", resolved_train)),
+            resumed=resumed,
+        )
+        cli = new_cli_path(home)
+        if reexec_wanted and not os.access(cli, os.X_OK):
+            reexec_wanted = False
+            detail = (detail + "; " if detail else "") + (
+                f"the new train's CLI was not found at {cli} — finished under "
+                "this process's CLI instead (no re-exec); run `snowline stack "
+                "sync` once more so the new train reconciles its own units"
+            )
         rpt = m.RunReport(
             train=resolved_train, role=cfg.role, instance_id=cfg.instance_id,
             started_at=started_at, finished_at=_now_iso(), auto=auto, dry_run=False,
             noop=False, services=tuple(changes), health_ok=health_ok, outcome=outcome,
             detail=detail, env_drift=tuple(env_drift), front_kickstarted=front_kicked,
-            front_ok=front_ok,
+            front_ok=front_ok, units=tuple(units),
         )
+        if reexec_wanted:
+            # Hand the rest of the run to the NEW train's code (#303): it
+            # takes the lock, sees the train already current (no-op path),
+            # reconciles every unit with ITS unit list, re-checks health and
+            # writes the run's single report. This process writes none.
+            argv = reexec_argv(
+                cli, role=role, train=resolved_train, auto=auto,
+                health_url=health_url, verbose=verbose,
+                resumed_from=platform_plan.previous_train or "none",
+            )
+            write_handoff(home, rpt)
+            report(f"stack sync: platform swapped to {resolved_train}; re-exec'ing {cli} to finish the run")
+            if lock is not None:
+                lock.release()
+                lock = None
+            os.environ[m.SYNC_RESUMED_ENV] = "1"
+            sys.stdout.flush()
+            sys.stderr.flush()
+            try:
+                os.execv(str(cli), argv)
+            except OSError as exc:
+                os.environ.pop(m.SYNC_RESUMED_ENV, None)
+                m.sync_handoff_path(home).unlink(missing_ok=True)
+                rpt = replace(rpt, detail=(rpt.detail + "; " if rpt.detail else "") + (
+                    f"re-exec of {cli} failed ({exc}) — finished under this "
+                    "process's CLI; run `snowline stack sync` once more so the "
+                    "new train reconciles its own units"
+                ))
+                write_report(home, rpt, dry_run=False)
+                return rpt
+            # Only reachable under a test double of os.execv.
+            return rpt
         write_report(home, rpt, dry_run=False)
         return rpt
 

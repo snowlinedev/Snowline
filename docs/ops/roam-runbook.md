@@ -455,8 +455,9 @@ The spoke is a warm standby: it must track the hub's deployed code within an
 hour or two. `snowline stack sync` itself renders
 `~/Library/LaunchAgents/dev.snowline.autoupgrade.plist` (a user LaunchAgent in
 `gui/<uid>`, no sudo, no human step) on every spoke sync, full or no-op, and
-`bootstrap-spoke` installs it as its last step. The first `stack sync` after
-this ships installs it. The hub role never gets it (sync refuses the hub).
+`bootstrap-spoke` installs it as its last step. The upgrade to the train that
+ships it installs it in the same run (see "Stack-managed units" below). The
+hub role never gets it (sync refuses the hub).
 
 - **Cadence:** `StartInterval` 3600, `RunAtLoad` false. Paired with the hub's
   hourly auto-cut there is usually a new train to pick up; a no-op sync is
@@ -490,6 +491,48 @@ this ships installs it. The hub role never gets it (sync refuses the hub).
   nothing was changed.
 - **Remove the timer:** `launchctl bootout gui/$(id -u)/dev.snowline.autoupgrade`
   and touch the disabled marker (the next manual sync re-installs and re-loads it otherwise; the timer never reloads itself).
+
+### Stack-managed units and how an upgrade finishes (#303)
+
+Besides the four service venvs, sync owns a set of **stack-managed units**:
+today the failover front (`front.env` + `dev.snowline.front.plist`, §6e), the
+platform's `SNOWLINE_FRONT_HEALTH_URL` key in `platform.env`, and the hourly
+auto-upgrade timer. **Every** `stack sync` — full upgrade or no-op —
+runs one reconcile pass over all of them: a missing or changed unit is
+written (and kickstarted if it is a running service), an unchanged one is
+left alone (no write, no kick, no launchctl — except re-loading an unloaded
+timer on a manual run). So a missing unit is always one `stack sync` away;
+there is no "run sync twice" and nothing to install by hand.
+
+**An upgrade finishes under the NEW train's CLI.** `~/.local/bin/snowline`
+runs the platform venv's `current`, i.e. the OLD train's code — which cannot
+know about a unit only the new train introduces (this is how the v0.4.0 →
+v0.5.2 upgrade on the MBP swapped every service but never installed the
+front). So once the old process has swapped the platform venv, kickstarted
+the services, health-checked and decided the run is `ok`, it releases
+`sync.lock` and **re-execs** `venvs/platform/current/bin/snowline stack sync`
+with the same flags (`--train` pinned to the train it just installed) plus an
+internal `--resumed-from <old train>`. The new CLI takes the lock, sees the
+train already current, reconciles every unit with ITS unit list,
+re-checks health and writes the run's **single** report:
+`sync-report.json` has `"resumed_from": "<old train>"` and a `units` list
+(`name`, `action`, `kicked`); the old process writes none (it logs one
+`re-exec'ing …` line). The exit code is the resumed process's, so the `--auto`
+exit discipline is unchanged.
+
+- It happens at most once (`--resumed-from` / `SNOWLINE_SYNC_RESUMED=1`).
+- Never after a revert or a `needs_attention` run — the code that started
+  those finishes them — never on a rollback (a `--train` older than the
+  platform's current train: the older CLI has nothing newer to add), and
+  never when sync already runs from the new venv.
+- `--dry-run` never re-execs; it prints `would re-exec <path>`.
+- If the new train's `bin/snowline` is missing or the exec fails, the run
+  finishes in the old process and the report says so — run `snowline stack
+  sync` once more and the new CLI reconciles its units on the no-op path.
+- Between the old process releasing the lock and the new one taking it, an
+  hourly timer fire can win the race; it runs the NEW CLI too (via
+  `current`), so the units still get reconciled (its report is a plain
+  no-op one) — the resumed run then exits `locked`.
 
 ### Failure modes
 
@@ -547,7 +590,11 @@ sync` renders `~/Library/LaunchAgents/dev.snowline.front.plist` (it runs the
 PLATFORM venv's `uvicorn --factory snowline_platform.front:create_app`, so a
 platform train swap upgrades it too and sync kickstarts it alongside) and
 `~/.config/snowline/front.env` (operator-owned, never clobbered — drift is
-reported like the other env files). `SNOWLINE_FRONT_HUB_URL` comes from
+reported like the other env files). It is one of the stack-managed units
+(§6b, #303): every sync, upgrade or no-op, reconciles it, so a spoke whose
+front is missing (`dev.snowline.front` not loaded, `:8850` refusing — e.g. it
+was upgraded by a pre-#303 CLI) gets it back from one plain `snowline stack
+sync`; no hand-rendering of `front.env` or the plist. `SNOWLINE_FRONT_HUB_URL` comes from
 `stack.json`'s `primary_gateway_url` (or the `http://<primary>:8850` default
 bootstrap-spoke would prompt with). Post-sync and post-boot health checks
 probe `http://127.0.0.1:8850/front/health` after the gateway's `/health` —
