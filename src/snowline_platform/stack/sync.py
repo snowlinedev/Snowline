@@ -542,7 +542,7 @@ def install_autoupgrade_timer(runner: Runner, home: Path, *, dry_run: bool) -> s
     false — loading must not start a sync inside a sync). launchctl calls are
     best-effort (check=False): a failed load must not fail an upgrade.
 
-    Returns "installed" | "updated" | "reloaded" | "healed" | "deferred" |
+    Returns "installed" | "updated" | "reloaded" | "healed" | "deferred" | "reload-failed" |
     "unchanged". When this very process IS the timer job, `bootout` would
     SIGTERM the running sync mid-upgrade, so a changed plist is only written
     and `autoupgrade.reload-pending` is touched ("deferred"); the next
@@ -569,7 +569,14 @@ def install_autoupgrade_timer(runner: Runner, home: Path, *, dry_run: bool) -> s
         runner.run(["launchctl", "bootstrap", domain, plist], check=False)
     elif action == "updated" or pending:
         runner.run(["launchctl", "bootout", target], check=False)
-        runner.run(["launchctl", "bootstrap", domain, plist], check=False)
+        # Clear the reload-pending marker only once the bootstrap really
+        # succeeded: a failed bootstrap leaves the job unloaded, and the
+        # marker keeps the next non-timer sync retrying (the heal path would
+        # too, but the marker says WHY).
+        try:
+            runner.run(["launchctl", "bootstrap", domain, plist])
+        except CommandError:
+            return action if action != "unchanged" else "reload-failed"
         if action == "unchanged":
             action = "reloaded"
     else:
@@ -593,6 +600,12 @@ def _timer_note(action: str, *, dry_run: bool) -> str | None:
         return f"would {'install' if action == 'installed' else 'update'} the hourly auto-upgrade timer ({label})"
     if action == "healed":
         return f"re-loaded the hourly auto-upgrade timer ({label}), which was not loaded"
+    if action == "reload-failed":
+        return (
+            f"the hourly auto-upgrade timer ({label}) was booted out but `launchctl "
+            f"bootstrap` FAILED — it is not loaded; reload-pending kept, the next "
+            f"manual `stack sync` retries (check the plist with plutil -lint)"
+        )
     return f"{action} the hourly auto-upgrade timer ({label})"
 
 

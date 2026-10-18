@@ -465,8 +465,9 @@ this ships installs it. The hub role never gets it (sync refuses the hub).
 - **Command:** `~/Library/Application Support/Snowline/venvs/platform/current/bin/snowline stack sync --auto`
   (via the `current` symlink, so a train swap never strands it on an old venv).
   PATH includes the venv bin, `~/.local/bin` (where `install.sh` puts uv), `/opt/homebrew/bin` and the keg-only `/opt/homebrew/opt/postgresql@16/bin` (createdb/psql).
-- **Reload rule:** written only when the content changed; first install is
-  `launchctl bootstrap`, a change is `bootout` + `bootstrap`; never
+- **Reload rule:** written only when the content changed; a first install is
+  `bootout` (ignored if nothing was loaded) + `bootstrap`, a change is
+  `bootout` + `bootstrap`; never
   kickstarted (loading must not start a sync inside a sync). If the plist
   changes during a timer-run sync, it is only written and
   `~/.config/snowline/autoupgrade.reload-pending` is touched (a `bootout` of

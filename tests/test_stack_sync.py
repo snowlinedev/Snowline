@@ -1251,6 +1251,35 @@ def test_timer_run_sync_defers_the_reload_and_touches_the_marker(tmp_path, monke
     assert not m.autoupgrade_reload_pending_path(home).exists()
 
 
+def test_failed_bootstrap_keeps_the_reload_marker_for_the_next_sync(tmp_path, monkeypatch):
+    """A pending reload whose `launchctl bootstrap` fails must not clear the
+    marker: the job is unloaded now, and the marker is what makes the next
+    manual sync retry (and say why)."""
+    home = tmp_path / "home"
+    _stack_config(home)
+    _seed_train_assets(home)
+    _sync(home)
+    m.autoupgrade_reload_pending_path(home).parent.mkdir(parents=True, exist_ok=True)
+    m.autoupgrade_reload_pending_path(home).touch()
+    monkeypatch.delenv("XPC_SERVICE_NAME", raising=False)
+
+    def bootstrap_fails(argv, cwd):
+        if argv[:2] == ["launchctl", "bootstrap"]:
+            return CommandError(argv, 5, "Input/output error")
+        return _full_fake_handler(argv, cwd)
+
+    runner = FakeRunner(bootstrap_fails)
+    rpt = _sync(home, runner)
+    assert [a[1] for a in _timer_runs(runner)] == ["bootout", "bootstrap"]
+    assert m.autoupgrade_reload_pending_path(home).exists()  # kept
+    assert "bootstrap` FAILED" in rpt.detail
+
+    runner2 = FakeRunner(_full_fake_handler)
+    _sync(home, runner2)  # retried, now succeeds, marker cleared
+    assert [a[1] for a in _timer_runs(runner2)] == ["bootout", "bootstrap"]
+    assert not m.autoupgrade_reload_pending_path(home).exists()
+
+
 def test_unloaded_timer_is_healed_and_a_loaded_one_is_left_alone(tmp_path, monkeypatch):
     home = tmp_path / "home"
     _stack_config(home)
