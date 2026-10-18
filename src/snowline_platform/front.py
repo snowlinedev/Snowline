@@ -453,6 +453,12 @@ async def relay_body(upstream_resp: httpx.Response, upstream: str):
             yield chunk
     except httpx.HTTPError as exc:
         log.warning("front: upstream %s stream broke after headers: %r", upstream, exc)
+        if upstream_resp.headers.get("content-length"):
+            # A declared length we cannot honour: ending "cleanly" would hand
+            # the client a short body that claims to be complete. Re-raise so
+            # the connection is dropped instead (chunked/SSE bodies, the MCP
+            # case, keep the quiet end above).
+            raise
 
 
 def _front_origin(scope: Scope, headers: Mapping[str, str]) -> str:
@@ -521,7 +527,7 @@ class FrontProxy:
             return JSONResponse(
                 {
                     "detail": f"front upstream {upstream!r} unreachable: "
-                    f"{type(exc).__name__}: {exc}",
+                    f"{type(exc).__name__}: {exc}".rstrip(": "),
                     "upstream": upstream,
                     "upstream_url": base,
                 },

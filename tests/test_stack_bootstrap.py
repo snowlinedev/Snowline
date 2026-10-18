@@ -628,5 +628,5 @@ def test_a_dead_front_is_a_warn_step_never_a_bootstrap_failure(tmp_path):
     assert report.outcome == "ok", report.detail
     steps = {st.name: st for st in report.steps}
     assert steps["post-boot-health"].status == "ok"
-    assert steps["front-health"].status == "failed"
+    assert steps["front-health"].status == "warned"
     assert steps["front-health"].detail.startswith("WARN:")

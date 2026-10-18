@@ -1014,7 +1014,11 @@ def reseed_check_cli_argv(config_path: Path) -> list[str]:
 @dataclass(frozen=True)
 class BootstrapStep:
     name: str
-    status: str  # "ok" | "skipped" | "failed"
+    # "ok" | "skipped" | "failed" | "warned" — `warned` is a probe that did
+    # not pass but does not fail the run (the failover front's health, which
+    # is reported, never a gate), so a consumer counting failed steps does not
+    # see a failure on a successful bootstrap.
+    status: str
     detail: str | None = None
 
 

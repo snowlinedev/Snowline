@@ -429,7 +429,7 @@ def run_bootstrap_spoke(
             if front_ok is not None:
                 steps.append(m.BootstrapStep(
                     name="front-health",
-                    status="ok" if front_ok else "failed",
+                    status="ok" if front_ok else "warned",
                     detail=None if front_ok else "WARN: " + FRONT_DOWN_DETAIL,
                 ))
                 report(f"[front-health] {'ok' if front_ok else 'WARN: failover front not answering'}")
