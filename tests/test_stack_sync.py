@@ -1055,3 +1055,164 @@ def test_hub_role_never_touches_platform_env(tmp_path):
                      health_sleep=lambda _s: None, report=lambda _: None)
     assert rpt.outcome == "failed"
     assert not m.env_file_path(home, "platform").exists()
+
+
+# -- the hourly auto-upgrade timer (item 4a321bea / #208) --------------------
+
+TIMER_LABEL = "dev.snowline.autoupgrade"
+
+
+def _timer_calls(runner, verb):
+    return [a for a in runner.runs if a[:2] == ("launchctl", verb) and TIMER_LABEL in " ".join(a)]
+
+
+def _timer_runs(runner):
+    return [a for a in runner.runs if TIMER_LABEL in " ".join(a)]
+
+
+def test_render_autoupgrade_plist_is_hourly_quiet_and_follows_current(tmp_path):
+    text = m.render_autoupgrade_plist(
+        home=tmp_path, platform_venv_current=m.service_current_link(tmp_path, "platform"),
+        logs=m.log_dir(tmp_path),
+    )
+    assert f"<string>{tmp_path}/Library/Application Support/Snowline/venvs/platform/current/bin/snowline</string>" in text
+    assert "<string>--auto</string>" in text
+    assert "<key>StartInterval</key>\n    <integer>3600</integer>" in text
+    assert "<key>RunAtLoad</key>\n    <false/>" in text
+    assert "KeepAlive" not in text
+    assert "snowline-autoupgrade.log" in text
+    assert "/opt/homebrew/bin" in text and "venvs/platform/current/bin:" in text
+
+
+def test_run_sync_full_path_installs_and_bootstraps_the_timer_never_kickstarts(tmp_path):
+    home = tmp_path / "home"
+    _stack_config(home)
+    _seed_train_assets(home)
+    runner = FakeRunner(_full_fake_handler)
+    rpt = s.run_sync(home=home, train="v0.1.0", runner=runner, health_sleep=lambda _s: None, report=lambda _: None)
+    assert rpt.outcome == "ok"
+    assert m.plist_path(home, m.AUTOUPGRADE_UNIT).exists()
+    assert len(_timer_calls(runner, "bootstrap")) == 1
+    assert not _timer_calls(runner, "bootout")  # first install: nothing to unload
+    assert not _timer_calls(runner, "kickstart")
+    assert "hourly auto-upgrade timer" in rpt.detail
+
+
+def test_run_sync_noop_path_installs_the_timer_then_leaves_it_alone(tmp_path):
+    home = tmp_path / "home"
+    _stack_config(home)
+    _seed_train_assets(home)
+    _sync(home)  # full path installs it
+    m.plist_path(home, m.AUTOUPGRADE_UNIT).unlink()  # simulate a pre-#208 spoke
+    runner = FakeRunner(_full_fake_handler)
+    rpt = _sync(home, runner)
+    assert rpt.noop is True and rpt.outcome == "noop"
+    assert m.plist_path(home, m.AUTOUPGRADE_UNIT).exists()
+    assert len(_timer_calls(runner, "bootstrap")) == 1
+    assert not _timer_calls(runner, "kickstart")
+
+    # unchanged -> not rewritten, no launchctl at all
+    path = m.plist_path(home, m.AUTOUPGRADE_UNIT)
+    before = path.stat().st_mtime_ns
+    runner2 = FakeRunner(_full_fake_handler)
+    rpt2 = _sync(home, runner2)
+    assert rpt2.detail == "already on the resolved train — nothing to do"
+    assert path.stat().st_mtime_ns == before
+    assert runner2.runs == []
+
+
+def test_changed_timer_plist_is_bootout_then_bootstrap(tmp_path):
+    home = tmp_path / "home"
+    _stack_config(home)
+    _seed_train_assets(home)
+    _sync(home)
+    path = m.plist_path(home, m.AUTOUPGRADE_UNIT)
+    path.write_text(path.read_text().replace("3600", "60"))
+    runner = FakeRunner(_full_fake_handler)
+    rpt = _sync(home, runner)
+    assert "3600" in path.read_text()
+    verbs = [a[1] for a in _timer_runs(runner)]
+    assert verbs == ["bootout", "bootstrap"]
+    assert not _timer_calls(runner, "kickstart")
+    assert "updated the hourly auto-upgrade timer" in rpt.detail
+
+
+def test_dry_run_does_not_install_the_timer(tmp_path):
+    home = tmp_path / "home"
+    _stack_config(home)
+    lines = []
+    s.run_sync(home=home, train="v0.1.0", dry_run=True, runner=FakeRunner(_ok_gh_auth, dry_run=True),
+               health_sleep=lambda _s: None, report=lines.append)
+    assert not m.plist_path(home, m.AUTOUPGRADE_UNIT).exists()
+    assert any("would install the hourly auto-upgrade timer" in ln for ln in lines)
+
+
+def test_hub_role_never_gets_the_timer(tmp_path):
+    home = tmp_path / "home"
+    _stack_config(home)
+    runner = FakeRunner(_full_fake_handler)
+    rpt = s.run_sync(home=home, role="primary", runner=runner, health_sleep=lambda _s: None, report=lambda _: None)
+    assert rpt.outcome == "failed"
+    assert not m.plist_path(home, m.AUTOUPGRADE_UNIT).exists()
+    assert _timer_runs(runner) == []
+
+
+def test_auto_disabled_marker_is_a_noop_with_a_report(tmp_path):
+    home = tmp_path / "home"
+    _stack_config(home)
+    marker = m.autoupgrade_disabled_path(home)
+    marker.touch()
+    runner = FakeRunner(_full_fake_handler)
+    lines = []
+    rpt = s.run_sync(home=home, auto=True, runner=runner, health_sleep=lambda _s: None, report=lines.append)
+    assert rpt.outcome == "noop" and rpt.noop is True and m.exit_code(rpt.outcome) == 0
+    assert "disabled by marker" in rpt.detail
+    assert json.loads(m.report_path(home).read_text())["outcome"] == "noop"
+    assert runner.runs == [] and runner.reads == []  # not even a gh call
+    assert not m.plist_path(home, m.AUTOUPGRADE_UNIT).exists()
+    assert "disabled by marker" in lines[-1]
+
+
+def test_marker_does_not_affect_a_manual_sync(tmp_path):
+    home = tmp_path / "home"
+    _stack_config(home)
+    m.autoupgrade_disabled_path(home).touch()
+    _seed_train_assets(home)
+    assert _sync(home).outcome == "ok"
+
+
+def test_second_sync_while_the_lock_is_held_exits_zero_locked(tmp_path):
+    home = tmp_path / "home"
+    _stack_config(home)
+    holder = s.SyncLock(m.sync_lock_path(home))
+    assert holder.acquire()
+    try:
+        runner = FakeRunner(_full_fake_handler)
+        lines = []
+        rpt = s.run_sync(home=home, auto=True, runner=runner, health_sleep=lambda _s: None, report=lines.append)
+    finally:
+        holder.release()
+    assert rpt.outcome == "locked" and m.exit_code(rpt.outcome) == 0
+    assert len(lines) == 1 and "another stack sync is running" in lines[0]
+    assert runner.runs == [] and runner.reads == []
+    assert not m.report_path(home).exists()  # never clobbers the running sync's report
+    # released -> the next run proceeds
+    assert s.SyncLock(m.sync_lock_path(home)).acquire()
+
+
+def test_auto_missing_stack_json_says_so_and_changes_nothing(tmp_path):
+    home = tmp_path / "home"
+    runner = FakeRunner(_ok_gh_auth)
+    rpt = s.run_sync(home=home, auto=True, runner=runner, health_sleep=lambda _s: None,
+                     prompt=lambda _m: pytest.fail("prompted"), report=lambda _: None)
+    assert rpt.outcome == "failed" and m.exit_code(rpt.outcome) == 1
+    assert "needs ~/.config/snowline/stack.json" in rpt.detail
+    assert "bootstrap-spoke" in rpt.detail and "nothing was changed" in rpt.detail
+    assert not m.stack_config_path(home).exists()
+    assert runner.runs == []
+
+
+def test_auto_replaces_any_supplied_prompt_with_a_hard_failure(tmp_path):
+    """Even if a caller hands --auto a real prompt, it can never be reached."""
+    with pytest.raises(m.StackError, match="--auto never prompts"):
+        s._no_prompt("the primary's tailnet address: ")

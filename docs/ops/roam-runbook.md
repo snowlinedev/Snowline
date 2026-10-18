@@ -437,6 +437,7 @@ Mapping the manual drill to the command:
 | (not previously machine-checked) | Registration gate (#228): polls the spoke platform's `/plugins` (default 60 s, every 2 s) until every plugin is listed WITH a `replication` block — `/health` answering is not registration — and refuses naming each missing plugin and its `~/Library/Application Support/Snowline/logs/snowline-<svc>.err.log`. Then a best-effort probe of each spoke ingest URL over this box's tailnet address: an unreachable port or a gateway 502/503/504 is a WARN (likely a `tailscale serve` mirror predating the plugin — `stack sync` does not manage it), never a refusal. |
 | `snowline replicate seed --config seed.json --reverse-pair` (§5 step 4) | Run as a subprocess through the same argv, unmodified. |
 | (not previously machine-checked) | Verifies `~/.config/snowline/pm.env` declares `SNOWLINE_PM_ROLE=spoke` — refuses loudly (without undoing the seed) if it says anything else. |
+| (not previously a step) | Last step: installs the hourly auto-upgrade timer `dev.snowline.autoupgrade` (see "Hourly auto-upgrade timer" below) — `launchctl bootstrap`, never kickstarted — so a fresh spoke tracks the hub from the start. `stack sync` installs it too, so it is idempotent. |
 | §6 re-seed (`reseed-check` then `seed --config … --reseed`) | `--reseed`: runs `reseed-check` first (its failure — either precondition, outbox or parked-set — surfaces verbatim in the command's output/report, never swallowed), then `seed --config seed.json --reseed`, then boots + reverse-pairs exactly as the fresh path. |
 
 A machine-readable record of every run (each precondition, each command,
@@ -444,6 +445,43 @@ outcome) is appended to `~/Library/Application Support/Snowline/bootstrap-histor
 (parallel to `sync`'s own `sync-history/` — see the PR that introduced this
 command for why it is a parallel report rather than a reuse of `sync`'s
 `RunReport`).
+
+### Hourly auto-upgrade timer (#208, spoke only)
+
+The spoke is a warm standby: it must track the hub's deployed code within an
+hour or two. `snowline stack sync` itself renders
+`~/Library/LaunchAgents/dev.snowline.autoupgrade.plist` (a user LaunchAgent in
+`gui/<uid>`, no sudo, no human step) on every spoke sync, full or no-op, and
+`bootstrap-spoke` installs it as its last step. The first `stack sync` after
+this ships installs it. The hub role never gets it (sync refuses the hub).
+
+- **Cadence:** `StartInterval` 3600, `RunAtLoad` false. Paired with the hub's
+  hourly auto-cut there is usually a new train to pick up; a no-op sync is
+  cheap and still health-checks. A run missed while the lid is closed
+  coalesces onto the next wake.
+- **Command:** `~/Library/Application Support/Snowline/venvs/platform/current/bin/snowline stack sync --auto`
+  (via the `current` symlink, so a train swap never strands it on an old venv).
+  PATH includes the venv bin and `/opt/homebrew/bin` for gh/uv.
+- **Reload rule:** written only when the content changed; first install is
+  `launchctl bootstrap`, a change is `bootout` + `bootstrap`; never
+  kickstarted (loading must not start a sync inside a sync). If the plist
+  changes during a timer-run sync, the reload is handed to a detached shell
+  (bootout of the running job would kill the sync itself).
+- **Log:** `~/Library/Application Support/Snowline/logs/snowline-autoupgrade.log`
+  (stdout and stderr). The machine-readable result is still
+  `sync-report.json` / `sync-history/`.
+- **Pause / resume:** `touch ~/.config/snowline/autoupgrade.disabled` makes
+  `--auto` exit 0 as a no-op (report written, detail "disabled by marker");
+  `rm` it to resume. No launchctl needed. Manual (non-`--auto`) sync ignores it.
+- **Lock:** every sync (manual or `--auto`) takes a non-blocking flock on
+  `~/Library/Application Support/Snowline/sync.lock`. A second run exits 0 with
+  a one-line `locked` message and does not overwrite the running sync's report.
+- **Never prompts:** `--auto` cannot ask anything. With no
+  `~/.config/snowline/stack.json` it fails (exit 1) with "`stack sync --auto`
+  needs ~/.config/snowline/stack.json (written by bootstrap-spoke / setup)";
+  nothing was changed.
+- **Remove the timer:** `launchctl bootout gui/$(id -u)/dev.snowline.autoupgrade`
+  and touch the disabled marker (sync re-installs the plist otherwise).
 
 ### Failure modes
 

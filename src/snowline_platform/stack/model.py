@@ -643,6 +643,77 @@ def _render_uvicorn_plist(
 """
 
 
+# The spoke's auto-upgrade timer (item 4a321bea / #208): a user LaunchAgent that
+# runs `snowline stack sync --auto` hourly. Rendered/installed by sync itself.
+AUTOUPGRADE_UNIT = "autoupgrade"
+AUTOUPGRADE_INTERVAL_S = 3600
+AUTOUPGRADE_PATH_EXTRAS = ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin")
+
+
+def autoupgrade_disabled_path(home: Path) -> Path:
+    """Kill switch: while this file exists `stack sync --auto` is a no-op."""
+    return config_dir(home) / "autoupgrade.disabled"
+
+
+def sync_lock_path(home: Path) -> Path:
+    return app_support_dir(home) / "sync.lock"
+
+
+def autoupgrade_log_path(home: Path) -> Path:
+    return log_dir(home) / "snowline-autoupgrade.log"
+
+
+def render_autoupgrade_plist(*, home: Path, platform_venv_current: Path, logs: Path) -> str:
+    """The timer plist. Execs the platform venv's `snowline` through the
+    stable `current` symlink (like the front), so a train swap never strands
+    the timer on an old venv. RunAtLoad is false and sync never kickstarts
+    it: loading the agent must not start a sync inside a sync. Never
+    prompts: `--auto` has no prompt path and launchd gives no tty."""
+    label = plist_label(AUTOUPGRADE_UNIT)
+    snowline_bin = platform_venv_current / "bin" / "snowline"
+    path_value = ":".join([str(platform_venv_current / "bin"), *AUTOUPGRADE_PATH_EXTRAS])
+    log = logs / "snowline-autoupgrade.log"
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hourly auto-upgrade timer for the packaged spoke (item 4a321bea / #208).
+  Rendered and (re)loaded by `snowline stack sync` / `bootstrap-spoke`,
+  never hand-edited. Pause without touching launchd:
+  touch ~/.config/snowline/autoupgrade.disabled
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{_xml_escape(str(snowline_bin))}</string>
+        <string>stack</string>
+        <string>sync</string>
+        <string>--auto</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>{AUTOUPGRADE_INTERVAL_S}</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>AbandonProcessGroup</key>
+    <true/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>{_xml_escape(str(home))}</string>
+        <key>PATH</key>
+        <string>{_xml_escape(path_value)}</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>{_xml_escape(str(log))}</string>
+    <key>StandardErrorPath</key>
+    <string>{_xml_escape(str(log))}</string>
+</dict>
+</plist>
+"""
+
+
 def _xml_escape(text: str) -> str:
     return (
         text.replace("&", "&amp;")
@@ -694,7 +765,7 @@ class RunReport:
     noop: bool
     services: tuple[ServiceChange, ...]
     health_ok: bool | None
-    # "ok" | "noop" | "reverted" | "needs_attention" | "failed"
+    # "ok" | "noop" | "locked" | "reverted" | "needs_attention" | "failed"
     outcome: str
     detail: str | None = None
     env_drift: tuple[str, ...] = field(default_factory=tuple)
@@ -744,7 +815,7 @@ def exit_code(outcome: str) -> int:
     (work item body, --auto contract). A `reverted` run safely undid itself
     but did NOT reach the target train, so it counts as a failure for the
     caller (a launchd timer) even though state is clean."""
-    return EXIT_OK if outcome in ("ok", "noop") else EXIT_FAILED
+    return EXIT_OK if outcome in ("ok", "noop", "locked") else EXIT_FAILED
 
 
 # --------------------------------------------------------------------------

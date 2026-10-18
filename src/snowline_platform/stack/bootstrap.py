@@ -48,6 +48,7 @@ from .sync import (
     Report,
     check_health,
     check_stack_health,
+    install_autoupgrade_timer,
     kickstart_service,
     read_current_train,
     read_stack_config,
@@ -499,6 +500,15 @@ def run_bootstrap_spoke(
         m.check_pm_role_is_spoke(pm_env_text)
         pm_role_ok = True
         ok("pm-role-verified", "pm.env declares SNOWLINE_PM_ROLE=spoke")
+
+        # -- LAST: the hourly auto-upgrade timer (#208) — a fresh spoke is
+        # self-updating from the start. Idempotent; never kickstarted.
+        timer_action = install_autoupgrade_timer(runner, home, dry_run=dry_run)
+        ok(
+            "autoupgrade-timer",
+            f"{m.plist_label(m.AUTOUPGRADE_UNIT)} {'would be ' if dry_run else ''}{timer_action}"
+            " (hourly `stack sync --auto`; pause with ~/.config/snowline/autoupgrade.disabled)",
+        )
 
         outcome = "ok"
         detail = (

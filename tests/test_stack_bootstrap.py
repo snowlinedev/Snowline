@@ -630,3 +630,15 @@ def test_a_dead_front_is_a_warn_step_never_a_bootstrap_failure(tmp_path):
     assert steps["post-boot-health"].status == "ok"
     assert steps["front-health"].status == "warned"
     assert steps["front-health"].detail.startswith("WARN:")
+
+
+def test_bootstrap_installs_the_autoupgrade_timer_as_its_last_step(tmp_path):
+    home = _fully_bootstrapped_home(tmp_path)
+    runner = FakeRunner(_health_ok_handler)
+    report = b.run_bootstrap_spoke(home=home, runner=runner, prompt=_no_prompt, health_sleep=_noop_sleep)
+    assert report.outcome == "ok", report.detail
+    assert [st.name for st in report.steps][-1] == "autoupgrade-timer"
+    assert [st.name for st in report.steps].index("reverse-pair") < len(report.steps) - 1
+    assert m.plist_path(home, m.AUTOUPGRADE_UNIT).exists()
+    timer = [a for a in runner.runs if "dev.snowline.autoupgrade" in " ".join(a)]
+    assert [a[1] for a in timer] == ["bootstrap"]  # loaded, never kickstarted
