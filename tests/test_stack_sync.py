@@ -1565,6 +1565,41 @@ def test_resumed_auto_run_with_a_dead_gateway_exits_nonzero(tmp_path, execs):
     assert "gateway health check FAILED" in rpt.detail
 
 
+def test_resumed_run_that_loses_the_lock_discards_the_handoff_and_exits_locked(tmp_path, execs):
+    """An hourly fire can win the lock between the old process releasing it
+    and the resumed pass taking it: the resumed pass exits `locked` (0), the
+    swap record is discarded so it can never be mis-applied, and the detail
+    says the other run reconciles."""
+    home = _upgraded_home(tmp_path)
+    _fake_new_cli(home)
+    _sync_v2(home, auto=True)
+    assert m.sync_handoff_path(home).exists()
+    holder = s.SyncLock(m.sync_lock_path(home))
+    assert holder.acquire()
+    try:
+        rpt = _sync_v2(home, runner=FakeRunner(_full_fake_handler), auto=True, resumed_from="v0.1.0")
+    finally:
+        holder.release()
+    assert rpt.outcome == "locked" and m.exit_code(rpt.outcome) == 0
+    assert "upgrade from v0.1.0 already swapped" in rpt.detail
+    assert not m.sync_handoff_path(home).exists()
+
+
+def test_resumed_flag_without_a_swap_record_is_an_ordinary_noop(tmp_path, execs):
+    """`--resumed-from` by hand (or after a discarded stale record) must not
+    claim an upgrade this process cannot vouch for."""
+    home = _upgraded_home(tmp_path)
+    _fake_new_cli(home)
+    _sync_v2(home, auto=True)
+    m.sync_handoff_path(home).unlink()
+    runner = FakeRunner(_full_fake_handler)
+    rpt = _sync_v2(home, runner=runner, auto=True, resumed_from="v0.1.0")
+    assert rpt.outcome == "noop" and rpt.noop is True and rpt.services == ()
+    assert rpt.resumed_from is None
+    assert "no swap record was found" in rpt.detail
+    assert "upgrade from v0.1.0 finished" not in rpt.detail
+
+
 def test_no_reexec_after_a_revert_or_needs_attention(tmp_path, execs):
     home = _upgraded_home(tmp_path)
     _fake_new_cli(home)

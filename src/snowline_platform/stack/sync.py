@@ -1016,6 +1016,19 @@ def run_sync(
             if not lock.acquire():
                 lock = None
                 detail = "another stack sync is running (sync.lock held) — skipped"
+                if resumed_from is not None:
+                    # The resumed pass lost the lock race (an hourly fire won):
+                    # that run reconciles the units itself; the swap record is
+                    # discarded here so it can never be mis-applied later.
+                    handoff = take_handoff(home)
+                    swapped = ", ".join(
+                        c.get("service", "?") for c in (handoff or {}).get("services", [])
+                        if isinstance(c, dict) and c.get("changed")
+                    )
+                    detail += (
+                        f"; the upgrade from {resumed_from} already swapped"
+                        f" {swapped or 'its services'} — the other run reconciles the units"
+                    )
                 report(f"stack sync: {detail}")
                 return m.RunReport(
                     train=resolved_train, role=role, instance_id=instance_id,
@@ -1066,6 +1079,16 @@ def run_sync(
             handoff = take_handoff(home) if resumed_from is not None and not dry_run else None
             if handoff and handoff.get("train") != resolved_train:
                 handoff = None  # stale (a resumed run that lost the lock race)
+            resumed_note = None
+            if resumed_from is not None and handoff is None and not dry_run:
+                # No swap record to resume (hand-passed flag, or a stale file
+                # was discarded): this is an ordinary no-op reconcile — never
+                # claim an upgrade that this process cannot vouch for.
+                resumed_note = (
+                    f"`--resumed-from {resumed_from}` given but no swap record was "
+                    "found — treated as an ordinary no-op reconcile"
+                )
+                resumed_from = None
             units = reconcile_units(home, cfg, runner, dry_run=dry_run, timer_run=timer_run)
             kicked_any = any(u.kicked is not None for u in units)
             noop_health, noop_front = (None, None) if dry_run else check_stack_health(
@@ -1098,6 +1121,8 @@ def run_sync(
                 detail = f"{head} — nothing to do"
             for note in _unit_notes(units):
                 detail += "; " + note
+            if resumed_note:
+                detail += "; " + resumed_note
             env_drift = [u.name for u in units if u.drift]
             if handoff:
                 env_drift = [*handoff.get("env_drift", ()), *(d for d in env_drift if d not in handoff.get("env_drift", ()))]
@@ -1288,7 +1313,11 @@ def run_sync(
         # kick); an unchanged platform is restarted so the running process
         # (env is sourced at exec time) picks the key up.
         units = kick_units(runner, home, units, dry_run=False, already_kicked=kicked)
-        key_kick_failed = _key_kick_failed(units)
+        # Attribute a failed platform kick honestly: when the platform was
+        # kicked for its own UPGRADE and that failed, it is the upgrade kick
+        # that failed (the service row carries kickstarted=False), not the key.
+        platform_upgrade_kick_failed = kicked.get("platform") is False
+        key_kick_failed = _key_kick_failed(units) and not platform_upgrade_kick_failed
         front_kicked = _front_kicked(units)
 
         health_ok, front_ok = check_stack_health(runner, health_url, sleep=health_sleep)
@@ -1358,6 +1387,13 @@ def run_sync(
         if key_kick_failed and outcome == "ok":
             outcome = "needs_attention"
             detail = "upgrade applied"
+        elif platform_upgrade_kick_failed and outcome == "ok":
+            outcome = "needs_attention"
+            detail = (
+                "upgrade applied, but the platform's kickstart FAILED — the old "
+                "process is still serving; run `launchctl kickstart -k "
+                "gui/$(id -u)/dev.snowline.platform` and check its err.log"
+            )
 
         for note in _unit_notes(units):
             detail = (detail + "; " if detail else "") + note
