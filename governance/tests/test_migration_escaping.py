@@ -11,7 +11,8 @@ from snowline_governance.config import escape_for_config
 
 def test_env_cli_fallback_survives_percent_in_url(monkeypatch, capsys):
     # Offline (`sql=True`) mode runs env.py without connecting, exercising the
-    # CLI-fallback `set_main_option` that raised ValueError before the fix.
+    # unconditional `set_main_option` (it overwrites any URL the Config already
+    # carries) that raised ValueError before the fix.
     monkeypatch.setenv(
         "SNOWLINE_GOVERNANCE_DATABASE_URL", "postgresql+psycopg://user:p%40ss@localhost/db"
     )
