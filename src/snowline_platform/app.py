@@ -9,6 +9,7 @@ this registry.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from contextlib import asynccontextmanager
@@ -27,6 +28,7 @@ from snowline_platform import (
     plugins_routes,
     replication,
     scopes_routes,
+    standby,
     surfaces_routes,
     ui_api,
 )
@@ -205,6 +207,14 @@ async def _lifespan(app: FastAPI):
             else:
                 yield
     finally:
+        # The standby readiness refresh (#259) runs as a background task off
+        # /health; cancel an in-flight one so shutdown doesn't leave it
+        # pending (shielded: this finally may already run under cancellation).
+        task = getattr(app.state, "standby_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+            with anyio.CancelScope(shield=True):
+                await asyncio.wait([task], timeout=5)
         # The /ui-api proxy's shared httpx client (ui_api.py) is created
         # lazily on first request, not here — but however it exits, close it
         # if one was ever created, so a restart doesn't leak an open client.
@@ -287,6 +297,9 @@ def create_app(
     app.include_router(replication.router)
     app.include_router(surfaces_routes.router)
     app.include_router(ui_api.router)
+    # The standby readiness surface (#259): GET /standby, plus the two
+    # read-only peer-relay routes (/standby/local, /stack/report).
+    app.include_router(standby.router)
 
     # The dashboard owns the /ui and /ui-api route namespaces (ui-shell.md
     # §5–§6), and `platform` is the platform's OWN tool-app route (/platform/mcp,
@@ -383,6 +396,13 @@ def create_app(
             body["degraded_reason"] = "; ".join(
                 ([prior] if prior else []) + plugin_reasons
             )
+        # The standby readiness rollup (#259) rides as its OWN field, set
+        # AFTER `status` is final: a lagging/unreachable peer is visible
+        # here but can never turn this instance's own health red. Served
+        # from cache, refreshed in the background: /health never awaits a
+        # peer (stale-while-revalidate, standby.for_health).
+        body["train"] = standby.platform_train()
+        body["standby"] = await standby.for_health(app, block=block)
         return body
 
     @app.get("/whoami")

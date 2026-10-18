@@ -31,6 +31,7 @@ from snowline_plugin_sdk.replication.health import (
     apply_to_health,
     replication_health_from_scope,
 )
+from snowline_plugin_sdk.train import cached_running_train
 
 from snowline_governance import (
     config,
@@ -166,8 +167,15 @@ def create_app(
         block = await anyio.to_thread.run_sync(
             replication_health_from_scope, session_scope
         )
+        # `train` (#259): the release train this process runs, relayed by
+        # the platform to the standby readiness surface.
         return apply_to_health(
-            {"status": "ok", "plugin": registration.PLUGIN_NAME}, block
+            {
+                "status": "ok",
+                "plugin": registration.PLUGIN_NAME,
+                "train": cached_running_train("snowline-governance"),
+            },
+            block,
         )
 
     # The `/ui-api` read routes (ui-shell.md §3/§5, issue #55) — the platform's

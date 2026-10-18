@@ -76,14 +76,29 @@ def _degraded_verdict(entry: RegisteredPlugin, resp: httpx.Response) -> str | No
     return str(reason) if reason else "plugin reported degraded"
 
 
-async def probe(
+def _health_detail(resp: httpx.Response) -> dict | None:
+    """The slice of a 2xx health body the standby readiness surface relays
+    (#259): the SDK `replication` block and the running `train`, when present.
+    None for a non-JSON / non-object body or one carrying neither."""
+    try:
+        body = resp.json()
+    except Exception:  # noqa: BLE001 - non-JSON 2xx carries no detail
+        return None
+    if not isinstance(body, dict):
+        return None
+    detail = {
+        k: body[k]
+        for k in ("replication", "train")
+        if isinstance(body.get(k), dict)
+    }
+    return detail or None
+
+
+async def probe_detail(
     client: httpx.AsyncClient, entry: RegisteredPlugin
-) -> tuple[PluginStatus, str | None]:
-    """Poll one plugin's health endpoint → (`UP` | `DEGRADED` | `DOWN`,
-    degraded reason). Every transport failure — connection refused (crashed
-    local), DNS/TLS error or timeout (unreachable remote) — is caught and
-    mapped to `DOWN`, never raised: an unhealthy plugin must not break the
-    round."""
+) -> tuple[PluginStatus, str | None, dict | None]:
+    """`probe` plus the relayed health-body slice (`_health_detail`; None
+    unless the answer was 2xx)."""
     try:
         resp = await client.get(health_url(entry.manifest))
     except httpx.HTTPError as exc:
@@ -93,13 +108,26 @@ async def probe(
             health_url(entry.manifest),
             exc,
         )
-        return PluginStatus.DOWN, None
+        return PluginStatus.DOWN, None, None
     if not resp.is_success:
-        return PluginStatus.DOWN, None
+        return PluginStatus.DOWN, None, None
+    detail = _health_detail(resp)
     reason = _degraded_verdict(entry, resp)
     if reason is not None:
-        return PluginStatus.DEGRADED, reason
-    return PluginStatus.UP, None
+        return PluginStatus.DEGRADED, reason, detail
+    return PluginStatus.UP, None, detail
+
+
+async def probe(
+    client: httpx.AsyncClient, entry: RegisteredPlugin
+) -> tuple[PluginStatus, str | None]:
+    """Poll one plugin's health endpoint → (`UP` | `DEGRADED` | `DOWN`,
+    degraded reason). Every transport failure — connection refused (crashed
+    local), DNS/TLS error or timeout (unreachable remote) — is caught and
+    mapped to `DOWN`, never raised: an unhealthy plugin must not break the
+    round."""
+    status, reason, _ = await probe_detail(client, entry)
+    return status, reason
 
 
 async def check(client: httpx.AsyncClient, entry: RegisteredPlugin) -> PluginStatus:
@@ -124,8 +152,9 @@ async def poll_once(
         # shutdown) must stay THIS plugin's DOWN — never abort the task group and
         # cancel the sibling checks (round isolation, health.md).
         reason: str | None = None
+        detail: dict | None = None
         try:
-            status, reason = await probe(client, entry)
+            status, reason, detail = await probe_detail(client, entry)
         except Exception:
             log.exception("health: unexpected error checking %s", entry.manifest.name)
             status = PluginStatus.DOWN
@@ -137,6 +166,7 @@ async def poll_once(
             status,
             expected_entry=entry,
             degraded_reason=reason,
+            health_detail=detail,
         )
         results[entry.manifest.name] = status
 

@@ -606,6 +606,54 @@ to restore automatic routing. The probe/hysteresis knobs
 by hand instead (e.g. on another port): `SNOWLINE_FRONT_HUB_URL=… snowline
 front --bind 127.0.0.1:18850` — the bind is refused unless it is loopback.
 
+## 6f. Can I fail over right now? (standby readiness, #259)
+
+Look at the **Standby** panel at the top of the hub dashboard's System page
+(`/ui/system`), or ask the hub directly:
+
+```sh
+curl -s http://100.81.176.75:8850/standby | jq '{rollup, reasons}'
+# the same block rides on /health as `standby` (it never changes /health's own status)
+curl -s http://100.81.176.75:8850/health | jq .standby.rollup
+```
+
+- **READY**: the spoke runs the hub's latest cut, and every replication
+  stream in both directions (platform, governance, memory, pm) is current
+  or only briefly lagging. Safe to switch.
+- **DEGRADED**: the spoke answers, but its code or data is behind. Code is
+  behind when its train is older than the hub's latest cut; the reason says
+  by how many trains. Data is behind when a stream has events pending for
+  longer than 15 min, or has a version hold. Each reason names the stream,
+  for example `data behind: pm hub->peer (40 pending, oldest 86400s)`. Fix
+  it before you rely on the spoke: run `stack sync` on the spoke, or clear
+  the wedged stream.
+- **UNKNOWN**: the hub can't tell. Either the spoke's platform didn't answer
+  within 2 s (it is asleep, off, or off the tailnet), or it runs a build
+  from before #259 and can't report its train or outbox. UNKNOWN is never
+  READY.
+
+Each peer row also shows the spoke's last `stack sync` outcome (read from
+its `sync-report.json` through `GET /stack/report`), the hub's last
+auto-cut, and where the spoke's failover front (§6e) is routing. That last
+row reads the front's `/front/health` (§6e "Reading `/front/health`":
+`upstream`, `hub_healthy`, `last_flip_at`, `flips`). The spoke's platform
+fetches it only when `SNOWLINE_FRONT_HEALTH_URL` is set in its environment,
+e.g. `SNOWLINE_FRONT_HEALTH_URL=http://127.0.0.1:8850/front/health` in
+`~/.config/snowline/platform.env`. `stack sync` does not render this
+variable yet, so add it by hand. Without it the front row is absent. If the
+front shows `upstream: spoke`, the row carries the note "the failover front
+is routing to the spoke".
+
+Thresholds can be changed per instance:
+`SNOWLINE_STANDBY_DATA_BEHIND_AFTER_S` (default 900) and
+`SNOWLINE_STANDBY_CODE_BEHIND_MAX_TRAINS` (default 0, so any lag counts).
+`/health` and `/standby` answer straight from the last computed block.
+When that block is older than 10 s, they start a refresh in the background,
+so `/health` never waits on a peer. The block's `age_s` says how old it is.
+The very first call after a restart reads UNKNOWN ("being computed") until
+the first refresh finishes, and a refresh that takes longer than 30 s is
+cached as UNKNOWN ("standby refresh timed out").
+
 ## 7. Acceptance — the §10 criteria and how to check each
 
 Availability (verify with real tailscale — see "Manual steps" below):
