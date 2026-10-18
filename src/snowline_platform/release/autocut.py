@@ -3,9 +3,11 @@
 The MBP spoke is a WARM STANDBY: when the hub loses power Sean keeps working
 against it, so it must carry what the hub has been running, not a train that
 lags by weeks. The spoke side already updates itself (`stack sync --auto`);
-this is the hub side — a launchd timer (`ops/hub/launchdaemons/
-dev.snowline.autocut.plist`) runs this verb hourly, and it cuts a PATCH train
-whenever any component's `origin/main` has moved since the last recorded cut.
+this is the hub side — run hourly by the platform daemon itself
+(`autocut_host.py`, item a25fa809: enabled by ~/.config/snowline/
+autocut.enabled) or by the launchd timer (`ops/hub/launchdaemons/
+dev.snowline.autocut.plist`), it cuts a PATCH train whenever any component's
+`origin/main` has moved since the last recorded cut.
 
 The whole decision lives here, in Python, so it is unit-testable; the plist
 only runs it. One run:
@@ -115,6 +117,33 @@ def report_history_dir(home: Path) -> Path:
 
 def lock_path(home: Path) -> Path:
     return app_support_dir(home) / LOCK_NAME
+
+
+# The switches under ~/.config/snowline (stack.model.config_dir). The kill
+# switch is honoured by BOTH runners — run-autocut.sh (the launchd timer) and
+# the in-process host (autocut_host.py); the enable marker is the in-process
+# host's opt-in, so a platform without it never cuts.
+ENABLE_MARKER_NAME = "autocut.enabled"
+DISABLE_MARKER_NAME = "autocut.disabled"
+ENV_FILE_NAME = "autocut.env"
+
+
+def config_dir(home: Path) -> Path:
+    from snowline_platform.stack import model as stack_model
+
+    return stack_model.config_dir(home)
+
+
+def enable_marker_path(home: Path) -> Path:
+    return config_dir(home) / ENABLE_MARKER_NAME
+
+
+def disable_marker_path(home: Path) -> Path:
+    return config_dir(home) / DISABLE_MARKER_NAME
+
+
+def env_file_path(home: Path) -> Path:
+    return config_dir(home) / ENV_FILE_NAME
 
 
 # --------------------------------------------------------------------------
@@ -706,3 +735,84 @@ def _run(
         )
     rpt.outcome = OUTCOME_OK
     rpt.detail = f"cut {rpt.version}"
+
+
+# --------------------------------------------------------------------------
+# `snowline release autocut --status` — "is a cut running right now?"
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LockState:
+    held: bool
+    pid: int | None = None  # the holder's pid as it wrote it (best effort)
+
+
+def lock_state(home: Path) -> LockState:
+    """Probe the run lock WITHOUT creating it: a shared non-blocking flock
+    fails exactly while a run holds its exclusive one. flock locks belong to
+    the open file description, so this sees a holder in this same process
+    too (the in-process host) — not only another process."""
+    path = lock_path(home)
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except FileNotFoundError:
+        return LockState(held=False)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            pid = None
+            try:
+                raw = os.pread(fd, 32, 0).decode(errors="replace").strip()
+                pid = int(raw) if raw.isdigit() else None
+            except OSError:
+                pass
+            return LockState(held=True, pid=pid)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return LockState(held=False)
+    finally:
+        os.close(fd)
+
+
+def status_lines(home: Path) -> list[str]:
+    """What `--status` prints: the switches, the lock, the latest report.
+    Read-only; touches no checkout and needs no release config."""
+    lines = [f"autocut status ({app_support_dir(home)})"]
+    enabled = enable_marker_path(home).exists()
+    disabled = disable_marker_path(home).exists()
+    if disabled:
+        switch = f"DISABLED — kill switch {disable_marker_path(home)} exists"
+    elif enabled:
+        switch = f"enabled — {enable_marker_path(home)} exists (the in-process host cuts)"
+    else:
+        switch = (
+            f"no enable marker ({enable_marker_path(home)}) — the in-process "
+            "host is idle (a launchd timer, if installed, still fires)"
+        )
+    lines.append(f"  switch:   {switch}")
+    lock = lock_state(home)
+    if lock.held:
+        who = f" by pid {lock.pid}" if lock.pid else ""
+        lines.append(
+            f"  lock:     HELD{who} — a cut is running right now; do NOT restart "
+            "the platform until it is free"
+        )
+    else:
+        lines.append("  lock:     free — no cut running")
+    latest = _previous_report(home)
+    if latest:
+        tail = f" — {latest['detail']}" if latest.get("detail") else ""
+        lines.append(
+            f"  last run: {latest.get('outcome')} at {latest.get('finished_at')}{tail}"
+        )
+        last = latest.get("last_cut")
+        if isinstance(last, dict):
+            lines.append(
+                f"  last cut: {last.get('version')} ({last.get('outcome')}) at {last.get('at')}"
+            )
+        else:
+            lines.append("  last cut: none recorded")
+    else:
+        lines.append(f"  last run: no report at {report_path(home)}")
+    return lines

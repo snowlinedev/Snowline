@@ -293,8 +293,10 @@ def _build_release(p: argparse.ArgumentParser) -> None:
         "autocut",
         help="unattended: cut the next PATCH train when main moved since the last cut",
         description=(
-            "The hub's hourly timer (#258, ops/hub/launchdaemons/"
-            "dev.snowline.autocut.plist). Compares every component's origin/main "
+            "The hub's hourly auto-cut (#258) — hosted in the platform daemon "
+            "when ~/.config/snowline/autocut.enabled exists, or run by the "
+            "launchd timer ops/hub/launchdaemons/dev.snowline.autocut.plist. "
+            "Compares every component's origin/main "
             "with the sha release/train.json recorded; exits 0 when nothing "
             "moved. Otherwise gates on every checkout being clean and AT "
             "origin/main, gh auth, the hub /health + every train service "
@@ -309,6 +311,12 @@ def _build_release(p: argparse.ArgumentParser) -> None:
     autocut.add_argument(
         "--dry-run", action="store_true",
         help="decide + gate + plan only; nothing is built, tagged, committed, or reported",
+    )
+    autocut.add_argument(
+        "--status", action="store_true",
+        help="print the enable/kill switches, whether the run lock is held (a "
+        "cut running right now — check before restarting the platform), and "
+        "the latest report; read-only, runs nothing",
     )
     autocut.add_argument(
         "--no-commit-manifest", dest="commit_manifest", action="store_false",
@@ -578,6 +586,10 @@ def _cmd_release_autocut(args) -> int:
     from snowline_platform.release import autocut as autocut_lib
     from snowline_platform.release import runner as release_runner
 
+    if args.status:
+        for line in autocut_lib.status_lines(Path.home()):
+            print(line)
+        return 0
     config, checkouts = _release_context(args)
     if args.platform_url:
         # The milestone gate reaches pm through config.platform_self_url(),

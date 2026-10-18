@@ -41,6 +41,11 @@ class Runner:
     dry_run: bool = False
     verbose: bool = False
     executed: list[list[str]] = field(default_factory=list)
+    # The environment every command starts from (per-call `env` layers on
+    # top). None means the process's own `os.environ` — the CLI. The
+    # in-process autocut host (autocut_host.py) passes its own, so a cut
+    # running inside the platform daemon never mutates the daemon's env.
+    base_env: Mapping[str, str] | None = None
 
     def _exec(
         self,
@@ -52,7 +57,7 @@ class Runner:
     ) -> str:
         if self.verbose:
             self.report(f"  $ {shlex.join(argv)}" + (f"  (in {cwd})" if cwd else ""))
-        merged = dict(os.environ)
+        merged = dict(os.environ if self.base_env is None else self.base_env)
         merged.update(env or {})
         # argv lists, never a shell string. `check=False` because the
         # returncode is inspected below — `check` here is the CALLER's contract.
