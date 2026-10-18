@@ -802,7 +802,9 @@ class RunReport:
     noop: bool
     services: tuple[ServiceChange, ...]
     health_ok: bool | None
-    # "ok" | "noop" | "locked" | "reverted" | "needs_attention" | "failed"
+    # "ok" | "noop" | "locked" | "skipped" | "reverted" | "needs_attention"
+    # | "failed". `skipped` (e2e43cfd): an `--auto` fire that declined to
+    # re-attempt a train whose last attempt reverted.
     outcome: str
     detail: str | None = None
     env_drift: tuple[str, ...] = field(default_factory=tuple)
@@ -818,8 +820,18 @@ class RunReport:
     # Set when this run is the NEW train's CLI finishing an upgrade the OLD
     # train's CLI started (#303): the train that process was running.
     resumed_from: str | None = None
+    # Captured before an unhealthy upgrade is reverted (4f9dfc47): per
+    # service the err.log tail, `launchctl print` state and which health URLs
+    # answered. None on every healthy / non-upgrade run.
+    health_diagnostic: dict | None = None
 
     def to_dict(self) -> dict:
+        d = self._base_dict()
+        if self.health_diagnostic is not None:
+            d["health_diagnostic"] = self.health_diagnostic
+        return d
+
+    def _base_dict(self) -> dict:
         return {
             "train": self.train,
             "role": self.role,
@@ -859,7 +871,7 @@ def exit_code(outcome: str) -> int:
     (work item body, --auto contract). A `reverted` run safely undid itself
     but did NOT reach the target train, so it counts as a failure for the
     caller (a launchd timer) even though state is clean."""
-    return EXIT_OK if outcome in ("ok", "noop", "locked") else EXIT_FAILED
+    return EXIT_OK if outcome in ("ok", "noop", "locked", "skipped") else EXIT_FAILED
 
 
 # --------------------------------------------------------------------------

@@ -163,7 +163,7 @@ def test_build_service_venv_installs_service_and_sdk_wheels_by_path(tmp_path):
     )
     assert venv_dir == m.service_venv_dir(home, "governance", "v0.1.0")
     assert runner.ran("uv", "python", "install", "3.12")
-    assert runner.ran("uv", "venv", "--python", "3.12", str(venv_dir))
+    assert runner.ran("uv", "venv", "--python", "3.12", "--clear", str(venv_dir))
     install_calls = runner.ran("uv", "pip", "install")
     assert len(install_calls) == 1
     argv = install_calls[0]
@@ -1679,3 +1679,207 @@ def test_failed_execv_falls_back_and_writes_the_report(tmp_path, monkeypatch):
     assert json.loads(m.report_path(home).read_text())["train"] == "v0.2.0"
     assert not m.sync_handoff_path(home).exists()
     assert os.environ.get(m.SYNC_RESUMED_ENV) is None
+
+
+# -- revert resilience: venvs, health budget + diagnostic, --auto skip -------
+
+GATEWAY_URL = s.DEFAULT_HEALTH_URL
+
+
+def _uv_aware(inner, *, fail_curl=lambda argv: False, latest="v0.2.0"):
+    """Fake that behaves like real `uv venv` (refuses an existing dir)."""
+    def handler(argv, cwd):
+        if argv[:2] == ["uv", "venv"]:
+            target = Path(argv[-1])
+            if target.exists() and "--clear" in argv:
+                import shutil
+                shutil.rmtree(target)
+            if target.exists():
+                return CommandError(argv, 2, f"A virtual environment already exists at {target}")
+            target.mkdir(parents=True)
+            return ""
+        if argv[:3] == ["gh", "release", "view"]:
+            return latest + "\n"
+        if argv and argv[0] == "curl" and fail_curl(argv):
+            return CommandError(argv, 7, "connection refused")
+        if argv[:2] == ["psql", "-Atqc"]:
+            return "snowline_platform\nsnowline_governance\nsnowline_memory\nsnowline_pm\n"
+        return inner(argv, cwd)
+    return handler
+
+
+def _quiet(home, runner, **kw):
+    return s.run_sync(home=home, runner=runner, health_sleep=lambda _s: None, report=lambda _: None, **kw)
+
+
+def _installed_v1(tmp_path, latest="v0.2.0"):
+    home = tmp_path / "home"
+    _stack_config(home)
+    _seed_train_assets(home)
+    first = _quiet(home, FakeRunner(_uv_aware(_full_fake_handler, latest=latest)), train="v0.1.0")
+    assert first.outcome == "ok"
+    _seed_train_assets(home, "v0.2.0")
+    return home
+
+
+def _revert_v2(home, **kw):
+    runner = FakeRunner(_uv_aware(_full_fake_handler, fail_curl=lambda a: True))
+    rpt = _quiet(home, runner, train="v0.2.0", **kw)
+    assert rpt.outcome == "reverted"
+    return rpt, runner
+
+
+def test_revert_sets_the_failed_venvs_aside_and_the_retry_rebuilds(tmp_path):
+    home = _installed_v1(tmp_path)
+    _revert_v2(home)
+    for svc in s.SERVICE_ORDER:
+        root = m.service_dir(home, svc)
+        assert not (root / "v0.2.0").exists()
+        assert len([p for p in root.iterdir() if p.name.startswith("v0.2.0.reverted-")]) == 1
+        assert Path(os.readlink(root / "current")).name == "v0.1.0"
+    retry = _quiet(home, FakeRunner(_uv_aware(_full_fake_handler)), train="v0.2.0")
+    assert retry.outcome == "ok"
+    for svc in s.SERVICE_ORDER:
+        assert Path(os.readlink(m.service_current_link(home, svc))).name == "v0.2.0"
+
+
+def test_build_service_venv_replaces_a_stale_target_dir(tmp_path):
+    home = tmp_path / "home"
+    manifest = m.parse_train_manifest(TRAIN_V1)
+    stale = m.service_venv_dir(home, "governance", "v0.1.0")
+    (stale / "bin").mkdir(parents=True)
+    (stale / "junk").write_text("x")
+    lines = []
+    runner = FakeRunner(_uv_aware(lambda a, c: "Python 3.12.3\n" if a[-1] == "--version" else ""))
+    s.build_service_venv(runner, home=home, train="v0.1.0", manifest=manifest,
+                         service="governance", find_links=[], report=lines.append)
+    assert not (stale / "junk").exists()  # the --clear'd dir was rebuilt
+    assert runner.ran("uv", "venv", "--python", "3.12", "--clear", str(stale))
+    assert any("replacing stale governance venv" in ln for ln in lines)
+
+
+def test_build_service_venv_refuses_to_rebuild_the_live_current_venv(tmp_path):
+    home = tmp_path / "home"
+    manifest = m.parse_train_manifest(TRAIN_V1)
+    live = m.service_venv_dir(home, "governance", "v0.1.0")
+    live.mkdir(parents=True)
+    s.swap_current(home, "governance", live)
+    with pytest.raises(m.StackError):
+        s.build_service_venv(FakeRunner(), home=home, train="v0.1.0", manifest=manifest,
+                             service="governance", find_links=[])
+    assert live.exists()
+
+
+def test_gc_keeps_only_the_newest_reverted_dir_per_train(tmp_path):
+    home = tmp_path / "home"
+    root = m.service_dir(home, "platform")
+    for name in ("v0.1.0", "v0.2.0.reverted-20260101T000000Z", "v0.2.0.reverted-20260102T000000Z",
+                 "v0.3.0.reverted-20260101T000000Z"):
+        (root / name).mkdir(parents=True)
+    doomed = s.gc_service_trains(home, "platform", keep={"v0.1.0"})
+    assert doomed == ["v0.2.0.reverted-20260101T000000Z"]
+    assert (root / "v0.2.0.reverted-20260102T000000Z").exists()
+    assert (root / "v0.3.0.reverted-20260101T000000Z").exists()
+
+
+def test_repeated_reverts_prune_older_reverted_dirs(tmp_path):
+    home = _installed_v1(tmp_path)
+    _revert_v2(home)
+    _revert_v2(home)
+    for svc in s.SERVICE_ORDER:
+        names = [p.name for p in m.service_dir(home, svc).iterdir() if ".reverted-" in p.name]
+        assert len(names) == 1
+
+
+def test_upgrade_health_budget_is_120_polls_and_env_overridable(tmp_path, monkeypatch):
+    assert s.UPGRADE_HEALTH_ATTEMPTS == 120
+    home = _installed_v1(tmp_path)
+    _, runner = _revert_v2(home)
+    gateway_polls = [r for r in runner.reads if r[0] == "curl" and r[-1] == GATEWAY_URL]
+    # 120 upgrade polls + 30 post-revert polls
+    assert len(gateway_polls) == 120 + 30
+
+    monkeypatch.setenv(s.HEALTH_BUDGET_ENV, "7")
+    assert s.upgrade_health_attempts() == 7
+    monkeypatch.setenv(s.HEALTH_BUDGET_ENV, "junk")
+    assert s.upgrade_health_attempts() == 120
+
+
+def test_noop_path_keeps_its_short_poll(tmp_path):
+    home = _installed_v1(tmp_path)
+    runner = FakeRunner(_uv_aware(_full_fake_handler, fail_curl=lambda a: True))
+    rpt = _quiet(home, runner, train="v0.1.0")
+    assert rpt.noop and rpt.health_ok is False
+    assert len([r for r in runner.reads if r[0] == "curl"]) == 3
+
+
+def test_slow_service_is_named_and_diagnostic_is_captured_and_persisted(tmp_path):
+    home = _installed_v1(tmp_path)
+    logs = m.log_dir(home)
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / "snowline-pm.err.log").write_text("\n".join(f"line {i}" for i in range(100)) + "\n")
+    pm_url = f"http://127.0.0.1:{m.SERVICE_PORTS['pm']}/health"
+
+    def inner(argv, cwd):
+        if argv[:2] == ["launchctl", "print"]:
+            return "stuff\n\tstate = spawn scheduled\n\tpid = 4242\n"
+        return _full_fake_handler(argv, cwd)
+
+    def fail(argv):
+        # gateway + pm never answer; governance/memory answer
+        return argv[-1] in (GATEWAY_URL, pm_url)
+
+    rpt = _quiet(home, FakeRunner(_uv_aware(inner, fail_curl=fail)), train="v0.2.0")
+    assert rpt.outcome == "reverted"
+    diag = rpt.health_diagnostic
+    assert diag["budget_polls"] == 120
+    assert diag["not_answering"] == ["platform", "pm"]
+    svcs = diag["services"]
+    assert svcs["governance"]["answered"] is True and svcs["governance"]["answered_at_poll"] == 1
+    assert svcs["pm"]["answered"] is False
+    assert svcs["pm"]["err_log_tail"][-1] == "line 99" and len(svcs["pm"]["err_log_tail"]) == 40
+    assert "(unreadable" in svcs["platform"]["err_log_tail"][0]
+    assert "state = spawn scheduled" in svcs["pm"]["launchctl"]
+    on_disk = json.loads(m.report_path(home).read_text())
+    assert on_disk["health_diagnostic"]["not_answering"] == ["platform", "pm"]
+    hist = max(m.report_history_dir(home).glob("*-v0.2.0.json"))
+    assert json.loads(hist.read_text())["health_diagnostic"]["services"]["pm"]["answered"] is False
+
+
+def test_healthy_upgrade_carries_no_diagnostic(tmp_path):
+    home = _installed_v1(tmp_path)
+    rpt = _quiet(home, FakeRunner(_uv_aware(_full_fake_handler)), train="v0.2.0")
+    assert rpt.outcome == "ok" and rpt.health_diagnostic is None
+    assert "health_diagnostic" not in json.loads(m.report_path(home).read_text())
+
+
+def test_auto_skips_a_train_whose_last_attempt_reverted(tmp_path):
+    home = _installed_v1(tmp_path)
+    _revert_v2(home)
+    runner = FakeRunner(_uv_aware(_full_fake_handler))
+    rpt = _quiet(home, runner, auto=True)
+    assert rpt.outcome == "skipped" and rpt.noop is True and m.exit_code(rpt.outcome) == 0
+    assert "v0.2.0 last attempt reverted at" in rpt.detail
+    assert "waiting for a newer train" in rpt.detail and "manual `stack sync`" in rpt.detail
+    assert not runner.ran("uv") and not runner.ran("launchctl", "kickstart")
+    assert json.loads(m.report_path(home).read_text())["outcome"] == "skipped"
+    # the skip does not hide the revert: a second --auto still skips
+    assert _quiet(home, FakeRunner(_uv_aware(_full_fake_handler)), auto=True).outcome == "skipped"
+
+
+def test_manual_sync_retries_a_reverted_train(tmp_path):
+    home = _installed_v1(tmp_path)
+    _revert_v2(home)
+    assert _quiet(home, FakeRunner(_uv_aware(_full_fake_handler)), auto=True).outcome == "skipped"
+    rpt = _quiet(home, FakeRunner(_uv_aware(_full_fake_handler)), train="v0.2.0")
+    assert rpt.outcome == "ok"
+
+
+def test_a_newer_train_clears_the_skip(tmp_path):
+    home = _installed_v1(tmp_path)
+    _revert_v2(home)
+    _seed_train_assets(home, "v0.3.0")
+    runner = FakeRunner(_uv_aware(_full_fake_handler, latest="v0.3.0"))
+    rpt = _quiet(home, runner, auto=True)
+    assert rpt.outcome == "ok" and rpt.train == "v0.3.0"
+    assert runner.ran("uv", "venv")

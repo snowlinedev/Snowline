@@ -418,6 +418,33 @@ timer installed, a rollback is undone within the hour**: run
   the accepted cost of keeping migrations forward-only (macOS distribution
   spec §5); there is no cheaper undo for a migration that already ran.
 
+**What a reverted upgrade leaves behind** (33f5b3da, 4f9dfc47, e2e43cfd):
+
+- **Venvs.** On an auto-revert each reverted service's `venvs/<svc>/<train>`
+  is moved to `venvs/<svc>/<train>.reverted-<UTC stamp>` (never deleted) so
+  `current` can never point at a half-booted venv. GC keeps only the newest
+  `.reverted-*` dir per train for autopsy. The next attempt at the same train
+  builds from a clean target dir: `build_service_venv` runs `uv venv --clear`
+  and logs "replacing stale <svc> venv" when it finds leftovers (it refuses to
+  touch the venv `current` points at).
+- **Health budget.** After an upgrade sync polls the gateway for up to
+  120 s (`UPGRADE_HEALTH_ATTEMPTS`; override with env
+  `SNOWLINE_SYNC_HEALTH_BUDGET_S=<seconds>`), because a cold boot with all four
+  services boot-migrating at once can outlast 30 s. The no-op path keeps its
+  short poll. While the gateway is not answering, each service's own
+  `http://127.0.0.1:<port>/health` is polled too.
+- **Diagnostic.** Before reverting (or flagging `needs_attention` on a failed
+  first install), sync records `health_diagnostic` in
+  `~/Library/Application Support/Snowline/sync-report.json` and the matching
+  `sync-history/<stamp>-<train>.json`: per service the last 40 lines of its
+  `snowline-<svc>.err.log`, the `launchctl print` state, and whether/when its
+  `/health` answered; `not_answering` names the slow services.
+- **`skipped`.** An `--auto` fire whose resolved train's last real attempt
+  ended `reverted` or `needs_attention` does not retry hourly: it writes a
+  `noop`-class report with outcome `skipped` (exit 0) saying "train vX last
+  attempt reverted at <ts>; waiting for a newer train". A newer train clears
+  the skip; a manual `snowline stack sync` always retries.
+
 ## 6b. Packaged spoke (`snowline stack bootstrap-spoke`, item 71317cd6)
 
 `snowline stack bootstrap-spoke [--dry-run] [--reseed]` is the guided,

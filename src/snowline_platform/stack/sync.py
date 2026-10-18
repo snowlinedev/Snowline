@@ -26,7 +26,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from pathlib import Path
 
 from ..release import model as relm
@@ -297,6 +297,47 @@ def ensure_interpreter(runner: Runner) -> None:
     runner.run(["uv", "python", "install", "3.12"])
 
 
+def note_stale_venv(home: Path, service: str, venv_dir: Path, *, report: Report = print) -> bool:
+    """A target venv dir that already exists and is not what `current` points
+    at is stale (33f5b3da: a failed attempt's leftovers made `uv venv` refuse
+    "A virtual environment already exists" on every retry). `uv venv --clear`
+    replaces it; this logs the fact and refuses to touch the live `current`
+    target."""
+    if not (venv_dir.exists() or venv_dir.is_symlink()):
+        return False
+    link = m.service_current_link(home, service)
+    try:
+        live = link.resolve() == venv_dir.resolve()
+    except OSError:
+        live = False
+    if live:
+        raise m.StackError(
+            f"{venv_dir} is the live `current` venv for {service} — refusing to rebuild it in place"
+        )
+    report(f"replacing stale {service} venv {venv_dir} (uv venv --clear)")
+    return True
+
+
+REVERTED_MARK = ".reverted-"
+
+
+def set_aside_reverted_venv(home: Path, service: str, train: str) -> Path | None:
+    """Move a reverted train's venv to `<train>.reverted-<UTC stamp>` (kept
+    for autopsy; `gc_service_trains` keeps the newest per train). Never
+    deletes. Returns the new path, or None when there was nothing to move."""
+    src = m.service_venv_dir(home, service, train)
+    if not src.exists():
+        return None
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    dest = src.with_name(f"{train}{REVERTED_MARK}{stamp}")
+    n = 1
+    while dest.exists():
+        n += 1
+        dest = src.with_name(f"{train}{REVERTED_MARK}{stamp}-{n}")
+    os.replace(src, dest)
+    return dest
+
+
 def build_service_venv(
     runner: Runner,
     *,
@@ -305,12 +346,14 @@ def build_service_venv(
     manifest: m.TrainManifest,
     service: str,
     find_links: list[Path],
+    report: Report = print,
 ) -> Path:
     entry = manifest.service(service)
     sdk_entry = manifest.sdk()
     venv_dir = m.service_venv_dir(home, service, train)
+    note_stale_venv(home, service, venv_dir, report=report)
     ensure_interpreter(runner)
-    runner.run(["uv", "venv", "--python", "3.12", str(venv_dir)])
+    runner.run(["uv", "venv", "--python", "3.12", "--clear", str(venv_dir)])
     python = venv_dir / "bin" / "python"
     install = [
         "uv", "pip", "install", "--python", str(python),
@@ -371,15 +414,35 @@ def swap_current(home: Path, service: str, target_dir: Path) -> None:
     os.replace(tmp, link)  # atomic rename(2) — no no-`current` window
 
 
+def prune_reverted_venvs(home: Path, service: str) -> list[str]:
+    """Keep only the newest `<train>.reverted-<stamp>` dir per train."""
+    root = m.service_dir(home, service)
+    if not root.exists():
+        return []
+    reverted = [p.name for p in root.iterdir() if p.is_dir() and REVERTED_MARK in p.name]
+    newest: dict[str, str] = {}
+    for n in reverted:
+        base, stamp = n.split(REVERTED_MARK, 1)
+        if base not in newest or stamp > newest[base].split(REVERTED_MARK, 1)[1]:
+            newest[base] = n
+    doomed = sorted(n for n in reverted if n not in newest.values())
+    for name in doomed:
+        shutil.rmtree(root / name, ignore_errors=True)
+    return doomed
+
+
 def gc_service_trains(home: Path, service: str, *, keep: set[str]) -> list[str]:
     root = m.service_dir(home, service)
     if not root.exists():
         return []
-    installed = [p.name for p in root.iterdir() if p.is_dir() and p.name != "current"]
+    installed = [
+        p.name for p in root.iterdir()
+        if p.is_dir() and p.name != "current" and REVERTED_MARK not in p.name
+    ]
     doomed = m.trains_to_gc(installed, keep=list(keep))
     for name in doomed:
         shutil.rmtree(root / name, ignore_errors=True)
-    return doomed
+    return doomed + prune_reverted_venvs(home, service)
 
 
 # --------------------------------------------------------------------------
@@ -902,6 +965,99 @@ def check_health(
     return False
 
 
+# Post-UPGRADE health budget (4f9dfc47): a cold boot with all four services
+# boot-migrating at once outlasted the old 30 s poll and false-reverted a good
+# train. ~1 s per poll. Override: SNOWLINE_SYNC_HEALTH_BUDGET_S (seconds).
+UPGRADE_HEALTH_ATTEMPTS = 120
+HEALTH_BUDGET_ENV = "SNOWLINE_SYNC_HEALTH_BUDGET_S"
+
+
+def upgrade_health_attempts() -> int:
+    raw = os.environ.get(HEALTH_BUDGET_ENV, "").strip()
+    if raw:
+        try:
+            return max(1, int(float(raw)))
+        except ValueError:
+            pass
+    return UPGRADE_HEALTH_ATTEMPTS
+
+
+def service_health_urls(health_url: str = DEFAULT_HEALTH_URL) -> dict[str, str]:
+    """Each service's own `/health`; the platform's is the gateway URL."""
+    urls = {svc: f"http://127.0.0.1:{port}/health" for svc, port in m.SERVICE_PORTS.items()}
+    urls["platform"] = health_url
+    return urls
+
+
+@dataclass
+class ServiceProbe:
+    """Per-service health observed during the upgrade budget."""
+    url: str
+    answered_at_poll: int | None = None  # 1-based; None = never answered
+    last_error: str | None = None
+
+
+def poll_upgrade_health(
+    runner: Runner,
+    health_url: str,
+    *,
+    attempts: int,
+    sleep: Callable[[float], None] = time.sleep,
+    delay: float = 1.0,
+) -> tuple[bool, dict[str, ServiceProbe]]:
+    """Poll the gateway for up to `attempts`; while it is not answering, also
+    poll each service's own /health so a failed upgrade can name WHICH service
+    was slow. Only the gateway decides the result."""
+    probes = {svc: ServiceProbe(url) for svc, url in service_health_urls(health_url).items()}
+    for i in range(attempts):
+        for probe in probes.values():
+            if probe.answered_at_poll is not None:
+                continue
+            try:
+                runner.read(["curl", "-fsS", "--max-time", "5", probe.url])
+                probe.answered_at_poll = i + 1
+            except CommandError as exc:
+                probe.last_error = str(exc)[:200]
+        if probes["platform"].answered_at_poll is not None:
+            return True, probes
+        if i + 1 < attempts:
+            sleep(delay)
+    return False, probes
+
+
+def capture_health_diagnostic(
+    runner: Runner, home: Path, probes: Mapping[str, ServiceProbe], *, attempts: int,
+    tail_lines: int = 40,
+) -> dict:
+    """What the report keeps when an upgrade is declared unhealthy: per
+    service the err.log tail, launchd state and whether its /health answered."""
+    uid = os.getuid()
+    diag: dict = {"budget_polls": attempts, "services": {}}
+    for svc, probe in probes.items():
+        entry: dict = {
+            "health_url": probe.url,
+            "answered": probe.answered_at_poll is not None,
+            "answered_at_poll": probe.answered_at_poll,
+            "last_error": probe.last_error,
+        }
+        log = m.service_err_log_path(home, svc)
+        try:
+            entry["err_log_tail"] = log.read_text(errors="replace").splitlines()[-tail_lines:]
+        except OSError as exc:
+            entry["err_log_tail"] = [f"(unreadable: {exc})"]
+        try:
+            out = runner.read(["launchctl", "print", m.gui_target(m.plist_label(svc), uid)], check=False)
+        except (CommandError, OSError) as exc:  # diagnostics must never break the revert
+            out = f"(launchctl print failed: {exc})"
+        keep = [ln.strip() for ln in out.splitlines()
+                if re.match(r"\s*(state|pid|runs|last exit code|active count|program)\b", ln)]
+        entry["launchctl"] = keep[:12] if keep else out.splitlines()[:12]
+        diag["services"][svc] = entry
+    slow = [svc for svc, p in probes.items() if p.answered_at_poll is None]
+    diag["not_answering"] = slow
+    return diag
+
+
 def check_stack_health(
     runner: Runner,
     health_url: str = DEFAULT_HEALTH_URL,
@@ -956,6 +1112,26 @@ def report_history_stamp(finished_at: str) -> str:
     review — the bug existed here and was copy-pasted into the bootstrap
     report before this shared helper existed)."""
     return finished_at.replace("+00:00", "Z").replace(":", "")
+
+
+def last_attempt_for_train(home: Path, train: str) -> dict | None:
+    """Newest history report for `train` that records a real attempt —
+    `skipped` / `locked` reports are ignored so a skip never hides the
+    revert it is waiting out."""
+    history_dir = m.report_history_dir(home)
+    if not history_dir.is_dir():
+        return None
+    for path in sorted(history_dir.glob(f"*-{train}.json"), reverse=True):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict) or data.get("train") != train:
+            continue
+        if data.get("outcome") in ("skipped", "locked"):
+            continue
+        return data
+    return None
 
 
 def write_report(home: Path, report: m.RunReport, *, dry_run: bool) -> None:
@@ -1158,6 +1334,26 @@ def run_sync(
             report(f"stack sync: already on {resolved_train}, {tail}")
             return rpt
 
+        if auto:
+            # e2e43cfd: do not hammer a train whose last attempt reverted (or
+            # needs a human) every hour — wait for a newer train. A manual
+            # `stack sync` never takes this path and always retries.
+            last = last_attempt_for_train(home, resolved_train)
+            if last is not None and last.get("outcome") in ("reverted", "needs_attention"):
+                detail = (
+                    f"train {resolved_train} last attempt {last['outcome']} at "
+                    f"{last.get('finished_at', '?')}; waiting for a newer train "
+                    "(manual `stack sync` forces a retry)"
+                )
+                rpt = m.RunReport(
+                    train=resolved_train, role=cfg.role, instance_id=cfg.instance_id,
+                    started_at=started_at, finished_at=_now_iso(), auto=True, dry_run=dry_run,
+                    noop=True, services=(), health_ok=None, outcome="skipped", detail=detail,
+                )
+                write_report(home, rpt, dry_run=dry_run)
+                report(f"stack sync: {detail}")
+                return rpt
+
         plans = {
             svc: m.plan_service_swap(svc, current_train=current_trains[svc], target_train=resolved_train)
             for svc in SERVICE_ORDER
@@ -1229,7 +1425,8 @@ def run_sync(
                 continue
             report(f"build {svc}")
             built[svc] = build_service_venv(
-                runner, home=home, train=resolved_train, manifest=manifest, service=svc, find_links=find_links
+                runner, home=home, train=resolved_train, manifest=manifest, service=svc,
+                find_links=find_links, report=report,
             )
 
         if "platform" in built:
@@ -1320,7 +1517,20 @@ def run_sync(
         key_kick_failed = _key_kick_failed(units) and not platform_upgrade_kick_failed
         front_kicked = _front_kicked(units)
 
-        health_ok, front_ok = check_stack_health(runner, health_url, sleep=health_sleep)
+        budget = upgrade_health_attempts()
+        gw_ok, probes = poll_upgrade_health(runner, health_url, attempts=budget, sleep=health_sleep)
+        health_diagnostic: dict | None = None
+        if gw_ok:
+            health_ok = True
+            front_ok = check_health(runner, FRONT_HEALTH_URL, sleep=health_sleep)
+        else:
+            health_ok, front_ok = False, None
+            health_diagnostic = capture_health_diagnostic(runner, home, probes, attempts=budget)
+            slow = health_diagnostic["not_answering"]
+            report(
+                f"gateway not healthy after {budget} polls; services not answering: "
+                f"{', '.join(slow) or 'none (gateway only)'}"
+            )
         any_crossed = any(c.migration_crossed for c in changes if c.changed)
         revertible = all(c.previous_train is not None for c in changes if c.changed)
 
@@ -1337,6 +1547,13 @@ def run_sync(
                 if c.changed and c.previous_train is not None:
                     swap_current(home, c.service, m.service_venv_dir(home, c.service, c.previous_train))
                     kickstart_service(runner, home, c.service)
+                    # Park the failed train's venv (33f5b3da): `current` is back
+                    # on the previous train, and the next attempt must start
+                    # from a clean target dir. Kept for autopsy, never deleted.
+                    aside = set_aside_reverted_venv(home, c.service, c.target_train)
+                    if aside is not None:
+                        report(f"kept reverted {c.service} venv at {aside}")
+                    prune_reverted_venvs(home, c.service)
             # the front runs from the platform venv — follow it back.
             if plans[m.FRONT_VENV_SERVICE].changes:
                 kickstart_service(runner, home, m.FRONT_SERVICE)
@@ -1420,7 +1637,7 @@ def run_sync(
             started_at=started_at, finished_at=_now_iso(), auto=auto, dry_run=False,
             noop=False, services=tuple(changes), health_ok=health_ok, outcome=outcome,
             detail=detail, env_drift=tuple(env_drift), front_kickstarted=front_kicked,
-            front_ok=front_ok, units=tuple(units),
+            front_ok=front_ok, units=tuple(units), health_diagnostic=health_diagnostic,
         )
         if reexec_wanted:
             # Hand the rest of the run to the NEW train's code (#303): it
