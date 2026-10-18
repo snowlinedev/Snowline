@@ -133,6 +133,36 @@ def install_heartbeat_httpx_filter() -> None:
     logging.getLogger("httpx").addFilter(_HEARTBEAT_HTTPX_FILTER)
 
 
+_DETAIL_LOG_LIMIT = 500
+
+
+_VALIDATION_ERROR_KEYS = ("loc", "msg", "type")
+
+
+def _detail(resp: httpx.Response) -> object:
+    """The platform's error `detail` from a response body (FastAPI/pydantic
+    shape), falling back to the raw text when the body is not a JSON object.
+
+    A pydantic 422 lists one dict per error and each carries `input` — for a
+    missing field that is the ENTIRE remaining manifest, which would both eat
+    the log's 500-char budget before the second error's `loc`/`msg` and echo
+    values the keys-only DEBUG line deliberately withholds. Keep only
+    `loc`/`msg`/`type` per error; anything that is not that shape passes
+    through unchanged (the callers `str()` it)."""
+    try:
+        detail = resp.json().get("detail", resp.text)
+    except (ValueError, AttributeError):
+        return resp.text
+    if isinstance(detail, list):
+        return [
+            {k: v for k, v in item.items() if k in _VALIDATION_ERROR_KEYS}
+            if isinstance(item, dict)
+            else item
+            for item in detail
+        ]
+    return detail
+
+
 def register_with_platform(
     manifest: dict,
     platform_url: str,
@@ -170,14 +200,10 @@ def register_with_platform(
         # gateway.md §3a). The plugin is NOT registered; returning True here
         # would log "confirmed" and run unregistered forever. WARNING every
         # beat is the intended loudness — the platform warns on its side too.
-        try:
-            detail = resp.json().get("detail", resp.text)
-        except ValueError:
-            detail = resp.text
         log.warning(
             "plugin %r registration REFUSED by the platform (409): %s",
             plugin_name,
-            detail,
+            _detail(resp),
         )
         return False
     if resp.status_code == httpx.codes.CREATED:
@@ -192,8 +218,19 @@ def register_with_platform(
             "re-asserted plugin %r with the platform at %s", plugin_name, platform
         )
         return True
+    # A rejected beat (422 on a malformed manifest, 5xx, …): surface the
+    # platform's `detail` body so the operator can see WHICH field was refused
+    # from the plugin's own err.log. Keys only at DEBUG — values can carry URLs.
+    log.debug("registration manifest keys posted to %s: %s", url, list(manifest))
+    hint = ""
+    if resp.status_code == httpx.codes.UNPROCESSABLE_ENTITY:
+        hint = " (the platform rejected this manifest's shape — usually a version skew between plugin and platform, or a malformed base_url from the env file)"
     log.warning(
-        "plugin registration to %s returned %s (will retry)", url, resp.status_code
+        "plugin registration to %s returned %s (will retry): %s%s",
+        url,
+        resp.status_code,
+        str(_detail(resp))[:_DETAIL_LOG_LIMIT],
+        hint,
     )
     return False
 
