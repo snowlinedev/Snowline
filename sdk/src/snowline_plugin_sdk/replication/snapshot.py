@@ -31,7 +31,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 # The custom-format archive flags §7 step 2 depends on: `-Fc` so the restore
 # side can use `pg_restore --clean --if-exists` (a plain SQL dump cannot),
@@ -132,10 +132,19 @@ def _from_sqlalchemy_url(url) -> tuple[str, dict[str, str]]:
         host=url.host,
         port=url.port,
         database=url.database,
-        query=url.query,
     )
     env = {"PGPASSWORD": str(url.password)} if url.password else {}
-    return scrubbed.render_as_string(hide_password=False), env
+    # The query is rendered HERE, percent-encoded: SQLAlchemy's own rendering
+    # uses quote_plus ("a b" -> "a+b"), and libpq does not decode "+" as a
+    # space, so `options=-c search_path=pm` would reach pg_dump corrupted.
+    pairs = []
+    for key, value in url.query.items():
+        for item in (value,) if isinstance(value, str) else value:
+            pairs.append(f"{quote(key, safe='')}={quote(item, safe='')}")
+    rendered = scrubbed.render_as_string(hide_password=False)
+    if pairs:
+        rendered += "?" + "&".join(pairs)
+    return rendered, env
 
 
 def database_url(session):

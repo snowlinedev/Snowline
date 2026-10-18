@@ -357,3 +357,22 @@ def test_pg_tool_resolution_order(monkeypatch, tmp_path):
     monkeypatch.setattr(snap.subprocess, "run", missing)
     with pytest.raises(snap.SnapshotError, match="SNOWLINE_PG_BIN"):
         snap.run_pg_dump("postgresql:///x", tmp_path / "out.dump")
+
+
+def test_sqlalchemy_url_query_is_percent_encoded_not_quote_plus(tmp_path):
+    """libpq does not decode "+" as a space: `options=-c search_path=pm` must
+    reach pg_dump as `%20`, and a literal "+" in a value stays `%2B`."""
+    url = make_url(
+        "postgresql+psycopg://localhost/snowline_pm"
+        "?options=-c%20search_path%3Dpm&tag=a%2Bb"
+    )
+    assert url.query == {"options": "-c search_path=pm", "tag": "a+b"}
+    rendered, env = snapshot_mod.libpq_url_and_env(url)
+    assert rendered == (
+        "postgresql://localhost/snowline_pm"
+        "?options=-c%20search_path%3Dpm&tag=a%2Bb"
+    )
+    assert "+" not in rendered.split("?", 1)[1]
+    assert env == {}
+    argv = snapshot_mod.pg_dump_argv(rendered, tmp_path / "x.dump")
+    assert argv[-1] == rendered
