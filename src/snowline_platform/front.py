@@ -113,9 +113,14 @@ DEFAULT_PROBE_TIMEOUT = 2.0
 DEFAULT_FAIL_THRESHOLD = 2
 DEFAULT_RECOVER_THRESHOLD = 6
 DEFAULT_CONNECT_TIMEOUT = 5.0
-# Per-READ timeout on a forwarded request. Generous: an MCP tool call may
-# think for minutes before its first byte, and an idle event stream that is
-# cut simply reconnects. `SNOWLINE_FRONT_READ_TIMEOUT=0` disables it.
+# Per-READ timeout on a forwarded NON-streaming request (dashboard, plain
+# HTTP contracts). `SNOWLINE_FRONT_READ_TIMEOUT=0` disables it. A request
+# whose `Accept` names `text/event-stream` — every MCP request, GET and POST —
+# gets NO read timeout: the platform's stateless MCP mount still serves the
+# standalone `GET /mcp/` SSE stream, which Claude Code holds open, silent,
+# for the whole session; a read timeout would cut it every N seconds. Keyed
+# off the REQUEST because the response content-type is only known after the
+# upstream answered. The connect timeout always applies.
 DEFAULT_READ_TIMEOUT = 600.0
 # The request body is buffered (so `content-length` is truthful and nothing
 # is half-sent on a connect failure). MCP/dashboard traffic is small JSON;
@@ -428,6 +433,28 @@ def relay_response_headers(
     return out
 
 
+def wants_event_stream(headers: Mapping[str, str]) -> bool:
+    return "text/event-stream" in headers.get("accept", "").lower()
+
+
+def read_timeout_for(config: FrontConfig, headers: Mapping[str, str]) -> float | None:
+    """No read timeout for an event-stream request (see DEFAULT_READ_TIMEOUT);
+    the configured one otherwise."""
+    return None if wants_event_stream(headers) else config.read_timeout
+
+
+async def relay_body(upstream_resp: httpx.Response, upstream: str):
+    """`http_proxy._raw_body`, except an upstream failure AFTER the headers
+    went out (a read timeout, a reset) just ends the stream with ONE warning
+    — the status is already sent, so there is nothing better to tell the
+    client, and an ASGI exception would dump a traceback per broken stream."""
+    try:
+        async for chunk in _raw_body(upstream_resp):
+            yield chunk
+    except httpx.HTTPError as exc:
+        log.warning("front: upstream %s stream broke after headers: %r", upstream, exc)
+
+
 def _front_origin(scope: Scope, headers: Mapping[str, str]) -> str:
     host = headers.get("host")
     if not host:
@@ -480,18 +507,21 @@ class FrontProxy:
             target,
             content=body,
             headers=forward_request_headers(request.scope["headers"], upstream),
-            timeout=httpx.Timeout(cfg.connect_timeout, read=cfg.read_timeout),
+            timeout=httpx.Timeout(
+                cfg.connect_timeout, read=read_timeout_for(cfg, request.headers)
+            ),
         )
         try:
             upstream_resp = await client.send(upstream_req, stream=True)
         except httpx.HTTPError as exc:
             # NO retry against the other upstream: stateless, never a double
             # write. The caller's retry lands wherever the router says then.
-            log.warning("front: upstream %s (%s) failed for %s %s: %s",
+            log.warning("front: upstream %s (%s) failed for %s %s: %r",
                         upstream, base, request.method, target, exc)
             return JSONResponse(
                 {
-                    "detail": f"front upstream {upstream!r} unreachable: {exc}",
+                    "detail": f"front upstream {upstream!r} unreachable: "
+                    f"{type(exc).__name__}: {exc}",
                     "upstream": upstream,
                     "upstream_url": base,
                 },
@@ -499,7 +529,7 @@ class FrontProxy:
                 headers={FRONT_HEADER: upstream},
             )
         response = StreamingResponse(
-            _raw_body(upstream_resp),
+            relay_body(upstream_resp, upstream),
             status_code=upstream_resp.status_code,
             background=BackgroundTask(upstream_resp.aclose),
         )

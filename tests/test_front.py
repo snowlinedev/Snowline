@@ -591,3 +591,86 @@ def test_cli_registers_the_front_verb(monkeypatch):
     monkeypatch.setattr(f, "serve", lambda bind=None: seen.setdefault("bind", bind))
     assert cli.main(["front", "--bind", "127.0.0.1:9000"]) == 0
     assert seen["bind"] == "127.0.0.1:9000"
+
+
+# --------------------------------------------------------------------------
+# Timeouts + broken streams (review of #294)
+# --------------------------------------------------------------------------
+
+
+def test_event_stream_requests_get_no_read_timeout_others_keep_the_default():
+    seen = {}
+
+    def hub(request):
+        seen[request.headers.get("accept", "")] = request.extensions["timeout"]
+        return httpx.Response(200)
+
+    async def go():
+        app = Upstreams(hub=hub).app()
+        await call(app, raw_path=b"/mcp/", headers=[("accept", "text/event-stream")])
+        await call(app, "POST", raw_path=b"/mcp/",
+                   headers=[("accept", "application/json, text/event-stream")], body=b"{}")
+        await call(app, raw_path=b"/ui-api/x", headers=[("accept", "application/json")])
+
+    asyncio.run(go())
+    assert seen["text/event-stream"]["read"] is None
+    assert seen["application/json, text/event-stream"]["read"] is None
+    assert seen["text/event-stream"]["connect"] == f.DEFAULT_CONNECT_TIMEOUT
+    assert seen["application/json"]["read"] == f.DEFAULT_READ_TIMEOUT
+    assert seen["application/json"]["connect"] == f.DEFAULT_CONNECT_TIMEOUT
+
+
+class BreakingStream(httpx.AsyncByteStream):
+    async def __aiter__(self):
+        yield b"data: 1\n\n"
+        raise httpx.ReadTimeout("idle")
+
+    async def aclose(self) -> None:
+        pass
+
+
+def test_a_stream_that_breaks_after_headers_ends_with_one_warning(caplog):
+    def hub(request):
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, stream=BreakingStream()
+        )
+
+    with caplog.at_level(logging.WARNING, logger="snowline_platform.front"):
+        ex = asyncio.run(call(Upstreams(hub=hub).app(), raw_path=b"/mcp/",
+                              headers=[("accept", "text/event-stream")]))
+    assert ex.status == 200
+    assert ex.body == b"data: 1\n\n"
+    assert ex.messages[-1]["type"] == "http.response.body"
+    assert ex.messages[-1].get("more_body", False) is False  # cleanly ended
+    broke = [r for r in caplog.records if "stream broke after headers" in r.getMessage()]
+    assert len(broke) == 1
+    assert broke[0].levelno == logging.WARNING and broke[0].exc_info is None
+    assert "hub" in broke[0].getMessage()
+
+
+def test_probe_loop_survives_a_non_http_exception(monkeypatch):
+    calls = {"n": 0}
+
+    async def flaky_probe(client, config):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("bug in one iteration")
+        return True
+
+    monkeypatch.setattr(f, "probe_hub", flaky_probe)
+    state = f.FrontState(_cfg(), now=FakeClock())
+
+    async def sleep(_s):
+        if calls["n"] >= 3:
+            raise asyncio.CancelledError
+        await asyncio.sleep(0)
+
+    async def go():
+        with pytest.raises(asyncio.CancelledError):
+            await f.probe_loop(state, None, sleep=sleep)
+
+    asyncio.run(go())
+    assert calls["n"] == 3
+    # the raising iteration counted as a failure, then the loop kept going
+    assert state.consecutive_successes == 2
+    assert state.hub_healthy is True
