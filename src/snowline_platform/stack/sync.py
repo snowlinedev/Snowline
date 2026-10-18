@@ -39,6 +39,9 @@ PLATFORM_REPO = "snowlinedev/Snowline"
 # this alias keeps every existing `s.SERVICE_ORDER` reference working.
 SERVICE_ORDER = m.SERVICE_ORDER
 DEFAULT_HEALTH_URL = "http://127.0.0.1:8848/health"
+# The failover front's own health (issue #260) — served by the front itself,
+# never proxied, so it answers whether or not the hub is up.
+FRONT_HEALTH_URL = m.front_health_url()
 
 _TEMPLATES_DIR = Path(__file__).with_name("templates") / "env"
 
@@ -358,7 +361,11 @@ def load_env_template(service: str) -> str:
 
 
 def env_variables(cfg: m.StackConfig, *, dashboard_dist: str) -> dict[str, str]:
+    platform_port = m.SERVICE_PORTS["platform"]
     return {
+        "hub_url": m.front_hub_url(cfg),
+        "spoke_url": f"http://127.0.0.1:{platform_port}",
+        "front_port": str(m.FRONT_PORT),
         "instance_id": cfg.instance_id,
         "trusted_cidrs": m.TRUSTED_CIDRS,
         "primary_tailnet_address": cfg.primary_tailnet_address,
@@ -397,6 +404,26 @@ def apply_plist(home: Path, service: str, *, dry_run: bool) -> bool:
         logs=m.log_dir(home),
     )
     path = m.plist_path(home, service)
+    existing = _read_optional(path)
+    if existing == rendered:
+        return False
+    if not dry_run:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(rendered)
+    return True
+
+
+def apply_front_plist(home: Path, *, dry_run: bool) -> bool:
+    """The failover front's plist (issue #260) — same ownership rules as the
+    services' (sync-owned, rewritten only on change). Returns whether it
+    changed."""
+    rendered = m.render_front_plist(
+        platform_venv_current=m.service_current_link(home, m.FRONT_VENV_SERVICE),
+        port=m.FRONT_PORT,
+        env_file=m.env_file_path(home, m.FRONT_SERVICE),
+        logs=m.log_dir(home),
+    )
+    path = m.plist_path(home, m.FRONT_SERVICE)
     existing = _read_optional(path)
     if existing == rendered:
         return False
@@ -469,6 +496,40 @@ def check_health(
     return False
 
 
+def check_stack_health(
+    runner: Runner,
+    health_url: str = DEFAULT_HEALTH_URL,
+    *,
+    front_url: str = FRONT_HEALTH_URL,
+    attempts: int = 30,
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[bool, bool | None]:
+    """`(gateway_ok, front_ok)` — the gateway's `/health` and the failover
+    front's own `/front/health` (issue #260), kept SEPARATE: only the gateway
+    decides a train's fate (ok / revert). A front can die for reasons no
+    train caused — port 8850 taken (KeepAlive crash-loop), an operator edit
+    to front.env failing validation — and coupling it to the revert decision
+    would revert every later train forever. A dead front is REPORTED
+    (`needs_attention` with its own detail), never a revert trigger.
+    `front_ok` is None when the gateway already failed (not checked — no
+    point spending another full poll budget)."""
+    if not check_health(runner, health_url, attempts=attempts, sleep=sleep):
+        return False, None
+    return True, check_health(runner, front_url, attempts=attempts, sleep=sleep)
+
+
+FRONT_DOWN_DETAIL = (
+    "the gateway is healthy but the failover front is NOT answering "
+    f"{FRONT_HEALTH_URL} — the MBP's Claude Code MCP entry "
+    "(http://127.0.0.1:8850/mcp) has no endpoint. Check "
+    "~/Library/Application Support/Snowline/logs/snowline-front.err.log "
+    "(a bad ~/.config/snowline/front.env value, or port 8850 already "
+    "taken: `lsof -nP -iTCP:8850 -sTCP:LISTEN`), then `launchctl kickstart "
+    "-k gui/$(id -u)/dev.snowline.front`. Not a train problem — nothing was "
+    "reverted for it."
+)
+
+
 # --------------------------------------------------------------------------
 # Run report persistence.
 # --------------------------------------------------------------------------
@@ -536,28 +597,36 @@ def run_sync(
             # a dead gateway must not report success indefinitely. One attempt
             # only — nothing was just kickstarted, so there is no boot race to
             # wait out; a healthy stack answers immediately.
-            noop_health = None if dry_run else check_health(
+            noop_health, noop_front = (None, None) if dry_run else check_stack_health(
                 runner, health_url, attempts=3, sleep=health_sleep
             )
             unhealthy = noop_health is False
+            front_down = noop_health is True and noop_front is False
+            if unhealthy:
+                detail = (
+                    "already on the resolved train, but the gateway health "
+                    "check FAILED — services may be down; check launchctl "
+                    "and the service logs (nothing was changed by sync)"
+                )
+            elif front_down:
+                detail = "already on the resolved train; " + FRONT_DOWN_DETAIL
+            else:
+                detail = "already on the resolved train — nothing to do"
             rpt = m.RunReport(
                 train=resolved_train, role=cfg.role, instance_id=cfg.instance_id,
                 started_at=started_at, finished_at=_now_iso(), auto=auto, dry_run=dry_run,
                 noop=True, services=(), health_ok=noop_health,
-                outcome="needs_attention" if unhealthy else "noop",
-                detail=(
-                    "already on the resolved train, but the gateway health "
-                    "check FAILED — services may be down; check launchctl "
-                    "and the service logs (nothing was changed by sync)"
-                    if unhealthy
-                    else "already on the resolved train — nothing to do"
-                ),
+                outcome="needs_attention" if unhealthy or front_down else "noop",
+                detail=detail, front_ok=noop_front,
             )
             write_report(home, rpt, dry_run=dry_run)
-            report(
-                f"stack sync: already on {resolved_train}, "
-                + ("but the stack is UNHEALTHY" if unhealthy else "nothing to do")
-            )
+            if unhealthy:
+                tail = "but the stack is UNHEALTHY"
+            elif front_down:
+                tail = "but the failover front is DOWN"
+            else:
+                tail = "nothing to do"
+            report(f"stack sync: already on {resolved_train}, {tail}")
             return rpt
 
         plans = {
@@ -572,6 +641,17 @@ def run_sync(
                     f"  {svc:<12} {p.previous_train or '(none)':<10} -> {p.target_train}"
                     f"{'  [build+swap]' if p.changes else '  [unchanged]'}"
                 )
+            front_env_exists = m.env_file_path(home, m.FRONT_SERVICE).exists()
+            report(
+                f"  {m.FRONT_SERVICE:<12} would render "
+                f"{m.plist_path(home, m.FRONT_SERVICE).name}"
+                + ("" if front_env_exists else f" + {m.FRONT_SERVICE}.env")
+                + (
+                    " and kickstart it (runs from the platform venv)"
+                    if plans[m.FRONT_VENV_SERVICE].changes or not front_env_exists
+                    else " (kickstart only if the plist changed)"
+                )
+            )
             rpt = m.RunReport(
                 train=resolved_train, role=cfg.role, instance_id=cfg.instance_id,
                 started_at=started_at, finished_at=_now_iso(), auto=auto, dry_run=True,
@@ -656,6 +736,18 @@ def run_sync(
             if result.action == "drifted":
                 env_drift.append(svc)
             apply_plist(home, svc, dry_run=False)
+        # The failover front (issue #260): not a service (no venv/DB/seed), but
+        # a stack-managed unit all the same — env + plist rendered here, and
+        # kickstarted below whenever anything it runs from changed.
+        front_env = apply_env_file(home, m.FRONT_SERVICE, variables=variables, dry_run=False)
+        if front_env.action == "drifted":
+            env_drift.append(m.FRONT_SERVICE)
+        front_plist_changed = apply_front_plist(home, dry_run=False)
+        front_needs_kick = (
+            front_plist_changed
+            or front_env.action == "written"
+            or plans[m.FRONT_VENV_SERVICE].changes
+        )
 
         ensure_databases(runner, report)
 
@@ -667,8 +759,9 @@ def run_sync(
                     target_train=change.target_train, changed=True,
                     migration_crossed=change.migration_crossed, kickstarted=ok,
                 )
+        front_kicked = kickstart_service(runner, home, m.FRONT_SERVICE) if front_needs_kick else None
 
-        health_ok = check_health(runner, health_url, sleep=health_sleep)
+        health_ok, front_ok = check_stack_health(runner, health_url, sleep=health_sleep)
         any_crossed = any(c.migration_crossed for c in changes if c.changed)
         revertible = all(c.previous_train is not None for c in changes if c.changed)
 
@@ -685,7 +778,10 @@ def run_sync(
                 if c.changed and c.previous_train is not None:
                     swap_current(home, c.service, m.service_venv_dir(home, c.service, c.previous_train))
                     kickstart_service(runner, home, c.service)
-            health_ok = check_health(runner, health_url, sleep=health_sleep)
+            # the front runs from the platform venv — follow it back.
+            if plans[m.FRONT_VENV_SERVICE].changes:
+                kickstart_service(runner, home, m.FRONT_SERVICE)
+            health_ok, front_ok = check_stack_health(runner, health_url, sleep=health_sleep)
 
         if outcome == "ok":
             for svc in SERVICE_ORDER:
@@ -724,11 +820,18 @@ def run_sync(
                 "symlinks auto-reverted and kickstarted back"
             )
 
+        if outcome == "ok" and front_ok is False:
+            # The train is good (gateway healthy, kept, GC'd); only the front
+            # is down — report it loudly, never revert for it.
+            outcome = "needs_attention"
+            detail = "upgrade applied; " + FRONT_DOWN_DETAIL
+
         rpt = m.RunReport(
             train=resolved_train, role=cfg.role, instance_id=cfg.instance_id,
             started_at=started_at, finished_at=_now_iso(), auto=auto, dry_run=False,
             noop=False, services=tuple(changes), health_ok=health_ok, outcome=outcome,
-            detail=detail, env_drift=tuple(env_drift),
+            detail=detail, env_drift=tuple(env_drift), front_kickstarted=front_kicked,
+            front_ok=front_ok,
         )
         write_report(home, rpt, dry_run=False)
         return rpt

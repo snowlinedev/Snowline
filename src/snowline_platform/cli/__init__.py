@@ -13,6 +13,9 @@ Two operator surfaces live here today:
 - `snowline stack sync` — installing/updating a packaged spoke instance from a
   release train (macOS distribution spec §5/§6, issue #203); see
   `snowline_platform.stack.sync`.
+- `snowline front` — run the spoke's loopback failover front by hand (issue
+  #260; `snowline_platform.front`). Under the packaged stack it runs from
+  launchd instead.
 
 All three are thin argparse shells over pure libraries — `replication_pairing` /
 `replication_seed`, `release.model` / `release.cutter`, and `stack.model` /
@@ -44,6 +47,10 @@ def main(argv: list[str] | None = None) -> int:
     _build_replicate(sub.add_parser("replicate", help="replication pairing + seeding (§5/§7)"))
     _build_release(sub.add_parser("release", help="cut packaged release trains (§2/§4)"))
     _build_stack(sub.add_parser("stack", help="install/update a packaged spoke instance (§5/§6)"))
+    _build_front(sub.add_parser(
+        "front",
+        help="run the spoke's loopback failover front (hub when healthy, else local spoke; #260)",
+    ))
     args = parser.parse_args(argv)
     try:
         return args.handler(args)
@@ -411,6 +418,34 @@ def _build_stack(p: argparse.ArgumentParser) -> None:
         "-v", "--verbose", action="store_true", help="echo every command as it runs"
     )
     bootstrap_p.set_defaults(handler=_cmd_stack_bootstrap_spoke)
+
+
+def _build_front(p: argparse.ArgumentParser) -> None:
+    p.description = (
+        "The spoke's loopback failover front (issue #260): forwards every "
+        "request verbatim to the hub gateway (SNOWLINE_FRONT_HUB_URL) while "
+        "its /health is green, else to the local spoke platform "
+        "(SNOWLINE_FRONT_SPOKE_URL, default http://127.0.0.1:8848), with "
+        "hysteresis. Serves GET /front/health itself. Under `snowline stack "
+        "sync` it runs from launchd (dev.snowline.front); this verb is for "
+        "running it by hand. See snowline_platform.front."
+    )
+    p.add_argument(
+        "--bind", default=None, metavar="HOST:PORT",
+        help="loopback bind (default: $SNOWLINE_FRONT_BIND or 127.0.0.1:8850)",
+    )
+    p.set_defaults(handler=_cmd_front)
+
+
+def _cmd_front(args) -> int:
+    from snowline_platform import front
+
+    try:
+        front.serve(args.bind)
+    except front.FrontConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def _cmd_stack_sync(args) -> int:

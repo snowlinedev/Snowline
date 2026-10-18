@@ -569,3 +569,57 @@ def test_bootstrap_report_round_trips_steps_through_json():
     assert data["instance_id"] == "roam"
     assert data["steps"][0]["name"] == "seed"
     assert data["pm_role_ok"] is True
+
+
+# -- the failover front (issue #260) -----------------------------------------
+
+
+def test_front_is_a_stack_unit_but_not_a_service():
+    """The front runs from the platform venv: no wheel, DB, seed stream or
+    env-posture guard of its own, so it must never leak into SERVICE_ORDER
+    (from which the venv builds, DB names and seed participants derive)."""
+    assert m.FRONT_SERVICE not in m.SERVICE_ORDER
+    assert m.FRONT_SERVICE not in m.SEED_PARTICIPANTS
+    assert m.FRONT_SERVICE not in m.DB_NAME
+    assert m.FRONT_SERVICE not in m.SERVICE_PORTS
+    assert m.FRONT_VENV_SERVICE == "platform"
+    # the hub gateway's port, on loopback — never one of the services' ports
+    assert m.FRONT_PORT == 8850 == m.DEFAULT_PRIMARY_GATEWAY_PORT
+    assert m.FRONT_PORT not in m.SERVICE_PORTS.values()
+    assert m.front_health_url() == "http://127.0.0.1:8850/front/health"
+
+
+def test_render_front_plist_runs_the_platform_venvs_uvicorn_factory_on_loopback():
+    from pathlib import Path
+    xml = m.render_front_plist(
+        platform_venv_current=Path("/home/x/Library/Application Support/Snowline/venvs/platform/current"),
+        env_file=Path("/home/x/.config/snowline/front.env"),
+        logs=Path("/home/x/logs"),
+    )
+    assert "<string>dev.snowline.front</string>" in xml
+    assert "set -a; . '/home/x/.config/snowline/front.env'; set +a; exec" in xml
+    assert "venvs/platform/current/bin/uvicorn' --factory 'snowline_platform.front:create_app'" in xml
+    assert "--host 127.0.0.1 --port 8850" in xml
+    assert "snowline-front.err.log" in xml and "snowline-front.out.log" in xml
+    assert "<key>KeepAlive</key>" in xml and "<key>RunAtLoad</key>" in xml
+    assert "<key>WorkingDirectory</key>" not in xml
+    assert "<key>EnvironmentVariables</key>" not in xml
+
+
+def test_front_hub_url_prefers_primary_gateway_url_else_the_default():
+    bare = m.StackConfig(role="spoke", instance_id="roam", primary_tailnet_address="mini.ts.net")
+    assert m.front_hub_url(bare) == "http://mini.ts.net:8850"
+    full = m.StackConfig(
+        role="spoke", instance_id="roam", primary_tailnet_address="mini.ts.net",
+        primary_gateway_url="http://100.81.176.75:8850",
+    )
+    assert m.front_hub_url(full) == "http://100.81.176.75:8850"
+
+
+def test_run_report_carries_front_kickstarted():
+    rpt = m.RunReport(
+        train="v0.1.0", role="spoke", instance_id="roam", started_at="a", finished_at="b",
+        auto=False, dry_run=False, noop=False, services=(), health_ok=True, outcome="ok",
+        front_kickstarted=True,
+    )
+    assert rpt.to_dict()["front_kickstarted"] is True

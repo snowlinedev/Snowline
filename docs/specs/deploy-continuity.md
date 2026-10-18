@@ -44,6 +44,11 @@ That is the platform's existing "LLM is the integration runtime" posture —
 but any future feature wanting server-push must revisit THIS spec first,
 because it would re-couple sessions to processes and forfeit the layer.
 
+*Who else leans on this layer:* the spoke's failover front (issue #260,
+`snowline_platform.front`; docs/ops/roam-runbook.md §6e) switches a client's
+upstream between the hub and the local spoke per request. That is only safe
+because there is no session to orphan — server-push would break it too.
+
 *Do layers 1–2 help governance/memory?* Layer 1 already covers them (their
 statelessness is why a plugin restart costs only in-flight calls). Layer 2 is
 **mostly for them**: plugin kickstarts are the common deploy, and the gateway
