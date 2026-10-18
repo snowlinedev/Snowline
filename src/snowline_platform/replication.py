@@ -192,14 +192,23 @@ def manifest_payload() -> dict:
     so pairing subscribes a peer to both. `contract_version` is the SDK envelope
     contract the platform's own emit/ingest speak (both instances run identical
     platform code, so a skew here is a real deploy skew worth refusing at
-    pairing). `advertised_base_url` is absent: a peer discovers the platform AT
+    pairing). `train_version` is the running train (#259, readiness
+    surface). `advertised_base_url` is absent: a peer discovers the platform AT
     its reachable base URL, so the stream carries no distinct advertised address —
     the field is present for shape-parity with the plugin block."""
+    from snowline_platform.standby import platform_train
+
     return {
         "contract_version": CONTRACT_VERSION,
         "ingest_path": INGEST_PATH,
         "events": list(PLATFORM_EVENTS),
         "advertised_base_url": None,
+        # The release train this platform runs (#259) — `v0.5.1`, `source`
+        # for an editable checkout, or None. Additive and advisory: pairing
+        # reads only the three required keys, so an older peer ignores it,
+        # and a peer's readiness view falls back to it when the peer
+        # predates `/standby/local`.
+        "train_version": platform_train().get("version"),
     }
 
 

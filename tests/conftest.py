@@ -228,3 +228,12 @@ def _isolate_system_launch_daemons(tmp_path, monkeypatch):
     from snowline_platform.stack import model as stack_model
 
     monkeypatch.setattr(stack_model, "SYSTEM_LAUNCH_DAEMONS_DIR", tmp_path / "_no_system_daemons")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_standby_reports(tmp_path, monkeypatch):
+    """The standby readiness surface (#259) reads sync/bootstrap/autocut
+    reports from the home's app-support dir and an optional front URL — never
+    let a developer's real reports (or front) leak into `/health` in tests."""
+    monkeypatch.setenv("SNOWLINE_STANDBY_HOME", str(tmp_path / "_standby_home"))
+    monkeypatch.delenv("SNOWLINE_FRONT_HEALTH_URL", raising=False)

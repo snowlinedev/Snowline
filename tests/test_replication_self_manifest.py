@@ -59,6 +59,8 @@ def test_self_manifest_shape_matches_the_replication_block():
         "ingest_path": replication.INGEST_PATH,
         "events": list(replication.PLATFORM_EVENTS),
         "advertised_base_url": None,
+        # #259: the running train, additive (pairing ignores it).
+        "train_version": replication.manifest_payload()["train_version"],
     }
     # The declared vocabulary is exactly what the platform applies/emits — scope
     # events plus the milestone-registry events (§9), so pairing subscribes a peer

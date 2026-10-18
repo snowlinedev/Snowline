@@ -50,6 +50,12 @@ class RegisteredPlugin:
     status: PluginStatus = PluginStatus.UNKNOWN
     # The plugin's self-reported reason while DEGRADED (None otherwise).
     degraded_reason: str | None = None
+    # The slice of the plugin's last 2xx health body the standby readiness
+    # surface relays (issue #259): its SDK `replication` block and its
+    # running `train`. None until a poll answers 2xx with a JSON body, and
+    # cleared when the plugin goes DOWN (a stale outbox reading must not
+    # outlive the plugin that reported it).
+    health_detail: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -256,6 +262,7 @@ class PluginRegistry:
         *,
         expected_entry: RegisteredPlugin | None = None,
         degraded_reason: str | None = None,
+        health_detail: dict | None = None,
     ) -> None:
         """Update a plugin's runtime status (used by the health checker).
 
@@ -274,4 +281,7 @@ class PluginRegistry:
             entry.status = status
             entry.degraded_reason = (
                 degraded_reason if status is PluginStatus.DEGRADED else None
+            )
+            entry.health_detail = (
+                health_detail if status is not PluginStatus.DOWN else None
             )

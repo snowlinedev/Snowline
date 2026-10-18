@@ -27,6 +27,7 @@ from snowline_platform import (
     plugins_routes,
     replication,
     scopes_routes,
+    standby,
     surfaces_routes,
     ui_api,
 )
@@ -287,6 +288,9 @@ def create_app(
     app.include_router(replication.router)
     app.include_router(surfaces_routes.router)
     app.include_router(ui_api.router)
+    # The standby readiness surface (#259): GET /standby, plus the two
+    # read-only peer-relay routes (/standby/local, /stack/report).
+    app.include_router(standby.router)
 
     # The dashboard owns the /ui and /ui-api route namespaces (ui-shell.md
     # §5–§6), and `platform` is the platform's OWN tool-app route (/platform/mcp,
@@ -383,6 +387,12 @@ def create_app(
             body["degraded_reason"] = "; ".join(
                 ([prior] if prior else []) + plugin_reasons
             )
+        # The standby readiness rollup (#259) rides as its OWN field, set
+        # AFTER `status` is final: a lagging/unreachable peer is visible
+        # here but can never turn this instance's own health red (and the
+        # computation is cached + time-bounded, never raising).
+        body["train"] = standby.platform_train()
+        body["standby"] = await standby.for_health(app)
         return body
 
     @app.get("/whoami")
