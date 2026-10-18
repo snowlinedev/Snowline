@@ -555,7 +555,9 @@ def _reverse_already_paired(
         sub_ids = [str(sub["id"]) for sub in outbound]
         try:
             pending, rejected = _spoke_undelivered_counts(sp, subscription_ids=sub_ids)
-        except SQLAlchemyError as exc:
+        except (SQLAlchemyError, ImportError, ValueError, OSError) as exc:
+            # A missing driver or a malformed URL fails before SQLAlchemy
+            # raises; keep the run's collect-and-continue contract either way.
             raise SeedError(
                 f"half-pair heal refused: could not read the spoke's outbox at "
                 f"{sp.spoke_db_url} to prove outbound(s) {sub_ids} hold no "
