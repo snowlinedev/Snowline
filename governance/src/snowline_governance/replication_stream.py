@@ -82,6 +82,7 @@ log = logging.getLogger("snowline.governance.replication_stream")
 # PAYLOAD_KEYS after one train). Nothing is inside the window today, so every
 # widening is empty - the tripwire in tests/test_replication_stream.py stays
 # armed for the next one. Nested objects (artifact `version`) are not inventoried.
+# Provenance: baseline = train v0.4.0; no widening since.
 _ENVELOPE_BODY = {"event_id", "at"}  # stamped on every governance payload
 _DECISION_KEYS = {
     "id", "decision", "rationale", "scope", "scope_id", "supersedes_id", "recorded_at",
@@ -124,7 +125,21 @@ PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     }.items()
 }
 WIDENED_KEYS: dict[str, frozenset[str]] = {t: frozenset() for t in PAYLOAD_KEYS}
-KEY_INVENTORY = KeyInventory(PAYLOAD_KEYS, WIDENED_KEYS)
+# `lww_source`: the register's ORIGINAL author, added ONLY by the §7.1 backfill
+# enumerator (`_replay_register`, cold-start union #284) on the register-class
+# events; apply reads it via `payload.get("lww_source")` in `_lww_apply`.
+OPTIONAL_KEYS: dict[str, frozenset[str]] = {
+    t: frozenset({"lww_source"})
+    for t in (
+        EVENT_SHADOW_NOTES_SET,
+        EVENT_ARTIFACT_MATURITY_SET,
+        EVENT_ARTIFACT_GOVERNS_SET,
+        EVENT_ARTIFACT_SUPERSEDED,
+        EVENT_ARTIFACT_CODE_REFS_SET,
+        EVENT_SHADOW_GRADUATED,
+    )  # == LWW_REGISTERS (asserted in tests)
+}
+KEY_INVENTORY = KeyInventory(PAYLOAD_KEYS, WIDENED_KEYS, OPTIONAL_KEYS)
 
 # The manifest's declared ingest route (§4) — the SDK router serves it and
 # `registration.build_manifest` advertises it; one constant so they can't skew.

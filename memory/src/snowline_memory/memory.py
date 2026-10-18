@@ -54,6 +54,7 @@ from snowline_memory.models import Memory
 # (declare the key here, guard it there, fold it into PAYLOAD_KEYS after one
 # train). Nothing is inside the window today, so the widened sets are empty and
 # the tripwire in tests/test_replication.py stays armed for the next widening.
+# Provenance: baseline = train v0.4.0; no widening since.
 PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     EVENT_MEMORY_SET: frozenset(
         {"id", "name", "description", "content", "kind", "scope_slug",

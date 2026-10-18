@@ -27,10 +27,7 @@ from snowline_platform.replication import KEY_INVENTORY
 
 
 def test_inventory_covers_exactly_the_platform_stream_vocabulary():
-    assert KEY_INVENTORY.event_types == set(replication.MILESTONE_EVENTS) | {
-        "scope.created",
-        "scope.updated",
-    }
+    assert KEY_INVENTORY.event_types == set(replication.PLATFORM_EVENTS)
 
 
 def _drive_full_write_surface(db_session) -> dict[str, list[dict]]:
@@ -69,6 +66,27 @@ def test_full_write_surface_payload_keys_match_declared(db_session):
     driven = _drive_full_write_surface(db_session)
     errors = check_emitted_payloads(KEY_INVENTORY, driven)
     assert not errors, "\n".join(errors)
+
+
+def test_backfill_enumerator_payload_keys_match_declared(db_session, monkeypatch):
+    """A (backfill path): the §7.1 enumerator replays the live-driven state and
+    adds the conditional per-register author stamps; they must be declared
+    OPTIONAL (allowed, never required). Not every type is replayed by the
+    enumerator, so coverage is not required - but the optional keys must
+    actually appear, or this variant guards nothing."""
+    # Authored rows store their source id only when replication is configured.
+    monkeypatch.setenv("SNOWLINE_REPLICATION_SOURCE_ID", "hub.platform")
+    _drive_full_write_surface(db_session)
+    driven: dict[str, list[dict]] = {}
+    for event_type, payload in replication.enumerate_backfill(db_session):
+        driven.setdefault(event_type, []).append(payload)
+    errors = check_emitted_payloads(KEY_INVENTORY, driven, require_all_types=False)
+    assert not errors, "\n".join(errors)
+    seen = {k for ps in driven.values() for p in ps for k in p}
+    declared_optional = {k for ks in KEY_INVENTORY.optional_keys.values() for k in ks}
+    assert declared_optional <= seen, (
+        f"optional keys never emitted by the backfill drive: {sorted(declared_optional - seen)}"
+    )
 
 
 def test_every_widened_key_has_an_apply_side_presence_guard():

@@ -311,6 +311,24 @@ def test_full_write_surface_payload_keys_match_declared(db_session):
     assert not errors, "\n".join(errors)
 
 
+def test_backfill_enumerator_payload_keys_match_declared(db_session):
+    """A (backfill path): the §7.1 enumerator replays the live-driven state and
+    adds `lww_source` on the register-class events; it must be declared
+    OPTIONAL. Coverage of every type is not required, but the optional key must
+    actually appear or this variant guards nothing."""
+    _drive_full_write_surface(db_session)
+    driven: dict[str, list[dict]] = {}
+    for event_type, payload in replication_stream.enumerate_backfill(db_session):
+        driven.setdefault(event_type, []).append(payload)
+    errors = check_emitted_payloads(
+        replication_stream.KEY_INVENTORY, driven, require_all_types=False
+    )
+    assert not errors, "\n".join(errors)
+    opt = replication_stream.KEY_INVENTORY.optional_keys
+    assert {t for t, ks in opt.items() if ks} == set(replication_stream.LWW_REGISTERS)
+    assert any("lww_source" in p for ps in driven.values() for p in ps)
+
+
 def test_every_widened_key_has_an_apply_side_presence_guard():
     """B: ast tripwire over `replication_apply` (armed even while the widened
     sets are empty)."""

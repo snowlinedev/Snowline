@@ -264,15 +264,18 @@ apply side reads a new key only on presence (`"k" in p` / `p.get("k", …)`),
 or an in-flight old-shape event nulls the replica's field on an LWW win. Each
 package declares a `snowline_plugin_sdk.replication.skew.KeyInventory`
 beside its event vocabulary — `PAYLOAD_KEYS[event_type]` (the baseline every
-N−1 peer sends) and `WIDENED_KEYS[event_type]` (keys added since, applied
-only on presence) — and two tests hold it: (A) the payloads its
-full-write-surface emit test produces carry exactly the declared keys, so no
+N−1 peer sends), `WIDENED_KEYS[event_type]` (keys added since, applied only
+on presence) and `OPTIONAL_KEYS[event_type]` (conditional keys such as the
+§7.1 backfill enumerator's author stamps: allowed, never required) — and two
+tests hold it: (A) the payloads that package's emit drive produces (and, where
+it has one, its backfill enumerator) carry exactly the declared keys, so no
 key widens a register undeclared and no declaration goes stale; (B) an ast
-tripwire proves every widened key has a presence guard in the apply module.
-Fold a widened key into the baseline only after one train has shipped with it
-emitted; a breaking change instead needs a contract-version bump. The
-platform's scope/milestone stream, governance, and memory are covered; pm
-keeps its own copy until it switches to the shared helper.
+tripwire checks that every widened or optional key has a guard-shaped read of
+the payload in the apply module (it checks the read exists, not that it is
+correct). Fold a widened key into the baseline only after one train has
+shipped with it emitted; a breaking change instead needs a contract-version
+bump. The platform's scope/milestone stream, governance, and memory are
+covered; pm keeps its own copy until it switches to the shared helper.
 
 ## 4. Plugin opt-in — the replication contract
 
