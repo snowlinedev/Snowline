@@ -151,7 +151,11 @@ class World:
 
 def plugins_body(statuses=None):
     statuses = statuses or {"platform": "up", "pm": "up", "governance": "up", "memory": "up"}
-    return {"plugins": [{"name": n, "status": s} for n, s in statuses.items()]}
+    plugins = []
+    for name, value in statuses.items():
+        status, reason = value if isinstance(value, tuple) else (value, None)
+        plugins.append({"name": name, "status": status, "degraded_reason": reason})
+    return {"plugins": plugins}
 
 
 def http(health=200, statuses=None, raise_on=None):
@@ -307,18 +311,43 @@ def test_last_cut_is_carried_forward_across_noop_runs(config, checkouts, home):
     assert read_report(home)["last_cut"]["version"] == "v0.5.2"
 
 
-@pytest.mark.parametrize(("strict", "outcome"), [(False, a.OUTCOME_OK), (True, a.OUTCOME_GATED)])
-def test_degraded_plugin_passes_by_default_but_not_under_strict(config, checkouts, home, strict, outcome):
-    """`degraded` = 2xx + a self-reported soft issue, still routed; on the hub
-    it is usually pm's replication to the OFFLINE standby — the very state
-    this timer exists to fix, so it must not stall the train by default."""
-    statuses = {"platform": "up", "pm": "degraded", "governance": "up", "memory": "up"}
+PEER_DOWN = "peer MBP.pm not delivering for 3023360s (> 900s): [Errno 61] Connection refused"
+TICK_LOOP = "delivery tick raised 4 consecutive times: OperationalError('db gone')"
+
+
+@pytest.mark.parametrize(
+    ("reason", "strict", "outcome"),
+    [
+        (PEER_DOWN, False, a.OUTCOME_OK),
+        (f"{PEER_DOWN}; peer MBP2.pm not delivering for 1000s (> 900s)", False, a.OUTCOME_OK),
+        (PEER_DOWN, True, a.OUTCOME_GATED),
+        (TICK_LOOP, False, a.OUTCOME_GATED),
+        (f"{PEER_DOWN}; {TICK_LOOP}", False, a.OUTCOME_GATED),
+        ("disk nearly full", False, a.OUTCOME_GATED),
+        (None, False, a.OUTCOME_GATED),
+    ],
+    ids=["peer-down", "two-peers-down", "peer-down-strict", "tick-crash-loop",
+         "peer-and-tick", "unrecognised", "no-reason"],
+)
+def test_degraded_passes_only_for_peer_not_delivering(config, checkouts, home, reason, strict, outcome):
+    """`degraded` for "peer X not delivering" is the OFFLINE standby — the
+    very state this timer exists to fix, so it must not stall the train. A
+    crash-looping delivery tick (or anything unrecognised) must not be cut
+    through."""
+    statuses = {"platform": "up", "pm": ("degraded", reason), "governance": "up", "memory": "up"}
     rpt, _r, cut = run(
         config, checkouts, home, World(checkouts),
         http_get=http(statuses=statuses), strict_health=strict,
     )
-    assert rpt.outcome == outcome
-    assert len(cut.calls) == (0 if strict else 1)
+    assert rpt.outcome == outcome, rpt.detail
+    assert len(cut.calls) == (1 if outcome == a.OUTCOME_OK else 0)
+
+
+def test_tolerated_degraded_rule():
+    assert a.tolerated_degraded(PEER_DOWN)
+    assert not a.tolerated_degraded(TICK_LOOP)
+    assert not a.tolerated_degraded("")
+    assert not a.tolerated_degraded(None)
 
 
 def test_a_taken_tag_at_another_sha_is_skipped_not_redefined(config, checkouts, home):
@@ -457,9 +486,15 @@ def test_rejected_record_push_undoes_the_commit_and_fails(config, checkouts, hom
     world = World(checkouts, push_fails=True)
     rpt, runner, cut = run(config, checkouts, home, world)
     assert [c["version"] for c in cut.calls] == ["v0.5.2"]
-    assert rpt.outcome == a.OUTCOME_FAILED
+    assert rpt.outcome == a.OUTCOME_PUBLISHED_UNRECORDED
+    assert a.exit_code(rpt.outcome) == 1
     assert runner.ran("git", "reset") == [("git", "reset", "--soft", "HEAD~1")]
     assert "published" in rpt.detail
+    data = read_report(home)
+    assert data["outcome"] == "published_unrecorded"
+    assert data["last_cut"]["version"] == "v0.5.2"
+    assert data["last_cut"]["outcome"] == "published_unrecorded"
+    assert "published" in data["last_cut"]["detail"]
 
 
 # -- recovering an uncommitted record --------------------------------------
@@ -481,6 +516,42 @@ def test_uncommitted_newer_record_is_committed_even_when_nothing_moved(config, c
     (commit,) = runner.ran("git", "commit")
     assert "release: train v0.5.2 (autocut: record recovered)" in commit
     assert runner.ran("git", "push")
+    # The recovered train IS the last cut — not a version-less "ok".
+    last = read_report(home)["last_cut"]
+    assert last["version"] == "v0.5.2"
+    assert last["shas"]["platform"] == NEW_PLATFORM
+    assert last["outcome"] == "recorded"
+
+
+def test_recovery_only_run_does_not_clobber_an_earlier_last_cut(config, checkouts, home):
+    run(config, checkouts, home, World(checkouts))  # autocut cut v0.5.2
+    assert read_report(home)["last_cut"]["version"] == "v0.5.2"
+    # A manual `release cut v0.5.3` without --commit-manifest, then the hour fires.
+    (checkouts["platform"] / "release" / "train.json").write_text(
+        json.dumps(manifest("v0.5.3", NEW_PLATFORM, NEW_PM))
+    )
+    world = World(
+        checkouts, heads={"platform": NEW_PLATFORM, "pm": NEW_PM}, diff_names={},
+        record_dirty=True, committed_manifest=manifest("v0.5.2", NEW_PLATFORM),
+    )
+    rpt, _runner, cut = run(config, checkouts, home, world)
+    assert rpt.outcome == a.OUTCOME_OK and cut.calls == []
+    assert read_report(home)["last_cut"]["version"] == "v0.5.3"
+
+
+def test_failed_recovery_commit_is_failed_and_keeps_last_cut(config, checkouts, home):
+    run(config, checkouts, home, World(checkouts))  # last_cut = v0.5.2
+    (checkouts["platform"] / "release" / "train.json").write_text(
+        json.dumps(manifest("v0.5.3", NEW_PLATFORM, NEW_PM))
+    )
+    world = World(
+        checkouts, heads={"platform": NEW_PLATFORM, "pm": NEW_PM}, diff_names={},
+        record_dirty=True, committed_manifest=manifest("v0.5.2", NEW_PLATFORM),
+        push_fails=True,
+    )
+    rpt, _runner, cut = run(config, checkouts, home, world)
+    assert rpt.outcome == a.OUTCOME_FAILED and cut.calls == []
+    assert read_report(home)["last_cut"]["version"] == "v0.5.2"
 
 
 # -- dry run ---------------------------------------------------------------
@@ -542,3 +613,86 @@ def test_manual_cut_commits_the_record_only_with_commit_manifest(config, checkou
         fetch_status=milestone_ok, commit_manifest=flag,
     )
     assert order == (["record", "commit v0.5.2 Snowline"] if flag else ["record"])
+
+
+# -- movement detection edges ----------------------------------------------
+
+
+def test_a_commit_touching_the_record_and_code_counts_as_moved(config, checkouts, home):
+    world = World(checkouts, diff_names={"platform": "release/train.json\nsrc/x.py\n"})
+    rpt, _r, cut = run(config, checkouts, home, world)
+    assert rpt.outcome == a.OUTCOME_OK
+    assert [c["version"] for c in cut.calls] == ["v0.5.2"]
+
+
+def test_an_unknown_recorded_sha_is_conservatively_moved(config, checkouts, home):
+    world = World(checkouts)
+    world.diff_names = {}
+    original = world.read
+
+    def read(argv, cwd):
+        if argv[:2] == ["git", "diff"]:
+            return runner_mod.CommandError(argv, 128, "bad object")
+        return original(argv, cwd)
+
+    world.read = read
+    rpt, _r, cut = run(config, checkouts, home, world)
+    assert next(cs for cs in rpt.components if cs.component == "platform").moved
+    assert [c["version"] for c in cut.calls] == ["v0.5.2"]
+
+
+# -- lock + report hygiene -------------------------------------------------
+
+
+def test_lock_is_released_after_an_exception_inside_run(config, checkouts, home):
+    def exploding_get(_url):
+        raise ValueError("not an OSError: escapes the health gate")
+
+    rpt, _r, cut = run(config, checkouts, home, World(checkouts), http_get=exploding_get)
+    assert rpt.outcome == a.OUTCOME_FAILED and cut.calls == []
+    rpt, _r, cut = run(config, checkouts, home, World(checkouts))
+    assert rpt.outcome == a.OUTCOME_OK
+    assert len(cut.calls) == 1
+
+
+def test_identical_gated_runs_write_one_history_entry(config, checkouts, home):
+    for _ in range(3):
+        rpt, _r, _c = run(config, checkouts, home, World(checkouts, dirty=True))
+        assert rpt.outcome == a.OUTCOME_GATED
+    assert len(list(a.report_history_dir(home).iterdir())) == 1
+    run(config, checkouts, home, World(checkouts, gh_ok=False))  # a NEW reason
+    assert len(list(a.report_history_dir(home).iterdir())) == 2
+
+
+# -- CLI wiring ------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("outcome", "code"),
+    [(a.OUTCOME_NOOP, 0), (a.OUTCOME_GATED, 2), (a.OUTCOME_FAILED, 1),
+     (a.OUTCOME_PUBLISHED_UNRECORDED, 1)],
+)
+def test_cli_autocut_propagates_platform_url_and_exit_code(monkeypatch, capsys, outcome, code):
+    from snowline_platform import cli
+
+    monkeypatch.setenv("SNOWLINE_PLATFORM_URL", "http://stale.test")
+    seen = {}
+
+    def fake_run_autocut(config, **kw):
+        seen.update(kw)
+        seen["env"] = os.environ.get("SNOWLINE_PLATFORM_URL")
+        return a.AutocutReport(started_at="t", outcome=outcome, detail="why")
+
+    monkeypatch.setattr(a, "run_autocut", fake_run_autocut)
+    rc = cli.main([
+        "release", "autocut", "--config", str(CONFIG_PATH),
+        "--platform-url", HUB, "--strict-health", "--no-commit-manifest",
+    ])
+    assert rc == code
+    assert seen["env"] == HUB  # the milestone gate reads this env
+    assert seen["platform_url"] == HUB
+    assert seen["strict_health"] is True
+    assert seen["commit_manifest"] is False
+    assert seen["dry_run"] is False
+    err = capsys.readouterr().err
+    assert (f"autocut {outcome}: why" in err) == (code != 0)

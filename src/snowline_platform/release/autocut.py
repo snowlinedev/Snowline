@@ -61,6 +61,10 @@ OUTCOME_LOCKED = "locked"
 OUTCOME_GATED = "gated"
 OUTCOME_FAILED = "failed"
 OUTCOME_DRY_RUN = "dry_run"
+# The train IS published on GitHub (tags + releases, so spokes can sync it),
+# but its release/train.json record commit could not be pushed. The record is
+# left uncommitted and the next run lands it; exits nonzero so it is seen.
+OUTCOME_PUBLISHED_UNRECORDED = "published_unrecorded"
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -70,14 +74,18 @@ REPORT_NAME = "autocut-report.json"
 HISTORY_DIR_NAME = "autocut-history"
 LOCK_NAME = "autocut.lock"
 
-# Plugin statuses that count as "registered and serving" for the health gate.
-# `degraded` is a 2xx health with a SELF-REPORTED soft issue and is still
-# routed (registry.PluginStatus) — and the commonest cause on the hub is
-# exactly "the standby spoke is off, so pm's replication to it is lagging",
-# i.e. the situation this timer exists to fix. Refusing on it would stall the
-# train for as long as the standby is powered down. `--strict-health` demands
-# `up`.
-ROUTABLE_STATUSES = ("up", "degraded")
+# The health gate wants every train service `up` — or `degraded` for ONE
+# reason only. `degraded` is a 2xx health with a SELF-REPORTED soft issue,
+# still routed (registry.PluginStatus), and the SDK replication health block
+# (sdk/replication/health.py) has exactly two causes for it:
+#   - "peer X not delivering for Ns (> Ts)…" — the standby spoke is off. That
+#     is the situation this timer exists to fix; refusing on it would stall
+#     the train for as long as the standby is powered down. ACCEPTED.
+#   - "delivery tick raised N consecutive times…" — the replication loop is
+#     crash-looping on the hub. Cutting through that ships whatever broke it.
+#     REFUSED, as is any reason this list does not recognise.
+# Multiple reasons are joined with "; ". `--strict-health` demands `up`.
+TOLERATED_DEGRADED_PREFIXES = ("peer ",)
 
 _PATCH_RE = re.compile(r"^v0\.(\d+)\.(\d+)$")
 
@@ -152,9 +160,15 @@ class AutocutReport:
     components: list[ComponentState] = field(default_factory=list)
     gates: list[GateResult] = field(default_factory=list)
     record_commit: str | None = None
+    # True once cut() was CALLED for `version` (whatever came of it) — what
+    # makes this run the new `last_cut`.
+    cut_attempted: bool = False
+    # True when this run only landed a record a previous cut left
+    # uncommitted (no new cut): `last_cut` then describes THAT train.
+    recovered_record: bool = False
     # The most recent run that actually cut (or tried to): carried forward
-    # across noop runs so the readiness surface can always answer "last cut:
-    # version, sha, at, outcome" from the one latest report file.
+    # across noop/gated runs so the readiness surface can always answer "last
+    # cut: version, sha, at, outcome" from the one latest report file.
     last_cut: dict | None = None
 
     def cut_summary(self) -> dict:
@@ -165,6 +179,15 @@ class AutocutReport:
             },
             "at": self.finished_at,
             "outcome": self.outcome,
+            "detail": self.detail,
+        }
+
+    def recovered_summary(self) -> dict:
+        return {
+            "version": self.previous_version,
+            "shas": {cs.component: cs.recorded_sha for cs in self.components},
+            "at": self.finished_at,
+            "outcome": "recorded",
             "detail": self.detail,
         }
 
@@ -179,6 +202,8 @@ class AutocutReport:
             "previous_version": self.previous_version,
             "version": self.version,
             "record_commit": self.record_commit,
+            "cut_attempted": self.cut_attempted,
+            "recovered_record": self.recovered_record,
             "components": [cs.to_dict() for cs in self.components],
             "gates": [gr.to_dict() for gr in self.gates],
             "last_cut": self.last_cut,
@@ -196,32 +221,38 @@ def exit_code(outcome: str) -> int:
     return EXIT_FAILED
 
 
-def _previous_last_cut(home: Path) -> dict | None:
+def _previous_report(home: Path) -> dict:
     try:
         data = json.loads(report_path(home).read_text())
     except (OSError, ValueError):
-        return None
-    last = data.get("last_cut") if isinstance(data, dict) else None
-    return last if isinstance(last, dict) else None
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def write_report(home: Path, report: AutocutReport) -> None:
     """Same shape of persistence as `stack.sync.write_report`: the latest run
-    at a fixed path, plus a timestamped history entry. Noop runs (hourly, the
-    common case) overwrite the latest file only — history is for runs that
-    did or refused something."""
+    at a fixed path, plus a timestamped history entry. History is written only
+    for a run that is not a noop AND whose (outcome, detail) differs from the
+    previous latest report — a hub gated "behind origin/main until someone
+    deploys" would otherwise leave dozens of identical entries a day."""
     from snowline_platform.stack.sync import report_history_stamp
 
     if report.dry_run:
         return
-    if report.outcome in (OUTCOME_OK, OUTCOME_FAILED):
+    previous = _previous_report(home)
+    if report.cut_attempted:
         report.last_cut = report.cut_summary()
+    elif report.recovered_record:
+        report.last_cut = report.recovered_summary()
     else:
-        report.last_cut = _previous_last_cut(home)
+        last = previous.get("last_cut")
+        report.last_cut = last if isinstance(last, dict) else None
     path = report_path(home)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(report.to_json())
     if report.outcome == OUTCOME_NOOP:
+        return
+    if (previous.get("outcome"), previous.get("detail")) == (report.outcome, report.detail):
         return
     history = report_history_dir(home)
     history.mkdir(parents=True, exist_ok=True)
@@ -344,7 +375,6 @@ def health_gate(
     import httpx
 
     unreachable = (OSError, httpx.HTTPError)
-    allowed = ("up",) if strict else ROUTABLE_STATUSES
     try:
         code, _ = http_get(f"{platform_url}/health")
     except unreachable as exc:  # connection refused, timeout
@@ -357,25 +387,40 @@ def health_gate(
         return GateResult("hub_health", False, f"{platform_url}/plugins unreachable: {exc}")
     if code != 200 or not isinstance(body, dict):
         return GateResult("hub_health", False, f"{platform_url}/plugins answered {code}")
-    statuses = {
-        str(p.get("name")): str(p.get("status"))
+    entries = {
+        str(p.get("name")): (str(p.get("status")), p.get("degraded_reason"))
         for p in body.get("plugins") or []
         if isinstance(p, dict)
     }
     problems = []
     notes = []
     for name in plugins:
-        status = statuses.get(name)
-        if status is None:
+        if name not in entries:
             problems.append(f"{name} not registered")
-        elif status not in allowed:
-            problems.append(f"{name} is {status}")
-        elif status != "up":
-            notes.append(f"{name} {status}")
+            continue
+        status, reason = entries[name]
+        if status == "up":
+            continue
+        if status == "degraded" and not strict and tolerated_degraded(reason):
+            notes.append(f"{name} degraded: {reason}")
+            continue
+        problems.append(f"{name} is {status}" + (f" ({reason})" if reason else ""))
     if problems:
         return GateResult("hub_health", False, "; ".join(problems))
     detail = "all train services registered" + (f" ({', '.join(notes)})" if notes else "")
     return GateResult("hub_health", True, detail)
+
+
+def tolerated_degraded(reason: object) -> bool:
+    """True only when EVERY "; "-joined degraded reason is a peer-not-
+    delivering one (see TOLERATED_DEGRADED_PREFIXES). No reason, a
+    crash-looping delivery tick, or anything unrecognised -> False."""
+    if not isinstance(reason, str) or not reason.strip():
+        return False
+    if "delivery tick raised" in reason:
+        return False
+    parts = [part.strip() for part in reason.split("; ")]
+    return all(part.startswith(TOLERATED_DEGRADED_PREFIXES) for part in parts)
 
 
 def milestone_gate(version: str, fetch: g.StatusFetcher) -> GateResult:
@@ -494,6 +539,12 @@ def run_autocut(
             fetch_status=fetch_status or g.fetch_milestone_status,
             cut_fn=cut_fn or c.cut, out_dir=out_dir,
         )
+    except c.ManifestCommitError as exc:
+        # After a completed cut the train is live on GitHub — "failed" would
+        # misreport it. A recovery-commit failure (no cut this run) is a
+        # plain failure.
+        rpt.outcome = OUTCOME_PUBLISHED_UNRECORDED if rpt.cut_attempted else OUTCOME_FAILED
+        rpt.detail = str(exc)
     except ReleaseError as exc:
         rpt.outcome = OUTCOME_FAILED
         rpt.detail = str(exc)
@@ -632,12 +683,14 @@ def _run(
             message=f"release: train {rpt.previous_version} (autocut: record recovered)",
             report=report,
         )
+        rpt.recovered_record = True
     if not rpt.version:
         rpt.outcome = OUTCOME_OK
         rpt.detail = f"recorded {rpt.previous_version}; nothing moved to cut"
         return
 
     report(f"\nautocut: cutting {rpt.version}")
+    rpt.cut_attempted = True
     cut_fn(
         config, rpt.version, checkouts=checkouts,
         out_dir=out_dir or manifest_checkout / ".release-build" / rpt.version,

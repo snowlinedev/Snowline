@@ -22,6 +22,7 @@ All three are thin argparse shells over pure libraries — `replication_pairing`
 from __future__ import annotations
 
 import argparse
+import functools
 import os
 import sys
 from pathlib import Path
@@ -548,7 +549,11 @@ def _cmd_release_autocut(args) -> int:
         # which reads this env — without it the gate asks the loopback default
         # and SKIPS (which autocut then refuses).
         os.environ["SNOWLINE_PLATFORM_URL"] = args.platform_url
-    runner = release_runner.Runner(report=print, dry_run=args.dry_run, verbose=args.verbose)
+    # flush=True on every report line: stdout and stderr share one launchd
+    # log file, and a block-buffered stdout would land the run's lines AFTER
+    # its final stderr error line.
+    report = functools.partial(print, flush=True)
+    runner = release_runner.Runner(report=report, dry_run=args.dry_run, verbose=args.verbose)
     rpt = autocut_lib.run_autocut(
         config,
         checkouts=checkouts,
@@ -558,11 +563,12 @@ def _cmd_release_autocut(args) -> int:
         dry_run=args.dry_run,
         commit_manifest=args.commit_manifest,
         strict_health=args.strict_health,
-        report=print,
+        report=report,
     )
     code = autocut_lib.exit_code(rpt.outcome)
     if code != 0:
-        print(f"error: autocut {rpt.outcome}: {rpt.detail}", file=sys.stderr)
+        sys.stdout.flush()
+        print(f"error: autocut {rpt.outcome}: {rpt.detail}", file=sys.stderr, flush=True)
     return code
 
 
