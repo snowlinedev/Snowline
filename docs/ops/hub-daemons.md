@@ -97,10 +97,11 @@ process, not uvicorn. A `kill -TERM` then makes the platform wait for the
 cut, up to 10 minutes, then kill it and exit (see "Auto-cut" below).
 A `launchctl kickstart -k` or `bootout` does not wait that long: launchd
 SIGKILLs the job after its exit timeout (20 seconds by default). The cut runs
-in its own process group, so that kill is not aimed at it, but whether launchd
-also tears it down with the job is not verified. Either way the train can be
-left half-published until the next tick recovers it. Wait for `lock: free`
-instead.
+in its own process group, so that kill is not aimed at it — but its output
+pipe leads to the dead platform, so the orphan dies with a broken pipe at its
+next log line, half-done, and releases the lock. Do not expect it to finish:
+the train is left half-published until the next tick recovers it. Wait for
+`lock: free` instead.
 
 ## Stack-sync guard
 

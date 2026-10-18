@@ -426,6 +426,12 @@ def test_parse_outcome_reads_run_autocuts_final_line():
         "gated", "gh_auth: no",
     )
     assert h.parse_outcome(["autocut 2026-10-18T12:00:00+00:00: noop"], 0) == ("noop", None)
+    # a locked fire (coexisting plist timer, or an orphaned cut after a
+    # SIGKILL) prints the final line too — it must never read as `failed`
+    assert h.parse_outcome([
+        "autocut: another autocut holds /h/autocut.lock — skipping this fire",
+        "autocut 2026-10-18T12:00:00+00:00: locked — another autocut holds /h/autocut.lock",
+    ], 0) == ("locked", "another autocut holds /h/autocut.lock")
 
 
 def test_default_command_is_this_venvs_snowline(root):

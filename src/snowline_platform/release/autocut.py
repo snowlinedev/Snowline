@@ -558,6 +558,9 @@ def run_autocut(
         rpt.detail = f"another autocut holds {lock.path}"
         rpt.finished_at = _now_iso()
         report(f"autocut: {rpt.detail} — skipping this fire")
+        # The same final line every other outcome prints: the in-process host
+        # parses it, and a locked fire must read `locked`, not `failed`.
+        report(f"autocut {rpt.finished_at}: {rpt.outcome} — {rpt.detail}")
         return rpt
     try:
         _run(
