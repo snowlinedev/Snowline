@@ -167,6 +167,8 @@ export type Standby = {
   peers: StandbyPeer[];
   rollup: StandbyRollup;
   reasons: string[];
+  /** Seconds since the platform computed this block (served from cache). */
+  age_s?: number | null;
 };
 
 export const fetchStandby = () => get<Standby>("/standby");

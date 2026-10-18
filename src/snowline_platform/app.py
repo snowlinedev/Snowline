@@ -9,6 +9,7 @@ this registry.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from contextlib import asynccontextmanager
@@ -206,6 +207,14 @@ async def _lifespan(app: FastAPI):
             else:
                 yield
     finally:
+        # The standby readiness refresh (#259) runs as a background task off
+        # /health; cancel an in-flight one so shutdown doesn't leave it
+        # pending (shielded: this finally may already run under cancellation).
+        task = getattr(app.state, "standby_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+            with anyio.CancelScope(shield=True):
+                await asyncio.wait([task], timeout=5)
         # The /ui-api proxy's shared httpx client (ui_api.py) is created
         # lazily on first request, not here — but however it exits, close it
         # if one was ever created, so a restart doesn't leak an open client.

@@ -117,6 +117,7 @@ export function StandbyBody(props: { data: Standby }) {
       <p className="standby-hub">
         Hub latest cut {cut ?? "unknown"}
         {autocut?.last_outcome ? ` · last auto-cut ${autocut.last_outcome}` : ""}
+        {d.age_s != null ? ` · checked ${Math.round(d.age_s)}s ago` : ""}
       </p>
       {d.peers.length === 0 ? (
         <ul className="standby-reasons">

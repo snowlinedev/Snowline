@@ -101,11 +101,11 @@ describe("Standby panel", () => {
   });
 
   it("explains an unpaired instance", async () => {
-    FIXTURES["/standby"] = { rollup: "UNKNOWN", reasons: ["no paired standby peer"], peers: [], hub: {} };
+    FIXTURES["/standby"] = { rollup: "UNKNOWN", reasons: ["no paired standby peer"], peers: [], hub: {}, age_s: 12.4 };
     renderSystem();
     const card = await panel();
     expect(card.getByText("no paired standby peer")).toBeTruthy();
-    expect(card.getByText("Hub latest cut unknown")).toBeTruthy();
+    expect(card.getByText("Hub latest cut unknown · checked 12s ago")).toBeTruthy();
   });
 });
 

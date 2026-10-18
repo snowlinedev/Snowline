@@ -826,3 +826,65 @@ def test_redact_covers_connection_strings_and_keeps_flags():
     for k in ("dsn", "database_url", "seed_config", "cookie", "session_id"):
         assert out[k] == standby.REDACTED, k
     assert out["reseed"] is False and out["outcome"] == "ok"
+
+
+def test_a_hung_refresh_times_out_into_a_cached_unknown(monkeypatch):
+    calls = []
+
+    async def hang(app, **kw):
+        calls.append(1)
+        await anyio.sleep(30)
+
+    monkeypatch.setattr(standby, "compute", hang)
+    monkeypatch.setattr(standby, "REFRESH_DEADLINE_SECONDS", 0.2)
+    app = _app()
+
+    async def go(get):
+        started = time.monotonic()
+        out = await standby.refresh(app)
+        elapsed = time.monotonic() - started
+        again = await standby.for_health(app)  # cached: no new refresh
+        return out, elapsed, again
+
+    out, elapsed, again = _in_one_loop(app, go)
+    assert elapsed < 2
+    assert out["rollup"] == "UNKNOWN"
+    assert out["reasons"] == ["standby refresh timed out (> 0.2s)"]
+    assert again["reasons"] == out["reasons"]
+    assert len(calls) == 1
+
+
+def test_served_block_carries_its_age(monkeypatch):
+    async def ready(app, **kw):
+        return {"rollup": "READY", "peers": [], "reasons": []}
+
+    monkeypatch.setattr(standby, "compute", ready)
+    app = _app()
+
+    async def go(get):
+        placeholder = await standby.for_health(app)
+        await app.state.standby_task
+        return placeholder
+
+    placeholder = _in_one_loop(app, go)
+    assert placeholder["age_s"] is None
+    app.state.standby_cache = (time.monotonic() - 4, app.state.standby_cache[1])
+    body = _request(app, "/health").json()["standby"]
+    assert body["rollup"] == "READY"
+    assert 3.9 <= body["age_s"] < 10
+    assert "age_s" not in app.state.standby_cache[1]  # the cache itself is untouched
+
+
+def test_lifespan_shutdown_cancels_an_in_flight_refresh(monkeypatch):
+    from starlette.testclient import TestClient
+
+    async def hang(app, **kw):
+        await anyio.sleep(60)
+
+    monkeypatch.setattr(standby, "compute", hang)
+    app = _app()
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+        task = app.state.standby_task
+        assert not task.done()
+    assert task.cancelled()

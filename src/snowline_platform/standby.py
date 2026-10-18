@@ -27,7 +27,8 @@ embedded as `health.standby` on `/health`:
         "autocut": <hub.autocut>,
         "front": {upstream, hub_healthy, last_flip_at, flips} | None,
         "rollup": "READY"|"DEGRADED"|"UNKNOWN", "reasons": [..], "notes": [..]}],
-     "rollup": <worst over peers>, "reasons": [..]}
+     "rollup": <worst over peers>, "reasons": [..],
+     "age_s": <seconds since computed, added when served from the cache>}
 
 "hub" is the instance ANSWERING (the surface is symmetric: a spoke asked the
 same question reports on its hub). Rollup rules:
@@ -99,6 +100,9 @@ HUB_TO_PEER = "hub->peer"
 PEER_TO_HUB = "peer->hub"
 
 CACHE_SECONDS = 10.0
+# A refresh runs in the background, but it must still end: one stuck DB
+# call or peer read past this is cached as an UNKNOWN "timed out" block.
+REFRESH_DEADLINE_SECONDS = 30.0
 PEER_BUDGET_SECONDS = 2.0
 FRONT_TIMEOUT_SECONDS = 0.5
 DEFAULT_DATA_BEHIND_AFTER_S = 900.0
@@ -885,7 +889,13 @@ PLACEHOLDER_REASON = "standby readiness is being computed — ask again in a few
 
 
 def _placeholder() -> dict:
-    return {"rollup": UNKNOWN, "reasons": [PLACEHOLDER_REASON], "peers": [], "pending": True}
+    return {
+        "rollup": UNKNOWN,
+        "reasons": [PLACEHOLDER_REASON],
+        "peers": [],
+        "pending": True,
+        "age_s": None,
+    }
 
 
 async def refresh(app, **kwargs) -> dict:
@@ -893,11 +903,24 @@ async def refresh(app, **kwargs) -> dict:
     an UNKNOWN block naming the error), so a raising computation is retried
     once per window, not on every caller. Never raises."""
     state = app.state
+    # TEST SEAM: tests inject an httpx client (MockTransport) here; production
+    # never sets it, so compute() builds and closes its own per refresh.
     client = getattr(state, "standby_http_client", None)
     if client is not None:
         kwargs.setdefault("client", client)
     try:
-        result = await compute(app, **kwargs)
+        with anyio.fail_after(REFRESH_DEADLINE_SECONDS):
+            result = await compute(app, **kwargs)
+    except TimeoutError:
+        log.warning("standby: refresh exceeded %ss", REFRESH_DEADLINE_SECONDS)
+        result = {
+            "computed_at": _utc_iso(),
+            "rollup": UNKNOWN,
+            "reasons": [
+                f"standby refresh timed out (> {REFRESH_DEADLINE_SECONDS:g}s)"
+            ],
+            "peers": [],
+        }
     except Exception as exc:  # liveness must not depend on this (logged with traceback)
         log.warning("standby: computation failed", exc_info=True)
         result = _failure_block(exc)
@@ -907,6 +930,12 @@ async def refresh(app, **kwargs) -> dict:
 
 def _cache(app) -> tuple[float, dict] | None:
     return getattr(app.state, "standby_cache", None)
+
+
+def _served(hit: tuple[float, dict]) -> dict:
+    """The cached block as served: plus `age_s`, seconds since it was
+    computed, so a reader (the dashboard panel) can show staleness."""
+    return {**hit[1], "age_s": round(max(time.monotonic() - hit[0], 0.0), 1)}
 
 
 def _is_fresh(hit) -> bool:
@@ -939,7 +968,7 @@ async def for_health(app, *, block: dict | None = None) -> dict:
             schedule_refresh(app, block=block)
         except Exception:  # scheduling must not fail /health (logged with traceback)
             log.warning("standby: could not schedule a refresh", exc_info=True)
-    return hit[1] if hit is not None else _placeholder()
+    return _served(hit) if hit is not None else _placeholder()
 
 
 async def for_route(app) -> dict:
@@ -954,7 +983,7 @@ async def for_route(app) -> dict:
                 await asyncio.shield(task)
         hit = _cache(app)
         if hit is not None:
-            return hit[1]
+            return _served(hit)
     return result
 
 
