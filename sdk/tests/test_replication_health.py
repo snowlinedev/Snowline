@@ -93,6 +93,8 @@ def test_pending_counts_and_oldest_age_per_peer(session):
     assert block["outbox"]["peers"] == {
         "hub.pm": {
             "pending": 2,
+            "oldest_pending_age_s": 120.0,
+            "version_hold": 0,
             "consecutive_failures": 0,
             "last_success_at": None,
             "last_error": None,
@@ -387,3 +389,70 @@ def test_seed_measured_against_db_clock(session):
     )
     age = (_utcnow() - since).total_seconds()
     assert 2 * 3600 - 30 < age < 2 * 3600 + 30
+
+
+# --- #259: per-peer age + version holds (the standby readiness surface) ------
+
+
+def _held(request):
+    if request.method == "GET":
+        return httpx.Response(405)
+    return httpx.Response(409, json={"status": "refused", "reason": "version_hold"})
+
+
+def test_version_hold_is_counted_per_peer(session):
+    """A 409 version_hold is retryable — the row stays pending with the
+    refusal in last_error — and the health block counts it so "data behind"
+    shows even while the peer answers."""
+    state = DeliveryHealth()
+    _setup(session)
+    emit.emit_event(session, "thing.recorded", {})
+    session.commit()
+    _deliver(session, _held, NOW, state)
+    peer = replication_health(session, now=NOW, state=state)["outbox"]["peers"]["hub.pm"]
+    assert peer["pending"] == 1
+    assert peer["version_hold"] == 1
+    assert "version_hold" in peer["last_error"]
+
+    _deliver(session, _ok, NOW + timedelta(hours=1), state)
+    peer = replication_health(session, now=NOW, state=state)["outbox"]["peers"]["hub.pm"]
+    assert peer["version_hold"] == 0
+    assert peer["pending"] == 0
+    assert peer["oldest_pending_age_s"] is None
+
+
+def test_oldest_pending_age_is_per_peer(session):
+    from snowline_plugin_sdk.replication.models import (
+        ReplicationOutboxRow,
+        ReplicationSubscription,
+    )
+    from sqlalchemy import select
+
+    _setup(session, peer_source_id="hub.pm")
+    emit.create_outbound_subscription(
+        session, "http://other.example/events/ingest", "s", ["thing.recorded"],
+        epoch="e2", peer_source_id="mbp.pm",
+    )
+    session.commit()
+    emit.emit_event(session, "thing.recorded", {})
+    session.commit()
+    subs = {s.id: s.peer_source_id for s in session.scalars(select(ReplicationSubscription))}
+    for r in session.scalars(select(ReplicationOutboxRow)):
+        age = 600 if subs[r.subscription_id] == "mbp.pm" else 30
+        r.created_at = NOW - timedelta(seconds=age)
+    session.commit()
+
+    block = replication_health(session, now=NOW, state=DeliveryHealth())
+    peers = block["outbox"]["peers"]
+    assert peers["mbp.pm"]["oldest_pending_age_s"] == 600.0
+    assert peers["hub.pm"]["oldest_pending_age_s"] == 30.0
+    assert block["outbox"]["oldest_pending_age_s"] == 600.0
+
+
+def test_unavailable_outbox_reports_unknown_age_and_holds():
+    state = DeliveryHealth()
+    state.record_failure("hub.pm", NOW, "boom")
+    peer = replication_health(None, now=NOW, state=state)["outbox"]["peers"]["hub.pm"]
+    assert peer["pending"] is None
+    assert peer["oldest_pending_age_s"] is None
+    assert peer["version_hold"] is None

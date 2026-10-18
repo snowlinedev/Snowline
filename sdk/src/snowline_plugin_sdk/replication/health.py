@@ -42,6 +42,7 @@ from datetime import datetime, timezone
 from sqlalchemy import DateTime, case, func, select
 from sqlalchemy.orm import Session
 
+from snowline_plugin_sdk.replication.envelope import REFUSAL_VERSION_HOLD
 from snowline_plugin_sdk.replication.models import (
     ReplicationOutboxRow,
     ReplicationSubscription,
@@ -189,6 +190,17 @@ def _outbox_rows(session: Session) -> list[tuple]:
                     else_=None,
                 )
             ).label("stuck_since"),
+            # Version holds (§3.2): a 409 `version_hold` refusal is retryable,
+            # so the held row stays `pending` with the refusal in `last_error`
+            # (`_response_error` embeds the ingest's `reason`). Counted so the
+            # readiness surface (#259) can flag "data behind" on a hold even
+            # while the peer is reachable and answering.
+            func.sum(
+                case(
+                    (ReplicationOutboxRow.last_error.like(f"%{REFUSAL_VERSION_HOLD}%"), 1),
+                    else_=0,
+                )
+            ).label("holds"),
         )
         .where(ReplicationOutboxRow.status == "pending")
         .group_by(ReplicationOutboxRow.subscription_id)
@@ -203,6 +215,7 @@ def _outbox_rows(session: Session) -> list[tuple]:
                 pending.c.oldest,
                 pending.c.attempts,
                 pending.c.stuck_since,
+                pending.c.holds,
                 _db_clock(session).label("db_now"),
             )
             .select_from(ReplicationSubscription)
@@ -222,7 +235,8 @@ def replication_health(
 
         {"status": "ok"|"degraded", "degraded_reason": str|None,
          "outbox": {"pending": N, "oldest_pending_age_s": X|None,
-                    "peers": {<peer>: {pending, consecutive_failures,
+                    "peers": {<peer>: {pending, oldest_pending_age_s,
+                                       version_hold, consecutive_failures,
                                        last_success_at, last_error,
                                        unreachable_since}},
                     "tick": {last_at, last_error, consecutive_errors}}}
@@ -256,7 +270,10 @@ def replication_health(
     unreachable: dict[str, datetime] = {
         k: v.unreachable_since for k, v in mem_peers.items() if v.unreachable_since
     }
-    for peer_source_id, target_url, n, oldest, attempts, stuck_since, db_now in rows:
+    peer_oldest: dict[str, datetime] = {}
+    for (
+        peer_source_id, target_url, n, oldest, attempts, stuck_since, holds, db_now,
+    ) in rows:
         if age_clock is None and db_now is not None:
             age_clock = db_now
         key = peer_source_id or target_url
@@ -265,6 +282,8 @@ def replication_health(
             key,
             {
                 "pending": 0,
+                "oldest_pending_age_s": None,
+                "version_hold": 0,
                 "consecutive_failures": mem.consecutive_failures,
                 "last_success_at": _iso(mem.last_success_at),
                 "last_error": mem.last_error,
@@ -273,6 +292,11 @@ def replication_health(
         )
         n = int(n or 0)
         entry["pending"] += n
+        entry["version_hold"] += int(holds or 0)
+        if n and oldest is not None:
+            cur_oldest = peer_oldest.get(key)
+            if cur_oldest is None or oldest < cur_oldest:
+                peer_oldest[key] = oldest
         if n:
             entry["consecutive_failures"] = max(
                 entry["consecutive_failures"], int(attempts or 0)
@@ -292,11 +316,18 @@ def replication_health(
         if oldest is not None and (oldest_all is None or oldest < oldest_all):
             oldest_all = oldest
 
+    for key, oldest in peer_oldest.items():
+        peers[key]["oldest_pending_age_s"] = round(
+            max(((age_clock or now) - oldest).total_seconds(), 0.0), 1
+        )
+
     if unavailable is not None:
         # DB half missing: report what the loop itself has seen.
         for key, mem in mem_peers.items():
             peers[key] = {
                 "pending": None,
+                "oldest_pending_age_s": None,
+                "version_hold": None,
                 "consecutive_failures": mem.consecutive_failures,
                 "last_success_at": _iso(mem.last_success_at),
                 "last_error": mem.last_error,
