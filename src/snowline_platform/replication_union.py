@@ -53,10 +53,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from snowline_plugin_sdk.replication.envelope import (
-    backfill_source_id,
-    is_backfill_source,
-)
+from snowline_plugin_sdk.replication.envelope import backfill_source_id
 
 from snowline_platform import replication_pairing as pairing
 from snowline_platform.replication_pairing import (
@@ -130,15 +127,8 @@ def _post_json(client, url: str, body: dict):
 def _live_outbound(client, me: Participant, other: Participant) -> list[dict]:
     """`me`'s ACTIVE live outbound subscriptions toward `other` — keyed by the
     stream identity (`source_id` = mine, `peer_source_id` = the other side's),
-    never a backfill stream."""
-    return [
-        s
-        for s in _get_json(client, f"{me.admin_base}/outbound")
-        if s.get("active")
-        and not is_backfill_source(s.get("source_id"))
-        and s.get("source_id") == me.source_id
-        and s.get("peer_source_id") == other.source_id
-    ]
+    never a backfill stream (shared with `refresh-vocabulary`)."""
+    return pairing.live_outbound(client, me, other)
 
 
 def _live_inbound(client, me: Participant, other: Participant) -> list[dict]:

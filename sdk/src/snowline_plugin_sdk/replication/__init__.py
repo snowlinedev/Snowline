@@ -33,6 +33,7 @@ from .emit import (
     retire_backfill_subscription,
     retire_outbound_subscription,
     set_subscription_secret,
+    widen_outbound_vocabulary,
 )
 from .envelope import (
     BACKFILL_SUFFIX,
@@ -86,6 +87,7 @@ __all__ = [
     "create_outbound_subscription",
     "list_outbound_subscriptions",
     "retire_outbound_subscription",
+    "widen_outbound_vocabulary",
     "set_subscription_secret",
     "deliver_pending",
     "replication_delivery_loop",

@@ -3,9 +3,10 @@
 Two operator surfaces live here today:
 
 - `snowline replicate ...` — replication pairing + seeding
-  (replication-continuity §5/§7, issue #82) and the §7.1 cold-start union merge
-  (`replicate union`, issue #98; library `replication_union`). Deliberately
-  CLI, not MCP: agents never manage replication plumbing (§5).
+  (replication-continuity §5/§7, issue #82), the §7.1 cold-start union merge
+  (`replicate union`, issue #98; library `replication_union`), and
+  `replicate refresh-vocabulary` (widen paired streams after an upgrade, pm#133).
+  Deliberately CLI, not MCP: agents never manage replication plumbing (§5).
 - `snowline release ...` — cutting the packaged stable channel's release trains
   (macOS distribution spec §2/§4, issue #202). Host-side by design; see
   `snowline_platform.release.cutter` for why it is not a set of CI workflows.
@@ -92,6 +93,25 @@ def _build_replicate(p: argparse.ArgumentParser) -> None:
     )
     pair.set_defaults(handler=_cmd_pair)
 
+    refresh = rsub.add_parser(
+        "refresh-vocabulary",
+        help="widen already-paired streams' event types after an upgrade (pm#133)",
+        description=(
+            "For every participant paired with the peer, widen BOTH directed "
+            "streams' event_types in place (same epoch, no re-seed) to what the "
+            "sender emits AND the receiver declares (sender ∩ receiver). Only "
+            "ever widens; refuses a contract_version-mismatched direction; "
+            "idempotent. Upgrade BOTH sides first. Writes made before the "
+            "refresh are not replayed; `reapply` anything the receiver parked."
+        ),
+    )
+    _add_pair_addressing(refresh)
+    refresh.add_argument(
+        "--dry-run", action="store_true",
+        help="discover + report per-direction plan without widening anything",
+    )
+    refresh.set_defaults(handler=_cmd_refresh_vocabulary)
+
     seed_p = rsub.add_parser(
         "seed",
         help="stand up / re-seed a spoke from a primary snapshot (§7)",
@@ -172,6 +192,30 @@ def _build_replicate(p: argparse.ArgumentParser) -> None:
     )
     check.add_argument("--config", required=True, help="path to the seed config JSON")
     check.set_defaults(handler=_cmd_reseed_check)
+
+
+def _add_pair_addressing(p: argparse.ArgumentParser) -> None:
+    """The local/peer addressing flags `pair` takes, for a verb that drives an
+    already-paired pair (`refresh-vocabulary`)."""
+    p.add_argument("peer_url", help="the peer platform's base URL (tailnet address)")
+    p.add_argument(
+        "--local-url",
+        default=os.environ.get("SNOWLINE_LOCAL_PLATFORM_URL", DEFAULT_LOCAL_PLATFORM_URL),
+        help="this instance's platform base URL (default: loopback :8848, §5.1)",
+    )
+    p.add_argument(
+        "--local-instance",
+        default=os.environ.get("SNOWLINE_INSTANCE_ID"),
+        help="this instance's SNOWLINE_INSTANCE_ID (e.g. 'roam'); defaults to the env",
+    )
+    p.add_argument("--peer-instance", required=True,
+                   help="the peer instance's SNOWLINE_INSTANCE_ID (e.g. 'primary')")
+    p.add_argument(
+        "--local-peer-url",
+        default=os.environ.get("SNOWLINE_LOCAL_PEER_URL"),
+        help="THIS instance's gateway as the peer reaches it (see `pair`); "
+        "accepted for symmetry — streams are matched by identity, not URL",
+    )
 
 
 def _build_release(p: argparse.ArgumentParser) -> None:
@@ -496,6 +540,30 @@ def _cmd_pair(args) -> int:
             return 1 if plan.refused else 0
         pairing.pair(client, local, peer, report=print)
     return 0
+
+
+def _cmd_refresh_vocabulary(args) -> int:
+    if not args.local_instance:
+        print(
+            "error: --local-instance not given and SNOWLINE_INSTANCE_ID is unset",
+            file=sys.stderr,
+        )
+        return 1
+    with _client() as client:
+        local = pairing.discover_participants(
+            client, args.local_url, args.local_instance, public_url=args.local_peer_url
+        )
+        peer = pairing.discover_participants(
+            client, args.peer_url, args.peer_instance, peer=True
+        )
+        print(
+            f"discovered {sorted(local)} on local ({args.local_instance}), "
+            f"{sorted(peer)} on peer ({args.peer_instance})"
+        )
+        plan = pairing.refresh_vocabulary(
+            client, local, peer, dry_run=args.dry_run, report=print
+        )
+    return 1 if plan.refused else 0
 
 
 def _cmd_union(args) -> int:

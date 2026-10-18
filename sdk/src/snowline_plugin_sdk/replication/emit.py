@@ -174,6 +174,67 @@ def set_subscription_secret(
     return _subscription_dict(sub)
 
 
+def widen_outbound_vocabulary(
+    session: Session, subscription_id: str, event_types: Iterable[str]
+) -> dict:
+    """WIDEN an active outbound stream's event vocabulary in place — the SDK
+    half of `snowline replicate refresh-vocabulary` (pm#133).
+
+    A subscription's `event_types` is written once at pairing (§5) from the
+    sender's then-declared vocabulary, and the emit hook only queues an event
+    whose type is in it. An event type a plugin gains in a later upgrade is
+    therefore silently never queued toward an existing pairing, and a
+    fresh-epoch re-seed cannot recover it (the rows were never written to the
+    outbox, so there is nothing to replay). This set-unions `event_types` into
+    the subscription instead, so every emit AFTER the widen carries the new
+    type on the SAME stream (same epoch, same seq counter — no re-seed).
+
+    Semantics, all load-bearing:
+      * set UNION, never narrowing — existing types keep their order, new ones
+        are appended in the given order (duplicates collapsed). Removing a type
+        from a live stream is not a supported operation here.
+      * idempotent — nothing new is a no-op (`added == []`, no write).
+      * refused (`ValueError`) for an unknown id, a RETIRED subscription, or a
+        §7.1 BACKFILL stream (whose vocabulary is empty by construction: a live
+        write fanned onto the walker's counter would corrupt it).
+
+    Which types to widen to is the CALLER's judgement: the pairing tooling
+    passes sender-events ∩ receiver-events, so a sender never starts emitting
+    a type its peer cannot apply yet (governance decision 54447516, N−1 skew).
+
+    Returns the subscription dict plus `added`: the types actually appended."""
+    try:
+        key = _as_uuid(subscription_id)
+    except ValueError:
+        key = None
+    sub = session.get(ReplicationSubscription, key) if key is not None else None
+    if sub is None:
+        raise ValueError(f"no replication subscription with id {subscription_id!r}")
+    if not sub.active:
+        raise ValueError(
+            f"replication subscription {subscription_id!r} is retired — widen "
+            f"the live stream that replaced it instead"
+        )
+    if is_backfill_source(sub.source_id):
+        raise ValueError(
+            f"replication subscription {subscription_id!r} is a §7.1 backfill "
+            f"stream; its vocabulary is empty by construction and cannot be widened"
+        )
+    current = list(sub.event_types or [])
+    seen = set(current)
+    added: list[str] = []
+    for event_type in event_types:
+        if event_type not in seen:
+            seen.add(event_type)
+            added.append(event_type)
+    if added:
+        # Reassign (never mutate in place): a plain JSON column does not track
+        # in-place list mutation, so an append would be silently dropped.
+        sub.event_types = current + added
+        session.flush()
+    return {**_subscription_dict(sub), "added": added}
+
+
 def _as_uuid(value) -> uuid.UUID:
     return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
 
@@ -227,11 +288,10 @@ def emit_event(session: Session, event_type: str, payload: dict) -> list[dict]:
     # vocabulary is empty, and the identity check is the belt to that braces —
     # a live write fanned onto the walker's counter would interleave
     # non-deterministic seqs and wear backfill causal context.
-    matching = [
-        s
-        for s in subs
-        if event_type in (s.event_types or []) and not is_backfill_source(s.source_id)
-    ]
+    live = [s for s in subs if not is_backfill_source(s.source_id)]
+    matching = [s for s in live if event_type in (s.event_types or [])]
+    if len(matching) != len(live):
+        _warn_streams_lacking(live, event_type)
     if not matching:
         return []
 
@@ -272,6 +332,41 @@ def emit_event(session: Session, event_type: str, payload: dict) -> list[dict]:
         envelopes.append(envelope)
     session.flush()
     return envelopes
+
+
+# (source_id, epoch, event_type) triples already warned about by
+# `_warn_streams_lacking` — process-lifetime, so the warning fires once per
+# stream and type rather than on every write. A plain set: the check runs on
+# the emit hot path and must stay a hash lookup.
+_VOCABULARY_WARNED: set[tuple[str, str, str]] = set()
+
+REFRESH_VOCABULARY_REMEDY = "snowline replicate refresh-vocabulary"
+
+
+def _warn_streams_lacking(live_subs, event_type: str) -> None:
+    """WARN once per (source_id, epoch, event_type) for an ACTIVE live stream
+    whose frozen vocabulary lacks `event_type` — the write itself commits
+    locally, it just does not replicate to that peer. Generic version of pm's
+    `_warn_pairings_lacking` so every plugin gets it.
+
+    This is expected (and the warning informational) when the PEER cannot apply
+    the type yet: `refresh-vocabulary` only widens to types both sides declare,
+    so the remedy is to upgrade the peer and then run it."""
+    for sub in live_subs:
+        if event_type in (sub.event_types or []):
+            continue
+        key = (sub.source_id, sub.epoch, event_type)
+        if key in _VOCABULARY_WARNED:
+            continue
+        _VOCABULARY_WARNED.add(key)
+        log.warning(
+            "replication: the stream %s (epoch %s) toward %s does not carry "
+            "%r, so this write does not replicate to it (its event_types were "
+            "fixed at pairing). Remedy: upgrade both sides, then run `%s` to "
+            "widen the stream; writes made before that are not replayed.",
+            sub.source_id, sub.epoch, sub.peer_source_id or sub.target_url,
+            event_type, REFRESH_VOCABULARY_REMEDY,
+        )
 
 
 def _peer_seen(session: Session, peer_source_id: str | None) -> int:

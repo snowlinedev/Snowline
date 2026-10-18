@@ -19,16 +19,22 @@ from ._replication_helpers import RoutedClient, make_participant, make_platform,
 
 @pytest.fixture()
 def two_instances(monkeypatch):
+    prim_plugins = [
+        plugin_entry("governance", "http://prim-gov", events=["decision.recorded"]),
+    ]
+    roam_plugins = [
+        plugin_entry("governance", "http://roam-gov", events=["decision.recorded"]),
+    ]
     apps = {
-        "prim-platform": make_platform(plugins=[
-            plugin_entry("governance", "http://prim-gov", events=["decision.recorded"]),
-        ]),
+        "prim-platform": make_platform(plugins=prim_plugins),
         "prim-gov": make_participant(),
-        "roam-platform": make_platform(plugins=[
-            plugin_entry("governance", "http://roam-gov", events=["decision.recorded"]),
-        ]),
+        "roam-platform": make_platform(plugins=roam_plugins),
         "roam-gov": make_participant(),
     }
+    # The registry serves these same dicts, so a test can mutate them to
+    # simulate an upgrade (refresh-vocabulary).
+    apps["prim-platform"].plugins = prim_plugins
+    apps["roam-platform"].plugins = roam_plugins
     client = RoutedClient({h: inst.app for h, inst in apps.items()})
     monkeypatch.setattr(cli, "_client", lambda: client)
     return apps
@@ -191,3 +197,36 @@ def test_union_timeout_is_a_clean_error_exit(monkeypatch, capsys):
     ])
     assert rc == 1
     assert "timed out waiting for backfill completion" in capsys.readouterr().err
+
+
+def test_refresh_vocabulary_command(two_instances, capsys):
+    """`replicate refresh-vocabulary`: after both sides gain an event type, the
+    verb widens the paired streams (dry-run first changes nothing), exits 0,
+    and a re-run reports already current."""
+    args = [
+        "http://prim-platform",
+        "--local-url", "http://roam-platform",
+        "--local-instance", "roam", "--peer-instance", "primary",
+    ]
+    assert cli.main(["replicate", "pair", *args]) == 0
+    for host in ("prim-platform", "roam-platform"):
+        (entry,) = two_instances[host].plugins
+        entry["manifest"]["replication"]["events"].append("decision.amended")
+    capsys.readouterr()
+
+    assert cli.main(["replicate", "refresh-vocabulary", *args, "--dry-run"]) == 0
+    assert "would add ['decision.amended']" in capsys.readouterr().out
+    with two_instances["roam-gov"].scope() as s:
+        assert s.scalars(select(ReplicationSubscription)).one().event_types == [
+            "decision.recorded"
+        ]
+
+    assert cli.main(["replicate", "refresh-vocabulary", *args]) == 0
+    assert "added ['decision.amended']" in capsys.readouterr().out
+    with two_instances["roam-gov"].scope() as s:
+        assert s.scalars(select(ReplicationSubscription)).one().event_types == [
+            "decision.recorded", "decision.amended",
+        ]
+
+    assert cli.main(["replicate", "refresh-vocabulary", *args]) == 0
+    assert "already current" in capsys.readouterr().out

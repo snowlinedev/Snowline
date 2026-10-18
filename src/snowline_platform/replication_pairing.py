@@ -31,6 +31,26 @@ matched pair whose declared `contract_version`s differ is REFUSED with a clear
 message (§10 — a version mismatch is a bug to fix, not a stream to open). A
 vocabulary (`events`) mismatch is WARNed but paired: the union still flows, and
 an event type one side doesn't know simply never arrives from it.
+
+Vocabulary is fixed at pairing, so widening is a SEPARATE operator step
+(`snowline replicate refresh-vocabulary`, `refresh_vocabulary` below; pm#133).
+The handshake writes the sender's then-declared `events` into the outbound
+subscription's `event_types`, and the SDK emit hook queues only those types — so
+an event type a plugin gains in a later upgrade is never queued toward an
+existing pairing (the SDK WARNs once per stream when that happens). Re-pairing
+under a fresh epoch cannot recover those writes either: they were never written
+to the outbox, so there is nothing to replay. `refresh_vocabulary` instead
+WIDENS each already-paired direction in place — same epoch, same seq counter —
+to `sender.events ∩ receiver.events` (what the sender emits AND the receiver can
+apply), via the SDK admin route `POST <admin>/outbound/vocabulary`. It is an
+explicit operator act (never automatic at startup), only ever set-unions (never
+narrows), REFUSES a direction whose declared contract_versions differ, and is
+idempotent: a direction already carrying the intersection is reported "already
+current". Holding back a type the receiver does not declare yet keeps the
+sender from emitting what its peer would only park (governance decision
+54447516, N−1 skew). Writes made between the upgrade and the refresh are not
+replayed — upgrade both sides, refresh, then `reapply` anything the receiver
+parked in the window.
 """
 
 from __future__ import annotations
@@ -40,6 +60,8 @@ import secrets
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+
+from snowline_plugin_sdk.replication.envelope import is_backfill_source
 
 from snowline_platform.replication import via_base
 
@@ -500,6 +522,242 @@ def pair(
         f"paired {len(plan.to_pair)} participant(s), "
         f"{len(plan.streams)} directed stream(s); "
         f"{len(plan.one_sided)} one-sided, {len(plan.refused)} refused"
+    )
+    return plan
+
+
+# --- widening a paired stream's vocabulary after an upgrade (pm#133) ----------
+
+VOCABULARY_ROUTE = "/outbound/vocabulary"
+
+
+def live_outbound(client, sender: Participant, receiver: Participant) -> list[dict]:
+    """`sender`'s ACTIVE live outbound subscriptions toward `receiver` — keyed by
+    STREAM IDENTITY (`source_id` = the sender's, `peer_source_id` = the
+    receiver's, exactly what `handshake_direction` stamps), never a §7.1
+    backfill stream. Identity rather than `target_url` because the target is
+    whatever address the pairing run was given (`--local-peer-url` or not),
+    while the identity is fixed at pairing."""
+    resp = client.get(f"{sender.admin_base}/outbound")
+    _raise_for_status(resp, f"GET {sender.admin_base}/outbound")
+    return [
+        s
+        for s in resp.json()
+        if s.get("active")
+        and not is_backfill_source(s.get("source_id"))
+        and s.get("source_id") == sender.source_id
+        and s.get("peer_source_id") == receiver.source_id
+    ]
+
+
+@dataclass
+class VocabularyDirection:
+    """One directed stream's refresh verdict (sender → receiver).
+
+    `status` is one of: `widened` (the admin route appended `added`),
+    `would-widen` (dry run), `current` (already carries the whole target),
+    `unpaired` (no live outbound toward the receiver — run `pair`), or
+    `refused` (contract_version mismatch, or the sender's SDK predates the
+    vocabulary route). `target` is sender.events ∩
+    receiver.events in the sender's declared order; `held_back` is what the
+    sender declares but the receiver does not (left out on purpose)."""
+
+    participant: str
+    sender: str
+    receiver: str
+    status: str
+    target: list[str] = field(default_factory=list)
+    added: list[str] = field(default_factory=list)
+    held_back: list[str] = field(default_factory=list)
+    subscription_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class RefreshPlan:
+    """What `refresh_vocabulary` decided/did, per directed stream."""
+
+    directions: list[VocabularyDirection] = field(default_factory=list)
+    one_sided: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def refused(self) -> list[VocabularyDirection]:
+        return [d for d in self.directions if d.status == "refused"]
+
+
+def vocabulary_target(sender: Participant, receiver: Participant) -> list[str]:
+    """What a sender→receiver stream SHOULD carry: every type the sender emits
+    that the receiver also declares (so can apply), in the sender's order."""
+    receivable = set(receiver.events)
+    return [e for e in dict.fromkeys(sender.events) if e in receivable]
+
+
+def refresh_direction(
+    client,
+    sender: Participant,
+    receiver: Participant,
+    *,
+    dry_run: bool = False,
+    report: Callable[[str], None] = lambda _msg: None,
+) -> VocabularyDirection:
+    """Widen ONE already-paired direction sender→receiver to
+    `vocabulary_target(sender, receiver)` (see the module docstring). Every
+    active live outbound subscription the sender holds toward the receiver is
+    widened (normally exactly one). Reads only on `dry_run`. A direction is
+    REFUSED (status "refused", never raised) on a contract_version mismatch or
+    when the sender's SDK predates the vocabulary route, so the remaining
+    directions still refresh and the operator sees the whole picture."""
+    label = f"{sender.source_id} -> {receiver.source_id}"
+    direction = VocabularyDirection(
+        participant=sender.name,
+        sender=sender.source_id,
+        receiver=receiver.source_id,
+        status="current",
+        target=vocabulary_target(sender, receiver),
+        held_back=[
+            e for e in dict.fromkeys(sender.events) if e not in set(receiver.events)
+        ],
+    )
+    try:
+        refuse_on_version_mismatch(sender, receiver)
+    except PairingError as exc:
+        direction.status = "refused"
+        report(f"  {label}: REFUSE — {exc}")
+        return direction
+
+    subs = live_outbound(client, sender, receiver)
+    if not subs:
+        direction.status = "unpaired"
+        strays = _active_live_outbound_elsewhere(client, sender, receiver)
+        if strays:
+            report(
+                f"  {label}: {len(strays)} active live stream(s) from the sender "
+                f"carry an unrecognised peer_source_id ({sorted(strays)}) — not "
+                f"widened; they were not opened by `snowline replicate pair`"
+            )
+        else:
+            report(
+                f"  {label}: no live outbound stream toward the receiver — not "
+                f"paired; run `snowline replicate pair` first (nothing to widen)"
+            )
+        return direction
+
+    for sub in subs:
+        direction.subscription_ids.append(sub["id"])
+        carried = set(sub.get("event_types") or [])
+        missing = [e for e in direction.target if e not in carried]
+        if not missing:
+            continue
+        if dry_run:
+            direction.added.extend(e for e in missing if e not in direction.added)
+            continue
+        resp = client.post(
+            f"{sender.admin_base}{VOCABULARY_ROUTE}",
+            json={"subscription_id": sub["id"], "event_types": direction.target},
+        )
+        if resp.status_code in (404, 405) and _is_unmounted(resp):
+            # Same shape as a contract_version mismatch: THIS direction is
+            # refused, the others still widen, the CLI exits non-zero.
+            direction.status = "refused"
+            report(
+                f"  {label}: REFUSE — {sender.name} at {sender.admin_base} has no "
+                f"{VOCABULARY_ROUTE} route; its SDK predates refresh-vocabulary "
+                f"(pm#133). Upgrade that side first, then re-run"
+            )
+            return direction
+        _raise_for_status(resp, f"POST {sender.admin_base}{VOCABULARY_ROUTE}")
+        for e in resp.json().get("added", []):
+            if e not in direction.added:
+                direction.added.append(e)
+
+    if direction.added:
+        direction.status = "would-widen" if dry_run else "widened"
+        verb = "would add" if dry_run else "added"
+        report(f"  {label}: {verb} {direction.added}")
+    else:
+        report(f"  {label}: already current ({len(direction.target)} event type(s))")
+    if direction.held_back:
+        report(
+            f"  {label}: held back {direction.held_back} — the receiver does "
+            f"not declare them yet; upgrade it and re-run"
+        )
+    return direction
+
+
+def _active_live_outbound_elsewhere(client, sender, receiver) -> set[str]:
+    """The `peer_source_id`s (as strings; None → "null") of the sender's
+    ACTIVE live outbound streams that do NOT point at the receiver — the
+    programmatic `create_outbound_subscription` defaults `peer_source_id` to
+    None, and such a stream is invisible to `live_outbound` yet blocks a
+    re-`pair` (the receiver already holds an active inbound). Reported, never
+    widened."""
+    resp = client.get(f"{sender.admin_base}/outbound")
+    _raise_for_status(resp, f"GET {sender.admin_base}/outbound")
+    rows = resp.json()
+    return {
+        str(r.get("peer_source_id"))
+        for r in rows
+        if r.get("active")
+        and r.get("source_id") == sender.source_id
+        and not is_backfill_source(r["source_id"])
+        and r.get("peer_source_id") != receiver.source_id
+    }
+
+
+def _is_unmounted(resp) -> bool:
+    """True when a 404/405 is the framework's no-such-route answer rather than
+    the vocabulary route's own 404 (unknown subscription id)."""
+    if resp.status_code == 405:
+        return True
+    try:
+        return resp.json().get("detail") == "Not Found"
+    except Exception:  # noqa: BLE001 - a non-JSON 404 is an unmounted path
+        return True
+
+
+def refresh_vocabulary(
+    client,
+    local: dict[str, Participant],
+    peer: dict[str, Participant],
+    *,
+    dry_run: bool = False,
+    report: Callable[[str], None] = print,
+) -> RefreshPlan:
+    """`snowline replicate refresh-vocabulary`: for every participant opted
+    into replication on BOTH instances, widen BOTH directed streams
+    (local→peer, peer→local) to sender.events ∩ receiver.events. A one-sided
+    participant is noted and skipped; a version-mismatched direction is
+    REFUSED (the other participants still refresh — each stream widens
+    independently) and shows up in `plan.refused` so the CLI exits non-zero.
+    Idempotent: a second run reports every direction "already current"."""
+    plan = RefreshPlan()
+    for name in sorted(set(local) | set(peer)):
+        l, p = local.get(name), peer.get(name)
+        if l is None or p is None:
+            present = "local" if l is not None else "peer"
+            plan.one_sided.append(name)
+            plan.notes.append(
+                f"WARN one-sided opt-in: {name!r} declares replication on the "
+                f"{present} instance only — skipped (no paired stream to widen)."
+            )
+            report(plan.notes[-1])
+            continue
+        report(f"refresh-vocabulary {name!r} (both directions)")
+        for sender, receiver in ((l, p), (p, l)):
+            plan.directions.append(
+                refresh_direction(
+                    client, sender, receiver, dry_run=dry_run, report=report
+                )
+            )
+    counts = {
+        status: sum(1 for d in plan.directions if d.status == status)
+        for status in ("widened", "would-widen", "current", "unpaired", "refused")
+    }
+    report(
+        ("dry-run: " if dry_run else "")
+        + f"{len(plan.directions)} directed stream(s): "
+        + ", ".join(f"{n} {status}" for status, n in counts.items() if n)
+        + (f"; {len(plan.one_sided)} one-sided" if plan.one_sided else "")
     )
     return plan
 

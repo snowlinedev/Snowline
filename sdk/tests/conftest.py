@@ -73,3 +73,14 @@ def _reset_replication_delivery_health():
     DELIVERY_HEALTH.reset()
     yield
     DELIVERY_HEALTH.reset()
+
+
+@pytest.fixture(autouse=True)
+def _reset_vocabulary_warned():
+    """The emit hook's warn-once set for streams lacking an event type (pm#133)
+    is process-wide: clear it so each test sees its own first warning."""
+    from snowline_plugin_sdk.replication import emit
+
+    emit._VOCABULARY_WARNED.clear()
+    yield
+    emit._VOCABULARY_WARNED.clear()

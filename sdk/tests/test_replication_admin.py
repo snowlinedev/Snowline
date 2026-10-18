@@ -237,6 +237,76 @@ def test_outbound_body_validation_edges(app_and_applied):
     assert empty_list.json()["event_types"] == []
 
 
+def test_widen_outbound_vocabulary_over_http(app_and_applied):
+    """`POST /outbound/vocabulary` (pm#133): set-union, idempotent, 400 on a
+    malformed body, 404 on an unknown id, 409 on a retired stream."""
+    app, _ = app_and_applied
+    sub = _request(
+        app, "POST", "/replication-admin/outbound",
+        json={
+            "target_url": "http://primary.plugin/events/ingest",
+            "secret": "handshake-minted",
+            "event_types": ["thing.recorded"],
+            "epoch": "e1",
+            "peer_source_id": "primary.plugin",
+        },
+    ).json()
+    path = "/replication-admin/outbound/vocabulary"
+
+    widened = _request(
+        app, "POST", path,
+        json={
+            "subscription_id": sub["id"],
+            "event_types": ["thing.added", "thing.recorded"],
+        },
+    )
+    assert widened.status_code == 200
+    body = widened.json()
+    assert body["event_types"] == ["thing.recorded", "thing.added"]
+    assert body["added"] == ["thing.added"]
+    assert "secret" not in body
+
+    again = _request(
+        app, "POST", path,
+        json={"subscription_id": sub["id"], "event_types": ["thing.added"]},
+    )
+    assert again.status_code == 200 and again.json()["added"] == []
+    listed = _request(app, "GET", "/replication-admin/outbound").json()
+    assert listed[0]["event_types"] == ["thing.recorded", "thing.added"]
+
+    no_types = _request(app, "POST", path, json={"subscription_id": sub["id"]})
+    assert no_types.status_code == 400
+    assert _request(
+        app, "POST", path, json={"subscription_id": sub["id"], "event_types": "thing.x"}
+    ).status_code == 400
+    assert _request(
+        app, "POST", path, json={"subscription_id": sub["id"], "event_types": [1]}
+    ).status_code == 400
+    assert _request(
+        app, "POST", path, json={"subscription_id": sub["id"], "event_types": [""]}
+    ).status_code == 400
+    assert _request(
+        app, "POST", path,
+        json={
+            "subscription_id": "00000000-0000-0000-0000-000000000000",
+            "event_types": [],
+        },
+    ).status_code == 404
+
+    _request(app, "POST", "/replication-admin/outbound/retire", json={"id": sub["id"]})
+    retired = _request(
+        app, "POST", path,
+        json={"subscription_id": sub["id"], "event_types": ["thing.later"]},
+    )
+    assert retired.status_code == 409
+    assert "retired" in retired.json()["detail"]
+
+    assert _request(
+        app, "POST", path, peer=HOTEL_LAN_PEER,
+        json={"subscription_id": sub["id"], "event_types": []},
+    ).status_code == 403
+
+
 def test_rejected_view_and_requeue_over_http(make_instance):
     """The sender-side dead-letter mirror (§3.1): /rejected surfaces a
     vocabulary-rejected row next to /parked, and the requeue action puts it
