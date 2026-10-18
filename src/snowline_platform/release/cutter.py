@@ -16,6 +16,7 @@ The order of operations is load-bearing:
   preflight (refuse on anything that would make a tag lie)
     -> plan the train (respin carry-forward, immutability check)
     -> per component: throwaway git worktree AT THE BLESSED SHA
+         -> tests (own venv in the tree, scratch DBs; never the live checkout)
          -> lock exports  (BEFORE stamping: `uv export --frozen` validates the
             lock against pyproject, and a stamped version would trip it)
          -> stamp versions -> uv build -> prune
@@ -46,6 +47,8 @@ from . import runner as r
 from .model import Component, ReleaseConfig, ReleaseError, Service, TrainPlan
 
 SMOKE_DB_PREFIX = "snowline_smoke_"
+TEST_DB_PREFIX = "snowline_cut_test_"
+TEST_VENV = ".venv-test"
 MANIFEST_RELPATH = Path("release/train.json")
 
 
@@ -116,18 +119,51 @@ class Cutter:
 
     # -- 2. tests ---------------------------------------------------------
 
-    def run_tests(self, comp: Component) -> None:
+    def run_tests(self, comp: Component, tree: Path) -> None:
+        """Run the component's test command INSIDE the throwaway build tree.
+
+        `tree` is the worktree `build` created at the blessed sha, so the tests
+        exercise exactly what will be tagged (not whatever the working tree
+        holds) and `uv run` never re-syncs a live hub checkout's `.venv` out
+        from under the source-run services (#293). The environment is a
+        separate venv inside the tree (`UV_PROJECT_ENVIRONMENT`), and the
+        DB-backed suites get scratch databases that are dropped afterwards."""
         if self.skip_tests:
             self.report(f"  tests skipped ({comp.name}) — --skip-tests")
             return
         if not comp.test:
             self.report(f"  no test command configured for {comp.name}")
             return
-        self.report(f"  tests: {' '.join(comp.test)} (in {self.checkout(comp)})")
-        # Run in the component's OWN checkout so `uv run` picks that project's
-        # venv and lock — pm's suite must never execute against the platform's
-        # environment.
-        self.runner.read(list(comp.test), cwd=self.checkout(comp), env=dict(comp.test_env))
+        self.report(f"  tests: {' '.join(comp.test)} (in {tree})")
+        env = dict(comp.test_env)
+        # The test venv lives BESIDE the tree (in the same throwaway tempdir,
+        # removed with it), never inside it: hatchling packs an in-tree venv
+        # into the sdist and `uv build` then fails on its absolute symlinks —
+        # no wheel, every cut dead at _prune. UV_LOCKED keeps `uv run` from
+        # rewriting the committed uv.lock before `uv export --frozen` reads it.
+        env["UV_PROJECT_ENVIRONMENT"] = str(tree.parent / TEST_VENV)
+        env["UV_LOCKED"] = "1"
+        # An operator-provided URL (autocut.env) always wins: that is the
+        # escape hatch for pointing the suites at a different Postgres.
+        scratch: list[str] = []
+        for var in comp.test_databases:
+            if os.environ.get(var):
+                continue
+            db = TEST_DB_PREFIX + var.removeprefix("SNOWLINE_").removesuffix(
+                "_TEST_DATABASE_URL"
+            ).lower()
+            env[var] = f"postgresql+psycopg:///{db}"
+            scratch.append(db)
+        try:
+            for db in scratch:
+                # --force: a leftover from a crashed cut may still hold a
+                # backend (a hung pytest); PG13+ terminates it.
+                self.runner.read(["dropdb", "--force", "--if-exists", db])
+                self.runner.read(["createdb", db])
+            self.runner.read(list(comp.test), cwd=tree, env=env)
+        finally:
+            for db in scratch:
+                self.runner.read(["dropdb", "--if-exists", db], check=False)
         self.report(f"  tests passed ({comp.name})")
 
     # -- 3. build ---------------------------------------------------------
@@ -138,6 +174,9 @@ class Cutter:
             shutil.rmtree(dist)
         dist.mkdir(parents=True, exist_ok=True)
         with _throwaway_worktree(self.runner, self.checkout(comp), sha, self.report) as tree:
+            # Tests first, against the pristine blessed tree: stamping below
+            # rewrites versions, and `uv run` must see the committed lock.
+            self.run_tests(comp, tree)
             self._export_locks(comp, tree, dist, version)
             self._stamp(comp, tree, version)
             self._build_wheels(comp, tree, dist)
@@ -587,7 +626,6 @@ def cut(
 
     for comp in to_build:
         report(f"\nbuild {comp.name}")
-        cutter.run_tests(comp)
         cutter.build(comp, plan.for_component(comp.name)[0].sha, version)
 
     report("\nmanifest")

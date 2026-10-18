@@ -184,12 +184,14 @@ passes `--force`.
 **Environment.** The plist sets `SNOWLINE_PLATFORM_URL`. Autocut uses it for
 the health gate and for the milestone gate, which skips without it, and
 autocut refuses a skipped gate. `--platform-url` overrides it. The wrapper
-also sources `~/.config/snowline/autocut.env` if the file exists. Put
-`SNOWLINE_PLATFORM_TEST_DATABASE_URL`, `SNOWLINE_GOVERNANCE_TEST_DATABASE_URL`
-and `SNOWLINE_MEMORY_TEST_DATABASE_URL` there, as
-`postgresql+psycopg:///<scratch db>`. **Without them the cut's platform test
-step skips every DB-backed test**, which leaves only the wheel smoke tests to
-guard the train.
+also sources `~/.config/snowline/autocut.env` if the file exists. The
+cutter runs each component's tests in its throwaway build tree (its own
+`.venv-test` beside the build tree, never the live checkout's `.venv`) against scratch databases it
+provisions and drops (`snowline_cut_test_<name>`). Set
+`SNOWLINE_PLATFORM_TEST_DATABASE_URL`, `SNOWLINE_GOVERNANCE_TEST_DATABASE_URL`,
+`SNOWLINE_MEMORY_TEST_DATABASE_URL` or `SNOWLINE_PM_TEST_DATABASE_URL` there
+only to point at a different Postgres; an operator-set URL is used as is and
+no scratch database is created for it.
 
 **Try it by hand:**
 `SNOWLINE_PLATFORM_URL=http://100.81.176.75:8850 .venv/bin/snowline release autocut --dry-run`.

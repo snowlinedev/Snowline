@@ -15,6 +15,7 @@ action.
 
 from __future__ import annotations
 
+import contextlib
 import json
 from pathlib import Path
 
@@ -38,9 +39,11 @@ class FakeRunner:
         self.reads: list[tuple[tuple[str, ...], Path | None]] = []
         self.runs: list[tuple[tuple[str, ...], Path | None]] = []
         self.report_lines: list[str] = []
+        self.read_envs: list[tuple[tuple[str, ...], dict[str, str]]] = []
 
     def read(self, argv, *, cwd=None, env=None, check=True):
         self.reads.append((tuple(argv), cwd))
+        self.read_envs.append((tuple(argv), dict(env or {})))
         out = self.handler(list(argv), cwd)
         if isinstance(out, Exception):
             if not check:
@@ -208,24 +211,114 @@ def test_missing_gh_auth_refuses_the_cut(config, checkouts, tmp_path):
         cut_mod.cut(config, "v0.1.0", checkouts=checkouts, out_dir=tmp_path / "b", runner=runner)
 
 
-# -- tests run in each repo's own environment ------------------------------
+# -- tests run in the throwaway build tree (#293) ---------------------------
+
+TEST_CMD = ("uv", "run", "python", "-m", "pytest", "-q")
+PM_DB_VAR = "SNOWLINE_PM_TEST_DATABASE_URL"
+PLATFORM_DB_VARS = (
+    "SNOWLINE_PLATFORM_TEST_DATABASE_URL",
+    "SNOWLINE_GOVERNANCE_TEST_DATABASE_URL",
+    "SNOWLINE_MEMORY_TEST_DATABASE_URL",
+)
 
 
-def test_component_tests_run_in_that_components_checkout(config, checkouts, tmp_path):
-    """pm's suite must execute against pm's own venv and lock, never the
-    platform's — `uv run` resolves the project from cwd."""
+@pytest.fixture(autouse=False)
+def clean_test_db_env(monkeypatch):
+    for var in (PM_DB_VAR, *PLATFORM_DB_VARS):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_component_tests_run_in_the_build_tree_with_own_venv(
+    config, checkouts, tmp_path, clean_test_db_env
+):
+    """The suite runs in the throwaway tree with a venv INSIDE it, so `uv run`
+    never re-syncs the live checkout's `.venv`."""
     runner = FakeRunner(make_handler())
     cutter = _cutter(config, checkouts, runner, tmp_path)
-    cutter.run_tests(config.component("pm"))
-    invocations = [(argv, cwd) for argv, cwd in runner.reads if argv[:2] == ("uv", "run")]
-    assert invocations == [(("uv", "run", "python", "-m", "pytest", "-q"), checkouts["pm"])]
+    tree = tmp_path / "tree"
+    cutter.run_tests(config.component("pm"), tree)
+    invocations = [(argv, cwd) for argv, cwd in runner.reads if argv == TEST_CMD]
+    assert invocations == [(TEST_CMD, tree)]
+    env = dict(runner.read_envs)[TEST_CMD]
+    assert env["UV_PROJECT_ENVIRONMENT"] == str(tree.parent / ".venv-test")  # beside, not inside
+    assert env["UV_LOCKED"] == "1"
+    assert str(checkouts["pm"]) not in " ".join(env.values())
+    assert any(f"(in {tree})" in line for line in runner.report_lines)
+    assert any("tests passed (pm)" in line for line in runner.report_lines)
+
+
+def test_build_runs_tests_in_the_worktree_never_the_checkout(
+    config, checkouts, tmp_path, clean_test_db_env
+):
+    runner = FakeRunner(make_handler())
+    cutter = _cutter(config, checkouts, runner, tmp_path)
+    pm = config.component("pm")
+    with contextlib.suppress(Exception):  # the fake world has no pyproject to build
+        cutter.build(pm, PM_SHA, "v0.1.0")
+    ran = [cwd for argv, cwd in runner.reads if argv == TEST_CMD]
+    assert len(ran) == 1
+    assert ran[0] != checkouts["pm"] and ran[0].name == "tree"
+    assert runner.did_read("git", "worktree", "add")
+
+
+def test_platform_tests_get_scratch_dbs_dropped_on_success(
+    config, checkouts, tmp_path, clean_test_db_env
+):
+    runner = FakeRunner(make_handler())
+    cutter = _cutter(config, checkouts, runner, tmp_path)
+    cutter.run_tests(config.component("platform"), tmp_path / "tree")
+    env = dict(runner.read_envs)[TEST_CMD]
+    dbs = {
+        "SNOWLINE_PLATFORM_TEST_DATABASE_URL": "snowline_cut_test_platform",
+        "SNOWLINE_GOVERNANCE_TEST_DATABASE_URL": "snowline_cut_test_governance",
+        "SNOWLINE_MEMORY_TEST_DATABASE_URL": "snowline_cut_test_memory",
+    }
+    for var, db in dbs.items():
+        assert env[var] == f"postgresql+psycopg:///{db}"
+        assert runner.did_read("createdb", db)
+    argvs = [a for a, _ in runner.reads]
+    for db in dbs.values():
+        assert argvs.index(("createdb", db)) < argvs.index(TEST_CMD)
+        assert argvs.index(TEST_CMD) < len(argvs) - 1 - argvs[::-1].index(
+            ("dropdb", "--if-exists", db)
+        )
+
+
+def test_scratch_dbs_dropped_when_tests_fail(config, checkouts, tmp_path, clean_test_db_env):
+    def handler(argv, cwd):
+        if tuple(argv) == TEST_CMD:
+            return runner_mod.CommandError(argv, 1, "1 failed")
+        return make_handler()(argv, cwd)
+
+    runner = FakeRunner(handler)
+    cutter = _cutter(config, checkouts, runner, tmp_path)
+    with pytest.raises(runner_mod.CommandError):
+        cutter.run_tests(config.component("pm"), tmp_path / "tree")
+    argvs = [a for a, _ in runner.reads]
+    assert argvs[-1] == ("dropdb", "--if-exists", "snowline_cut_test_pm")
+    assert not any("tests passed" in line for line in runner.report_lines)
+
+
+def test_operator_provided_test_db_url_is_preserved(
+    config, checkouts, tmp_path, clean_test_db_env, monkeypatch
+):
+    monkeypatch.setenv(PM_DB_VAR, "postgresql+psycopg://other-host/mine")
+    runner = FakeRunner(make_handler())
+    cutter = _cutter(config, checkouts, runner, tmp_path)
+    cutter.run_tests(config.component("pm"), tmp_path / "tree")
+    env = dict(runner.read_envs)[TEST_CMD]
+    assert PM_DB_VAR not in env  # inherited from os.environ untouched
+    assert not runner.did_read("createdb")
+    assert not runner.did_read("dropdb")
 
 
 def test_skip_tests_runs_nothing(config, checkouts, tmp_path):
     runner = FakeRunner(make_handler())
     cutter = _cutter(config, checkouts, runner, tmp_path, skip_tests=True)
-    cutter.run_tests(config.component("pm"))
+    cutter.run_tests(config.component("pm"), tmp_path / "tree")
     assert not runner.did_read("uv", "run")
+    assert not runner.did_read("createdb")
+    assert any("tests skipped (pm)" in line for line in runner.report_lines)
 
 
 # -- lock exports + the SDK-pin rewrite ------------------------------------
