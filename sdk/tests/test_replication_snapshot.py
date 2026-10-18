@@ -387,9 +387,23 @@ def _snapshot_dirs(root):
     return [p for p in root.iterdir() if p.name.startswith("snowline-snapshot-")]
 
 
-async def _drive_asgi(app, body: bytes, secret: str, *, disconnect_after: int | None):
+async def _drive_asgi(
+    app,
+    body: bytes,
+    secret: str,
+    *,
+    disconnect_after: int | None,
+    spec_version: str | None = None,
+    send_raises: bool = False,
+):
     """Call the app as a raw ASGI server: httpx's ASGITransport buffers the
-    whole response, so it cannot model a client that goes away mid-stream."""
+    whole response, so it cannot model a client that goes away mid-stream.
+
+    Starlette has two disconnect paths keyed on `scope["asgi"]["spec_version"]`:
+    below 2.4 it listens for `http.disconnect` in a task group and cancels the
+    stream (what uvicorn advertises today); from 2.4 the server surfaces the
+    gone client as an OSError from `send`, which Starlette re-raises as
+    ClientDisconnect. `send_raises=True` models the latter."""
     sent_body = 0
     disconnected = anyio.Event()
     request_sent = False
@@ -402,16 +416,26 @@ async def _drive_asgi(app, body: bytes, secret: str, *, disconnect_after: int | 
         await disconnected.wait()
         return {"type": "http.disconnect"}
 
+    raised = False
+
     async def send(message):
-        nonlocal sent_body
+        nonlocal sent_body, raised
+        if raised:
+            return  # the client is gone: swallow the 500 the error middleware sends
         if message["type"] == "http.response.body" and message.get("body"):
             sent_body += 1
             if disconnect_after is not None and sent_body >= disconnect_after:
+                if send_raises:
+                    raised = True
+                    raise OSError("client went away")
                 disconnected.set()
 
+    asgi = {"version": "3.0"}
+    if spec_version is not None:
+        asgi["spec_version"] = spec_version
     scope = {
         "type": "http",
-        "asgi": {"version": "3.0"},
+        "asgi": asgi,
         "http_version": "1.1",
         "method": "POST",
         "path": SNAPSHOT_PATH,
@@ -452,13 +476,13 @@ def test_temp_dump_is_removed_when_the_client_disconnects_mid_stream(
     # Keep the abandoned generator alive: cleanup must not depend on its
     # finalisation (the point of the BackgroundTask).
     keep = []
-    real_chunks = admin_mod.StreamingResponse
+    real_response = admin_mod._SnapshotResponse
 
     def capturing(content, *a, **kw):
         keep.append(content)
-        return real_chunks(content, *a, **kw)
+        return real_response(content, *a, **kw)
 
-    monkeypatch.setattr(admin_mod, "StreamingResponse", capturing)
+    monkeypatch.setattr(admin_mod, "_SnapshotResponse", capturing)
     app, sessions = app_and_sessions
     _prime(sessions)
 
@@ -466,6 +490,42 @@ def test_temp_dump_is_removed_when_the_client_disconnects_mid_stream(
         lambda: _drive_asgi(app, _body(), "s3cret-stream-key", disconnect_after=1)
     )
 
+    n_chunks = len(ARCHIVE) // 4
     assert keep, "the route should have streamed"
-    assert sent < len(ARCHIVE) // 4 + 1  # the stream really was cut short
+    assert sent < n_chunks  # the stream really was cut short
+    assert _snapshot_dirs(tmp_path) == []
+
+
+def test_temp_dump_is_removed_on_the_spec_2_4_disconnect_path(
+    app_and_sessions, fake_pg_dump, tmp_path, monkeypatch
+):
+    # ASGI spec >= 2.4: Starlette does not run a task group; the server's
+    # `send` raises OSError once the client is gone and Starlette re-raises
+    # ClientDisconnect — a path on which a BackgroundTask would never run.
+    # Cleanup must still happen (response-level `finally`).
+    from starlette.requests import ClientDisconnect
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(admin_mod, "SNAPSHOT_CHUNK_BYTES", 4)
+    keep = []
+    real_response = admin_mod._SnapshotResponse
+
+    def capturing(content, *a, **kw):
+        keep.append(content)
+        return real_response(content, *a, **kw)
+
+    monkeypatch.setattr(admin_mod, "_SnapshotResponse", capturing)
+    app, sessions = app_and_sessions
+    _prime(sessions)
+
+    async def run():
+        with pytest.raises(ClientDisconnect):
+            await _drive_asgi(
+                app, _body(), "s3cret-stream-key",
+                disconnect_after=1, spec_version="2.4", send_raises=True,
+            )
+
+    anyio.run(run)
+
+    assert keep, "the route should have streamed"
     assert _snapshot_dirs(tmp_path) == []
