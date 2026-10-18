@@ -487,6 +487,110 @@ command for why it is a parallel report rather than a reuse of `sync`'s
   runbook's §6 procedure end to end, including the fresh-epoch retirement of
   the old streams.
 
+## 6e. Failover front — one MCP URL that survives the hub going dark (#260)
+
+The MBP's Claude Code normally talks to the hub (the mini's gateway,
+`http://100.81.176.75:8850`) so it always has the newest fixes. When the mini
+loses power, work must continue against the MBP's own spoke — usually with the
+operator on a phone driving a remote-control session, where "edit the MCP URL"
+is not an available step. The **failover front** makes that automatic.
+
+It is a tiny loopback-only reverse proxy on the spoke at **`127.0.0.1:8850`**
+(the hub gateway's own port), stack-managed like the services: `snowline stack
+sync` renders `~/Library/LaunchAgents/dev.snowline.front.plist` (it runs the
+PLATFORM venv's `uvicorn --factory snowline_platform.front:create_app`, so a
+platform train swap upgrades it too and sync kickstarts it alongside) and
+`~/.config/snowline/front.env` (operator-owned, never clobbered — drift is
+reported like the other env files). `SNOWLINE_FRONT_HUB_URL` comes from
+`stack.json`'s `primary_gateway_url` (or the `http://<primary>:8850` default
+bootstrap-spoke would prompt with). Post-sync and post-boot health checks
+probe `http://127.0.0.1:8850/front/health` alongside the gateway's `/health`.
+The hub never gets one: `stack sync` is spoke-only (decision 54447516).
+
+**Routing.** Every request is forwarded verbatim (method, raw path, query,
+body, headers minus hop-by-hop; responses stream unbuffered, so MCP's
+`text/event-stream` replies pass straight through) to ONE upstream:
+
+- the **hub** while a background probe of `<hub>/health` answers **200**
+  within 2 s (a `"status": "degraded"` body is still a 200 and still
+  routable — only non-200, unreachable or timeout counts as a failure);
+- the **local spoke platform** (`http://127.0.0.1:8848`) otherwise.
+
+Probes run every 5 s. Hysteresis: flip hub→spoke after **2** consecutive
+failures (~10 s), back spoke→hub only after **6** consecutive successes (~30 s
+stable) — a flapping hub keeps you on the spoke rather than flapping with it.
+At boot the first probe picks the starting upstream directly. The choice is
+per request, at request start; a request in flight when a flip happens finishes
+against its original upstream, and an upstream failure on a request is a 502
+naming that upstream — **never** retried against the other one (no double
+writes). This is safe because every MCP surface is stateless
+(deploy-continuity §2, layer 1): there is no session to orphan when the
+upstream changes under a client. Every flip is logged at WARNING to
+`~/Library/Application Support/Snowline/logs/snowline-front.err.log`.
+
+**Convergence.** Writes made against the spoke during an outage converge to the
+hub via the existing bidirectional pairing (replication-continuity §4, decision
+0b8390f7) once it is back — the spoke→primary stream's outbox delivers them.
+The front changes nothing on the wire.
+
+### Claude Code's MCP entry (on the MBP)
+
+Point the `snowline` MCP server at the front — the same path as the hub's,
+only the host changes:
+
+```bash
+claude mcp remove snowline            # the old entry pointing at 100.81.176.75:8850
+claude mcp add --transport http snowline http://127.0.0.1:8850/mcp
+```
+
+(pass the same `-s/--scope` the old entry had — e.g. `-s user` — to both.)
+
+(or set `"url": "http://127.0.0.1:8850/mcp"` on the `snowline` server in the
+MCP config by hand). Nothing else changes: the hub sees the MBP's tailnet
+address as the peer exactly as before, the spoke sees loopback (`owner`), and
+the caller's own headers (incl. any `Authorization`) go up unchanged.
+
+**Dashboard.** The front forwards `/ui` too, so `http://127.0.0.1:8850/ui` on
+the MBP is the hub's dashboard while the hub is up and the spoke's own while it
+is not — bookmark that instead of the hub URL. (Absolute redirects from either
+upstream are rewritten back onto the front.)
+
+### Reading `/front/health`
+
+`GET http://127.0.0.1:8850/front/health` is served by the front itself and
+never proxied (`/health` IS proxied, so it stays the truthful answer of
+whichever upstream served it — the `X-Snowline-Front: hub|spoke` response
+header on every proxied reply says which):
+
+```bash
+curl -s http://127.0.0.1:8850/front/health | jq
+# {"status": "ok", "upstream": "hub", "hub_url": "http://100.81.176.75:8850",
+#  "spoke_url": "http://127.0.0.1:8848", "hub_healthy": true,
+#  "last_probe_at": "...", "last_flip_at": null, "flips": 0,
+#  "consecutive_failures": 0, "consecutive_successes": 42,
+#  "forced": null, "fail_threshold": 2, "recover_threshold": 6}
+```
+
+`upstream` is where writes are going right now. The shape is stable and
+additive-only (the standby readiness surface, item 5bb2a79c, reads it).
+
+### Forcing an upstream (debugging)
+
+Uncomment `SNOWLINE_FRONT_FORCE_UPSTREAM=hub|spoke` in
+`~/.config/snowline/front.env` and restart the front:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/dev.snowline.front
+```
+
+Forced, it never flips (the probe still runs, so `hub_healthy` stays truthful;
+`/front/health` shows `"forced": "spoke"`). Comment it out and kickstart again
+to restore automatic routing. The probe/hysteresis knobs
+(`SNOWLINE_FRONT_PROBE_INTERVAL`, `_PROBE_TIMEOUT`, `_FAIL_THRESHOLD`,
+`_RECOVER_THRESHOLD`, `_READ_TIMEOUT`) live in the same file. To run a front
+by hand instead (e.g. on another port): `SNOWLINE_FRONT_HUB_URL=… snowline
+front --bind 127.0.0.1:18850` — the bind is refused unless it is loopback.
+
 ## 7. Acceptance — the §10 criteria and how to check each
 
 Availability (verify with real tailscale — see "Manual steps" below):
