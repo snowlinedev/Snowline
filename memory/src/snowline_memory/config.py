@@ -47,6 +47,15 @@ DEFAULT_BASE_URL = "http://127.0.0.1:8802"
 DEFAULT_SOURCE_ID = "local.memory"
 
 
+def escape_for_config(value: str) -> str:
+    """Escape a value for Alembic's `Config.set_main_option`. The Config rides
+    configparser, whose interpolation treats a bare `%` as syntax, so a
+    percent-encoded credential (`%40` for `@`) or a path containing `%` raises
+    ValueError. Readers get the original back (configparser collapses `%%` to
+    `%` on read), so this is a pure storage escape."""
+    return value.replace("%", "%%")
+
+
 def database_url() -> str:
     return os.environ.get("SNOWLINE_MEMORY_DATABASE_URL", DEFAULT_DATABASE_URL)
 

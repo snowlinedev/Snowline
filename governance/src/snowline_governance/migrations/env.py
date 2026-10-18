@@ -2,11 +2,11 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 from snowline_plugin_sdk.replication.models import ReplicationBase
 
-from snowline_governance.config import database_url
+from snowline_governance.config import database_url, escape_for_config
 from snowline_governance.models import Base
 
 config = context.config
-config.set_main_option("sqlalchemy.url", database_url())
+config.set_main_option("sqlalchemy.url", escape_for_config(database_url()))
 
 # Governance's own metadata PLUS the adopted SDK replication tables
 # (replication-continuity §4, #79) — so autogenerate compares against the full

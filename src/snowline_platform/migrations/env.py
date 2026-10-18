@@ -1,12 +1,12 @@
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
-from snowline_platform.config import database_url
+from snowline_platform.config import database_url, escape_for_config
 from snowline_platform.models import Base
 from snowline_plugin_sdk.replication.models import ReplicationBase
 
 config = context.config
-config.set_main_option("sqlalchemy.url", database_url())
+config.set_main_option("sqlalchemy.url", escape_for_config(database_url()))
 
 # Two metadatas: the platform's own `Scope` table, and the SDK's replication
 # tables the platform adopts (spec §8, issue #81) — a SEPARATE metadata by
