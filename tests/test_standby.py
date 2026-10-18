@@ -299,6 +299,25 @@ def test_assess_peer_splits_directions():
     assert "the failover front is routing to the spoke" in row["notes"]
 
 
+def test_sync_trouble_note_survives_the_auto_skip_that_follows_a_revert():
+    """A revert at 10:00 then an hourly `skipped` report must not make the
+    standby note vanish (the skip detail says 'last attempt reverted')."""
+    def note_for(sync):
+        row = standby.assess_peer(
+            peer={"peer": "MBP", "platform_url": PEER_URL},
+            fetched={"reachable": True, "snapshot": {"train": {"version": "v0.5.1"},
+                     "services": {"platform": "v0.5.1"}, "streams": []},
+                     "reports": {"sync": sync}},
+            hub_streams=[], hub_instance="mini", hub_cut="v0.5.1",
+            autocut=None, data_threshold=900, code_max=0,
+        )
+        return row["notes"]
+    assert "last stack sync reverted: d" in note_for({"outcome": "reverted", "detail": "d"})
+    skipped = note_for({"outcome": "skipped", "detail": "train v0.5.2 last attempt reverted at T; waiting"})
+    assert any(n.startswith("last stack sync skipped") and "reverted" in n for n in skipped)
+    assert note_for({"outcome": "noop", "detail": None}) == []
+
+
 def test_assess_peer_falls_back_to_manifest_train():
     row = standby.assess_peer(
         peer={"peer": "MBP", "platform_url": PEER_URL},

@@ -118,7 +118,7 @@ PLATFORM_PACKAGE = "snowline-platform"
 
 # The autocut outcomes that mean "a train was published" (release/autocut.py).
 _PUBLISHED_OUTCOMES = {"ok", "published_unrecorded", "recorded"}
-_SYNC_TROUBLE = {"failed", "reverted", "needs_attention"}
+_SYNC_TROUBLE = {"failed", "reverted", "needs_attention", "skipped"}
 
 
 # --------------------------------------------------------------------------
