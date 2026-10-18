@@ -1642,6 +1642,9 @@ def test_no_reexec_on_a_rollback_or_when_already_running_the_new_venv(tmp_path, 
     home = _upgraded_home(tmp_path)
     _fake_new_cli(home)
     monkeypatch.setattr(s, "running_under", lambda venv: True)
+    # (the stale-venv guard also consults running_under; this test pre-creates
+    # the venv dir, so neutralise just that guard)
+    monkeypatch.setattr(s, "note_stale_venv", lambda *a, **k: False)
     assert _sync_v2(home).outcome == "ok"
     assert execs == []
     monkeypatch.undo()
@@ -1791,18 +1794,44 @@ def test_repeated_reverts_prune_older_reverted_dirs(tmp_path):
         assert len(names) == 1
 
 
-def test_upgrade_health_budget_is_120_polls_and_env_overridable(tmp_path, monkeypatch):
-    assert s.UPGRADE_HEALTH_ATTEMPTS == 120
+def test_upgrade_health_budget_is_120_s_and_env_overridable(tmp_path, monkeypatch):
+    assert s.UPGRADE_HEALTH_BUDGET_S == 120
     home = _installed_v1(tmp_path)
-    _, runner = _revert_v2(home)
+    rpt, runner = _revert_v2(home)
     gateway_polls = [r for r in runner.reads if r[0] == "curl" and r[-1] == GATEWAY_URL]
-    # 120 upgrade polls + 30 post-revert polls
-    assert len(gateway_polls) == 120 + 30
+    # 120 upgrade polls + the SAME budget after the revert kick (not 30)
+    assert len(gateway_polls) == 120 + 120
+    assert rpt.health_diagnostic["polls"] == 120
+    assert "post_revert" in rpt.health_diagnostic
 
     monkeypatch.setenv(s.HEALTH_BUDGET_ENV, "7")
-    assert s.upgrade_health_attempts() == 7
+    assert s.upgrade_health_budget_s() == 7
     monkeypatch.setenv(s.HEALTH_BUDGET_ENV, "junk")
-    assert s.upgrade_health_attempts() == 120
+    assert s.upgrade_health_budget_s() == 120
+
+
+def test_post_revert_health_gets_the_full_budget_and_can_succeed_late(tmp_path):
+    """The previous train booting in 45 s must not read as a failed revert."""
+    home = _installed_v1(tmp_path)
+    state = {"reverted": False, "n": 0}
+
+    def inner(argv, cwd):
+        if argv[:3] == ["launchctl", "kickstart", "-k"] and state.get("seen_fail"):
+            state["reverted"] = True
+        return _full_fake_handler(argv, cwd)
+
+    def fail(argv):
+        if argv[-1] != GATEWAY_URL:
+            return False
+        if not state["reverted"]:
+            state["seen_fail"] = state["n"] >= 0
+            state["n"] += 1
+            return True
+        state["n"] += 1
+        return state["n"] < 120 + 45  # healthy only after 45 polls post-revert
+
+    rpt = _quiet(home, FakeRunner(_uv_aware(inner, fail_curl=fail)), train="v0.2.0")
+    assert rpt.outcome == "reverted" and rpt.health_ok is True
 
 
 def test_noop_path_keeps_its_short_poll(tmp_path):
@@ -1810,7 +1839,8 @@ def test_noop_path_keeps_its_short_poll(tmp_path):
     runner = FakeRunner(_uv_aware(_full_fake_handler, fail_curl=lambda a: True))
     rpt = _quiet(home, runner, train="v0.1.0")
     assert rpt.noop and rpt.health_ok is False
-    assert len([r for r in runner.reads if r[0] == "curl"]) == 3
+    assert len([r for r in runner.reads if r[0] == "curl" and r[-1] == GATEWAY_URL]) == 3
+    assert rpt.health_diagnostic["polls"] == 3
 
 
 def test_slow_service_is_named_and_diagnostic_is_captured_and_persisted(tmp_path):
@@ -1832,7 +1862,7 @@ def test_slow_service_is_named_and_diagnostic_is_captured_and_persisted(tmp_path
     rpt = _quiet(home, FakeRunner(_uv_aware(inner, fail_curl=fail)), train="v0.2.0")
     assert rpt.outcome == "reverted"
     diag = rpt.health_diagnostic
-    assert diag["budget_polls"] == 120
+    assert diag["polls"] == 120 and diag["budget_s"] == 120
     assert diag["not_answering"] == ["platform", "pm"]
     svcs = diag["services"]
     assert svcs["governance"]["answered"] is True and svcs["governance"]["answered_at_poll"] == 1
@@ -1865,6 +1895,55 @@ def test_auto_skips_a_train_whose_last_attempt_reverted(tmp_path):
     assert json.loads(m.report_path(home).read_text())["outcome"] == "skipped"
     # the skip does not hide the revert: a second --auto still skips
     assert _quiet(home, FakeRunner(_uv_aware(_full_fake_handler)), auto=True).outcome == "skipped"
+
+
+def test_skip_still_reconciles_and_health_checks(tmp_path):
+    home = _installed_v1(tmp_path)
+    _revert_v2(home)
+    runner = FakeRunner(_uv_aware(_full_fake_handler))
+    rpt = _quiet(home, runner, auto=True)
+    assert rpt.outcome == "skipped" and rpt.health_ok is True and rpt.units
+    assert [u.name for u in rpt.units]  # units reconciled
+
+
+def test_skip_with_a_dead_gateway_is_needs_attention_with_a_diagnostic(tmp_path):
+    home = _installed_v1(tmp_path)
+    _revert_v2(home)
+    runner = FakeRunner(_uv_aware(_full_fake_handler, fail_curl=lambda a: a[-1] == GATEWAY_URL))
+    rpt = _quiet(home, runner, auto=True)
+    assert rpt.outcome == "needs_attention" and rpt.health_ok is False
+    assert m.exit_code(rpt.outcome) == 1
+    assert "waiting for a newer train" in rpt.detail and "FAILED" in rpt.detail
+    assert rpt.health_diagnostic["polls"] == 3
+    # the needs_attention skip-path report does not hide the revert: still skipping
+    runner2 = FakeRunner(_uv_aware(_full_fake_handler))
+    assert _quiet(home, runner2, auto=True).outcome == "skipped"
+    assert not runner2.ran("uv")
+
+
+def test_needs_attention_followed_by_a_manual_rollback_does_not_skip_the_train(tmp_path):
+    """A front-caused needs_attention leaves current == target; after a manual
+    rollback to vPrev, --auto must retry X rather than freeze it."""
+    home = _installed_v1(tmp_path)
+    dead_front = _uv_aware(_full_fake_handler, fail_curl=lambda a: a[-1] == s.FRONT_HEALTH_URL)
+    up = _quiet(home, FakeRunner(dead_front), train="v0.2.0")
+    assert up.outcome == "needs_attention"
+    back = _quiet(home, FakeRunner(_uv_aware(_full_fake_handler)), train="v0.1.0")
+    assert back.outcome == "ok"
+    runner = FakeRunner(_uv_aware(_full_fake_handler))
+    rpt = _quiet(home, runner, auto=True)
+    assert rpt.outcome == "ok" and rpt.train == "v0.2.0"
+
+
+def test_build_service_venv_refuses_the_venv_the_cli_runs_from(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    manifest = m.parse_train_manifest(TRAIN_V1)
+    venv = m.service_venv_dir(home, "platform", "v0.1.0")
+    venv.mkdir(parents=True)
+    monkeypatch.setattr(s.sys, "prefix", str(venv))
+    with pytest.raises(m.StackError):
+        s.build_service_venv(FakeRunner(), home=home, train="v0.1.0", manifest=manifest,
+                             service="platform", find_links=[])
 
 
 def test_manual_sync_retries_a_reverted_train(tmp_path):

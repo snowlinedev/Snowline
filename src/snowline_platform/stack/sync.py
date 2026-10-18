@@ -310,9 +310,9 @@ def note_stale_venv(home: Path, service: str, venv_dir: Path, *, report: Report 
         live = link.resolve() == venv_dir.resolve()
     except OSError:
         live = False
-    if live:
+    if live or running_under(venv_dir):
         raise m.StackError(
-            f"{venv_dir} is the live `current` venv for {service} — refusing to rebuild it in place"
+            f"{venv_dir} is the live `current` venv for {service} (or the venv this CLI runs from) — refusing to rebuild it in place"
         )
     report(f"replacing stale {service} venv {venv_dir} (uv venv --clear)")
     return True
@@ -967,19 +967,21 @@ def check_health(
 
 # Post-UPGRADE health budget (4f9dfc47): a cold boot with all four services
 # boot-migrating at once outlasted the old 30 s poll and false-reverted a good
-# train. ~1 s per poll. Override: SNOWLINE_SYNC_HEALTH_BUDGET_S (seconds).
-UPGRADE_HEALTH_ATTEMPTS = 120
+# train. A WALL-CLOCK budget in seconds (each poll's own cost counts, so a
+# hanging gateway cannot stretch it). Override: SNOWLINE_SYNC_HEALTH_BUDGET_S.
+UPGRADE_HEALTH_BUDGET_S = 120.0
 HEALTH_BUDGET_ENV = "SNOWLINE_SYNC_HEALTH_BUDGET_S"
+DIAG_LOG_TAIL_BYTES = 64 * 1024
 
 
-def upgrade_health_attempts() -> int:
+def upgrade_health_budget_s() -> float:
     raw = os.environ.get(HEALTH_BUDGET_ENV, "").strip()
     if raw:
         try:
-            return max(1, int(float(raw)))
+            return max(1.0, float(raw))
         except ValueError:
             pass
-    return UPGRADE_HEALTH_ATTEMPTS
+    return UPGRADE_HEALTH_BUDGET_S
 
 
 def service_health_urls(health_url: str = DEFAULT_HEALTH_URL) -> dict[str, str]:
@@ -991,7 +993,7 @@ def service_health_urls(health_url: str = DEFAULT_HEALTH_URL) -> dict[str, str]:
 
 @dataclass
 class ServiceProbe:
-    """Per-service health observed during the upgrade budget."""
+    """Per-service health observed during the budget."""
     url: str
     answered_at_poll: int | None = None  # 1-based; None = never answered
     last_error: str | None = None
@@ -1001,38 +1003,77 @@ def poll_upgrade_health(
     runner: Runner,
     health_url: str,
     *,
-    attempts: int,
+    budget_s: float | None = None,
+    attempts: int | None = None,
     sleep: Callable[[float], None] = time.sleep,
     delay: float = 1.0,
-) -> tuple[bool, dict[str, ServiceProbe]]:
-    """Poll the gateway for up to `attempts`; while it is not answering, also
-    poll each service's own /health so a failed upgrade can name WHICH service
-    was slow. Only the gateway decides the result."""
+) -> tuple[bool, dict[str, ServiceProbe], int]:
+    """Poll the gateway until it answers, `budget_s` seconds of wall clock
+    (poll time + sleeps) are spent, or `attempts` polls are made. While the
+    gateway is not answering, each service's own /health is polled too so a
+    failed upgrade can name WHICH service was slow. Only the gateway decides
+    the result. Returns `(gateway_ok, probes, polls_made)`."""
     probes = {svc: ServiceProbe(url) for svc, url in service_health_urls(health_url).items()}
-    for i in range(attempts):
+    elapsed = 0.0
+    polls = 0
+    while True:
+        polls += 1
+        t0 = time.monotonic()
         for probe in probes.values():
             if probe.answered_at_poll is not None:
                 continue
             try:
                 runner.read(["curl", "-fsS", "--max-time", "5", probe.url])
-                probe.answered_at_poll = i + 1
+                probe.answered_at_poll = polls
             except CommandError as exc:
                 probe.last_error = str(exc)[:200]
+        elapsed += time.monotonic() - t0
         if probes["platform"].answered_at_poll is not None:
-            return True, probes
-        if i + 1 < attempts:
-            sleep(delay)
-    return False, probes
+            return True, probes, polls
+        if attempts is not None and polls >= attempts:
+            return False, probes, polls
+        elapsed += delay
+        if budget_s is not None and elapsed >= budget_s:
+            return False, probes, polls
+        sleep(delay)
+
+
+def stack_health(
+    runner: Runner,
+    health_url: str,
+    *,
+    budget_s: float | None = None,
+    attempts: int | None = None,
+    front_attempts: int = 30,
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[bool, bool | None, dict[str, ServiceProbe], int]:
+    """`check_stack_health` with per-service probes: `(gateway_ok, front_ok,
+    probes, polls)`; `front_ok` is None when the gateway failed."""
+    gw_ok, probes, polls = poll_upgrade_health(
+        runner, health_url, budget_s=budget_s, attempts=attempts, sleep=sleep
+    )
+    if not gw_ok:
+        return False, None, probes, polls
+    return True, check_health(runner, FRONT_HEALTH_URL, attempts=front_attempts, sleep=sleep), probes, polls
+
+
+def _tail_lines(path: Path, n: int) -> list[str]:
+    with path.open("rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        fh.seek(max(0, size - DIAG_LOG_TAIL_BYTES))
+        data = fh.read()
+    return data.decode(errors="replace").splitlines()[-n:]
 
 
 def capture_health_diagnostic(
-    runner: Runner, home: Path, probes: Mapping[str, ServiceProbe], *, attempts: int,
-    tail_lines: int = 40,
+    runner: Runner, home: Path, probes: Mapping[str, ServiceProbe], *,
+    budget_s: float, polls: int, tail_lines: int = 40,
 ) -> dict:
     """What the report keeps when an upgrade is declared unhealthy: per
     service the err.log tail, launchd state and whether its /health answered."""
     uid = os.getuid()
-    diag: dict = {"budget_polls": attempts, "services": {}}
+    diag: dict = {"budget_s": budget_s, "polls": polls, "services": {}}
     for svc, probe in probes.items():
         entry: dict = {
             "health_url": probe.url,
@@ -1040,9 +1081,8 @@ def capture_health_diagnostic(
             "answered_at_poll": probe.answered_at_poll,
             "last_error": probe.last_error,
         }
-        log = m.service_err_log_path(home, svc)
         try:
-            entry["err_log_tail"] = log.read_text(errors="replace").splitlines()[-tail_lines:]
+            entry["err_log_tail"] = _tail_lines(m.service_err_log_path(home, svc), tail_lines)
         except OSError as exc:
             entry["err_log_tail"] = [f"(unreadable: {exc})"]
         try:
@@ -1051,10 +1091,9 @@ def capture_health_diagnostic(
             out = f"(launchctl print failed: {exc})"
         keep = [ln.strip() for ln in out.splitlines()
                 if re.match(r"\s*(state|pid|runs|last exit code|active count|program)\b", ln)]
-        entry["launchctl"] = keep[:12] if keep else out.splitlines()[:12]
+        entry["launchctl"] = keep[:12] or out.splitlines()[:12] or ["(no output — not loaded?)"]
         diag["services"][svc] = entry
-    slow = [svc for svc, p in probes.items() if p.answered_at_poll is None]
-    diag["not_answering"] = slow
+    diag["not_answering"] = [svc for svc, p in probes.items() if p.answered_at_poll is None]
     return diag
 
 
@@ -1128,7 +1167,9 @@ def last_attempt_for_train(home: Path, train: str) -> dict | None:
             continue
         if not isinstance(data, dict) or data.get("train") != train:
             continue
-        if data.get("outcome") in ("skipped", "locked"):
+        # skipped / locked / noop-path reports are not attempts: they must
+        # never hide the revert a skip is waiting out.
+        if data.get("outcome") in ("skipped", "locked") or data.get("noop"):
             continue
         return data
     return None
@@ -1267,9 +1308,16 @@ def run_sync(
                 resumed_from = None
             units = reconcile_units(home, cfg, runner, dry_run=dry_run, timer_run=timer_run)
             kicked_any = any(u.kicked is not None for u in units)
-            noop_health, noop_front = (None, None) if dry_run else check_stack_health(
-                runner, health_url, attempts=30 if kicked_any else 3, sleep=health_sleep
-            )
+            noop_diag: dict | None = None
+            noop_health, noop_front = None, None
+            if not dry_run:
+                noop_health, noop_front, nprobes, npolls = stack_health(
+                    runner, health_url, sleep=health_sleep,
+                    **({"budget_s": 30.0} if kicked_any else {"attempts": 3}),
+                )
+                if noop_health is False:
+                    noop_diag = capture_health_diagnostic(
+                        runner, home, nprobes, budget_s=30.0 if kicked_any else 3.0, polls=npolls)
             unhealthy = noop_health is False
             front_down = noop_health is True and noop_front is False
             key_kick_failed = _key_kick_failed(units)
@@ -1319,6 +1367,7 @@ def run_sync(
                 health_ok=noop_health, outcome=outcome, detail=detail,
                 env_drift=tuple(env_drift), front_kickstarted=front_kicked,
                 front_ok=noop_front, units=tuple(units), resumed_from=resumed_from,
+                health_diagnostic=noop_diag,
             )
             write_report(home, rpt, dry_run=dry_run)
             if unhealthy:
@@ -1335,20 +1384,47 @@ def run_sync(
             return rpt
 
         if auto:
-            # e2e43cfd: do not hammer a train whose last attempt reverted (or
-            # needs a human) every hour — wait for a newer train. A manual
-            # `stack sync` never takes this path and always retries.
+            # e2e43cfd: do not hammer a train whose last attempt REVERTED every
+            # hour — wait for a newer train; a manual `stack sync` never takes
+            # this path and always retries. Only `reverted`: every upgrade-path
+            # `needs_attention` leaves current == target, so the next --auto
+            # takes the no-op path before reaching here; the only way one gets
+            # here is after a manual `--train vPrev` rollback, where freezing
+            # train X for a front/key problem X did not cause would contradict
+            # runbook 6a.
             last = last_attempt_for_train(home, resolved_train)
-            if last is not None and last.get("outcome") in ("reverted", "needs_attention"):
+            if last is not None and last.get("outcome") == "reverted":
                 detail = (
                     f"train {resolved_train} last attempt {last['outcome']} at "
                     f"{last.get('finished_at', '?')}; waiting for a newer train "
                     "(manual `stack sync` forces a retry)"
                 )
+                # A skipped spoke is a not-up-to-date spoke, not an unwatched
+                # one: still reconcile units and health-check what is running.
+                units = reconcile_units(home, cfg, runner, dry_run=dry_run, timer_run=timer_run)
+                skip_health, skip_diag = None, None
+                if not dry_run:
+                    kicked_any = any(u.kicked is not None for u in units)
+                    skip_health, _skip_front, sprobes, spolls = stack_health(
+                        runner, health_url, sleep=health_sleep,
+                        **({"budget_s": 30.0} if kicked_any else {"attempts": 3}),
+                    )
+                    if skip_health is False:
+                        skip_diag = capture_health_diagnostic(
+                            runner, home, sprobes, budget_s=30.0 if kicked_any else 3.0, polls=spolls)
+                skip_outcome = "needs_attention" if skip_health is False else "skipped"
+                if skip_outcome == "needs_attention":
+                    detail += (
+                        "; the gateway health check FAILED on the running train — "
+                        "services may be down; check launchctl and the service logs"
+                    )
+                for note in _unit_notes(units):
+                    detail += "; " + note
                 rpt = m.RunReport(
                     train=resolved_train, role=cfg.role, instance_id=cfg.instance_id,
                     started_at=started_at, finished_at=_now_iso(), auto=True, dry_run=dry_run,
-                    noop=True, services=(), health_ok=None, outcome="skipped", detail=detail,
+                    noop=True, services=(), health_ok=skip_health, outcome=skip_outcome,
+                    detail=detail, units=tuple(units), health_diagnostic=skip_diag,
                 )
                 write_report(home, rpt, dry_run=dry_run)
                 report(f"stack sync: {detail}")
@@ -1517,18 +1593,17 @@ def run_sync(
         key_kick_failed = _key_kick_failed(units) and not platform_upgrade_kick_failed
         front_kicked = _front_kicked(units)
 
-        budget = upgrade_health_attempts()
-        gw_ok, probes = poll_upgrade_health(runner, health_url, attempts=budget, sleep=health_sleep)
+        budget = upgrade_health_budget_s()
+        health_ok, front_ok, probes, polls = stack_health(
+            runner, health_url, budget_s=budget, sleep=health_sleep
+        )
         health_diagnostic: dict | None = None
-        if gw_ok:
-            health_ok = True
-            front_ok = check_health(runner, FRONT_HEALTH_URL, sleep=health_sleep)
-        else:
-            health_ok, front_ok = False, None
-            health_diagnostic = capture_health_diagnostic(runner, home, probes, attempts=budget)
+        if not health_ok:
+            health_diagnostic = capture_health_diagnostic(
+                runner, home, probes, budget_s=budget, polls=polls)
             slow = health_diagnostic["not_answering"]
             report(
-                f"gateway not healthy after {budget} polls; services not answering: "
+                f"gateway not healthy after {polls} polls ({budget:g} s budget); services not answering: "
                 f"{', '.join(slow) or 'none (gateway only)'}"
             )
         any_crossed = any(c.migration_crossed for c in changes if c.changed)
@@ -1557,7 +1632,14 @@ def run_sync(
             # the front runs from the platform venv — follow it back.
             if plans[m.FRONT_VENV_SERVICE].changes:
                 kickstart_service(runner, home, m.FRONT_SERVICE)
-            health_ok, front_ok = check_stack_health(runner, health_url, sleep=health_sleep)
+            # The previous train gets the same budget: a revert whose old
+            # train needs 45 s to boot must not read as "the revert failed too".
+            health_ok, front_ok, rprobes, rpolls = stack_health(
+                runner, health_url, budget_s=budget, sleep=health_sleep
+            )
+            if not health_ok and health_diagnostic is not None:
+                health_diagnostic["post_revert"] = capture_health_diagnostic(
+                    runner, home, rprobes, budget_s=budget, polls=rpolls)
 
         if outcome == "ok":
             for svc in SERVICE_ORDER:

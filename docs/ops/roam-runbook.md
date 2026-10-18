@@ -428,22 +428,35 @@ timer installed, a rollback is undone within the hour**: run
   and logs "replacing stale <svc> venv" when it finds leftovers (it refuses to
   touch the venv `current` points at).
 - **Health budget.** After an upgrade sync polls the gateway for up to
-  120 s (`UPGRADE_HEALTH_ATTEMPTS`; override with env
+  120 s of wall clock (`UPGRADE_HEALTH_BUDGET_S`; override with env
   `SNOWLINE_SYNC_HEALTH_BUDGET_S=<seconds>`), because a cold boot with all four
-  services boot-migrating at once can outlast 30 s. The no-op path keeps its
-  short poll. While the gateway is not answering, each service's own
+  services boot-migrating at once can outlast 30 s. The post-revert poll gets
+  the same budget (the previous train can be slow to boot too). The no-op path
+  keeps its short poll. While the gateway is not answering, each service's own
   `http://127.0.0.1:<port>/health` is polled too.
 - **Diagnostic.** Before reverting (or flagging `needs_attention` on a failed
-  first install), sync records `health_diagnostic` in
+  first install or a dead no-op/skipped gateway), sync records
+  `health_diagnostic` in
   `~/Library/Application Support/Snowline/sync-report.json` and the matching
   `sync-history/<stamp>-<train>.json`: per service the last 40 lines of its
   `snowline-<svc>.err.log`, the `launchctl print` state, and whether/when its
-  `/health` answered; `not_answering` names the slow services.
+  `/health` answered; `not_answering` names the slow services; a failed
+  post-revert poll adds a `post_revert` block of the same shape.
 - **`skipped`.** An `--auto` fire whose resolved train's last real attempt
-  ended `reverted` or `needs_attention` does not retry hourly: it writes a
-  `noop`-class report with outcome `skipped` (exit 0) saying "train vX last
-  attempt reverted at <ts>; waiting for a newer train". A newer train clears
-  the skip; a manual `snowline stack sync` always retries.
+  ended `reverted` does not retry hourly: it writes a `noop`-class report with
+  outcome `skipped` (exit 0) saying "train vX last attempt reverted at <ts>;
+  waiting for a newer train". The skip path still reconciles units and
+  health-checks the running train; a dead gateway turns it into
+  `needs_attention` (exit 1) while the skip stays in force. The hub's standby
+  rollup keeps the "last stack sync" note for `skipped`. A newer train clears
+  the skip; a manual `snowline stack sync` always retries. A `needs_attention`
+  attempt never causes a skip (it leaves `current` on the new train, so the
+  next `--auto` is a no-op), so a manual rollback with `--train vPrev` does not
+  freeze the newer train.
+- **Manual rollback and venvs.** `--train vPrev` rebuilds vPrev's kept venv
+  with `uv venv --clear` (and re-downloads its assets with `--clobber`); it
+  refuses to clear the venv `current` points at or the one the running CLI
+  lives in.
 
 ## 6b. Packaged spoke (`snowline stack bootstrap-spoke`, item 71317cd6)
 
