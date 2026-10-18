@@ -960,6 +960,41 @@ def test_existing_platform_env_without_the_key_gets_it_appended_and_platform_kic
     assert "SNOWLINE_FRONT_HEALTH_URL" in rpt.detail
 
 
+def test_failed_platform_kick_for_the_key_is_needs_attention_not_noop(tmp_path):
+    """The key is appended but `launchctl kickstart` fails: the OLD platform
+    keeps answering /health, so the health check passes — the run must still
+    say needs_attention and name the manual kick, because the key is present
+    now and no later run will retry it (review of #297)."""
+    home = tmp_path / "home"
+    _stack_config(home)
+    _seed_train_assets(home)
+    _sync(home)
+    path = m.env_file_path(home, "platform")
+    old = path.read_text().replace(s.load_platform_front_block().replace(
+        "$front_health_url", m.front_health_url()), "")
+    assert "SNOWLINE_FRONT_HEALTH_URL" not in old
+    path.write_text(old)
+
+    def failing_platform_kick(argv, cwd):
+        if argv[:2] == ["launchctl", "kickstart"] and argv[-1].endswith("dev.snowline.platform"):
+            return CommandError(argv, 1, "no such process")
+        return _full_fake_handler(argv, cwd)
+
+    runner = FakeRunner(failing_platform_kick)
+    rpt = _sync(home, runner)
+    assert FRONT_URL_LINE in path.read_text()  # the key did land
+    assert len(_platform_kicks(runner)) == 1  # one attempt, which failed
+    assert rpt.noop is True
+    assert rpt.outcome == "needs_attention"
+    assert "kickstart FAILED" in rpt.detail and "launchctl kickstart" in rpt.detail
+    assert "restarted the platform" not in rpt.detail
+
+    # a second run: key present, nothing re-attempted, plain no-op
+    runner2 = FakeRunner(_full_fake_handler)
+    rpt2 = _sync(home, runner2)
+    assert _platform_kicks(runner2) == [] and rpt2.outcome == "noop"
+
+
 def test_existing_operator_value_is_kept_and_reported_as_drift(tmp_path):
     home = tmp_path / "home"
     cfg = _stack_config(home)

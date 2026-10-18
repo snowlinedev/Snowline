@@ -382,8 +382,8 @@ def ensure_platform_front_key(
     `platform.env` that lacks it (issue #296), so the standby readiness panel
     shows the front row without a manual edit. Same ownership rule as every
     env file: the key is only ever ADDED — an existing assignment (any value) is
-    never touched, and a missing
-    file is left to `apply_env_file`, whose template already carries the key.
+    never touched, and a missing file is left to `apply_env_file`, whose
+    template already carries the key.
     Spoke-only by construction (sync refuses the hub) and only when the
     failover front is installed. Returns whether the key was (or, on a dry
     run, would be) appended."""
@@ -396,7 +396,11 @@ def ensure_platform_front_key(
     if not dry_run:
         block = m.render_env(load_platform_front_block(), variables)
         sep = "" if existing.endswith("\n") else "\n"
-        path.write_text(existing + sep + block)
+        # Append, never truncate-then-write: the file is operator-owned and
+        # carries DB URLs — a crash between truncate and write would empty it.
+        # "a" keeps mode and ownership.
+        with path.open("a") as fh:
+            fh.write(sep + block)
     return True
 
 
@@ -570,6 +574,14 @@ FRONT_DOWN_DETAIL = (
     "reverted for it."
 )
 
+FRONT_KEY_KICK_FAILED_DETAIL = (
+    "SNOWLINE_FRONT_HEALTH_URL was added to platform.env but the platform "
+    "kickstart FAILED, so the running platform does not have it; sync will not "
+    "retry (the key is present now) — run "
+    "`launchctl kickstart -k gui/$(id -u)/dev.snowline.platform` by hand and "
+    "check the platform's err.log"
+)
+
 
 # --------------------------------------------------------------------------
 # Run report persistence.
@@ -635,25 +647,28 @@ def run_sync(
         if m.is_noop(resolved_train=resolved_train, current_trains=current_trains):
             # A no-op still health-checks (#210 review): the --auto timer's
             # exit code is the monitoring signal, and an up-to-date spoke with
-            # a dead gateway must not report success indefinitely. One attempt
-            # only — nothing was just kickstarted, so there is no boot race to
-            # wait out; a healthy stack answers immediately.
-            # Issue #296: an up-to-date spoke still gets the front-health key
-            # added to its platform.env (once), and the platform restarted to
-            # read it — otherwise it would wait for the next train.
+            # a dead gateway must not report success indefinitely. Normally one
+            # attempt only (nothing was kickstarted, a healthy stack answers
+            # immediately); the one exception is issue #296 below, where an
+            # up-to-date spoke gets the front-health key added to its
+            # platform.env (once) and the platform restarted to read it —
+            # otherwise it would wait for the next train — so that run waits
+            # out the boot like an upgrade does.
             key_added = ensure_platform_front_key(
                 home,
                 variables=env_variables(cfg, dashboard_dist=str(m.dashboard_root(home) / "current")),
                 front_installed=m.plist_path(home, m.FRONT_SERVICE).exists(),
                 dry_run=dry_run,
             )
+            key_kicked: bool | None = None
             if key_added and not dry_run:
-                kickstart_service(runner, home, "platform")
+                key_kicked = kickstart_service(runner, home, "platform")
             noop_health, noop_front = (None, None) if dry_run else check_stack_health(
                 runner, health_url, attempts=30 if key_added else 3, sleep=health_sleep
             )
             unhealthy = noop_health is False
             front_down = noop_health is True and noop_front is False
+            key_kick_failed = key_kicked is False
             if unhealthy:
                 detail = (
                     "already on the resolved train, but the gateway health "
@@ -664,7 +679,9 @@ def run_sync(
                 detail = "already on the resolved train; " + FRONT_DOWN_DETAIL
             else:
                 detail = "already on the resolved train — nothing to do"
-            if key_added:
+            if key_kick_failed:
+                detail += "; " + FRONT_KEY_KICK_FAILED_DETAIL
+            elif key_added:
                 detail += (
                     f"{'; would add' if dry_run else '; added'} {_FRONT_KEY} to platform.env"
                     f"{'' if dry_run else ' and restarted the platform'}"
@@ -673,7 +690,11 @@ def run_sync(
                 train=resolved_train, role=cfg.role, instance_id=cfg.instance_id,
                 started_at=started_at, finished_at=_now_iso(), auto=auto, dry_run=dry_run,
                 noop=True, services=(), health_ok=noop_health,
-                outcome="needs_attention" if unhealthy or front_down else "noop",
+                outcome=(
+                    "needs_attention"
+                    if unhealthy or front_down or key_kick_failed
+                    else "noop"
+                ),
                 detail=detail, front_ok=noop_front,
             )
             write_report(home, rpt, dry_run=dry_run)
@@ -681,6 +702,8 @@ def run_sync(
                 tail = "but the stack is UNHEALTHY"
             elif front_down:
                 tail = "but the failover front is DOWN"
+            elif key_kick_failed:
+                tail = "but the platform kickstart for the front-health key FAILED"
             else:
                 tail = "nothing to do"
             report(f"stack sync: already on {resolved_train}, {tail}")
@@ -825,10 +848,13 @@ def run_sync(
                     target_train=change.target_train, changed=True,
                     migration_crossed=change.migration_crossed, kickstarted=ok,
                 )
+        key_kick_failed = False
         if platform_key_kick_pending:
             # Key newly written into an unchanged platform: restart it so the
-            # running process (env is sourced at exec time) picks it up.
-            kickstart_service(runner, home, "platform")
+            # running process (env is sourced at exec time) picks it up. A
+            # failed kick is reported below — the key is present now, so no
+            # later run would retry it.
+            key_kick_failed = not kickstart_service(runner, home, "platform")
         front_kicked = kickstart_service(runner, home, m.FRONT_SERVICE) if front_needs_kick else None
 
         health_ok, front_ok = check_stack_health(runner, health_url, sleep=health_sleep)
@@ -895,6 +921,12 @@ def run_sync(
             # is down — report it loudly, never revert for it.
             outcome = "needs_attention"
             detail = "upgrade applied; " + FRONT_DOWN_DETAIL
+        if key_kick_failed:
+            if outcome == "ok":
+                outcome = "needs_attention"
+                detail = "upgrade applied; " + FRONT_KEY_KICK_FAILED_DETAIL
+            else:
+                detail = (detail + "; " if detail else "") + FRONT_KEY_KICK_FAILED_DETAIL
 
         rpt = m.RunReport(
             train=resolved_train, role=cfg.role, instance_id=cfg.instance_id,
