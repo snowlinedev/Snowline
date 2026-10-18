@@ -1324,3 +1324,323 @@ def test_plist_path_has_local_bin_and_keg_only_postgres(tmp_path):
         home=tmp_path, platform_venv_current=tmp_path / "v", logs=tmp_path)
     assert f"{tmp_path}/.local/bin" in text and "postgresql@16/bin" in text
     assert "AbandonProcessGroup" not in text
+
+
+# -- one reconcile pass for every stack-managed unit + re-exec (#303) -------
+
+
+def _strip_front_key(home):
+    path = m.env_file_path(home, "platform")
+    old = path.read_text().replace(s.load_platform_front_block().replace(
+        "$front_health_url", m.front_health_url()), "")
+    assert "SNOWLINE_FRONT_HEALTH_URL" not in old
+    path.write_text(old)
+
+
+def _front_kicks(runner):
+    return [a[-1] for a in runner.ran("launchctl", "kickstart") if a[-1].endswith("/dev.snowline.front")]
+
+
+def test_old_cli_upgrade_then_noop_with_the_new_unit_list_installs_every_unit(tmp_path, monkeypatch):
+    """The live defect (item 924fc510): the OLD train's CLI ran the upgrade,
+    so units only the NEW train knows were never rendered; the no-op path
+    must reconcile them all on the next run."""
+    home = tmp_path / "home"
+    _stack_config(home)
+    _seed_train_assets(home)
+    with monkeypatch.context() as mp:
+        mp.setattr(s, "UNITS", ())  # the old train: no front, no timer, no key logic
+        assert _sync(home).outcome == "ok"
+    _strip_front_key(home)  # the old train's platform.env template had no key
+    assert not m.plist_path(home, m.FRONT_SERVICE).exists()
+    assert not m.env_file_path(home, m.FRONT_SERVICE).exists()
+    assert not m.plist_path(home, m.AUTOUPGRADE_UNIT).exists()
+
+    runner = FakeRunner(_full_fake_handler)
+    rpt = _sync(home, runner)
+    assert rpt.noop is True and rpt.outcome == "noop"
+    assert m.plist_path(home, m.FRONT_SERVICE).exists()
+    assert m.env_file_path(home, m.FRONT_SERVICE).exists()
+    assert m.plist_path(home, m.AUTOUPGRADE_UNIT).exists()
+    assert FRONT_URL_LINE in m.env_file_path(home, "platform").read_text()
+    assert len(_front_kicks(runner)) == 1 and len(_platform_kicks(runner)) == 1
+    assert rpt.front_kickstarted is True
+    assert [a[1] for a in _timer_runs(runner)] == ["bootout", "bootstrap"]
+    assert {u.name: u.action for u in rpt.units} == {
+        "platform-front-key": "added", "front": "installed", "autoupgrade": "installed",
+    }
+    assert "installed the failover front" in rpt.detail
+    assert "hourly auto-upgrade timer" in rpt.detail
+
+    # and the next one is a true no-op again
+    runner2 = FakeRunner(_full_fake_handler)
+    rpt2 = _sync(home, runner2)
+    assert rpt2.detail == "already on the resolved train — nothing to do"
+    assert runner2.runs == []
+    assert all(u.action == "unchanged" for u in rpt2.units)
+
+
+def test_full_path_reconciles_every_unit_in_the_same_run(tmp_path):
+    home = tmp_path / "home"
+    _stack_config(home)
+    _seed_train_assets(home)
+    runner = FakeRunner(_full_fake_handler)
+    rpt = _sync(home, runner)
+    assert rpt.outcome == "ok"
+    assert [(u.name, u.action) for u in rpt.units] == [
+        ("platform-front-key", "unchanged"), ("front", "installed"), ("autoupgrade", "installed"),
+    ]
+    assert m.plist_path(home, m.FRONT_SERVICE).exists()
+    assert m.plist_path(home, m.AUTOUPGRADE_UNIT).exists()
+    assert len(_front_kicks(runner)) == 1
+    kicks = [a[-1] for a in runner.ran("launchctl", "kickstart")]
+    assert kicks[-1].endswith("/dev.snowline.front")  # after the services
+
+
+def test_full_path_key_added_to_a_changed_platform_reuses_its_upgrade_kick(tmp_path):
+    home = tmp_path / "home"
+    _stack_config(home)
+    _seed_train_assets(home)
+    _sync(home)
+    _strip_front_key(home)
+    _seed_v2_manifest(home)
+    runner = FakeRunner(_full_fake_handler)
+    rpt = s.run_sync(home=home, train="v0.2.0", runner=runner, health_sleep=lambda _s: None, report=lambda _: None)
+    assert rpt.outcome == "ok"
+    assert FRONT_URL_LINE in m.env_file_path(home, "platform").read_text()
+    assert "platform" not in rpt.env_drift  # the key landed before the drift pass
+    assert len(_platform_kicks(runner)) == 1  # the upgrade kick, not a second one
+    key = next(u for u in rpt.units if u.name == "platform-front-key")
+    assert key.action == "added" and key.kicked is True
+
+
+def test_reconcile_units_is_idempotent_and_defers_the_timer_reload_on_a_timer_run(tmp_path):
+    home = tmp_path / "home"
+    cfg = _stack_config(home)
+    _seed_train_assets(home)
+    _sync(home)
+    runner = FakeRunner(_full_fake_handler)
+    units = s.reconcile_units(home, cfg, runner, dry_run=False, timer_run=False)
+    assert all(u.action == "unchanged" and u.kicked is None for u in units)
+    assert runner.runs == []
+
+    path = m.plist_path(home, m.AUTOUPGRADE_UNIT)
+    path.write_text(path.read_text().replace("3600", "60"))
+    runner2 = FakeRunner(_full_fake_handler)
+    units2 = s.reconcile_units(home, cfg, runner2, dry_run=False, timer_run=True)
+    timer = next(u for u in units2 if u.name == m.AUTOUPGRADE_UNIT)
+    assert timer.action == "deferred"
+    assert "3600" in path.read_text()
+    assert _timer_runs(runner2) == [] and not [a for a in runner2.reads if TIMER_LABEL in " ".join(a)]
+    assert m.autoupgrade_reload_pending_path(home).exists()
+
+
+def test_reconcile_units_dry_run_writes_and_kicks_nothing(tmp_path):
+    home = tmp_path / "home"
+    cfg = _stack_config(home)
+    runner = FakeRunner(_full_fake_handler, dry_run=True)
+    units = s.reconcile_units(home, cfg, runner, dry_run=True, timer_run=False)
+    assert {u.name: u.action for u in units}["front"] == "installed"
+    assert all(u.kicked is None for u in units)
+    assert not m.plist_path(home, m.FRONT_SERVICE).exists()
+    assert not m.plist_path(home, m.AUTOUPGRADE_UNIT).exists()
+    assert runner.runs == []
+
+
+# --- re-exec ----------------------------------------------------------------
+
+
+def _fake_new_cli(home, train="v0.2.0"):
+    cli = m.service_venv_dir(home, "platform", train) / "bin" / "snowline"
+    cli.parent.mkdir(parents=True, exist_ok=True)
+    cli.write_text("#!/bin/sh\n")
+    cli.chmod(0o755)
+    return cli
+
+
+@pytest.fixture
+def execs(monkeypatch):
+    """Record os.execv calls (never really exec) and check the sync lock is
+    free at exec time. Pins the resumed-env marker so the test restores it."""
+    monkeypatch.setenv(m.SYNC_RESUMED_ENV, "0")
+    calls = []
+
+    def fake_execv(path, argv):
+        # argv[0] = <app support>/venvs/platform/current/bin/snowline
+        lock_path = Path(argv[0]).parents[4] / "sync.lock"
+        assert lock_path.exists()  # the run did take it
+        lock = s.SyncLock(lock_path)
+        calls.append((path, list(argv), lock.acquire(), os.environ.get(m.SYNC_RESUMED_ENV)))
+        lock.release()
+
+    monkeypatch.setattr(os, "execv", fake_execv)
+    return calls
+
+
+def _upgraded_home(tmp_path):
+    home = tmp_path / "home"
+    _stack_config(home)
+    _seed_train_assets(home)
+    assert _sync(home).outcome == "ok"
+    _seed_v2_manifest(home)
+    return home
+
+
+def _sync_v2(home, runner=None, **kw):
+    return s.run_sync(home=home, train="v0.2.0", runner=runner or FakeRunner(_full_fake_handler),
+                      health_sleep=lambda _s: None, report=kw.pop("report", lambda _: None), **kw)
+
+
+def test_successful_platform_swap_reexecs_the_new_cli_once_with_the_same_flags(tmp_path, execs):
+    home = _upgraded_home(tmp_path)
+    cli = _fake_new_cli(home)
+    reports_before = len(list(m.report_history_dir(home).glob("*.json")))
+    lines = []
+    rpt = _sync_v2(home, report=lines.append)
+    assert rpt.outcome == "ok"
+    assert len(execs) == 1
+    path, argv, lock_free, marker = execs[0]
+    expected_cli = str(m.service_current_link(home, "platform") / "bin" / "snowline")
+    assert path == expected_cli and Path(path).resolve() == cli.resolve()
+    assert argv == [expected_cli, "stack", "sync", "--role", "spoke", "--train", "v0.2.0",
+                    "--resumed-from", "v0.1.0"]
+    assert lock_free is True  # released before the exec
+    assert marker == "1"
+    # the old process writes no report — the resumed run writes the single one
+    assert len(list(m.report_history_dir(home).glob("*.json"))) == reports_before
+    assert json.loads(m.report_path(home).read_text())["train"] == "v0.1.0"
+    assert m.sync_handoff_path(home).exists()
+    assert any("re-exec'ing" in ln for ln in lines)
+
+
+def test_auto_flags_and_health_url_ride_the_reexec(tmp_path, execs):
+    home = _upgraded_home(tmp_path)
+    _fake_new_cli(home)
+    _sync_v2(home, auto=True, health_url="http://127.0.0.1:9999/health",
+             runner=FakeRunner(_full_fake_handler), verbose=True)
+    (_, argv, _, _), = execs
+    assert argv[3:] == ["--role", "spoke", "--train", "v0.2.0", "--auto",
+                        "--health-url", "http://127.0.0.1:9999/health", "-v",
+                        "--resumed-from", "v0.1.0"]
+
+
+def test_resumed_run_writes_the_single_report_with_units_and_resumed_from(tmp_path, execs):
+    home = _upgraded_home(tmp_path)
+    _fake_new_cli(home)
+    _sync_v2(home, auto=True)
+    assert len(execs) == 1
+    reports_before = len(list(m.report_history_dir(home).glob("*.json")))
+
+    # what the exec'd new CLI runs: the same run_sync, --resumed-from set
+    monkeypatch_env = os.environ.get(m.SYNC_RESUMED_ENV)
+    assert monkeypatch_env == "1"
+    runner = FakeRunner(_full_fake_handler)
+    rpt = _sync_v2(home, runner=runner, auto=True, resumed_from="v0.1.0")
+    assert len(execs) == 1  # never a second re-exec
+    assert rpt.outcome == "ok" and m.exit_code(rpt.outcome) == 0
+    assert rpt.resumed_from == "v0.1.0" and rpt.noop is False
+    assert [c.target_train for c in rpt.services] == ["v0.2.0"] * 4  # from the handoff
+    assert all(c.changed and c.kickstarted for c in rpt.services)
+    assert "upgrade from v0.1.0 finished under the v0.2.0 CLI" in rpt.detail
+    assert runner.runs == []  # every unit already current: nothing rewritten or kicked
+    assert not m.sync_handoff_path(home).exists()
+    data = json.loads(m.report_path(home).read_text())
+    assert data["resumed_from"] == "v0.1.0" and data["train"] == "v0.2.0"
+    assert [u["name"] for u in data["units"]] == ["platform-front-key", "front", "autoupgrade"]
+    assert len(list(m.report_history_dir(home).glob("*.json"))) == reports_before + 1
+
+
+def test_resumed_auto_run_with_a_dead_gateway_exits_nonzero(tmp_path, execs):
+    home = _upgraded_home(tmp_path)
+    _fake_new_cli(home)
+    _sync_v2(home, auto=True)
+
+    def dead_gateway(argv, cwd):
+        if argv and argv[0] == "curl" and argv[-1] == s.DEFAULT_HEALTH_URL:
+            return CommandError(argv, 7, "connection refused")
+        return _full_fake_handler(argv, cwd)
+
+    rpt = _sync_v2(home, runner=FakeRunner(dead_gateway), auto=True, resumed_from="v0.1.0")
+    assert rpt.outcome == "needs_attention" and m.exit_code(rpt.outcome) == 1
+    assert "gateway health check FAILED" in rpt.detail
+
+
+def test_no_reexec_after_a_revert_or_needs_attention(tmp_path, execs):
+    home = _upgraded_home(tmp_path)
+    _fake_new_cli(home)
+
+    def dead_gateway(argv, cwd):
+        if argv and argv[0] == "curl" and argv[-1] == s.DEFAULT_HEALTH_URL:
+            return CommandError(argv, 7, "connection refused")
+        return _full_fake_handler(argv, cwd)
+
+    assert _sync_v2(home, runner=FakeRunner(dead_gateway)).outcome == "reverted"
+    assert _sync_v2(home, runner=FakeRunner(_dead_front)).outcome == "needs_attention"
+    assert execs == []
+    assert json.loads(m.report_path(home).read_text())["outcome"] == "needs_attention"
+
+
+def test_no_reexec_on_dry_run_but_it_says_it_would(tmp_path, execs):
+    home = _upgraded_home(tmp_path)
+    _fake_new_cli(home)
+    lines = []
+    rpt = _sync_v2(home, runner=FakeRunner(_full_fake_handler, dry_run=True), dry_run=True,
+                   report=lines.append)
+    assert rpt.dry_run is True and execs == []
+    assert any("would re-exec" in ln and "venvs/platform/current/bin/snowline" in ln for ln in lines)
+
+
+def test_no_reexec_when_already_resumed_by_flag_or_marker(tmp_path, execs, monkeypatch):
+    home = _upgraded_home(tmp_path)
+    _fake_new_cli(home)
+    assert _sync_v2(home, resumed_from="v0.1.0").outcome == "ok"
+    assert execs == []
+    # the train is now current; roll forward again by flag-free run under the marker
+    home2 = _upgraded_home(tmp_path / "b")
+    _fake_new_cli(home2)
+    monkeypatch.setenv(m.SYNC_RESUMED_ENV, "1")
+    assert _sync_v2(home2).outcome == "ok"
+    assert execs == []
+
+
+def test_no_reexec_on_a_rollback_or_when_already_running_the_new_venv(tmp_path, execs, monkeypatch):
+    home = _upgraded_home(tmp_path)
+    _fake_new_cli(home)
+    monkeypatch.setattr(s, "running_under", lambda venv: True)
+    assert _sync_v2(home).outcome == "ok"
+    assert execs == []
+    monkeypatch.undo()
+    monkeypatch.setenv(m.SYNC_RESUMED_ENV, "0")
+    monkeypatch.setattr(os, "execv", lambda *a: execs.append(a))
+    _fake_new_cli(home, "v0.1.0")
+    rpt = s.run_sync(home=home, train="v0.1.0", runner=FakeRunner(_full_fake_handler),
+                     health_sleep=lambda _s: None, report=lambda _: None)
+    assert rpt.outcome == "ok"  # rollback: the older CLI has no newer units to add
+    assert execs == []
+
+
+def test_missing_new_cli_falls_back_to_finishing_in_process(tmp_path, execs):
+    home = _upgraded_home(tmp_path)  # no fake CLI in the v0.2.0 venv
+    rpt = _sync_v2(home)
+    assert execs == []
+    assert rpt.outcome == "ok"
+    assert "new train's CLI was not found" in rpt.detail and "once more" in rpt.detail
+    assert json.loads(m.report_path(home).read_text())["train"] == "v0.2.0"
+    assert not m.sync_handoff_path(home).exists()
+
+
+def test_failed_execv_falls_back_and_writes_the_report(tmp_path, monkeypatch):
+    monkeypatch.setenv(m.SYNC_RESUMED_ENV, "0")
+    home = _upgraded_home(tmp_path)
+    _fake_new_cli(home)
+
+    def boom(path, argv):
+        raise OSError(8, "Exec format error")
+
+    monkeypatch.setattr(os, "execv", boom)
+    rpt = _sync_v2(home)
+    assert rpt.outcome == "ok"
+    assert "re-exec of" in rpt.detail and "Exec format error" in rpt.detail
+    assert json.loads(m.report_path(home).read_text())["train"] == "v0.2.0"
+    assert not m.sync_handoff_path(home).exists()
+    assert os.environ.get(m.SYNC_RESUMED_ENV) is None
