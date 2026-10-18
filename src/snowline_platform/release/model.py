@@ -154,6 +154,8 @@ class Component:
     services: tuple[Service, ...]
     test: tuple[str, ...] = ()
     test_env: Mapping[str, str] = field(default_factory=dict)
+    # Env vars naming scratch test databases the cutter provisions (#293).
+    test_databases: tuple[str, ...] = ()
     prune_wheels: tuple[str, ...] = ()
     dashboard: Dashboard | None = None
     carries_manifest: bool = False
@@ -229,6 +231,7 @@ def parse_config(data: Mapping[str, object], source: Path | None = None) -> Rele
                 services=services,
                 test=tuple(raw.get("test", ())),
                 test_env=dict(raw.get("test_env", {})),
+                test_databases=tuple(raw.get("test_databases", ())),
                 prune_wheels=tuple(raw.get("prune_wheels", ())),
                 dashboard=dashboard,
                 carries_manifest=bool(raw.get("carries_manifest", False)),
