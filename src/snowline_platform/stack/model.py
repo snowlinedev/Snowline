@@ -157,6 +157,13 @@ def log_dir(home: Path) -> Path:
     return app_support_dir(home) / "logs"
 
 
+def service_err_log_path(home: Path, service: str) -> Path:
+    """The launchd stderr log `render_plist` points a service at (its
+    `StandardErrorPath`) — where a plugin that crashed after `/health`
+    answered left its traceback."""
+    return log_dir(home) / f"snowline-{service}.err.log"
+
+
 def report_path(home: Path) -> Path:
     return app_support_dir(home) / "sync-report.json"
 
@@ -871,6 +878,38 @@ def build_seed_config(cfg: StackConfig, *, local_platform_port: int) -> dict:
 
 def seed_config_path(home: Path) -> Path:
     return config_dir(home) / "seed.json"
+
+
+def check_participants_registered(
+    home: Path, registered: set[str] | None, *, spoke_platform_url: str, waited_s: float
+) -> None:
+    """The registration gate before §7 step 4 (#228): every seed participant
+    except the platform (whose scope stream is self-declared, not registered)
+    must appear in the spoke platform's `/plugins` with a `replication`
+    block. `/health` answering is NOT registration — a plugin populates
+    `/plugins` only from its heartbeat's first beat, and one that boots,
+    answers health, then crashes never registers at all. `registered=None`
+    means `/plugins` itself never answered."""
+    expected = [svc for svc in SEED_PARTICIPANTS if svc != "platform"]
+    if registered is None:
+        raise StackError(
+            f"the spoke platform's {spoke_platform_url}/plugins never answered "
+            f"within {waited_s:.0f}s — refusing to reverse-pair; check "
+            f"{service_err_log_path(home, 'platform')}"
+        )
+    missing = [svc for svc in expected if svc not in registered]
+    if missing:
+        detail = "; ".join(
+            f"{svc} (see {service_err_log_path(home, svc)})" for svc in missing
+        )
+        raise StackError(
+            f"participant(s) not registered with replication on the spoke "
+            f"platform ({spoke_platform_url}/plugins) after {waited_s:.0f}s: "
+            f"{detail} — the service answered /health but never registered (or "
+            "crashed after). Fix it, kickstart it, then re-run bootstrap-spoke "
+            "or `snowline replicate seed --config <seed.json> --reverse-pair "
+            "--participants NAME` (idempotent)"
+        )
 
 
 # -- CLI argv builders (pure — the fake-runner tests assert these exactly) --
