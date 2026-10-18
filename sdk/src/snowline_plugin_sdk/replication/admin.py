@@ -178,6 +178,24 @@ def _authorize_snapshot(
     return sub if (ok and sub is not None) else None
 
 
+class _SnapshotResponse(StreamingResponse):
+    """A StreamingResponse that owns a temp directory and removes it when the
+    response is over — completed, cancelled or errored. Response-level so it
+    does not depend on Starlette's disconnect path: below ASGI spec 2.4 the
+    stream task is cancelled from a task group; from 2.4 `stream_response`
+    raises ClientDisconnect, and a BackgroundTask would never run."""
+
+    def __init__(self, content, *, tmpdir: str, **kwargs):
+        super().__init__(content, **kwargs)
+        self._tmpdir = tmpdir
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+
 def build_replication_router(
     session_scope: Callable[[], AbstractContextManager[Session]],
     apply,
@@ -366,6 +384,11 @@ def build_replication_router(
         # this coroutine (the streaming generator below owns its cleanup), and
         # pg_dump writes the file itself.
         tmpdir = tempfile.mkdtemp(prefix="snowline-snapshot-")
+        # The dump holds the whole store (replication secrets included): the
+        # directory must be owner-only. mkdtemp already creates it 0700;
+        # enforce rather than assert (an assert is stripped under -O, and a
+        # mount that misreports mode bits would 500 the route for nothing).
+        os.chmod(tmpdir, 0o700)
         dest = os.path.join(tmpdir, "snapshot.dump")
         try:
             # pg_dump is blocking and can run for a while — off the event loop.
@@ -385,7 +408,18 @@ def build_replication_router(
             finally:
                 shutil.rmtree(tmpdir, ignore_errors=True)
 
-        return StreamingResponse(_chunks(), media_type="application/octet-stream")
+        # Starlette cancels the response task on client disconnect without
+        # closing a sync generator, so the generator's `finally` alone could be
+        # left to GC. Cleanup is therefore unconditional at the RESPONSE level:
+        # `__call__` removes the directory in its own `finally`, which covers
+        # both Starlette disconnect paths — the task-group cancel (ASGI spec
+        # < 2.4, what uvicorn advertises today) AND the spec >= 2.4 path, where
+        # `stream_response` raises ClientDisconnect and a background task would
+        # never run. The generator's `finally` stays as belt-and-braces (rmtree
+        # twice is harmless).
+        return _SnapshotResponse(
+            _chunks(), media_type="application/octet-stream", tmpdir=tmpdir
+        )
 
     # --- parking: the loud read (§8.1) ---------------------------------------
 

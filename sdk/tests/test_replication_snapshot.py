@@ -24,6 +24,7 @@ argv).
 from __future__ import annotations
 
 import json
+import tempfile
 from contextlib import contextmanager
 
 import anyio
@@ -32,6 +33,7 @@ import pytest
 from fastapi import FastAPI
 from sqlalchemy.engine import make_url
 
+from snowline_plugin_sdk.replication import admin as admin_mod
 from snowline_plugin_sdk.replication import emit as emit_mod
 from snowline_plugin_sdk.replication import snapshot as snapshot_mod
 from snowline_plugin_sdk.replication.admin import build_replication_router
@@ -357,3 +359,173 @@ def test_pg_tool_resolution_order(monkeypatch, tmp_path):
     monkeypatch.setattr(snap.subprocess, "run", missing)
     with pytest.raises(snap.SnapshotError, match="SNOWLINE_PG_BIN"):
         snap.run_pg_dump("postgresql:///x", tmp_path / "out.dump")
+
+
+def test_sqlalchemy_url_query_is_percent_encoded_not_quote_plus(tmp_path):
+    """libpq does not decode "+" as a space: `options=-c search_path=pm` must
+    reach pg_dump as `%20`, and a literal "+" in a value stays `%2B`."""
+    url = make_url(
+        "postgresql+psycopg://localhost/snowline_pm"
+        "?options=-c%20search_path%3Dpm&tag=a%2Bb"
+    )
+    assert url.query == {"options": "-c search_path=pm", "tag": "a+b"}
+    rendered, env = snapshot_mod.libpq_url_and_env(url)
+    assert rendered == (
+        "postgresql://localhost/snowline_pm"
+        "?options=-c%20search_path%3Dpm&tag=a%2Bb"
+    )
+    assert "+" not in rendered.split("?", 1)[1]
+    assert env == {}
+    argv = snapshot_mod.pg_dump_argv(rendered, tmp_path / "x.dump")
+    assert argv[-1] == rendered
+
+
+# --- temp-dump cleanup (#227) ---------------------------------------------------
+
+
+def _snapshot_dirs(root):
+    return [p for p in root.iterdir() if p.name.startswith("snowline-snapshot-")]
+
+
+async def _drive_asgi(
+    app,
+    body: bytes,
+    secret: str,
+    *,
+    disconnect_after: int | None,
+    spec_version: str | None = None,
+    send_raises: bool = False,
+):
+    """Call the app as a raw ASGI server: httpx's ASGITransport buffers the
+    whole response, so it cannot model a client that goes away mid-stream.
+
+    Starlette has two disconnect paths keyed on `scope["asgi"]["spec_version"]`:
+    below 2.4 it listens for `http.disconnect` in a task group and cancels the
+    stream (what uvicorn advertises today); from 2.4 the server surfaces the
+    gone client as an OSError from `send`, which Starlette re-raises as
+    ClientDisconnect. `send_raises=True` models the latter."""
+    sent_body = 0
+    disconnected = anyio.Event()
+    request_sent = False
+
+    async def receive():
+        nonlocal request_sent
+        if not request_sent:
+            request_sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        await disconnected.wait()
+        return {"type": "http.disconnect"}
+
+    raised = False
+
+    async def send(message):
+        nonlocal sent_body, raised
+        if raised:
+            return  # the client is gone: swallow the 500 the error middleware sends
+        if message["type"] == "http.response.body" and message.get("body"):
+            sent_body += 1
+            if disconnect_after is not None and sent_body >= disconnect_after:
+                if send_raises:
+                    raised = True
+                    raise OSError("client went away")
+                disconnected.set()
+
+    asgi = {"version": "3.0"}
+    if spec_version is not None:
+        asgi["spec_version"] = spec_version
+    scope = {
+        "type": "http",
+        "asgi": asgi,
+        "http_version": "1.1",
+        "method": "POST",
+        "path": SNAPSHOT_PATH,
+        "raw_path": SNAPSHOT_PATH.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "scheme": "http",
+        "server": ("plugin", 80),
+        "client": (TAILNET_PEER, 4242),
+        "headers": [
+            (b"host", b"plugin"),
+            (b"content-length", str(len(body)).encode()),
+            (b"x-snowline-signature", sign_body(secret, body).encode()),
+        ],
+    }
+    await app(scope, receive, send)
+    return sent_body
+
+
+def test_temp_dump_is_removed_after_a_full_read(
+    app_and_sessions, fake_pg_dump, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    app, sessions = app_and_sessions
+    _prime(sessions)
+
+    resp = _signed(app, _body(), "s3cret-stream-key")
+
+    assert resp.content == ARCHIVE
+    assert _snapshot_dirs(tmp_path) == []
+
+
+def test_temp_dump_is_removed_when_the_client_disconnects_mid_stream(
+    app_and_sessions, fake_pg_dump, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(admin_mod, "SNAPSHOT_CHUNK_BYTES", 4)  # several chunks
+    # Keep the abandoned generator alive: cleanup must not depend on its
+    # finalisation (the point of the BackgroundTask).
+    keep = []
+    real_response = admin_mod._SnapshotResponse
+
+    def capturing(content, *a, **kw):
+        keep.append(content)
+        return real_response(content, *a, **kw)
+
+    monkeypatch.setattr(admin_mod, "_SnapshotResponse", capturing)
+    app, sessions = app_and_sessions
+    _prime(sessions)
+
+    sent = anyio.run(
+        lambda: _drive_asgi(app, _body(), "s3cret-stream-key", disconnect_after=1)
+    )
+
+    n_chunks = len(ARCHIVE) // 4
+    assert keep, "the route should have streamed"
+    assert sent < n_chunks  # the stream really was cut short
+    assert _snapshot_dirs(tmp_path) == []
+
+
+def test_temp_dump_is_removed_on_the_spec_2_4_disconnect_path(
+    app_and_sessions, fake_pg_dump, tmp_path, monkeypatch
+):
+    # ASGI spec >= 2.4: Starlette does not run a task group; the server's
+    # `send` raises OSError once the client is gone and Starlette re-raises
+    # ClientDisconnect — a path on which a BackgroundTask would never run.
+    # Cleanup must still happen (response-level `finally`).
+    from starlette.requests import ClientDisconnect
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(admin_mod, "SNAPSHOT_CHUNK_BYTES", 4)
+    keep = []
+    real_response = admin_mod._SnapshotResponse
+
+    def capturing(content, *a, **kw):
+        keep.append(content)
+        return real_response(content, *a, **kw)
+
+    monkeypatch.setattr(admin_mod, "_SnapshotResponse", capturing)
+    app, sessions = app_and_sessions
+    _prime(sessions)
+
+    async def run():
+        with pytest.raises(ClientDisconnect):
+            await _drive_asgi(
+                app, _body(), "s3cret-stream-key",
+                disconnect_after=1, spec_version="2.4", send_raises=True,
+            )
+
+    anyio.run(run)
+
+    assert keep, "the route should have streamed"
+    assert _snapshot_dirs(tmp_path) == []
