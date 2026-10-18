@@ -39,6 +39,50 @@ from snowline_plugin_sdk.contract import (
     EVENT_SCOPE_UPDATED,
 )
 from snowline_plugin_sdk.replication.admin import _require_trusted, build_replication_router
+from snowline_plugin_sdk.replication.skew import KeyInventory
+
+# N-1 skew guard (decision 54447516, #216): the payload-key inventory of the
+# platform's own stream — scope.* (spec §8) and milestone.* (milestones.md §9).
+# PAYLOAD_KEYS = the baseline every N-1 peer sends; WIDENED_KEYS = keys added
+# since, which apply reads ONLY on presence (`"k" in payload` / `.get`). A new
+# payload key lands in WIDENED_KEYS with its guard and folds into PAYLOAD_KEYS
+# only after one train ships. Enforced by tests/test_replication_skew.py
+# (emitted keys == declared; every widened key guarded in scopes.py /
+# milestones.py apply). Helper: snowline_plugin_sdk.replication.skew.
+_SCOPE_BASE = {"id", "slug", "name", "kind", "parent", "isolated", "status"}
+_MILESTONE_ROW = {
+    "address", "anchor", "name", "outcome", "status", "target_date",
+    "activated_at", "achieved_at", "cancelled_at", "merged_into", "authored_at",
+}
+# line_rank (release-line.md §2.3), title (#156), per-register clocks (#247).
+_MILESTONE_ROW_WIDENED = {
+    "line_rank", "title", "descriptive_authored_at", "lifecycle_authored_at",
+}
+PAYLOAD_KEYS: dict[str, frozenset[str]] = {
+    EVENT_SCOPE_CREATED: frozenset(_SCOPE_BASE),
+    EVENT_SCOPE_UPDATED: frozenset(_SCOPE_BASE),
+    EVENT_MILESTONE_CREATED: frozenset(_MILESTONE_ROW),
+    EVENT_MILESTONE_UPDATED: frozenset(_MILESTONE_ROW),
+    EVENT_MILESTONE_TRANSITIONED: frozenset(
+        _MILESTONE_ROW | {"from_status", "to_status", "reason"}
+    ),
+    EVENT_MILESTONE_DEPENDENCY_CHANGED: frozenset(
+        {"op", "dependent", "dependency", "authored_at"}
+    ),
+    EVENT_MILESTONE_MERGED: frozenset({"from", "into", "authored_at"}),
+}
+WIDENED_KEYS: dict[str, frozenset[str]] = {
+    # created_at / updated_at: the scope LWW clock (spec §7.1, additive).
+    EVENT_SCOPE_CREATED: frozenset({"created_at", "updated_at"}),
+    EVENT_SCOPE_UPDATED: frozenset({"created_at", "updated_at"}),
+    EVENT_MILESTONE_CREATED: frozenset(_MILESTONE_ROW_WIDENED),
+    EVENT_MILESTONE_UPDATED: frozenset(_MILESTONE_ROW_WIDENED),
+    # `warnings`: persisted transition warnings (QA 6396993e), additive.
+    EVENT_MILESTONE_TRANSITIONED: frozenset(_MILESTONE_ROW_WIDENED | {"warnings"}),
+    EVENT_MILESTONE_DEPENDENCY_CHANGED: frozenset(),
+    EVENT_MILESTONE_MERGED: frozenset(),
+}
+KEY_INVENTORY = KeyInventory(PAYLOAD_KEYS, WIDENED_KEYS)
 
 # Where the platform receives PEER instances' signed scope events, and the §5
 # admin surface (pairing CLI target, #82) — distinct from the plugin registry's
