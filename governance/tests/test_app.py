@@ -76,6 +76,27 @@ def test_main_surface_exposes_the_decision_and_artifact_tools():
     }
 
 
+def test_document_body_params_are_not_json_pre_parsed():
+    """A JSON document body (a store listing, a policy set) must reach the tool
+    as the string it was sent. FastMCP JSON-decodes any string argument whose
+    annotation is not exactly `str`, which turned `revise_artifact`'s
+    `body_snapshot: str | None` into a dict and failed validation — so a JSON
+    artifact could be registered over MCP but never revised (feedback
+    1aa39bd4, snowline-marketing#30)."""
+    surface = build_main_surface(scope_client=_NoopScopeClient())
+    manager = surface._tool_manager
+    body = '{"schema_version": 1, "app": {"key": "vial"}}'
+    for tool, param, required in (
+        ("register_artifact", "body", {}),
+        ("revise_artifact", "body_snapshot", {"artifact_id": "a1"}),
+    ):
+        meta = manager.get_tool(tool).fn_metadata
+        parsed = meta.pre_parse_json({**required, param: body})
+        assert parsed[param] == body, (tool, param)
+        args = meta.arg_model.model_validate(parsed)
+        assert getattr(args, param) == body, (tool, param)
+
+
 def test_polymorphic_tool_params_advertise_typed_schemas():
     """Feedback e9ac7680: untyped tool params surface as schema-less, so
     clients pass JSON-encoded strings that only fail server-side. The
