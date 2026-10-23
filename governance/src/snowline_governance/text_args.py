@@ -10,68 +10,66 @@ policy set) arrived as a dict and failed validation; a rationale reading
 `null` silently became None (snowlinedev/Snowline#315).
 
 `install_text_safe_pre_parse(mcp)` swaps each registered tool's metadata for a
-subclass whose pre-parse only touches params whose annotation can actually hold
-a list, dict, tuple, set or model. Text params reach the tool exactly as sent,
-including an explicit `null`. Call it once, after every tool is registered.
+subclass that hands FastMCP's own pre-parse only the arguments whose param can
+hold something other than plain text. Text params reach the tool exactly as
+sent, including an explicit `null`. Call it once, after every tool is
+registered.
 """
 
 from __future__ import annotations
 
-import json
+import enum
 import types
 import typing
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.utilities.func_metadata import FuncMetadata
-from pydantic import BaseModel
+from pydantic import PrivateAttr
 
-_CONTAINERS = (list, dict, tuple, set, frozenset)
+# Annotations that can only ever be a scalar. Anything not provably made of
+# these keeps FastMCP's JSON decode (the safe default: an unresolved forward
+# ref, a dataclass or a NewType behaves exactly as it did before this module).
+_SCALARS = (str, int, float, bool, type(None))
 
 
-def admits_container(annotation: Any) -> bool:
-    """True if a value of `annotation` may be a list/dict/tuple/set or a model —
-    the only shapes a JSON-encoded string argument should be decoded into."""
-    if annotation is Any:
-        return True
+def is_text_only(annotation: Any) -> bool:
+    """True if every value `annotation` admits is a scalar (text, number,
+    bool, None, a Literal or an Enum) — so a JSON string sent for it must
+    never be decoded into a container."""
     origin = typing.get_origin(annotation)
     if origin is typing.Annotated:
-        return admits_container(typing.get_args(annotation)[0])
+        return is_text_only(typing.get_args(annotation)[0])
     if origin in (typing.Union, types.UnionType):
-        return any(admits_container(a) for a in typing.get_args(annotation))
-    if origin is not None:
-        return isinstance(origin, type) and issubclass(origin, _CONTAINERS)
+        return all(is_text_only(a) for a in typing.get_args(annotation))
+    if origin is typing.Literal:
+        return True
+    if annotation is None:
+        return True
     if isinstance(annotation, type):
-        return issubclass(annotation, (*_CONTAINERS, BaseModel))
+        return issubclass(annotation, (*_SCALARS, enum.Enum))
     return False
 
 
 class TextSafeFuncMetadata(FuncMetadata):
-    """`FuncMetadata` whose JSON pre-parse skips params that cannot hold a
-    container. Otherwise identical to FastMCP's: a string that decodes to a
-    bare scalar is still left alone."""
+    """`FuncMetadata` whose JSON pre-parse never touches a text-only param.
+    Everything else goes through FastMCP's own `pre_parse_json` unchanged."""
+
+    _text_keys: frozenset[str] = PrivateAttr(default=frozenset())
 
     def pre_parse_json(self, data: dict[str, Any]) -> dict[str, Any]:
-        new_data = data.copy()
-        fields = {}
-        for name, info in self.arg_model.model_fields.items():
-            fields[name] = info
+        decodable = {k: v for k, v in data.items() if k not in self._text_keys}
+        return {**data, **super().pre_parse_json(decodable)}
+
+
+def _text_keys(meta: FuncMetadata) -> frozenset[str]:
+    keys: set[str] = set()
+    for name, info in meta.arg_model.model_fields.items():
+        if is_text_only(info.annotation):
+            keys.add(name)
             if info.alias:
-                fields[info.alias] = info
-        for key, value in data.items():
-            info = fields.get(key)
-            if info is None or not isinstance(value, str):
-                continue
-            if not admits_container(info.annotation):
-                continue
-            try:
-                parsed = json.loads(value)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(parsed, str | int | float):
-                continue
-            new_data[key] = parsed
-        return new_data
+                keys.add(info.alias)
+    return frozenset(keys)
 
 
 def install_text_safe_pre_parse(mcp: FastMCP) -> None:
@@ -80,6 +78,8 @@ def install_text_safe_pre_parse(mcp: FastMCP) -> None:
         meta = tool.fn_metadata
         if isinstance(meta, TextSafeFuncMetadata):
             continue
-        tool.fn_metadata = TextSafeFuncMetadata.model_construct(
+        safe = TextSafeFuncMetadata.model_construct(
             **{name: getattr(meta, name) for name in type(meta).model_fields}
         )
+        safe._text_keys = _text_keys(meta)
+        tool.fn_metadata = safe
