@@ -58,6 +58,7 @@ from snowline_governance.scope_client import (
     ScopeClient,
     ScopeNotFoundError,
 )
+from snowline_governance.text_args import install_text_safe_pre_parse
 
 _MAIN_INSTRUCTIONS = """\
 Snowline GOVERNANCE surface: the decision graph (`record_decision`, \
@@ -882,6 +883,7 @@ def build_main_surface(
             _supersede_artifact_sync, artifact_id, replaced_by_id
         )
 
+    install_text_safe_pre_parse(mcp)
     return mcp
 
 
@@ -1114,4 +1116,5 @@ def build_shadow_surface(
     # on this surface; that absence IS the isolation guarantee (decision 8a7f0a11).
     _register_read_tools(mcp, client, mclient)
 
+    install_text_safe_pre_parse(mcp)
     return mcp
