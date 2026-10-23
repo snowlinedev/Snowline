@@ -58,6 +58,7 @@ from snowline_governance.scope_client import (
     ScopeClient,
     ScopeNotFoundError,
 )
+from snowline_governance.text_args import install_text_safe_pre_parse
 
 _MAIN_INSTRUCTIONS = """\
 Snowline GOVERNANCE surface: the decision graph (`record_decision`, \
@@ -744,22 +745,14 @@ def build_main_surface(
         artifact_id: str,
         relation: str = "refines",
         supersedes: str | None = None,
-        # Plain `str`, NOT `str | None`: FastMCP JSON-decodes any string
-        # argument whose annotation is not exactly `str`, so a JSON document
-        # body (a store listing, a policy set) arrived as a dict and failed
-        # validation. `register_artifact`'s `body: str` never had the problem.
-        # "" (the default) keeps the old None meaning — a version with no
-        # inline snapshot.
-        body_snapshot: str = "",
+        body_snapshot: str | None = None,
         summary: str | None = None,
         milestone: str | None = None,
         allow_terminal_milestone: bool = False,
     ) -> dict:
         """Create a new version of an artifact. `relation` is `refines` (normal
         improve) or `pivot` (a redirection kept as a branch). `body_snapshot` is
-        the new inline content, passed through verbatim — a JSON document body
-        stays a string; omitted or empty means no inline snapshot. `summary` is
-        a one-line "why this version".
+        the new inline content; `summary` a one-line "why this version".
 
         `supersedes` defaults to the current CANONICAL version — the leaf of the
         eligible subgraph, NOT the DAG leaf which may be a pending draft (§6.1.4).
@@ -771,8 +764,8 @@ def build_main_surface(
         terminal milestones need `allow_terminal_milestone=True`."""
         return await anyio.to_thread.run_sync(
             _revise_artifact_sync,
-            artifact_id, relation, supersedes, body_snapshot or None, summary,
-            milestone, allow_terminal_milestone,
+            artifact_id, relation, supersedes, body_snapshot, summary, milestone,
+            allow_terminal_milestone,
         )
 
     def _resolve_artifact_sync(artifact_id, version_id):
@@ -890,6 +883,7 @@ def build_main_surface(
             _supersede_artifact_sync, artifact_id, replaced_by_id
         )
 
+    install_text_safe_pre_parse(mcp)
     return mcp
 
 
@@ -1122,4 +1116,5 @@ def build_shadow_surface(
     # on this surface; that absence IS the isolation guarantee (decision 8a7f0a11).
     _register_read_tools(mcp, client, mclient)
 
+    install_text_safe_pre_parse(mcp)
     return mcp
