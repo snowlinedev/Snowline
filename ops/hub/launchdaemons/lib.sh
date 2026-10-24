@@ -99,12 +99,15 @@ AUTOCUT_LOG="$OWNER_HOME/Library/Logs/snowline-autocut.log"
 # treated as HELD — a guard that cannot tell must refuse, not wave through.
 lock_held() {
   [ -e "$1" ] || return 1
-  /usr/bin/python3 -c 'import fcntl, os, sys
-fd = os.open(sys.argv[1], os.O_RDONLY)
+  /usr/bin/python3 -c 'import errno, fcntl, os, sys
+try:
+    fd = os.open(sys.argv[1], os.O_RDONLY)
+except OSError:
+    sys.exit(2)          # cannot even open it: the probe could not run
 try:
     fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-except OSError:
-    sys.exit(0)
+except OSError as e:
+    sys.exit(0 if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN) else 2)
 sys.exit(1)' "$1" 2>/dev/null
   case $? in
     0) return 0 ;;
