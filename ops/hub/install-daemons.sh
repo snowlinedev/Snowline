@@ -121,16 +121,15 @@ label="dev.snowline.backup"
 log_file="$BACKUP_LOG"
 echo "== $label (per-user agent)"
 # the log must belong to the owner (the agent opens it as uid 501); make
-# sure it exists with that owner before anything tails or judges it
-if [ ! -e "$log_file" ]; then
-  touch "$log_file" && chown "$OWNER_UID" "$log_file"
-fi
+# sure it exists AND is owned by the owner (a root-created one would lock
+# the agent out of its own StandardOutPath)
+[ -e "$log_file" ] || touch "$log_file"
+chown "$OWNER_UID" "$log_file"
 plist_src="$LAUNCHAGENTS_SRC/$label.plist"
 script="$(backup_agent_script)"
 if [ -z "$script" ] || [ ! -f "$script" ]; then
   echo "   the tracked agent plist runs '$script', which is not on this hub (checkout moved? then edit ops/hub/launchagents/$label.plist); NOT installing a unit that would fail with EX_CONFIG" >&2
-  fail=1
-  exit "$fail"
+  exit 1
 fi
 # The unit runs the CANONICAL script, which sources the canonical lib.sh and
 # backup.env. This install must therefore BE the canonical checkout (same
@@ -139,8 +138,7 @@ fi
 # not know them. Refuse otherwise.
 if [ ! "$OPS_HUB/snowline-backup.sh" -ef "$script" ]; then
   echo "   this install runs from $OPS_HUB, but the unit runs $script; run the install from the canonical checkout (after pulling) — NOT touching the backup unit" >&2
-  fail=1
-  exit "$fail"
+  exit 1
 fi
 echo "   unit runs $script"
 as_owner() { sudo -u "#$OWNER_UID" -H /bin/bash "$script" "$@"; }
@@ -169,8 +167,10 @@ judge_dump() {
 # when this install's context cannot read the destination)
 log_since() {
   LOGSAYS=NONE
-  ls_lines="$(awk -v s="$1" '$1 >= s' "$log_file" 2>/dev/null)"
-  if printf '%s\n' "$ls_lines" | grep -q -E 'FAILED|run incomplete|interrupted|cannot|not writable|missing'; then
+  # only the script's own stamped lines (pg_dump/pg_restore stderr shares
+  # the file, unstamped); only its own failure wordings count as FAIL
+  ls_lines="$(awk -v s="$1" '$1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ && $1 >= s' "$log_file" 2>/dev/null)"
+  if printf '%s\n' "$ls_lines" | grep -q -E 'FAILED to back up|run incomplete|interrupted \(SIGTERM|cannot take the run lock|backup destination (missing|not writable)'; then
     LOGSAYS=FAIL
   elif printf '%s\n' "$ls_lines" | grep -q 'backed up'; then
     LOGSAYS=OK

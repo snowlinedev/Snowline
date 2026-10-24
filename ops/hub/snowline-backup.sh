@@ -77,12 +77,18 @@ trap 'log "interrupted (SIGTERM/SIGINT)${OUT:+; removing $OUT.partial}" >&2; [ -
 # Operator overrides live in ~/.config/snowline/backup.env (optional; sourced
 # here), NOT in the launchd plist: install-daemons.sh replaces the plist with
 # the tracked copy whenever it differs, so anything put there would be lost.
+# The file supplies DEFAULTS: a variable already set in the environment
+# (a scratch test's SNOWLINE_BACKUP_DIR=/tmp/x, say) wins over it.
 BACKUP_ENV="$HOME/.config/snowline/backup.env"
 if [ -f "$BACKUP_ENV" ]; then
+    env_dir="${SNOWLINE_BACKUP_DIR:-}"; env_days="${SNOWLINE_BACKUP_RETENTION_DAYS:-}"; env_dbs="${SNOWLINE_BACKUP_DBS:-}"
     set -a
     # shellcheck disable=SC1090
     . "$BACKUP_ENV"
     set +a
+    [ -z "$env_dir" ]  || SNOWLINE_BACKUP_DIR="$env_dir"
+    [ -z "$env_days" ] || SNOWLINE_BACKUP_RETENTION_DAYS="$env_days"
+    [ -z "$env_dbs" ]  || SNOWLINE_BACKUP_DBS="$env_dbs"
 fi
 # Off-machine by default: iCloud Drive replicates the dumps off this host, so a
 # disk failure / theft doesn't take the backups with it. The default lives in
@@ -140,7 +146,7 @@ case "${1:-}" in
         # 2, so a caller can tell "no dump" from "could not even run".
         mins="${2:-}"
         case "$mins" in ''|*[!0-9]*) echo "--check needs a number of minutes" >&2; exit 2 ;; esac
-        [ -d "$DEST" ] || { echo NONE; exit 1; }
+        [ -d "$DEST" ] || { echo UNREADABLE; exit 2; }   # same contract as a run: missing = cannot run here
         cutoff="$(date -u -v-"${mins}"M +%Y%m%d-%H%M%S 2>/dev/null)" || { echo UNREADABLE; exit 2; }
         [ -n "$cutoff" ] || { echo UNREADABLE; exit 2; }
         found=no
@@ -161,7 +167,6 @@ esac
 # the split is done with globbing off so a stray `*` cannot expand against
 # the cwd, and each name must be a plain identifier (the catalog query
 # applies the same rule in SQL).
-# (the catalog query applies the same identifier rule in SQL)
 DBS_EXPLICIT="${SNOWLINE_BACKUP_DBS:-}"
 set -f
 # shellcheck disable=SC2086
@@ -332,30 +337,19 @@ for DB in "$@"; do
     if [ "$dump_rc" -eq 0 ] \
         && pg_restore -l "$OUT.partial" > /dev/null \
         && mv "$OUT.partial" "$OUT"; then
+        OUT=""   # landed: the interrupt trap must not name it any more
         # Size is best-effort (an iCloud file can be evicted to a placeholder
         # the instant it lands, making du error).
         SIZE="$(du -h "$OUT" 2>/dev/null | cut -f1 || true)"
         log "backed up ${DB} -> ${OUT} (${SIZE:-size unknown})"
     else
-        rm -f "$OUT.partial"
+        rm -f "$OUT.partial"; OUT=""
         log "FAILED to back up ${DB} (pg_dump, archive check, or rename failed)" >&2
         FAILED="$FAILED $DB"
         continue
     fi
-
-    # Prune this store's dumps past the retention window. Per-store pattern, so
-    # dumps of stores no longer in the list (e.g. the legacy snowline_dev
-    # history) are left alone. iCloud evicts old files to `.NAME.icloud`
-    # placeholders, which must be pruned by the same rule or the folder grows
-    # without bound. Age comes from the UTC stamp in the NAME (same rule as
-    # --check: a placeholder's mtime is eviction time, not dump time); the
-    # old pre-Z names are local time and go by mtime. Non-fatal: a find
-    # hiccup must not make a run whose dump already succeeded read as failed.
-    prune_by_name "$DB" || true
-    # legacy pre-Z names (local-time stamps) and their placeholders: by mtime
-    # (-mtime +N means "older than N+1 days"; +N-1 gives the same window as the stamp rule)
-    find "$DEST" -maxdepth 1 \( -name "${DB}-*[0-9].dump" -o -name ".${DB}-*[0-9].dump.icloud" \) -type f -mtime +"$((RETENTION_DAYS - 1))" -delete 2>/dev/null || true
 done
+
 trap - TERM INT
 
 # Stale .partial leftovers from any store.

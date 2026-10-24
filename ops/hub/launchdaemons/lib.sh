@@ -24,7 +24,6 @@ OWNER_HOME="${SNOWLINE_OWNER_HOME:-/Users/seanlynch}"
 DAEMONS_DIR=/Library/LaunchDaemons           # not DEST: the backup script's dump dir
 AGENTS="$OWNER_HOME/Library/LaunchAgents"
 OPS_HUB="$(cd "$(dirname "$0")" && pwd)"      # the calling script's directory
-case "$OPS_HUB" in */launchdaemons) OPS_HUB="${OPS_HUB%/launchdaemons}" ;; esac
 LAUNCHDAEMONS_SRC="$OPS_HUB/launchdaemons"
 LAUNCHAGENTS_SRC="$OPS_HUB/launchagents"
 ICLOUD_ROOT="$OWNER_HOME/Library/Mobile Documents/com~apple~CloudDocs"

@@ -457,7 +457,8 @@ by a `.git/info/exclude` entry. Git overwrites an ignored file on checkout
 (unlink and rewrite, a sub-second window), so a plain `git pull --ff-only`
 is the whole step: the tracked script lands and the agent keeps dumping
 from the same path, now with the hardened script; do the pull away from
-the top of the hour, when the agent fires. Afterwards drop the stale
+the minute the agent fires (a StartInterval unit fires at load time plus
+multiples of an hour, not on the hour: `tail` the log for the last stamp). Afterwards drop the stale
 exclude line. Do NOT delete the copy first: the hourly agent would spawn a
 missing program in the meantime (EX_CONFIG, penalty box). The agent plist
 already installed on the hub (the #223 one) runs the script directly with
