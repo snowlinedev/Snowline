@@ -427,7 +427,8 @@ The `.env` secrets are deliberately not backed up. Overrides go in
 `~/.config/snowline/backup.env` (sourced by the script as the owner; never
 in the plist, which the install replaces with the tracked copy):
 `SNOWLINE_BACKUP_DIR` (a non-iCloud path skips the iCloud root check but
-its parent must exist), `SNOWLINE_BACKUP_RETENTION_DAYS`,
+must already exist — it is never created, so an unplugged volume cannot be
+replaced by a local folder), `SNOWLINE_BACKUP_RETENTION_DAYS`,
 `SNOWLINE_BACKUP_DBS` (plain identifiers, space-separated).
 `bash ops/hub/snowline-backup.sh --print-dest` prints the destination the
 script resolves; the install uses it (as the owner) to know where to look.
