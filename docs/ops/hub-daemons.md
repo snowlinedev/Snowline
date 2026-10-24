@@ -37,7 +37,8 @@ each of platform / pm / governance / memory:
    That script is the backup agent's own installer and can be run on its
    own, without sudo, whenever the backup needs (re)proving — re-running
    `install-daemons.sh` restarts all four services and is NOT the way to
-   do that. It (re)loads `ops/hub/launchagents/dev.snowline.backup.plist`
+   do that. Its outcome is printed, not folded into `install-daemons.sh`'s
+   exit status, which is the services' result. It (re)loads `ops/hub/launchagents/dev.snowline.backup.plist`
    into `gui/501` when the tracked plist differs from the one last
    confirmed loaded, the unit is not loaded, its last run exited with
    anything other than 0 or 3, or there is no evidence the unit itself
@@ -482,7 +483,10 @@ dumped at every login; the tracked one does not (the first timed run is an
 hour after loading). Otherwise different bytes only: the next `ops/hub/install-backup-agent.sh`
 (run as the owner, from the canonical checkout after the pull — from any
 other checkout it refuses) will therefore replace and reload it once and
-prove it with one run.
+prove it with one run. Run it away from the minute the old agent fires:
+the pre-#319 script holds no run lock, so the installer cannot see a dump
+in progress and would boot the agent out mid-dump (one lost hour, one
+stale `.partial` for a day — once).
 
 **Is it alive?** Do this whenever you touch the hub — the job has silently
 died twice (2026-07-09 to 09-04 after the repo move; 2026-09-13 to 10-23

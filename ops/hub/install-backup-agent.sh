@@ -54,12 +54,11 @@ echo "== $label (per-user agent; unit runs $BACKUP_SCRIPT)"
 # from a scratch test would make them judge a different folder.
 query() { env -u SNOWLINE_BACKUP_DIR -u SNOWLINE_BACKUP_RETENTION_DAYS -u SNOWLINE_BACKUP_DBS /bin/bash "$BACKUP_SCRIPT" "$@"; }
 dest="$(query --print-dest 2>/dev/null)" || dest="(unknown: --print-dest failed)"
-# dump_evidence <minutes> <since-stamp> — sets EVIDENCE to OK (a dump newer
-# than <minutes> in the destination), NONE (readable, none there), LOG_OK /
-# LOG_FAIL (the destination cannot be read from this context — Terminal or
-# ssh without Full Disk Access — so the agent's own log lines since
-# <since-stamp> decide, by their LAST run), or UNKNOWN; EVIDENCE_MSG carries
-# the --check reason.
+# dump_evidence <minutes> — sets EVIDENCE to OK (a dump newer than <minutes>
+# in the destination), NONE (readable, none there), LOG_OK / LOG_FAIL (the
+# destination cannot be read from this context — Terminal or ssh without
+# Full Disk Access — so LOGSAYS, from a log_verdict the caller ran first,
+# stands in), or UNKNOWN; EVIDENCE_MSG carries the --check reason.
 dump_evidence() {
   EVIDENCE_MSG="$(query --check "$1" 2>&1)"; de_rc=$?
   EVIDENCE_MSG="$(printf '%s\n' "$EVIDENCE_MSG" | tail -n 1)"
@@ -67,7 +66,8 @@ dump_evidence() {
     0) EVIDENCE=OK; return ;;
     1) EVIDENCE=NONE; return ;;
   esac
-  log_verdict "$2"
+  # destination not readable from here: the caller's log_verdict (computed
+  # once, before this) stands in
   case "$LOGSAYS" in
     OK)   EVIDENCE=LOG_OK ;;
     FAIL) EVIDENCE=LOG_FAIL ;;
@@ -115,12 +115,17 @@ elif ! unit_snapshot "$domain/$label"; then
 else
   case "$UNIT_EXIT" in
     ""|0|3) ;;
+    2)
+      # "cannot run here" (destination or volume missing, TCC, bad
+      # configuration): a reload changes nothing; report, do not churn
+      echo "   loaded, but its last run exited 2 (cannot run here) — fix the cause in $log_file; a reload would not help" >&2
+      fail=1 ;;
     *) why="last run exited $UNIT_EXIT" ;;
   esac
-  if [ -z "$why" ]; then
+  if [ -z "$why" ] && [ "$fail" = 0 ]; then
     since="$(date -u -v-120M +%FT%TZ)"
-    dump_evidence 120 "$since"
     log_verdict "$since"   # the unit's own account; a manual run leaves no line here
+    dump_evidence 120
     case "$EVIDENCE:$LOGSAYS" in
       OK:OK|LOG_OK:OK) echo "   unchanged and loaded, the unit dumped within 2 h; left as it is" ;;
       OK:NONE)         why="a dump landed within 2 h but the unit's log shows no run (a manual dump? the unit not firing?)" ;;
@@ -179,21 +184,29 @@ if [ "$loaded" = yes ]; then
     done
     deferred=no
     if [ "$code" = 3 ]; then
-      # deferring to a concurrent run: wait for it, then its OWN outcome
-      # (the log's last run) must be clean before its dumps count
+      # deferring to a concurrent run: wait for it to finish (if it does
+      # not within the bound, say so and stop — nothing was proven), then
+      # its OWN "run exit" line, which necessarily postdates this
+      # kickstart, must be clean before its dumps count; its dump stamps
+      # predate the kickstart by its runtime, so that window reaches back
       echo "   stepped aside (another run held the lock); deferring to that run"
-      unit_busy_wait backup 600 || true
-      run_epoch=$((run_epoch - 1800)); run_stamp="$(date -u -v-30M +%FT%TZ)"
-      deferred=yes; code=0
-      log_verdict "$run_stamp"
-      if [ "$LOGSAYS" = FAIL ]; then
-        code=1
+      if ! unit_busy_wait backup 600; then
+        echo "   the concurrent run is still going after 10 min; nothing proven — re-run later" >&2
+        fail=1; code=""; skip_verdict=yes
+      else
+        deferred=yes; code=0
+        log_verdict "$run_stamp"
+        [ "$LOGSAYS" = FAIL ] && code=1
+        run_epoch=$((run_epoch - 1800))
       fi
     fi
     tail -n 8 "$log_file" 2>/dev/null | sed 's/^/   /'
     if [ "$deferred" = yes ]; then how="the concurrent run completed"; else how="exit $code"; fi
-    if [ "$code" = 0 ]; then
-      dump_evidence $(( ($(date +%s) - run_epoch) / 60 + 1 )) "$run_stamp"
+    if [ "${skip_verdict:-no}" = yes ]; then
+      :
+    elif [ "$code" = 0 ]; then
+      [ "$deferred" = yes ] || log_verdict "$run_stamp"
+      dump_evidence $(( ($(date +%s) - run_epoch) / 60 + 1 ))
       case "$EVIDENCE" in
         OK)       echo "   OK ($how; dump landed in $dest)" ;;
         LOG_OK)   echo "   OK ($how; the log shows the dump — destination not checkable from this context: $EVIDENCE_MSG)" ;;

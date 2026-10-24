@@ -194,8 +194,14 @@ case "${1:-}" in
         esac
         cutoff="$(date -u -v-"${mins}"M +%Y%m%d-%H%M%S 2>/dev/null)" || { echo UNREADABLE; exit 2; }
         [ -n "$cutoff" ] || { echo UNREADABLE; exit 2; }
+        # only this job's own stores count (the STORE_RE / SCRATCH_RE rule):
+        # a scratch store dumped by hand into the folder is not evidence
         found=no
-        while IFS="$TAB" read -r s _; do
+        while IFS="$TAB" read -r s f; do
+            [ -n "$f" ] || continue
+            store="${f##*/}"; store="${store#.}"; store="${store%-"$s"Z.dump*}"
+            printf '%s' "$store" | grep -q -E "$STORE_RE" || continue
+            printf '%s' "$store" | grep -q -E "$SCRATCH_RE" && continue
             [ "$s" \< "$cutoff" ] || found=yes
         done <<EOF_Z
 $(z_dumps '*')

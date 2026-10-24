@@ -103,6 +103,14 @@ done
 # migration's window. A per-user agent on purpose (docs "DB backups"); the
 # installer is idempotent and is also the thing to run by itself, without
 # sudo, whenever the backup needs (re)proving.
+# Its outcome is reported, not folded into this script's exit status: that
+# status is the SERVICES' deploy result, which an automation wrapper may
+# key on, and the backup proof can be inconclusive from an ssh session for
+# reasons that have nothing to do with the services.
 echo "== dev.snowline.backup (ops/hub/install-backup-agent.sh, as the owner)"
-sudo -u "#$OWNER_UID" -H /bin/sh "$OPS_HUB/install-backup-agent.sh" || fail=1
+if sudo -u "#$OWNER_UID" -H /bin/sh "$OPS_HUB/install-backup-agent.sh"; then
+  echo "== backup agent: OK"
+else
+  echo "== backup agent: NOT OK (see above) — fix and re-run ops/hub/install-backup-agent.sh as the owner; the services' result is exit $fail" >&2
+fi
 exit "$fail"

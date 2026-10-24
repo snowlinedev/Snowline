@@ -211,7 +211,10 @@ autocut_guard() {
 # anything is booted out, so nothing is torn down before its replacement is
 # on disk. Returns 1 (nothing touched) if the copy fails.
 place_unit() {
-  if ! { mkdir -p "$(dirname "$2")" && chown "$3" "$(dirname "$2")" \
+  pu_dir="$(dirname "$2")"
+  # the directory is created (and owned) only when it is missing; an
+  # existing one is left as the operator has it
+  if ! { { [ -d "$pu_dir" ] || { mkdir -p "$pu_dir" && chown "$3" "$pu_dir"; }; } \
          && cp "$1" "$2" && chown "$3" "$2" && chmod 644 "$2"; }; then
     echo "   could not install $1 -> $2; nothing changed" >&2
     return 1
