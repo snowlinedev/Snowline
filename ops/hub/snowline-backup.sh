@@ -82,10 +82,10 @@ trap 'log "interrupted (SIGTERM/SIGINT)${OUT:+; removing $OUT.partial}" >&2; [ -
 BACKUP_ENV="$HOME/.config/snowline/backup.env"
 if [ -f "$BACKUP_ENV" ]; then
     env_dir="${SNOWLINE_BACKUP_DIR:-}"; env_days="${SNOWLINE_BACKUP_RETENTION_DAYS:-}"; env_dbs="${SNOWLINE_BACKUP_DBS:-}"
-    set -a
+    set -a; set +u   # the file may reference variables this shell does not have
     # shellcheck disable=SC1090
     . "$BACKUP_ENV" || die "cannot source $BACKUP_ENV (syntax error?); refusing to run half-configured"
-    set +a
+    set -u; set +a
     [ -z "$env_dir" ]  || SNOWLINE_BACKUP_DIR="$env_dir"
     [ -z "$env_days" ] || SNOWLINE_BACKUP_RETENTION_DAYS="$env_days"
     [ -z "$env_dbs" ]  || SNOWLINE_BACKUP_DBS="$env_dbs"

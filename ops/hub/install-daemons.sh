@@ -2,9 +2,11 @@
 # Move the hub's four services from per-user LaunchAgents to system
 # LaunchDaemons so they start at boot without a login (#239 / 239ec238),
 # install the autocut launchd timer (#258) when the in-process host is not
-# enabled, and install the hourly DB backup agent (decision c68ec655) —
-# which stays a per-user LaunchAgent on purpose, see docs/ops/hub-daemons.md
-# "DB backups".
+# enabled, and then run the backup agent's own installer as the owner
+# (ops/hub/install-backup-agent.sh; decision c68ec655 — the backup stays a
+# per-user LaunchAgent on purpose, see docs/ops/hub-daemons.md "DB backups").
+# This is the services' deploy path: every run restarts all four services.
+# To (re)prove only the backup, run install-backup-agent.sh by itself.
 # Idempotent. Run:  sudo ops/hub/install-daemons.sh [--wait]
 # Refuses (exit 75) while an autocut is running; --wait waits up to 15 min.
 # Rollback:        sudo ops/hub/uninstall-daemons.sh
@@ -92,197 +94,11 @@ for entry in $urls; do
   [ "$ok" = yes ] || fail=1
 done
 
-# --- the backup agent: tracked plist -> ~/Library/LaunchAgents, loaded ---
-# After the services are up, so the proving run below does not land in a
-# boot migration's window (the dump itself also bounds that with pg_dump
-# --lock-wait-timeout). A per-user agent on purpose (docs "DB backups"):
-# the dumps need the owner's session anyway (Postgres is the owner's agent,
-# iCloud syncs per session), so a daemon would add no coverage, only a TCC
-# problem. Operator overrides live in ~/.config/snowline/backup.env, never
-# in the plist. The plist carries the canonical checkout path for the script
-# (never a path taken from whichever checkout runs this install), and is not
-# loaded at all when nothing is at that path. The unit is (re)loaded — plist
-# copied in at that point, never before — when the tracked plist differs
-# from the installed one, the unit is not
-# loaded, its last run exited with anything but 0 or 3 (3 = "stepped
-# aside" is harmless), or no dump has landed in the last two hours (an exit
-# code alone is not evidence: a unit launchd stopped firing still shows its
-# old exit 0). A dump in progress (it holds backup.lock) is waited for
-# first; the hourly fire landing in the instant between the last probe and
-# the bootout would lose that hour's dump, which the proving run below then
-# replaces.
-# Everything that looks at the destination is asked of the script itself,
-# run as the owner (`--print-dest`, `--check <minutes>`): same backup.env,
-# same path, same uid — root never reads the owner's iCloud folder. (The
-# TCC context is this install's — Terminal or sshd — not the agent's
-# launchd session, so a denial here is reported as "could not check", not
-# as a dead unit.)
-label="dev.snowline.backup"
-log_file="$BACKUP_LOG"
-echo "== $label (per-user agent)"
-# the log must belong to the owner (the agent opens it as uid 501); make
-# sure it exists AND is owned by the owner (a root-created one would lock
-# the agent out of its own StandardOutPath)
-[ -e "$log_file" ] || touch "$log_file"
-chown "$OWNER_UID" "$log_file"
-plist_src="$LAUNCHAGENTS_SRC/$label.plist"
-script="$(backup_agent_script)"
-if [ -z "$script" ] || [ ! -f "$script" ]; then
-  echo "   the tracked agent plist runs '$script', which is not on this hub (checkout moved? then edit ops/hub/launchagents/$label.plist); NOT installing a unit that would fail with EX_CONFIG" >&2
-  exit 1
-fi
-# The unit runs the CANONICAL script, which sources the canonical lib.sh and
-# backup.env. This install must therefore BE the canonical checkout (same
-# file, not merely equal bytes): from a branch or worktree it would install
-# a unit running other code and send the queries below to a script that may
-# not know them. Refuse otherwise.
-if [ ! "$OPS_HUB/snowline-backup.sh" -ef "$script" ]; then
-  echo "   this install runs from $OPS_HUB, but the unit runs $script; run the install from the canonical checkout (after pulling) — NOT touching the backup unit" >&2
-  exit 1
-fi
-echo "   unit runs $script"
-as_owner() { sudo -u "#$OWNER_UID" -H /bin/bash "$script" "$@"; }
-# the destination, as the script resolves it (stdout only: one line); a
-# failure (a bad backup.env line, a sudo problem) is shown with the
-# script's own last line
-dest_err="$(mktemp -t snowline-install-dest)"
-if ! dest="$(as_owner --print-dest 2>"$dest_err")" || [ -z "$dest" ]; then
-  echo "   --print-dest failed: $(tail -n 1 "$dest_err")" >&2
-  dest="(unknown)"
-fi
-rm -f "$dest_err"
-# judge_dump <minutes> — sets JUDGE to OK / NONE / UNKNOWN for a dump newer
-# than <minutes>, by the script's EXIT CODE (0/1/other), and JUDGE_MSG to
-# its last output line so a failure says why (a backup.env error, sudo,
-# TCC). A plain command, not a substitution: the variables must reach the
-# caller.
-judge_dump() {
-  JUDGE_MSG="$(as_owner --check "$1" 2>&1)"; jd_rc=$?
-  JUDGE_MSG="$(printf '%s\n' "$JUDGE_MSG" | tail -n 1)"
-  case $jd_rc in 0) JUDGE=OK ;; 1) JUDGE=NONE ;; *) JUDGE=UNKNOWN ;; esac
-}
-# dump_evidence <minutes> <since-stamp> — the ONE evidence rule: sets
-# EVIDENCE to OK (a dump newer than <minutes> in the destination), NONE (the
-# destination is readable and holds none), LOG_OK / LOG_FAIL (the
-# destination cannot be read from this context, so the agent's own log
-# lines since <since-stamp> decide) or UNKNOWN (neither source says
-# anything); EVIDENCE_MSG carries the --check failure reason.
-dump_evidence() {
-  judge_dump "$1"
-  EVIDENCE_MSG="$JUDGE_MSG"
-  case "$JUDGE" in
-    OK|NONE) EVIDENCE="$JUDGE" ;;
-    *)
-      log_since "$2"
-      case "$LOGSAYS" in
-        OK)   EVIDENCE=LOG_OK ;;
-        FAIL) EVIDENCE=LOG_FAIL ;;
-        *)    EVIDENCE=UNKNOWN ;;
-      esac ;;
-  esac
-}
-# log_since <YYYY-MM-DDTHH:MM:SSZ> — sets LOGSAYS to OK / FAIL / NONE from the
-# backup log's lines stamped at or after that instant (the agent's own
-# account of a run, written from its own launchd session — the fallback
-# when this install's context cannot read the destination)
-log_since() {
-  LOGSAYS=NONE
-  # only the script's own stamped lines (pg_dump/pg_restore stderr shares
-  # the file, unstamped); only its own failure wordings count as FAIL
-  ls_lines="$(awk -v s="$1" '$1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ && $1 >= s' "$log_file" 2>/dev/null)"
-  if printf '%s\n' "$ls_lines" | grep -q -E 'FAILED to back up|run incomplete|interrupted \(SIGTERM|cannot take the run lock|backup destination (missing|not writable)'; then
-    LOGSAYS=FAIL
-  elif printf '%s\n' "$ls_lines" | grep -q 'backed up'; then
-    LOGSAYS=OK
-  fi
-}
-why=""
-if ! cmp -s "$plist_src" "$AGENTS/$label.plist" 2>/dev/null; then
-  why="plist changed"
-elif ! launchctl print "gui/$OWNER_UID/$label" >/dev/null 2>&1; then
-  why="not loaded"
-else
-  unit_snapshot "gui/$OWNER_UID/$label"
-  case "$UNIT_EXIT" in
-    ""|0|3) ;;
-    *) why="last run exited $UNIT_EXIT" ;;
-  esac
-  if [ -z "$why" ]; then
-    dump_evidence 120 "$(date -u -v-120M +%FT%TZ)"
-    case "$EVIDENCE" in
-      OK)       echo "   unchanged and loaded, dumped within 2 h; left as it is" ;;
-      LOG_OK)   echo "   unchanged and loaded; the log shows a dump within 2 h (destination not checkable from here: $EVIDENCE_MSG); left as it is" ;;
-      NONE)     why="no dump in the last 2 h in $dest" ;;
-      LOG_FAIL) why="the log shows a failed run within 2 h" ;;
-      *)        echo "   unchanged and loaded; could not check $dest ($EVIDENCE_MSG) and the log shows no run within 2 h — check by hand: ls -t '$dest' | head" >&2; fail=1 ;;
-    esac
-  fi
-fi
-backup_loaded=no
-if [ -n "$why" ]; then
-  echo "   reloading ($why)"
-  if ! unit_busy_wait backup 600; then
-    echo "   a dump is still running (or its lock cannot be probed); leaving $label as it is — re-run the install later" >&2
-    fail=1
-  elif load_unit "$label" "gui/$OWNER_UID" "$plist_src" "$AGENTS/$label.plist" "$OWNER_UID" no; then
-    backup_loaded=yes
-  else
-    fail=1
-  fi
-fi
-
-# --- prove the backup, if this install (re)loaded it ---
-# Through launchd (`kickstart`), so the run happens in the agent's OWN
-# session — its TCC posture, its environment — not this install's (an ssh
-# session without Full Disk Access could not even write the destination).
-# Completion is seen in launchd's run counter and the run's exit code is
-# the agent's; evidence is a dump newer than the run (asked of the script
-# as the owner) or, when this context cannot read the destination, the
-# agent's own log lines for the run. Exit 3 (an hourly fire held the lock)
-# is waited out once and judged by the same evidence: a dump newer than the
-# run start is what matters, whichever run made it.
-if [ "$backup_loaded" = yes ]; then
-  echo "== $label (proving run, via launchd)"
-  unit_snapshot "gui/$OWNER_UID/$label"; runs_before="$UNIT_RUNS"
-  run_stamp="$(date -u +%FT%TZ)"; run_epoch="$(date +%s)"
-  if ! launchctl kickstart "gui/$OWNER_UID/$label"; then
-    echo "   kickstart refused; the unit is loaded but unproven — run 'bash $script' by hand as the owner" >&2
-    fail=1
-  else
-    code=""; i=0
-    while [ "$i" -lt 600 ]; do   # 120 s Postgres wait + up to 60 s lock wait per store + the dumps
-      unit_snapshot "gui/$OWNER_UID/$label" || break   # unit gone
-      if [ "$UNIT_RUNNING" = no ] && [ "$UNIT_RUNS" -gt "$runs_before" ]; then
-        code="$UNIT_EXIT"; break
-      fi
-      sleep 2
-      i=$((i + 2))
-    done
-    if [ "$code" = 3 ]; then
-      # the run that held the lock stamped its files when IT started, before
-      # this kickstart: judge against a window that reaches back to it
-      echo "   stepped aside (another run held the lock); waiting for that run and judging its dump instead"
-      unit_busy_wait backup 600 || true
-      run_epoch=$((run_epoch - 900)); run_stamp="$(date -u -v-15M +%FT%TZ)"
-      code=0
-    fi
-    tail -n 8 "$log_file" 2>/dev/null | sed 's/^/   /'
-    if [ "$code" = 0 ]; then
-      dump_evidence $(( ($(date +%s) - run_epoch) / 60 + 1 )) "$run_stamp"
-      case "$EVIDENCE" in
-        OK)       echo "   OK (exit 0; dump landed in $dest)" ;;
-        LOG_OK)   echo "   OK (exit 0; the log shows the dump — destination not checkable from this context: $EVIDENCE_MSG)" ;;
-        NONE)     echo "   exit 0 but NO new dump in $dest — not trusting it; check $log_file" >&2; fail=1 ;;
-        LOG_FAIL) echo "   exit 0 but the log shows a failed run — check $log_file" >&2; fail=1 ;;
-        *)        echo "   exit 0, UNCONFIRMED: could not check $dest ($EVIDENCE_MSG) and the log shows no dump — verify by hand: ls -t '$dest' | head" >&2; fail=1 ;;
-      esac
-    elif [ -z "$code" ]; then
-      echo "   no result after ${i}s (still running, never spawned, or killed by a signal) — check $log_file and 'launchctl print gui/$OWNER_UID/$label'" >&2
-      fail=1
-    else
-      echo "   FAILED (exit $code) — see $log_file (1: a store failed; 2: cannot run here)" >&2
-      fail=1
-    fi
-  fi
-fi
+# --- the backup agent: its own installer, as the owner ---
+# After the services are up, so its proving run cannot land in a boot
+# migration's window. A per-user agent on purpose (docs "DB backups"); the
+# installer is idempotent and is also the thing to run by itself, without
+# sudo, whenever the backup needs (re)proving.
+echo "== dev.snowline.backup (ops/hub/install-backup-agent.sh, as the owner)"
+sudo -u "#$OWNER_UID" -H /bin/sh "$OPS_HUB/install-backup-agent.sh" || fail=1
 exit "$fail"

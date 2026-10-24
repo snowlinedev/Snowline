@@ -30,20 +30,23 @@ each of platform / pm / governance / memory:
    reported as a fault. Left alone when unchanged and loaded, skipped
    (non-zero exit) if a cut is running.
 5. Polls the four `/health` URLs for up to 60s and prints UP/DOWN.
-6. Installs the hourly DB backup agent (after the services are up, so its
-   proving run cannot land in a boot migration's window): (re)loads
-   `ops/hub/launchagents/dev.snowline.backup.plist` into `gui/501` (copying
-   it to `~/Library/LaunchAgents/` at that moment) when the tracked plist
-   differs, the unit is not loaded, its last run exited with anything other
-   than 0 or 3, or no dump landed in the last two hours — waiting first for
-   a dump in progress. The plist carries the canonical checkout path for
-   the script on purpose (a path rendered from whichever checkout runs the
-   install could be a scratch worktree); the install refuses to load the
-   unit when nothing is at that path — edit the tracked plist if the hub
-   checkout ever moves.
+6. Runs `ops/hub/install-backup-agent.sh` as the owner (after the services
+   are up, so its proving run cannot land in a boot migration's window).
+   That script is the backup agent's own installer and can be run on its
+   own, without sudo, whenever the backup needs (re)proving — re-running
+   `install-daemons.sh` restarts all four services and is NOT the way to
+   do that. It (re)loads `ops/hub/launchagents/dev.snowline.backup.plist`
+   into `gui/501` when the tracked plist differs, the unit is not loaded,
+   its last run exited with anything other than 0 or 3, or no dump landed
+   in the last two hours — waiting first for a dump in progress. The plist
+   carries the canonical checkout path for the script on purpose (a path
+   taken from whichever checkout runs an install could be a scratch
+   worktree); the installer refuses to run from any other checkout and
+   refuses to load a unit whose script is missing — update `BACKUP_SCRIPT`
+   in `lib.sh` and the tracked plist if the hub checkout ever moves.
    Operator overrides live in `~/.config/snowline/backup.env`, never in the
    plist. It stays a per-user agent on purpose ("DB backups" below).
-7. If step 6 (re)loaded the backup agent, proves it by firing one run
+7. If step 6 (re)loaded the backup agent, the installer proves it by firing one run
    through launchd (`kickstart`, so it runs in the agent's own session) and
    fails the install unless that run exited 0 AND a dump newer than it was
    confirmed — in the destination, or, when the install's own context
@@ -464,10 +467,10 @@ missing program in the meantime (EX_CONFIG, penalty box). The agent plist
 already installed on the hub (the #223 one) runs the script directly with
 a `WorkingDirectory` and an explicit `SNOWLINE_BACKUP_DIR` equal to the
 default; the tracked one runs it via `/bin/bash` with neither. Same
-behaviour, different bytes: the next `sudo ops/hub/install-daemons.sh`
-will therefore replace and reload it once (one dump, judged) — run it from
-the canonical checkout after the pull; from any other checkout or worktree
-it refuses to touch the backup unit.
+behaviour, different bytes: the next `ops/hub/install-backup-agent.sh`
+(run as the owner, from the canonical checkout after the pull — from any
+other checkout it refuses) will therefore replace and reload it once and
+prove it with one run.
 
 **Is it alive?** Do this whenever you touch the hub — the job has silently
 died twice (2026-07-09 to 09-04 after the repo move; 2026-09-13 to 10-23
@@ -514,7 +517,9 @@ and every later run exits 2). To reload the unit after editing the plist:
 `launchctl bootout gui/501/dev.snowline.backup; launchctl bootstrap gui/501
 ~/Library/LaunchAgents/dev.snowline.backup.plist` (no RunAtLoad: the first
 timed run is an hour after loading; `launchctl kickstart
-gui/501/dev.snowline.backup` fires one now), or just re-run
-`sudo ops/hub/install-daemons.sh`, which proves the unit with one run. Do not `kickstart -k` a timer that launchd has put
+gui/501/dev.snowline.backup` fires one now), or just run
+`ops/hub/install-backup-agent.sh` as the owner, which reloads if needed and
+proves the unit with one run (do not re-run `install-daemons.sh` for this:
+it restarts all four services). Do not `kickstart -k` a timer that launchd has put
 in its penalty box after repeated spawn failures — it hangs;
 bootout/bootstrap instead.

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Shared constants and helpers for the hub's launchd ops scripts. Sourced (not
-# executed) by ops/hub/install-daemons.sh, ops/hub/uninstall-daemons.sh and
-# ops/hub/snowline-backup.sh. POSIX sh. (run-service.sh, the services' boot
+# executed) by ops/hub/install-daemons.sh, ops/hub/uninstall-daemons.sh,
+# ops/hub/install-backup-agent.sh and ops/hub/snowline-backup.sh. POSIX sh. (run-service.sh, the services' boot
 # wrapper, deliberately does NOT source this: it keeps its own inline
 # Postgres wait so it depends on no file but itself.)
 
@@ -29,6 +29,12 @@ LAUNCHAGENTS_SRC="$OPS_HUB/launchagents"
 ICLOUD_ROOT="$OWNER_HOME/Library/Mobile Documents/com~apple~CloudDocs"
 BACKUP_DIR="$ICLOUD_ROOT/Snowline/db-backups"   # the backup script's default destination
 BACKUP_LOG="$OWNER_HOME/Library/Logs/snowline-backup.log"   # the agent plist's StandardOut/ErrorPath
+# The canonical hub checkout's backup script: what the tracked agent plist
+# runs (deliberately fixed — a path taken from whichever checkout runs an
+# install could be a scratch worktree, dying with EX_CONFIG when deleted).
+# install-backup-agent.sh checks the plist against this and refuses to run
+# from any other checkout.
+BACKUP_SCRIPT=/Users/seanlynch/Projects/snowline-platform/ops/hub/snowline-backup.sh
 
 # ---- logging ----
 # Helpers log through `log`. A caller that defines its own log() FUNCTION
@@ -197,24 +203,29 @@ autocut_guard() {
 # Boot the label out of <domain>, wait for it to be gone, copy <src> to
 # <dst> (creating the directory, owned by <owner>), bootstrap it, and
 # kickstart it when <kick> is yes (never for a timer: that fires a run).
-# Sets UNIT_RESULT: installed | still-old (the old registration never went
-# away, or bootstrap was refused with it still loaded: the OLD definition
-# keeps running; when the teardown wait failed the plist on disk is left as
-# it was) | not-loaded (plist installed, bootstrap refused, nothing loaded —
-# a gui-domain unit then loads at the next login). Returns 0 only for
-# installed.
+# Order: the plist is put in place FIRST (launchd holds its own copy of a
+# loaded definition, so overwriting the file is harmless), then the old
+# registration is booted out, waited for, and the new one bootstrapped —
+# nothing is torn down before its replacement is on disk.
+# Sets UNIT_RESULT: installed | copy-failed (the plist could not be put in
+# place; nothing was touched) | still-old (the old registration did not go
+# away within 30 s, or bootstrap was refused with it still loaded: it keeps
+# running the OLD definition, the new plist is on disk, re-run) |
+# not-loaded (bootstrap refused, nothing loaded — a gui-domain unit then
+# loads at the next login) | not-started (loaded, kickstart refused).
+# Returns 0 only for installed.
 load_unit() {
   lu_label="$1"; lu_domain="$2"; lu_src="$3"; lu_dst="$4"; lu_owner="$5"; lu_kick="$6"
-  launchctl bootout "$lu_domain/$lu_label" 2>/dev/null || true
-  if ! wait_unloaded "$lu_domain/$lu_label"; then
-    echo "   old registration of $lu_label still loaded after 30s; plist NOT replaced — re-run" >&2
-    UNIT_RESULT=still-old
-    return 1
-  fi
   if ! { mkdir -p "$(dirname "$lu_dst")" && chown "$lu_owner" "$(dirname "$lu_dst")" \
          && cp "$lu_src" "$lu_dst" && chown "$lu_owner" "$lu_dst" && chmod 644 "$lu_dst"; }; then
-    echo "   could not install $lu_src -> $lu_dst; $lu_label NOT loaded" >&2
+    echo "   could not install $lu_src -> $lu_dst; $lu_label left as it was" >&2
     UNIT_RESULT=copy-failed
+    return 1
+  fi
+  launchctl bootout "$lu_domain/$lu_label" 2>/dev/null || true
+  if ! wait_unloaded "$lu_domain/$lu_label"; then
+    echo "   old registration of $lu_label still loaded after 30s (it keeps running the old definition; the new plist is on disk) — re-run" >&2
+    UNIT_RESULT=still-old
     return 1
   fi
   if ! launchctl bootstrap "$lu_domain" "$lu_dst"; then
@@ -234,19 +245,6 @@ load_unit() {
   fi
   UNIT_RESULT=installed
   return 0
-}
-
-# backup_agent_script — the script path the tracked backup agent plist runs
-# (the canonical hub checkout, deliberately fixed: a unit rendered from
-# whichever checkout runs the install could point at a scratch worktree and
-# die with EX_CONFIG when it is deleted — the #220 failure mode). The
-# install refuses to load the unit when nothing is at that path.
-backup_agent_script() {
-  # the LAST ProgramArguments entry: the script, whether or not argv[0] is
-  # an interpreter
-  bas_n="$(plutil -extract ProgramArguments raw -o - "$LAUNCHAGENTS_SRC/dev.snowline.backup.plist" 2>/dev/null)" || return 1
-  [ "${bas_n:-0}" -gt 0 ] || return 1
-  plutil -extract "ProgramArguments.$((bas_n - 1))" raw -o - "$LAUNCHAGENTS_SRC/dev.snowline.backup.plist" 2>/dev/null
 }
 
 # ---- per-user agent restore (the services' rollback) ----
