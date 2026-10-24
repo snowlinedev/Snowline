@@ -47,8 +47,6 @@
 
     <key>StartInterval</key>
     <integer>3600</integer>
-    <key>RunAtLoad</key>
-    <true/>
 
     <key>StandardOutPath</key>
     <string>/Users/seanlynch/Library/Logs/snowline-backup.log</string>

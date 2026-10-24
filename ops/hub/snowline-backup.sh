@@ -178,12 +178,6 @@ set +f
 # (valid_names runs in a subshell here, so its exit 2 must be propagated)
 DBS_EXPLICIT="$(valid_names strict "$@")" || exit 2
 DBS_EXPLICIT="${DBS_EXPLICIT% }"
-# Exit codes: 2 = cannot run at all (destination / iCloud root / unwritable /
-# lock — the environment, not the data); 1 = some store(s) failed to dump;
-# 3 = another run held the lock (stepped aside). install-daemons.sh reads
-# them to judge the RunAtLoad run; nothing is rolled back on any of them.
-die() { log "$*" >&2; exit 2; }
-
 # --- run lock: a flock on $BACKUP_LOCK, held for the whole run ---
 # fd 9 is opened on the lock file for the life of this process; a one-line
 # python takes the flock on that inherited fd (the lock lives on the open
@@ -192,7 +186,7 @@ die() { log "$*" >&2; exit 2; }
 # lock, no pid to trust. lib.sh's unit_busy_wait probes the same file before
 # the ops scripts boot this unit out (a probe holds a shared lock for an
 # instant, so the acquire retries over a few seconds). A second run while
-# one holds the lock (RunAtLoad racing the hourly fire) steps aside with
+# one holds the lock (a manual or proving run racing the hourly fire) steps aside with
 # exit 3, which install-daemons.sh never mistakes for "dumps landed"; any
 # other flock error (an fs without flock, a bad fd) is exit 2.
 mkdir -p "$(dirname "$BACKUP_LOCK")"
@@ -301,7 +295,6 @@ else
     DBS="$FALLBACK_DBS"
     log "WARNING: could not list databases from the server ($(tr '\n' ' ' < "$CATALOG_ERR")); dumping the fallback list only: $DBS" >&2
 fi
-rm -f "$CATALOG_ERR"
 
 # UTC stamp so file names sort monotonically (no DST fold) and match the log.
 STAMP="$(date -u +%Y%m%d-%H%M%SZ)"
@@ -368,10 +361,10 @@ for DB in "$@"; do
     # hiccup must not make a run whose dump already succeeded read as failed.
     prune_by_name "$DB" || true
     # legacy pre-Z names (local-time stamps) and their placeholders: by mtime
-    find "$DEST" -maxdepth 1 \( -name "${DB}-*[0-9].dump" -o -name ".${DB}-*[0-9].dump.icloud" \) -type f -mtime +"$RETENTION_DAYS" -delete 2>/dev/null || true
+    # (-mtime +N means "older than N+1 days"; +N-1 gives the same window as the stamp rule)
+    find "$DEST" -maxdepth 1 \( -name "${DB}-*[0-9].dump" -o -name ".${DB}-*[0-9].dump.icloud" \) -type f -mtime +"$((RETENTION_DAYS - 1))" -delete 2>/dev/null || true
 done
 trap - TERM INT
-rm -f "$Z_DUMPS_ERR"
 
 # Stale .partial leftovers from any store.
 find "$DEST" -maxdepth 1 -name '*.partial' -type f -mtime +1 -delete || true

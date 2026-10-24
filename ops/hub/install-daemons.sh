@@ -113,7 +113,10 @@ done
 # replaces.
 # Everything that looks at the destination is asked of the script itself,
 # run as the owner (`--print-dest`, `--check <minutes>`): same backup.env,
-# same TCC grant, same path — root never reads the owner's iCloud folder.
+# same path, same uid — root never reads the owner's iCloud folder. (The
+# TCC context is this install's — Terminal or sshd — not the agent's
+# launchd session, so a denial here is reported as "could not check", not
+# as a dead unit.)
 label="dev.snowline.backup"
 log_file="$OWNER_HOME/Library/Logs/snowline-backup.log"
 echo "== $label (per-user agent)"
@@ -159,7 +162,7 @@ else
     case "$(judge_dump 120)" in
       OK)   echo "   unchanged and loaded, dumped within 2 h; left as it is" ;;
       NONE) why="no dump in the last 2 h in $dest" ;;
-      *)    echo "   unchanged and loaded; could not check $dest for a recent dump (as the owner) — check by hand: ls -t '$dest' | head" >&2; fail=1 ;;
+      *)    echo "   unchanged and loaded; could not check $dest for a recent dump from this install's context (TCC? sudo?) — check by hand: ls -t '$dest' | head" >&2; fail=1 ;;
     esac
   fi
 fi
@@ -188,12 +191,12 @@ fi
 if [ "$backup_loaded" = yes ]; then
   echo "== $label (proving run, as the owner)"
   run_epoch="$(date +%s)"
-  as_owner; rc=$?
+  as_owner >>"$log_file" 2>&1; rc=$?   # its lines go where the hourly runs' do
   if [ "$rc" = 3 ]; then
     echo "   an hourly run held the lock; waiting for it, then running once more"
     unit_busy_wait backup 600 || true
     run_epoch="$(date +%s)"
-    as_owner; rc=$?
+    as_owner >>"$log_file" 2>&1; rc=$?
   fi
   tail -n 8 "$log_file" 2>/dev/null | sed 's/^/   /'
   if [ "$rc" = 0 ]; then
@@ -201,7 +204,7 @@ if [ "$backup_loaded" = yes ]; then
     case "$(judge_dump "$mins")" in
       OK)   echo "   OK (exit 0; dump landed in $dest)" ;;
       NONE) echo "   exit 0 but NO new dump in $dest — not trusting it; check $log_file" >&2; fail=1 ;;
-      *)    echo "   exit 0, UNCONFIRMED: could not check $dest (as the owner) — verify by hand: ls -t '$dest' | head" >&2; fail=1 ;;
+      *)    echo "   exit 0, UNCONFIRMED: could not check $dest from this install's context (TCC? sudo?) — verify by hand: ls -t '$dest' | head" >&2; fail=1 ;;
     esac
   else
     echo "   FAILED (exit $rc) — see $log_file (1: a store failed; 2: cannot run here; 3: lock held twice in a row)" >&2

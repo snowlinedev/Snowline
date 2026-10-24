@@ -31,7 +31,7 @@ each of platform / pm / governance / memory:
    (non-zero exit) if a cut is running.
 5. Polls the four `/health` URLs for up to 60s and prints UP/DOWN.
 6. Installs the hourly DB backup agent (after the services are up, so its
-   RunAtLoad dump cannot block a boot migration): (re)loads
+   proving run cannot land in a boot migration's window): (re)loads
    `ops/hub/launchagents/dev.snowline.backup.plist` into `gui/501` (copying
    it to `~/Library/LaunchAgents/` at that moment) when the tracked plist
    differs, the unit is not loaded, its last run exited with anything other
@@ -104,7 +104,7 @@ mid-cut: a running cut is refused up front (exit 75, or waited for with
 with a message and a non-zero exit. The backup agent is only reloaded after
 a dump in progress (it holds `backup.lock`) has finished; a fire landing in
 the instant between the last probe and the bootout would lose that hour's
-dump (the RunAtLoad dump that follows replaces it).
+dump (the proving run that follows replaces it).
 
 ## Deploy routine change
 
@@ -479,7 +479,8 @@ ls -t ~/Library/Mobile\ Documents/com~apple~CloudDocs/Snowline/db-backups | head
 log lines says which store failed. Exit 2 means the run could not start at
 all (destination missing or unwritable, iCloud root absent, lib.sh missing,
 lock file unopenable). Exit 3 means the run stepped aside because another
-backup run held the lock (RunAtLoad racing the hourly fire; harmless once).
+backup run held the lock (a manual or proving run racing the hourly fire;
+harmless once).
 A log line "interrupted (SIGTERM/SIGINT)" (exit 143, or `(never exited)`
 in launchctl) means the run was killed mid-dump — a bootout, logout or
 shutdown; its partial was removed and the next tick dumps again.
