@@ -30,6 +30,9 @@
 # Restore (to a scratch DB, to inspect first):
 #   createdb snowline_restore && pg_restore --no-owner -d snowline_restore <dump>
 set -uo pipefail
+# The command line, captured before anything below touches the positional
+# parameters (the store-list normalisation re-sets them).
+ARG1="${1:-}"; ARG2="${2:-}"
 export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 umask 077
 
@@ -184,7 +187,7 @@ dest_state() {
 #   --check <minutes>   exit 0 if a dump (or its iCloud-evicted placeholder)
 #                       newer than <minutes> exists in the destination,
 #                       1 if none, 2 if the destination cannot be read
-case "${1:-}" in
+case "$ARG1" in
     --print-dest)
         QUIET_EXIT=yes
         printf '%s\n' "$DEST"
@@ -199,7 +202,7 @@ case "${1:-}" in
         # compare as strings against one cutoff stamp — no fork per file.
         # Prints OK / NONE / UNREADABLE on stdout as well as exiting 0 / 1 /
         # 2, so a caller can tell "no dump" from "could not even run".
-        mins="${2:-}"
+        mins="$ARG2"
         case "$mins" in ''|*[!0-9]*) echo "--check needs a number of minutes" >&2; exit 2 ;; esac
         # Same destination rule as a run (dest_state): a leaf that does not
         # exist yet under a present iCloud root is "no dump yet" (NONE); a
@@ -231,7 +234,7 @@ EOF_Z
         echo NONE; exit 1
         ;;
     "") ;;   # no arguments: a real run
-    *) die "unknown argument '$1' (this script takes no arguments except --print-dest and --check <minutes>); refusing to run" ;;
+    *) die "unknown argument '$ARG1' (this script takes no arguments except --print-dest and --check <minutes>); refusing to run" ;;
 esac
 # An explicit store list is validated here, before anything slow or
 # side-effecting: a whitespace-only value is "unset", not "dump nothing";
