@@ -396,7 +396,7 @@ set -f
 # shellcheck disable=SC2086
 set -- $DBS
 set +f
-# prune_by_name <store> — delete this store's Z-stamped dumps and
+# prune_all <store> — delete this store's Z-stamped dumps and
 # placeholders whose name stamp is older than RETENTION_DAYS (string
 # comparison against one cutoff stamp; no fork per file).
 PRUNE_CUTOFF="$(date -u -v-"${RETENTION_DAYS}"d +%Y%m%d-%H%M%S 2>/dev/null)" || PRUNE_CUTOFF=""
