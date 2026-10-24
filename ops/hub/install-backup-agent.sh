@@ -117,12 +117,13 @@ else
     ""|0|3) ;;
     2)
       # "cannot run here" (destination or volume missing, TCC, bad
-      # configuration): a reload changes nothing; report, do not churn
-      echo "   loaded, but its last run exited 2 (cannot run here) — fix the cause in $log_file; a reload would not help" >&2
-      fail=1 ;;
+      # configuration): a reload changes nothing, so none — but the unit is
+      # proven again right away, which is how a fixed cause is confirmed
+      echo "   loaded, but its last run exited 2 (cannot run here; see $log_file) — no reload, proving it again instead"
+      reprove=yes ;;
     *) why="last run exited $UNIT_EXIT" ;;
   esac
-  if [ -z "$why" ] && [ "$fail" = 0 ]; then
+  if [ -z "$why" ] && [ "${reprove:-no}" = no ]; then
     since="$(date -u -v-120M +%FT%TZ)"
     log_verdict "$since"   # the unit's own account; a manual run leaves no line here
     dump_evidence 120
@@ -153,75 +154,69 @@ if [ -n "$why" ]; then
   fi
 fi
 
-# --- prove a (re)loaded unit with one run through launchd ---
+# --- prove the unit with one run through launchd ---
 # `kickstart`, so the run happens in the agent's OWN launchd session (its
 # TCC posture, its environment), not this shell's. Completion is seen in
 # launchd's run counter and the exit code is the agent's; evidence is a
 # dump newer than the run (or the agent's own log lines when the
-# destination cannot be read from here). Exit 3 (an hourly fire held the
-# lock) is waited out and judged by the same evidence, with the window
-# reaching back to the run that held the lock.
-if [ "$loaded" = yes ]; then
-  echo "== $label (proving run, via launchd)"
+# destination cannot be read from here). Exit 3 (an hourly or manual run
+# held the lock) proves nothing about the unit: wait for that run, then
+# fire once more; a second step-aside ends as "nothing proven".
+prove_run() {
+  pr_try="$1"
   unit_snapshot "$domain/$label"; runs_before="$UNIT_RUNS"
   run_stamp="$(date -u +%FT%TZ)"; run_epoch="$(date +%s)"
   if ! launchctl kickstart "$domain/$label"; then
     echo "   kickstart refused; the unit is loaded but unproven — run 'bash $BACKUP_SCRIPT' by hand" >&2
+    fail=1; return
+  fi
+  code=""; i=0; spawned=no
+  while [ "$i" -lt 900 ]; do   # 120 s Postgres wait + up to 60 s lock wait per store + the dumps
+    unit_snapshot "$domain/$label" || break   # unit gone
+    [ "$UNIT_RUNNING" = yes ] && spawned=yes
+    if [ "$UNIT_RUNNING" = no ] && [ "$UNIT_RUNS" -gt "$runs_before" ]; then
+      code="$UNIT_EXIT"; break
+    fi
+    # a kickstart that launchd accepted but could not spawn (EX_CONFIG:
+    # the program vanished) never increments runs: give up after a minute
+    if [ "$spawned" = no ] && [ "$i" -ge 60 ]; then break; fi
+    sleep 2
+    i=$((i + 2))
+  done
+  if [ "$code" = 3 ]; then
+    if [ "$pr_try" = 1 ]; then
+      echo "   stepped aside (another run held the lock); waiting for it, then firing once more"
+      if unit_busy_wait backup 600; then prove_run 2; return; fi
+      echo "   the concurrent run is still going after 10 min; nothing proven — re-run later" >&2
+    else
+      echo "   stepped aside twice; nothing proven — re-run later" >&2
+    fi
+    fail=1; return
+  fi
+  tail -n 8 "$log_file" 2>/dev/null | sed 's/^/   /'
+  if [ "$code" = 0 ]; then
+    log_verdict "$run_stamp"
+    dump_evidence $(( ($(date +%s) - run_epoch) / 60 + 1 ))
+    case "$EVIDENCE" in
+      OK)       echo "   OK (exit 0; dump landed in $dest)" ;;
+      LOG_OK)   echo "   OK (exit 0; the log shows the dump — destination not checkable from this context: $EVIDENCE_MSG)" ;;
+      NONE)     echo "   exit 0 but NO new dump in $dest — not trusting it; check $log_file" >&2; fail=1 ;;
+      LOG_FAIL) echo "   exit 0 but the log's last run failed — check $log_file" >&2; fail=1 ;;
+      *)        echo "   exit 0, UNCONFIRMED: could not check $dest ($EVIDENCE_MSG) and the log shows no run — verify by hand: ls -t '$dest' | head" >&2; fail=1 ;;
+    esac
+  elif [ -z "$code" ]; then
+    echo "   no result after ${i}s (still running, never spawned, or killed by a signal) — check $log_file and 'launchctl print $domain/$label'" >&2
     fail=1
   else
-    code=""; i=0; spawned=no
-    while [ "$i" -lt 900 ]; do   # 120 s Postgres wait + up to 60 s lock wait per store + the dumps
-      unit_snapshot "$domain/$label" || break   # unit gone
-      [ "$UNIT_RUNNING" = yes ] && spawned=yes
-      if [ "$UNIT_RUNNING" = no ] && [ "$UNIT_RUNS" -gt "$runs_before" ]; then
-        code="$UNIT_EXIT"; break
-      fi
-      # a kickstart that launchd accepted but could not spawn (EX_CONFIG:
-      # the program vanished) never increments runs: give up after a minute
-      if [ "$spawned" = no ] && [ "$i" -ge 60 ]; then break; fi
-      sleep 2
-      i=$((i + 2))
-    done
-    deferred=no
-    if [ "$code" = 3 ]; then
-      # deferring to a concurrent run: wait for it to finish (if it does
-      # not within the bound, say so and stop — nothing was proven), then
-      # its OWN "run exit" line, which necessarily postdates this
-      # kickstart, must be clean before its dumps count; its dump stamps
-      # predate the kickstart by its runtime, so that window reaches back
-      echo "   stepped aside (another run held the lock); deferring to that run"
-      if ! unit_busy_wait backup 600; then
-        echo "   the concurrent run is still going after 10 min; nothing proven — re-run later" >&2
-        fail=1; code=""; skip_verdict=yes
-      else
-        deferred=yes; code=0
-        log_verdict "$run_stamp"
-        [ "$LOGSAYS" = FAIL ] && code=1
-        run_epoch=$((run_epoch - 1800))
-      fi
-    fi
-    tail -n 8 "$log_file" 2>/dev/null | sed 's/^/   /'
-    if [ "$deferred" = yes ]; then how="the concurrent run completed"; else how="exit $code"; fi
-    if [ "${skip_verdict:-no}" = yes ]; then
-      :
-    elif [ "$code" = 0 ]; then
-      [ "$deferred" = yes ] || log_verdict "$run_stamp"
-      dump_evidence $(( ($(date +%s) - run_epoch) / 60 + 1 ))
-      case "$EVIDENCE" in
-        OK)       echo "   OK ($how; dump landed in $dest)" ;;
-        LOG_OK)   echo "   OK ($how; the log shows the dump — destination not checkable from this context: $EVIDENCE_MSG)" ;;
-        NONE)     echo "   exit 0 but NO new dump in $dest — not trusting it; check $log_file" >&2; fail=1 ;;
-        LOG_FAIL) echo "   exit 0 but the log's last run failed — check $log_file" >&2; fail=1 ;;
-        *)        echo "   exit 0, UNCONFIRMED: could not check $dest ($EVIDENCE_MSG) and the log shows no dump — verify by hand: ls -t '$dest' | head" >&2; fail=1 ;;
-      esac
-    elif [ -z "$code" ]; then
-      echo "   no result after ${i}s (still running, never spawned, or killed by a signal) — check $log_file and 'launchctl print $domain/$label'" >&2
-      fail=1
-    else
-      [ "$deferred" = yes ] && how="the concurrent run's last line reports a failure"
-      echo "   FAILED ($how) — see $log_file (1: a store failed; 2: cannot run here)" >&2
-      fail=1
-    fi
+    echo "   FAILED (exit $code) — see $log_file (1: a store failed; 2: cannot run here)" >&2
+    fail=1
   fi
+}
+if [ "$loaded" = yes ]; then
+  echo "== $label (proving run, via launchd)"
+  prove_run 1
+elif [ "${reprove:-no}" = yes ]; then
+  echo "== $label (re-proving the last exit 2 without a reload, via launchd)"
+  prove_run 1
 fi
 exit "$fail"

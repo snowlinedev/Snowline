@@ -137,18 +137,21 @@ flock_fd() {
 }
 
 # lock_state <path> — prints held / free / unknown: a shared non-blocking
-# probe through flock_fd on a read fd, released at once. It fails only while
-# an exclusive holder runs and never leaves the probe owning the lock.
+# probe (same semantics as flock_fd's sh mode), released at once. It fails
+# only while an exclusive holder runs and never leaves the probe owning the
+# lock.
 # "unknown" = the probe itself could not run (unreadable file, perl
 # missing): a guard that cannot tell must refuse, not wave through, so
 # callers treat it like held — but without waiting on it.
 lock_state() {
   [ -e "$1" ] || { echo free; return; }
-  if ! { exec 8<"$1"; } 2>/dev/null; then echo unknown; return; fi
-  flock_fd 8 sh 1
-  ls_rc=$?
-  exec 8<&-
-  case $ls_rc in 0) echo free ;; 1) echo held ;; *) echo unknown ;; esac
+  # perl opens the path itself: under /bin/sh a failed `exec 8<` redirection
+  # on the special builtin exits the whole script, so no shell-side open here
+  /usr/bin/perl -e 'use Fcntl qw(:flock);
+    open(my $fh, "<", $ARGV[0]) or exit 2;
+    exit 0 if flock($fh, LOCK_SH | LOCK_NB);
+    exit(($!{EWOULDBLOCK} || $!{EAGAIN}) ? 1 : 2);' "$1" 2>/dev/null
+  case $? in 0) echo free ;; 1) echo held ;; *) echo unknown ;; esac
 }
 # lock_held <path> — true unless the lock is known to be free.
 lock_held() { [ "$(lock_state "$1")" != free ]; }

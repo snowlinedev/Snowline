@@ -146,6 +146,13 @@ z_dumps() {
     done
 }
 
+# store_wanted <name> — the ONE store rule, for the catalog pass and --check
+# alike: a snowline_* name that is not a scratch one. A bash regex match: no
+# fork per name.
+store_wanted() {
+    [[ $1 =~ $STORE_RE ]] && ! [[ $1 =~ $SCRATCH_RE ]]
+}
+
 # dest_state — the ONE destination rule, for --check and the run alike:
 # prints ok (exists), no-leaf (absent, but under a present iCloud root: may
 # be created), or missing (iCloud root absent, or a non-iCloud destination
@@ -194,14 +201,18 @@ case "${1:-}" in
         esac
         cutoff="$(date -u -v-"${mins}"M +%Y%m%d-%H%M%S 2>/dev/null)" || { echo UNREADABLE; exit 2; }
         [ -n "$cutoff" ] || { echo UNREADABLE; exit 2; }
-        # only this job's own stores count (the STORE_RE / SCRATCH_RE rule):
-        # a scratch store dumped by hand into the folder is not evidence
+        # only the stores this job dumps count: the configured list when
+        # SNOWLINE_BACKUP_DBS is set, else the catalog rule (store_wanted) —
+        # a scratch or foreign dump put in the folder by hand is not evidence
         found=no
         while IFS="$TAB" read -r s f; do
             [ -n "$f" ] || continue
             store="${f##*/}"; store="${store#.}"; store="${store%-"$s"Z.dump*}"
-            printf '%s' "$store" | grep -q -E "$STORE_RE" || continue
-            printf '%s' "$store" | grep -q -E "$SCRATCH_RE" && continue
+            if [ -n "${SNOWLINE_BACKUP_DBS:-}" ]; then
+                case " ${SNOWLINE_BACKUP_DBS} " in *" $store "*) ;; *) continue ;; esac
+            else
+                store_wanted "$store" || continue
+            fi
             [ "$s" \< "$cutoff" ] || found=yes
         done <<EOF_Z
 $(z_dumps '*')
@@ -301,13 +312,17 @@ CATALOG_OK=yes
 # never silently dropped from the backup set: the query returns
 # "<name>|<connectable>" and the unconnectable ones are reported below.
 CATALOG_ROWS="$(psql -X -At -d postgres -c "select datname, (datallowconn and has_database_privilege(datname, 'CONNECT')) from pg_database where not datistemplate and datname <> 'postgres' and datname ~ '^[A-Za-z0-9_]+\$' order by 1" 2>"$CATALOG_ERR")" || CATALOG_OK=no
-# One pass: the store filter (STORE_RE minus SCRATCH_RE) applied once,
-# connectable names to LIVE, the others to UNCONNECTABLE.
-CATALOG_SPLIT="$(printf '%s\n' "$CATALOG_ROWS" | awk -F'|' -v store="$STORE_RE" -v scratch="$SCRATCH_RE" '
-    $1 ~ store && $1 !~ scratch { if ($2 == "t") live = live " " $1; else dead = dead " " $1 }
-    END { print live; print dead }')"
-LIVE="$(printf '%s\n' "$CATALOG_SPLIT" | sed -n 1p)"; LIVE="${LIVE# }"
-UNCONNECTABLE="$(printf '%s\n' "$CATALOG_SPLIT" | sed -n 2p)"; UNCONNECTABLE="${UNCONNECTABLE# }"
+# One pass over the rows: the store rule (store_wanted) applied once per
+# name, connectable names to LIVE, the others to UNCONNECTABLE.
+LIVE=""; UNCONNECTABLE=""
+while IFS='|' read -r cat_name cat_ok; do
+    [ -n "$cat_name" ] || continue
+    store_wanted "$cat_name" || continue
+    if [ "$cat_ok" = t ]; then LIVE="$LIVE $cat_name"; else UNCONNECTABLE="$UNCONNECTABLE $cat_name"; fi
+done <<EOF_ROWS
+$CATALOG_ROWS
+EOF_ROWS
+LIVE="${LIVE# }"; UNCONNECTABLE="${UNCONNECTABLE# }"
 [ -z "$UNCONNECTABLE" ] || log "WARNING: snowline store(s) this role cannot connect to, NOT backed up: $UNCONNECTABLE (parked? CONNECT revoked?)" >&2
 # (LIVE was built above, in the same pass)
 if [ -n "$DBS_EXPLICIT" ]; then
@@ -404,7 +419,6 @@ for DB in "$@"; do
         rm -f "$OUT.partial"; OUT=""
         log "FAILED to back up ${DB} (pg_dump, archive check, or rename failed)" >&2
         FAILED="$FAILED $DB"
-        continue
     fi
 done
 
