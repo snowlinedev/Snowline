@@ -344,21 +344,31 @@ the few seconds between the check and the bootout is not covered.
 
 Decision c68ec655 (supersedes e4578136): every live Postgres store on the hub
 is dumped every hour into iCloud Drive. The unit is a system LaunchDaemon
-(installed by `install-daemons.sh`, runs as `UserName=seanlynch`) so a backup
-is taken whether or not anyone is logged in; before the move it was a
-login-only LaunchAgent.
+(installed by `install-daemons.sh`, runs as `UserName=seanlynch`) like the
+services, so the timer survives a reboot without anyone re-loading it; the
+dumps themselves still need the owner's session, because Postgres is the
+owner's per-user agent and iCloud syncs per session — after a FileVault boot
+that session always exists. Before the move it was a login-only LaunchAgent.
+The install waits for the unit's first (RunAtLoad) dump and fails if it did
+not exit 0; a rollback with `uninstall-daemons.sh` restores the agent plist,
+and leaves the daemon in place if there is none to restore.
 
 **What runs.** `ops/hub/launchdaemons/dev.snowline.backup.plist` fires
 `ops/hub/snowline-backup.sh` every 3600 s and once on load. The script:
 
-- dumps `snowline_platform pm governance memory musher marketing` with
-  `pg_dump -Fc` (override the list with `SNOWLINE_BACKUP_DBS`), verifies each
-  archive with `pg_restore -l`, then renames `.partial` to the final name —
-  one store failing does not skip the others, and the run exits 1 if any did;
-- cross-checks the list against every `*_DATABASE_URL` in
-  `~/.config/snowline/*.env` and in the `dev.snowline.*` plists; a configured
-  store that is not in the list is logged as a WARNING and fails the run, so
-  a new service cannot go unbacked-up silently;
+- waits up to 120 s for `pg_isready` (Postgres is the owner's per-user
+  LaunchAgent, so at boot it can start after this daemon fires), then dumps
+  `snowline_platform`, `snowline_pm`, `snowline_governance`,
+  `snowline_memory`, `snowline_musher` and `snowline_marketing` with
+  `pg_dump -Fc`, verifies each archive with `pg_restore -l`, then renames
+  `.partial` to the final name — one store failing does not skip the others,
+  and the run exits 1 if any did;
+- cross-checks that list against every `*_DATABASE_URL` in
+  `~/.config/snowline/*.env` and in the `dev.snowline.*` plists
+  (`*_TEST_*` / `*_DRYRUN_*` URLs are ignored); with the default list, a
+  configured store that is missing is logged as a WARNING and fails the run,
+  so a new service cannot go unbacked-up silently. Setting
+  `SNOWLINE_BACKUP_DBS` explicitly is a deliberate exclusion and only notes it;
 - refuses to run if the iCloud Drive root is missing (`mkdir -p` would
   otherwise recreate the folder locally and every run would "succeed" while
   nothing left the machine);

@@ -7,7 +7,10 @@
 
 SERVICES="platform pm governance memory"
 TIMERS="autocut"  # system-only; no LaunchAgent predecessor to restore
-AGENT_TIMERS="backup"  # had a per-user agent before the daemon move: restore it
+# Timers that had a per-user agent before the daemon move: restore the agent
+# if its .disabled-* plist is there; if NOT, leave the daemon in place — a
+# rollback must never leave the hub with no backup unit at all.
+AGENT_TIMERS="backup"
 OWNER_UID=501
 OWNER_HOME=/Users/seanlynch
 DEST=/Library/LaunchDaemons
@@ -57,6 +60,14 @@ done
 for svc in $SERVICES $AGENT_TIMERS; do
   label="dev.snowline.$svc"
   echo "== $label"
+  case " $AGENT_TIMERS " in
+    *" $svc "*)
+      if ! ls "$AGENTS/$label.plist.disabled-"* >/dev/null 2>&1; then
+        echo "   no .disabled-* agent plist to restore; LEAVING the system daemon $label in place" >&2
+        continue
+      fi
+      ;;
+  esac
   launchctl bootout "system/$label" 2>/dev/null || true
   rm -f "$DEST/$label.plist"
   # restore the newest .disabled-* agent plist, if any
@@ -76,4 +87,4 @@ for svc in $SERVICES $AGENT_TIMERS; do
     esac
   fi
 done
-echo "done; check the four /health URLs (docs/ops/hub-daemons.md)"
+echo "done; check the four /health URLs and 'launchctl print gui/$OWNER_UID/dev.snowline.backup' (docs/ops/hub-daemons.md)"

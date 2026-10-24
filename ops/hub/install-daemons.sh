@@ -10,15 +10,13 @@
 [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
 
 SERVICES="platform pm governance memory"
-# Interval timers (#258): installed + bootstrapped, never kickstarted — a
-# kickstart would fire an immediate run (for autocut, a ~6-minute cut).
-TIMERS="autocut"
-# Timers that replace a per-user LaunchAgent of the same label (the backup job
-# predates the daemon move). Bootstrapped like TIMERS, and additionally the
-# old agent is booted out and its plist moved aside — a timer loaded in both
-# domains would dump twice an hour. RunAtLoad on the backup plist means the
-# bootstrap itself takes one backup, which proves the path end to end.
-AGENT_TIMERS="backup"
+# Interval timers (#258, c68ec655): installed + bootstrapped, never
+# kickstarted — a kickstart would fire an immediate run (for autocut, a
+# ~6-minute cut). Any per-user LaunchAgent of the same label is booted out and
+# its plist moved aside first (the backup job predates the daemon move; a
+# timer loaded in both domains would dump twice an hour) — no-ops for a timer
+# that never had one.
+TIMERS="autocut backup"
 OWNER_UID=501
 OWNER_HOME=/Users/seanlynch
 SRC="$(cd "$(dirname "$0")" && pwd)/launchdaemons"
@@ -79,18 +77,14 @@ for svc in $SERVICES; do
   launchctl kickstart -k "system/$label"
 done
 
-for timer in $TIMERS $AGENT_TIMERS; do
+for timer in $TIMERS; do
   label="dev.snowline.$timer"
   echo "== $label (timer; not kickstarted)"
-  case " $AGENT_TIMERS " in
-    *" $timer "*)
-      launchctl bootout "gui/$OWNER_UID/$label" 2>/dev/null || true
-      if [ -f "$AGENTS/$label.plist" ]; then
-        mv "$AGENTS/$label.plist" "$AGENTS/$label.plist.disabled-$STAMP"
-        echo "   agent plist -> $label.plist.disabled-$STAMP"
-      fi
-      ;;
-  esac
+  launchctl bootout "gui/$OWNER_UID/$label" 2>/dev/null || true
+  if [ -f "$AGENTS/$label.plist" ]; then
+    mv "$AGENTS/$label.plist" "$AGENTS/$label.plist.disabled-$STAMP"
+    echo "   agent plist -> $label.plist.disabled-$STAMP"
+  fi
   launchctl bootout "system/$label" 2>/dev/null || true
   cp "$SRC/$label.plist" "$DEST/$label.plist"
   chown root:wheel "$DEST/$label.plist"
@@ -115,9 +109,24 @@ for entry in $urls; do
   [ "$ok" = yes ] || fail=1
 done
 
-# The backup timer's RunAtLoad dump: give it a moment, then show the verdict.
+# The backup timer's RunAtLoad dump proves the path end to end: wait for the
+# run to finish (it waits up to 120s for Postgres itself) and FAIL the install
+# if it exited non-zero — the old agent has already been retired above, so a
+# daemon that cannot dump must not pass silently.
 echo "== dev.snowline.backup (RunAtLoad dump)"
-sleep 5
-launchctl print system/dev.snowline.backup 2>/dev/null | grep -E "last exit code|runs =" | sed 's/^/   /'
-tail -n 6 "$OWNER_HOME/Library/Logs/snowline-backup.log" 2>/dev/null | sed 's/^/   /'
+i=0
+code=""
+while [ "$i" -lt 150 ]; do
+  code="$(launchctl print system/dev.snowline.backup 2>/dev/null | sed -n 's/.*last exit code = \([0-9]*\).*/\1/p' | head -n 1)"
+  [ -n "$code" ] && break
+  sleep 2
+  i=$((i + 2))
+done
+tail -n 8 "$OWNER_HOME/Library/Logs/snowline-backup.log" 2>/dev/null | sed 's/^/   /'
+if [ "$code" = "0" ]; then
+  echo "   backup: OK (exit 0)"
+else
+  echo "   backup: FAILED (exit ${code:-still running after ${i}s}) — see $OWNER_HOME/Library/Logs/snowline-backup.log" >&2
+  fail=1
+fi
 exit "$fail"
