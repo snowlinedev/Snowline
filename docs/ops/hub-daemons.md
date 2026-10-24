@@ -59,7 +59,9 @@ each of platform / pm / governance / memory:
    fails the install unless that run exited 0 AND a dump newer than it was
    confirmed — in the destination, or, when the install's own context
    cannot read it (ssh without Full Disk Access), in the agent's log lines
-   for the run. An exit 3 (an hourly fire held the lock) is waited out and
+   for the run. An
+   exit 3 (a manual run held the lock; launchd runs one instance per label,
+   so the hourly fire itself never can) is waited out and
    judged by the same evidence. An unchanged, loaded agent is left alone
    only when its last run was fine (exit 0, or 3) AND a dump landed in the
    last two hours (by the same two sources).
@@ -417,7 +419,7 @@ RunAtLoad; the first timed run is an hour after loading). The script:
 - the store list comes from the server's own catalog: every `snowline_*`
   database, except scratch ones; one this role cannot connect to (parked,
   or CONNECT revoked) is a failed store — logged by name, and the run
-  ends incomplete (exit 1), never silently whole — — a name with a `_test`, `_dryrun`, `_e2e`
+  ends incomplete (exit 1), never silently whole. A scratch name is one with a `_test`, `_dryrun`, `_e2e`
   or `_restore` component (as a whole component: `snowline_pm_test_sp` and
   `snowline_restore` are scratch, `snowline_testimonials` would be a store)
   and the legacy `snowline_dev`; only plain-identifier names — so a new

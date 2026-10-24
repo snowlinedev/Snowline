@@ -322,12 +322,18 @@ EOF_ROWS
 LIVE="${LIVE# }"; UNCONNECTABLE="${UNCONNECTABLE# }"
 # A store this role cannot connect to is a FAILED store, not a footnote:
 # the run ends incomplete (exit 1) so launchd, the installer and the "run
-# exit" line all say the backup is not whole.
+# exit" line all say the backup is not whole — unless an explicit
+# SNOWLINE_BACKUP_DBS leaves it out, which is the operator's way of saying
+# "parked on purpose".
 FAILED=""
 for uc in $UNCONNECTABLE; do
+    if [ -n "$DBS_EXPLICIT" ]; then
+        case " $DBS_EXPLICIT " in *" $uc "*) ;; *) continue ;; esac
+    fi
     log "FAILED to back up ${uc}: this role cannot connect to it (parked? CONNECT revoked?)" >&2
     FAILED="$FAILED $uc"
 done
+[ "$CATALOG_OK" = yes ] || [ -z "$DBS_EXPLICIT" ] || log "WARNING: could not list databases from the server ($(tr '\n' ' ' < "$CATALOG_ERR")); the connectability check and the exclusion note are skipped this run" >&2
 # (LIVE was built above, in the same pass)
 if [ -n "$DBS_EXPLICIT" ]; then
     DBS="$DBS_EXPLICIT"

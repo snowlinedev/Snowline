@@ -229,7 +229,16 @@ place_unit() {
 # checksum of what it successfully bootstrapped in $LOCKS_DIR/<label>.loaded
 # and this compares against it.
 unit_current() {
-  [ "$(cat "$LOCKS_DIR/$1.loaded" 2>/dev/null)" = "$(cksum < "$2" | cut -d' ' -f1)" ]
+  [ -f "$2" ] && [ -s "$LOCKS_DIR/$1.loaded" ] \
+    && [ "$(cat "$LOCKS_DIR/$1.loaded" 2>/dev/null)" = "$(cksum < "$2" | cut -d' ' -f1)" ]
+}
+# record_loaded <label> <plist> — write that marker. The directory is the
+# OWNER's (the backup and autocut locks live there too): when root writes
+# it, directory and marker are handed to the owner, or the owner's own
+# units could no longer open their locks.
+record_loaded() {
+  { mkdir -p "$LOCKS_DIR" && cksum < "$2" | cut -d' ' -f1 > "$LOCKS_DIR/$1.loaded"; } || return 1
+  if [ "$(id -u)" = 0 ]; then chown "$OWNER_UID" "$LOCKS_DIR" "$LOCKS_DIR/$1.loaded" || return 1; fi
 }
 # load_unit <label> <domain> <dst-plist> — boot the label out of <domain>,
 # wait for it to be gone, bootstrap the plist (a RunAtLoad / KeepAlive unit
@@ -260,7 +269,9 @@ load_unit() {
     fi
     return 1
   fi
-  mkdir -p "$LOCKS_DIR" && cksum < "$lu_dst" | cut -d' ' -f1 > "$LOCKS_DIR/$lu_label.loaded"
+  if ! record_loaded "$lu_label" "$lu_dst"; then
+    echo "   $lu_label is loaded, but its confirmed-loaded marker could not be written under $LOCKS_DIR — the next install will reload it; check that directory" >&2
+  fi
   UNIT_RESULT=installed
   return 0
 }

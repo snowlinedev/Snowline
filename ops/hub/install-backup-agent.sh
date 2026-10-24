@@ -164,8 +164,13 @@ prove_run() {
   unit_snapshot "$domain/$label"; runs_before="$UNIT_RUNS"
   run_stamp="$(date -u +%FT%TZ)"; run_epoch="$(date +%s)"
   if [ "$UNIT_RUNNING" = yes ]; then
+    # its start is the first stamped log line after the previous run's
+    # "run exit" line (or, failing that, 15 min ago)
     echo "   a run is already in flight; judging that one"
-    runs_before=$((UNIT_RUNS - 1)); run_epoch=$((run_epoch - 900)); run_stamp="$(date -u -v-15M +%FT%TZ)"
+    runs_before=$((UNIT_RUNS - 1))
+    started="$(awk '$2 == "run" && $3 == "exit" { s = ""; next } $1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ && s == "" { s = $1 } END { print s }' "$log_file" 2>/dev/null)"
+    started_epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$started" +%s 2>/dev/null)" || started_epoch=""
+    if [ -n "$started" ] && [ -n "$started_epoch" ]; then run_stamp="$started"; run_epoch="$started_epoch"; else run_epoch=$((run_epoch - 900)); run_stamp="$(date -u -v-15M +%FT%TZ)"; fi
   elif ! launchctl kickstart "$domain/$label"; then
     echo "   kickstart refused; the unit is loaded but unproven — run 'bash $BACKUP_SCRIPT' by hand" >&2
     fail=1; return
@@ -212,10 +217,7 @@ prove_run() {
     fail=1
   fi
 }
-if [ "$loaded" = yes ]; then
-  echo "== $label (proving run, via launchd)"
-  prove_run 1
-elif [ "$action" = reprove ]; then
+if [ "$loaded" = yes ] || [ "$action" = reprove ]; then
   echo "== $label (proving run, via launchd)"
   prove_run 1
 fi

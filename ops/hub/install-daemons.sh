@@ -20,6 +20,7 @@ autocut_guard "$@"
 
 STAMP="$(date +%Y%m%d)"
 fail=0
+svc_fail=0   # the services only: what gates the backup step below
 
 # --- the services: per-user agent -> system daemon ---
 # The daemon plist goes on disk first (nothing is torn down before its
@@ -29,7 +30,7 @@ fail=0
 for svc in $SERVICES; do
   label="dev.snowline.$svc"
   echo "== $label"
-  place_unit "$LAUNCHDAEMONS_SRC/$label.plist" "$DAEMONS_DIR/$label.plist" root:wheel || { fail=1; continue; }
+  place_unit "$LAUNCHDAEMONS_SRC/$label.plist" "$DAEMONS_DIR/$label.plist" root:wheel || { fail=1; svc_fail=1; continue; }
   # stop the agent (ignore: it may not be loaded) and wait for it to be
   # gone — a service runs its whole startup before binding, so the daemon
   # must never start while the agent is still shutting down ...
@@ -43,10 +44,10 @@ for svc in $SERVICES; do
   # ... and only start the daemon once the agent is really gone
   if ! wait_unloaded "gui/$OWNER_UID/$label"; then
     echo "   agent $label still registered after 30s; NOT starting the daemon on top of it — re-run the install (the daemon plist is in place and loads at the next boot)" >&2
-    fail=1
+    fail=1; svc_fail=1
     continue
   fi
-  load_unit "$label" system "$DAEMONS_DIR/$label.plist" || fail=1
+  load_unit "$label" system "$DAEMONS_DIR/$label.plist" || { fail=1; svc_fail=1; }
 done
 
 # --- system-only timers (autocut): bootstrapped, never kickstarted ---
@@ -96,7 +97,7 @@ for entry in $urls; do
     i=$((i + 1))
   done
   echo "   $name $url: $([ "$ok" = yes ] && echo UP || echo DOWN)"
-  [ "$ok" = yes ] || fail=1
+  [ "$ok" = yes ] || { fail=1; svc_fail=1; }
 done
 
 # --- the backup agent: its own installer, as the owner ---
@@ -109,7 +110,7 @@ done
 # key on, and the backup proof can be inconclusive from an ssh session for
 # reasons that have nothing to do with the services.
 echo "== dev.snowline.backup (ops/hub/install-backup-agent.sh, as the owner)"
-if [ "$fail" != 0 ]; then
+if [ "$svc_fail" != 0 ]; then
   # the ordering exists so the proving dump never lands in a boot
   # migration's window; with a service DOWN that is where it would land
   echo "== backup agent: SKIPPED (a service is DOWN or failed to install; its proving dump must not land in a migration) — run ops/hub/install-backup-agent.sh as the owner once /health is clean" >&2
