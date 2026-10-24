@@ -40,7 +40,6 @@ umask 077
 # deliberate choice; stores it leaves out are noted in the log. If the
 # catalog cannot be read, the run falls back to the known stores
 # (FALLBACK_DBS) and says so, never silently dumping nothing.
-DBS_EXPLICIT="${SNOWLINE_BACKUP_DBS:-}"
 FALLBACK_DBS="snowline_platform snowline_pm snowline_governance snowline_memory snowline_musher snowline_marketing"
 # Only Snowline's own stores (`snowline_*`) — the hub's cluster may host other
 # projects' databases, which are not this job's to dump — minus the scratch
@@ -170,16 +169,6 @@ CATALOG_OK=yes
 CATALOG_ERR="$(mktemp -t snowline-backup-psql)"
 CATALOG="$(psql -X -At -d postgres -c "select datname from pg_database where not datistemplate and datname <> 'postgres' order by 1" 2>"$CATALOG_ERR")" || CATALOG_OK=no
 LIVE="$(printf '%s\n' "$CATALOG" | grep -E "$STORE_RE" | grep -v -E "$SCRATCH_RE" | grep -v '^$' || true)"
-# A whitespace-only SNOWLINE_BACKUP_DBS is "unset", not "dump nothing"; the
-# split is done with globbing off so a stray `*` cannot expand against the
-# cwd, and each name must be a plain identifier.
-set -f; set -- $DBS_EXPLICIT; set +f
-DBS_EXPLICIT="$*"
-for db in $DBS_EXPLICIT; do
-    case "$db" in
-        *[!A-Za-z0-9_]*) die "SNOWLINE_BACKUP_DBS entry is not a database name: '$db'" ;;
-    esac
-done
 if [ -n "$DBS_EXPLICIT" ]; then
     DBS="$DBS_EXPLICIT"
     EXCLUDED=""
