@@ -84,9 +84,17 @@ for db in $DBS_EXPLICIT; do
         *[!A-Za-z0-9_]*) log "SNOWLINE_BACKUP_DBS entry is not a database name: '$db'" >&2; exit 2 ;;
     esac
 done
-# Exit codes: 2 = cannot run at all (destination / iCloud root / unwritable —
-# the environment, not the data); 1 = some store(s) failed to dump.
-# install-daemons.sh rolls the unit back to the per-user agent only on 2.
+# `--print-dest`: print the resolved destination and exit — how
+# install-daemons.sh learns where to look for a fresh dump, by asking this
+# script as the owner instead of re-reading backup.env as root.
+if [ "${1:-}" = --print-dest ]; then
+    printf '%s\n' "$DEST"
+    exit 0
+fi
+# Exit codes: 2 = cannot run at all (destination / iCloud root / unwritable /
+# lock — the environment, not the data); 1 = some store(s) failed to dump;
+# 3 = another run held the lock (stepped aside). install-daemons.sh reads
+# them to judge the RunAtLoad run; nothing is rolled back on any of them.
 die() { log "$*" >&2; exit 2; }
 
 # --- run lock: a flock on $BACKUP_LOCK, held for the whole run ---

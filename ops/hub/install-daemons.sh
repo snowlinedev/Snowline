@@ -30,7 +30,11 @@ for svc in $SERVICES; do
   #    gone — a service runs its whole startup before binding, so the daemon
   #    must never start while the agent is still shutting down ...
   launchctl bootout "gui/$OWNER_UID/$label" 2>/dev/null || true
-  wait_unloaded "gui/$OWNER_UID/$label" || echo "   agent $label still registered after 30s; continuing" >&2
+  if ! wait_unloaded "gui/$OWNER_UID/$label"; then
+    echo "   agent $label still registered after 30s; NOT starting the daemon on top of it — re-run the install" >&2
+    fail=1
+    continue
+  fi
   # 2. ... and move its plist aside so it cannot reload at login and double-bind
   if [ -f "$AGENTS/$label.plist" ]; then
     mv "$AGENTS/$label.plist" "$AGENTS/$label.plist.disabled-$STAMP"
@@ -57,9 +61,22 @@ for svc in $SERVICES; do
 done
 
 # --- system-only timers (autocut): bootstrapped, never kickstarted ---
+# The launchd autocut timer is the ALTERNATIVE to the in-process autocut host
+# (docs "Auto-cut"); when the host is enabled (~/.config/snowline/
+# autocut.enabled) the timer is not installed, or two cutters would fire each
+# hour. The timer is for a hub that runs the host disabled on purpose.
 for timer in $TIMERS; do
   label="dev.snowline.$timer"
   echo "== $label (timer; not kickstarted)"
+  if [ "$timer" = autocut ] && [ -e "$OWNER_HOME/.config/snowline/autocut.enabled" ]; then
+    if launchctl print "system/$label" >/dev/null 2>&1; then
+      echo "   in-process autocut host is enabled AND this timer is loaded: two cutters — remove one (docs 'Auto-cut')" >&2
+      fail=1
+    else
+      echo "   in-process autocut host is enabled; timer not installed"
+    fi
+    continue
+  fi
   if cmp -s "$LAUNCHDAEMONS_SRC/$label.plist" "$DAEMONS_DIR/$label.plist" \
      && launchctl print "system/$label" >/dev/null 2>&1; then
     echo "   unchanged and loaded; left as it is"
@@ -83,47 +100,66 @@ done
 # --- the backup agent: tracked plist -> ~/Library/LaunchAgents, loaded ---
 # A per-user agent on purpose (docs "DB backups"): the dumps need the
 # owner's session anyway (Postgres is the owner's agent, iCloud syncs per
-# session), so a daemon would add no coverage, only a TCC problem. The plist
-# is copied only when it differs (operator overrides live in
-# ~/.config/snowline/backup.env, never in the plist, so nothing is lost);
-# the unit is (re)loaded when its plist changed, it is not loaded, or its
-# last run failed (exit 1 or 2 — exit 3, "stepped aside", is harmless),
-# waiting first for a dump in progress (it holds backup.lock). RunAtLoad
-# means a load takes one dump, judged below.
+# session), so a daemon would add no coverage, only a TCC problem. Operator
+# overrides live in ~/.config/snowline/backup.env, never in the plist. The
+# unit is (re)loaded — plist copied in at that point, never before — when
+# the tracked plist differs, the unit is not loaded, its last run failed
+# (exit 1 or 2; 3 = "stepped aside" is harmless), or no dump has landed in
+# the last two hours (an exit code alone is not evidence: a unit launchd
+# stopped firing still shows its old exit 0). A dump in progress (it holds
+# backup.lock) is waited for first; the hourly fire landing in the instant
+# between the last probe and the bootout would lose that hour's dump, which
+# the RunAtLoad dump then replaces. RunAtLoad means a load takes one dump,
+# judged below.
 label="dev.snowline.backup"
+log_file="$OWNER_HOME/Library/Logs/snowline-backup.log"
 echo "== $label (per-user agent)"
-backup_loaded=skip
+# the destination as the SCRIPT resolves it (backup.env read as the owner)
+dest="$(sudo -u "#$OWNER_UID" -H /bin/bash "$OPS_HUB/snowline-backup.sh" --print-dest 2>/dev/null || echo "$BACKUP_DIR")"
+# recent_dump — a dump (or its iCloud-evicted placeholder) in the last 2 h;
+# prints its name, "?" when this shell may not read the destination, or nothing
+recent_dump() {
+  err="$(mktemp -t snowline-install-find)"
+  name="$(find "$dest" -maxdepth 1 \( -name '*.dump' -o -name '.*.dump.icloud' \) -type f -mmin -120 2>"$err" | head -n 1)"
+  if [ -n "$name" ]; then basename "$name"; elif [ -s "$err" ]; then echo "?"; fi
+  rm -f "$err"
+}
+why=""
 if ! cmp -s "$LAUNCHAGENTS_SRC/$label.plist" "$AGENTS/$label.plist" 2>/dev/null; then
-  cp "$LAUNCHAGENTS_SRC/$label.plist" "$AGENTS/$label.plist"
-  chown "$OWNER_UID" "$AGENTS/$label.plist"
-  chmod 644 "$AGENTS/$label.plist"
-  echo "   plist installed/updated -> $AGENTS/$label.plist"
-  backup_loaded=reload
+  why="plist changed"
 elif ! launchctl print "gui/$OWNER_UID/$label" >/dev/null 2>&1; then
-  backup_loaded=reload
+  why="not loaded"
 else
   code="$(unit_last_exit "gui/$OWNER_UID/$label")"
   case "$code" in
-    ""|0|3) echo "   unchanged and loaded; left as it is" ;;
-    *) echo "   unchanged and loaded, but its last run exited $code — reloading to judge a fresh run" >&2; backup_loaded=reload ;;
+    ""|0|3) ;;
+    *) why="last run exited $code" ;;
   esac
+  if [ -z "$why" ]; then
+    case "$(recent_dump)" in
+      "")  why="no dump in the last 2 h in $dest" ;;
+      "?") echo "   unchanged and loaded; could not confirm a recent dump in $dest from this shell — check by hand: ls -t '$dest' | head" >&2; fail=1 ;;
+      *)   echo "   unchanged and loaded, dumped within 2 h; left as it is" ;;
+    esac
+  fi
 fi
-if [ "$backup_loaded" = reload ]; then
-  # wait for a dump in progress, and re-check right before the bootout: an
-  # hourly fire in that gap would otherwise be killed mid-dump
-  if unit_busy_wait backup 600 && ! lock_held "$BACKUP_LOCK"; then
+backup_loaded=no
+if [ -n "$why" ]; then
+  echo "   reloading ($why)"
+  if unit_busy_wait backup 600; then
     launchctl bootout "gui/$OWNER_UID/$label" 2>/dev/null || true
     wait_unloaded "gui/$OWNER_UID/$label" || true
+    cp "$LAUNCHAGENTS_SRC/$label.plist" "$AGENTS/$label.plist"
+    chown "$OWNER_UID" "$AGENTS/$label.plist"
+    chmod 644 "$AGENTS/$label.plist"
     if launchctl bootstrap "gui/$OWNER_UID" "$AGENTS/$label.plist"; then
       backup_loaded=yes
     else
       echo "   could NOT load $label into gui/$OWNER_UID (no login session?); it loads at the next login" >&2
-      backup_loaded=no
       fail=1
     fi
   else
-    echo "   a dump is running; leaving $label as it is — re-run the install after it finishes" >&2
-    backup_loaded=no
+    echo "   a dump is still running; leaving $label as it is (plist NOT replaced) — re-run the install after it finishes" >&2
     fail=1
   fi
 fi
@@ -152,7 +188,6 @@ done
 # cannot read the destination the result is a warning, not a pass.
 if [ "$backup_loaded" = yes ]; then
   echo "== $label (RunAtLoad dump)"
-  log_file="$OWNER_HOME/Library/Logs/snowline-backup.log"
   code=""; running=no; i=0
   while [ "$i" -lt 300 ]; do
     if unit_running "gui/$OWNER_UID/$label"; then
@@ -167,8 +202,6 @@ if [ "$backup_loaded" = yes ]; then
     i=$((i + 2))
   done
   tail -n 8 "$log_file" 2>/dev/null | sed 's/^/   /'
-  # the destination, as the script computes it: backup.env override, else default
-  dest="$(sh -c '[ -f "$1" ] && . "$1"; echo "${SNOWLINE_BACKUP_DIR:-$2}"' sh "$OWNER_HOME/.config/snowline/backup.env" "$BACKUP_DIR" 2>/dev/null)"
   if [ "$code" = 0 ]; then
     find_err="$(mktemp -t snowline-install-find)"
     fresh="$(find "$dest" -maxdepth 1 \( -name '*.dump' -o -name '.*.dump.icloud' \) -type f -newer "$START_MARK" 2>"$find_err" | head -n 1)"

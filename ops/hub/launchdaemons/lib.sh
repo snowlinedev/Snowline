@@ -94,6 +94,9 @@ LOCKS_DIR="$OWNER_HOME/Library/Application Support/Snowline"
 BACKUP_LOCK="$LOCKS_DIR/backup.lock"
 AUTOCUT_LOCK="$LOCKS_DIR/autocut.lock"
 AUTOCUT_LOG="$OWNER_HOME/Library/Logs/snowline-autocut.log"
+# Exit 0 = held, 1 = free; anything else means the probe itself could not
+# run (python3 shim without Command Line Tools, unreadable file) and is
+# treated as HELD — a guard that cannot tell must refuse, not wave through.
 lock_held() {
   [ -e "$1" ] || return 1
   /usr/bin/python3 -c 'import fcntl, os, sys
@@ -102,7 +105,12 @@ try:
     fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
 except OSError:
     sys.exit(0)
-sys.exit(1)' "$1"
+sys.exit(1)' "$1" 2>/dev/null
+  case $? in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) echo "   cannot probe the lock $1 (python3 unavailable?); treating it as held" >&2; return 0 ;;
+  esac
 }
 autocut_lock_held() { lock_held "$AUTOCUT_LOCK"; }
 
