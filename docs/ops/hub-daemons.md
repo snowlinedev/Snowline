@@ -474,7 +474,9 @@ missing program in the meantime (EX_CONFIG, penalty box). The agent plist
 already installed on the hub (the #223 one) runs the script directly with
 a `WorkingDirectory` and an explicit `SNOWLINE_BACKUP_DIR` equal to the
 default; the tracked one runs it via `/bin/bash` with neither. Same
-behaviour, different bytes: the next `ops/hub/install-backup-agent.sh`
+behaviour but for one thing — the old plist has `RunAtLoad`, so it also
+dumped at every login; the tracked one does not (the first timed run is an
+hour after loading). Otherwise different bytes only: the next `ops/hub/install-backup-agent.sh`
 (run as the owner, from the canonical checkout after the pull — from any
 other checkout it refuses) will therefore replace and reload it once and
 prove it with one run.
@@ -489,7 +491,9 @@ ls -t ~/Library/Mobile\ Documents/com~apple~CloudDocs/Snowline/db-backups | head
 ```
 
 `last exit code = 0` and a dump under an hour old is healthy. Exit 1 with
-log lines says which store failed. Exit 2 means the run could not start at
+log lines says which store failed; every run ends with a `run exit <code>`
+line, which the installer reads when it cannot see the destination. Exit 2
+means the run could not start at
 all (destination missing or unwritable, iCloud root absent, lib.sh missing,
 lock file unopenable) or refused its configuration (a `backup.env` that
 does not source, a bad `SNOWLINE_BACKUP_RETENTION_DAYS` or

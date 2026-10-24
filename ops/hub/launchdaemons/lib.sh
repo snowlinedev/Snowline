@@ -13,7 +13,7 @@ SERVICES="platform pm governance memory"
 TIMERS="autocut"
 # The hourly DB backup is a per-user LaunchAgent on purpose (see
 # docs/ops/hub-daemons.md "DB backups"); its tracked plist lives under
-# ops/hub/launchagents/ and install-daemons.sh installs it.
+# ops/hub/launchagents/ and install-backup-agent.sh installs it.
 
 OWNER_UID=501
 # The hub owner's home. The root-run ops scripts need it fixed; the backup

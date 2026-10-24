@@ -1,7 +1,7 @@
 #!/bin/bash
 # Hourly dump of EVERY live Snowline Postgres store on the hub. Launched by
 # ops/hub/launchagents/dev.snowline.backup.plist (the owner's per-user
-# LaunchAgent, installed by ops/hub/install-daemons.sh); see
+# LaunchAgent, installed by ops/hub/install-backup-agent.sh); see
 # docs/ops/hub-daemons.md "DB backups". One-shot: launchd's timer fires it on
 # schedule, so a failed run is simply a skipped run (no retry storm) — the
 # next scheduled run takes a fresh dump.
@@ -59,15 +59,26 @@ SNOWLINE_OWNER_HOME="$HOME"
 # Exit codes: 2 = cannot run at all (destination / iCloud root / unwritable /
 # lock / bad configuration — the environment, not the data); 1 = some
 # store(s) failed to dump; 3 = another run held the lock (stepped aside).
-# install-daemons.sh reads them; nothing is rolled back on any of them.
+# install-backup-agent.sh reads them; nothing is rolled back on any of them.
 die() { log "$*" >&2; exit 2; }
 # Temp files for the catalog read's and the dump listing's stderr: created
 # here, in the parent shell (z_dumps runs in subshells, where an assignment
 # would never reach the trap), removed on every exit path.
-CATALOG_ERR="$(mktemp -t snowline-backup-psql)"
-Z_DUMPS_ERR="$(mktemp -t snowline-backup-find)"
+CATALOG_ERR="$(mktemp -t snowline-backup-psql)" || die "cannot create a temp file (TMPDIR unwritable?)"
+Z_DUMPS_ERR="$(mktemp -t snowline-backup-find)" || die "cannot create a temp file (TMPDIR unwritable?)"
 PROBE=""   # the destination write probe, set below; removed on every exit too
-trap 'rm -f "$CATALOG_ERR" "$Z_DUMPS_ERR" ${PROBE:+"$PROBE"}' EXIT
+# Every run ends with ONE machine-readable line, "run exit <code>", written
+# by the EXIT trap whatever the path (success, a refusal, a step-aside, an
+# interrupt): install-backup-agent.sh reads the LAST such line to judge a
+# run when it cannot see the destination itself. Queries (--print-dest,
+# --check) do not log one.
+QUIET_EXIT=no
+on_exit() {
+    oe_rc=$?
+    rm -f "$CATALOG_ERR" "$Z_DUMPS_ERR" ${PROBE:+"$PROBE"}
+    [ "$QUIET_EXIT" = yes ] || log "run exit $oe_rc"
+}
+trap on_exit EXIT
 # A SIGTERM/SIGINT at ANY point (a bootout during the Postgres wait, a
 # logout, a shutdown) logs itself; once a dump is in flight (OUT/DUMP_PID
 # set below) it is killed and its partial removed. Armed here, not just
@@ -75,7 +86,7 @@ trap 'rm -f "$CATALOG_ERR" "$Z_DUMPS_ERR" ${PROBE:+"$PROBE"}' EXIT
 OUT=""; DUMP_PID=""
 trap 'log "interrupted (SIGTERM/SIGINT)${OUT:+; removing $OUT.partial}" >&2; [ -z "$DUMP_PID" ] || kill "$DUMP_PID" 2>/dev/null; [ -z "$OUT" ] || rm -f "$OUT.partial"; exit 143' TERM INT
 # Operator overrides live in ~/.config/snowline/backup.env (optional; sourced
-# here), NOT in the launchd plist: install-daemons.sh replaces the plist with
+# here), NOT in the launchd plist: install-backup-agent.sh replaces the plist with
 # the tracked copy whenever it differs, so anything put there would be lost.
 # The file supplies DEFAULTS: a variable already set in the environment
 # (a scratch test's SNOWLINE_BACKUP_DIR=/tmp/x, say) wins over it.
@@ -99,39 +110,43 @@ if [ -f "$BACKUP_ENV" ]; then
 fi
 # Off-machine by default: iCloud Drive replicates the dumps off this host, so a
 # disk failure / theft doesn't take the backups with it. The default lives in
-# lib.sh (BACKUP_DIR) so install-daemons.sh judges the same folder. Override
+# lib.sh (BACKUP_DIR) so install-backup-agent.sh judges the same folder. Override
 # with SNOWLINE_BACKUP_DIR (in backup.env) to point at a tailnet rsync
 # target, an external volume, etc.
 DEST="${SNOWLINE_BACKUP_DIR:-$BACKUP_DIR}"
 RETENTION_DAYS="${SNOWLINE_BACKUP_RETENTION_DAYS:-30}"
 case "$RETENTION_DAYS" in ''|*[!0-9]*) die "SNOWLINE_BACKUP_RETENTION_DAYS must be a whole number of days, at least 1: '$RETENTION_DAYS'" ;; esac
 [ "$RETENTION_DAYS" -ge 1 ] || die "SNOWLINE_BACKUP_RETENTION_DAYS must be at least 1: '$RETENTION_DAYS'"
-# name_stamp <path> — sets NAME_STAMP to the YYYYMMDD-HHMMSS UTC stamp of a
-# Z-named dump or placeholder (…-YYYYMMDD-HHMMSSZ.dump[.icloud]); fails for
-# any other name. Parameter expansion only, result in a variable: no fork
-# per file in --check and prune.
+# name_stamp <path> — sets NAME_STAMP to the YYYYMMDD-HHMMSS stamp in a
+# dump's or placeholder's name (…-YYYYMMDD-HHMMSSZ.dump[.icloud]; the
+# pre-#319 names lack the Z and are local time — a few hours off, which the
+# 30-day retention does not care about); fails for any other name.
+# Parameter expansion only, result in a variable: no fork per file.
 name_stamp() {
-    NAME_STAMP="${1##*/}"; NAME_STAMP="${NAME_STAMP%.icloud}"; NAME_STAMP="${NAME_STAMP%Z.dump}"
+    NAME_STAMP="${1##*/}"; NAME_STAMP="${NAME_STAMP%.icloud}"; NAME_STAMP="${NAME_STAMP%.dump}"; NAME_STAMP="${NAME_STAMP%Z}"
     NAME_STAMP="${NAME_STAMP#"${NAME_STAMP%???????????????}"}"   # last 15 chars
     case "$NAME_STAMP" in
         [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]) return 0 ;;
         *) return 1 ;;
     esac
 }
-# z_dumps <name-prefix> — one "<stamp>\t<path>" line per Z-named dump or
-# placeholder of that prefix in DEST (`*` for every store). The ONE rule
-# --check (evidence) and the prune (retention) share. find's stderr goes
-# to Z_DUMPS_ERR for the caller to inspect.
+# z_dumps <name-prefix> [all] — one "<stamp>\t<path>" line per dump or
+# placeholder of that prefix in DEST (`*` for every store): Z-named (UTC)
+# ones by default, pre-#319 local-time names too with `all`. The ONE
+# listing --check (evidence: Z names only, written by this script) and the
+# prune (retention: every name) share. find's stderr goes to Z_DUMPS_ERR
+# for the caller to inspect.
 TAB=$'\t'
 z_dumps() {
-    find "$DEST" -maxdepth 1 \( -name "$1-[0-9]*Z.dump" -o -name ".$1-[0-9]*Z.dump.icloud" \) -type f 2>"$Z_DUMPS_ERR" \
+    if [ "${2:-}" = all ]; then zd_tail='[0-9]'; else zd_tail='Z'; fi
+    find "$DEST" -maxdepth 1 \( -name "$1-[0-9]*${zd_tail}.dump" -o -name ".$1-[0-9]*${zd_tail}.dump.icloud" \) -type f 2>"$Z_DUMPS_ERR" \
     | while IFS= read -r zf; do
         name_stamp "$zf" || continue
         printf '%s\t%s\n' "$NAME_STAMP" "$zf"
     done
 }
 
-# Queries install-daemons.sh makes by running this script AS THE OWNER
+# Queries install-backup-agent.sh makes by running this script AS THE OWNER
 # (so backup.env, TCC consent and the destination are exactly this
 # script's), checked before anything below touches the positional params:
 #   --print-dest        print the resolved destination
@@ -140,10 +155,12 @@ z_dumps() {
 #                       1 if none, 2 if the destination cannot be read
 case "${1:-}" in
     --print-dest)
+        QUIET_EXIT=yes
         printf '%s\n' "$DEST"
         exit 0
         ;;
     --check)
+        QUIET_EXIT=yes
         # A dump counts by the UTC stamp in its NAME (this script writes
         # <store>-YYYYMMDD-HHMMSSZ.dump), not by mtime: an iCloud-evicted
         # placeholder carries eviction time, and old pre-Z names are local
@@ -202,7 +219,7 @@ done
 # the ops scripts boot this unit out (a probe holds a shared lock for an
 # instant, so the acquire retries over a few seconds). A second run while
 # one holds the lock (a manual or proving run racing the hourly fire) steps aside with
-# exit 3, which install-daemons.sh never mistakes for "dumps landed"; any
+# exit 3, which install-backup-agent.sh never mistakes for "dumps landed"; any
 # other flock error (an fs without flock, a bad fd) is exit 2.
 mkdir -p "$(dirname "$BACKUP_LOCK")"
 exec 9>>"$BACKUP_LOCK" || die "cannot open the run lock $BACKUP_LOCK (root-owned from a sudo run?); fix its ownership"
@@ -324,7 +341,7 @@ PRUNE_CUTOFF="$(date -u -v-"${RETENTION_DAYS}"d +%Y%m%d-%H%M%S 2>/dev/null)" || 
 KEEP_MIN=3
 prune_by_name() {
     [ -n "$PRUNE_CUTOFF" ] || return 0   # no cutoff, no pruning (never over-delete; warned above)
-    z_dumps "$1" | sort -r | awk -F"$TAB" -v cutoff="$PRUNE_CUTOFF" -v keep="$KEEP_MIN" \
+    z_dumps "$1" all | sort -r | awk -F"$TAB" -v cutoff="$PRUNE_CUTOFF" -v keep="$KEEP_MIN" \
         'NR > keep && $1 < cutoff { print $2 }' \
     | while IFS= read -r pb_f; do rm -f "$pb_f"; done
     return 0
@@ -335,17 +352,17 @@ prune_by_name() {
 # removes its partial.
 for DB in "$@"; do
     # Prune FIRST, and for every store whether or not its dump then succeeds:
-    # a full destination (iCloud quota, disk) must be able to free itself.
-    # Per-store pattern, so dumps of stores no longer in the list (e.g. the
-    # legacy snowline_dev history) are left alone. iCloud evicts old files
-    # to `.NAME.icloud` placeholders, which are pruned by the same rule or
-    # the folder grows without bound. Age comes from the UTC stamp in the
-    # NAME (same rule as --check: a placeholder's mtime is eviction time,
-    # not dump time); the old pre-Z names are local time and go by mtime.
-    # Non-fatal: a find hiccup must not fail the run.
+    # a full destination (iCloud quota, disk) must be able to free itself —
+    # while the newest KEEP_MIN of a store are always kept, so a store whose
+    # dump keeps failing never loses its last good copy. Per-store pattern,
+    # so dumps of stores no longer in the list (e.g. the legacy snowline_dev
+    # history) are left alone. iCloud evicts old files to `.NAME.icloud`
+    # placeholders, which are pruned by the same rule or the folder grows
+    # without bound. Age comes from the stamp in the NAME (same rule as
+    # --check: a placeholder's mtime is eviction time, not dump time), for
+    # the pre-#319 local-time names too. Non-fatal: a find hiccup must not
+    # fail the run.
     prune_by_name "$DB" || true
-    # (-mtime +N means "older than N+1 days"; +N-1 gives the same window as the stamp rule)
-    find "$DEST" -maxdepth 1 \( -name "${DB}-*[0-9].dump" -o -name ".${DB}-*[0-9].dump.icloud" \) -type f -mtime +"$((RETENTION_DAYS - 1))" -delete 2>/dev/null || true
     OUT="$DEST/${DB}-${STAMP}.dump"
     # Dump to a .partial name, verify the archive is readable, then atomically
     # rename — an interrupted or truncated dump (machine sleep, OOM, iCloud

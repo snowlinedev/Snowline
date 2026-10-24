@@ -71,19 +71,21 @@ dump_evidence() {
   esac
 }
 # log_verdict <since-stamp> — sets LOGSAYS to OK / FAIL / NONE from the
-# agent's own log since <since-stamp>. The script ends every run with ONE
-# summary line: "run complete: N store(s)" or "run incomplete; failed: …",
-# and every refusal is a stamped line too; WARNING/note lines are
-# informational and ignored, pg_dump's unstamped stderr likewise. The LAST
-# remaining stamped line is the verdict, so an old failure cannot outrank
-# a later clean run, and a run cut short (no summary) is NONE, not OK.
+# agent's own log since <since-stamp>: the script's EXIT trap writes one
+# machine-readable "run exit <code>" line per run, whatever the path. The
+# LAST such line is the verdict (0 = OK; 3, a step-aside, is not a verdict
+# at all and the line before it is consulted; anything else = FAIL), so an
+# old failure cannot outrank a later clean run and a run cut short by
+# SIGKILL (no line) is NONE, not OK.
 log_verdict() {
-  lv_last="$(awk -v s="$1" '$1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ && $1 >= s && $2 != "WARNING:" && $2 != "note:"' "$log_file" 2>/dev/null | tail -n 1)"
-  case "$lv_last" in
-    *"run complete:"*) LOGSAYS=OK ;;
-    *"run incomplete"*|*interrupted*|*cannot*|*missing*|*"not writable"*|*refusing*|*"must be"*|*"is not a"*|*"stepping aside"*) LOGSAYS=FAIL ;;
-    *) LOGSAYS=NONE ;;
-  esac
+  LOGSAYS=NONE
+  for lv_code in $(awk -v s="$1" '$1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ && $1 >= s && $2 == "run" && $3 == "exit" { print $4 }' "$log_file" 2>/dev/null | tail -r); do
+    case "$lv_code" in
+      3) continue ;;
+      0) LOGSAYS=OK; return ;;
+      *) LOGSAYS=FAIL; return ;;
+    esac
+  done
 }
 
 # --- decide: leave alone, or (re)load ---
@@ -109,7 +111,7 @@ else
       LOG_OK)   echo "   unchanged and loaded; the log shows a dump within 2 h (destination not checkable from here: $EVIDENCE_MSG); left as it is" ;;
       NONE)     why="no dump in the last 2 h in $dest" ;;
       LOG_FAIL) why="the log's last run within 2 h failed" ;;
-      *)        echo "   unchanged and loaded; could not check $dest ($EVIDENCE_MSG) and the log shows no run within 2 h — check by hand: ls -t '$dest' | head" >&2; fail=1 ;;
+      *)        why="no dump evidence in the last 2 h (destination not checkable from here: $EVIDENCE_MSG; no run in the log)" ;;
     esac
   fi
 fi
@@ -145,12 +147,16 @@ if [ "$loaded" = yes ]; then
     echo "   kickstart refused; the unit is loaded but unproven — run 'bash $BACKUP_SCRIPT' by hand" >&2
     fail=1
   else
-    code=""; i=0
+    code=""; i=0; spawned=no
     while [ "$i" -lt 900 ]; do   # 120 s Postgres wait + up to 60 s lock wait per store + the dumps
       unit_snapshot "$domain/$label" || break   # unit gone
+      [ "$UNIT_RUNNING" = yes ] && spawned=yes
       if [ "$UNIT_RUNNING" = no ] && [ "$UNIT_RUNS" -gt "$runs_before" ]; then
         code="$UNIT_EXIT"; break
       fi
+      # a kickstart that launchd accepted but could not spawn (EX_CONFIG:
+      # the program vanished) never increments runs: give up after a minute
+      if [ "$spawned" = no ] && [ "$i" -ge 60 ]; then break; fi
       sleep 2
       i=$((i + 2))
     done

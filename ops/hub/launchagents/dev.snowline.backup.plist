@@ -8,7 +8,7 @@
 
     <!-- Hourly pg_dump of every live Snowline store (decision c68ec655). The
          owner's PER-USER LaunchAgent (gui/501), installed and (re)loaded by
-         ops/hub/install-daemons.sh from this tracked file — the #220 root
+         ops/hub/install-backup-agent.sh from this tracked file — the #220 root
          cause was this unit's files living outside main.
 
          A per-user agent on purpose, not a system daemon like the services:
@@ -20,17 +20,17 @@
 
          One-shot, NOT KeepAlive: it dumps, verifies, prunes and exits; the
          timer fires it again on schedule, so a failed run is simply a
-         skipped run (no retry storm). No RunAtLoad: the install proves the
-         script by running it synchronously as the owner and reading its
-         exit code, and a load must not start a dump behind the operator's
-         back (StartInterval fires from load, so the first timed run is an
-         hour after loading). No WorkingDirectory: the script does not use
+         skipped run (no retry storm). No RunAtLoad: the installer proves
+         the unit by firing one run through launchd and reading its exit
+         code and evidence, and a load must not start a dump behind the
+         operator's back (StartInterval fires from load, so the first timed
+         run is an hour after loading). No WorkingDirectory: the script does not use
          it, and a missing directory would make launchd refuse to spawn
          (EX_CONFIG) — the silent-failure mode this unit exists to avoid.
          The script sets its own PATH.
 
          Overrides the script accepts, in ~/.config/snowline/backup.env (never
-         here: the install replaces this file with the tracked copy):
+         here: the installer replaces this file with the tracked copy):
            SNOWLINE_BACKUP_DIR — where dumps land (default: iCloud Drive; a
              non-iCloud path skips the iCloud root check and must already
              exist — it is never created);

@@ -34,15 +34,17 @@ for svc in $SERVICES; do
   # gone — a service runs its whole startup before binding, so the daemon
   # must never start while the agent is still shutting down ...
   launchctl bootout "gui/$OWNER_UID/$label" 2>/dev/null || true
-  if ! wait_unloaded "gui/$OWNER_UID/$label"; then
-    echo "   agent $label still registered after 30s; NOT starting the daemon on top of it — re-run the install" >&2
-    fail=1
-    continue
-  fi
-  # ... and move its plist aside so it cannot reload at login and double-bind
+  # ... move its plist aside at once, so that whatever happens next only
+  # the daemon can come up at the next boot/login (never both) ...
   if [ -f "$AGENTS/$label.plist" ]; then
     mv "$AGENTS/$label.plist" "$AGENTS/$label.plist.disabled-$STAMP"
     echo "   agent plist -> $label.plist.disabled-$STAMP"
+  fi
+  # ... and only start the daemon once the agent is really gone
+  if ! wait_unloaded "gui/$OWNER_UID/$label"; then
+    echo "   agent $label still registered after 30s; NOT starting the daemon on top of it — re-run the install (the daemon plist is in place and loads at the next boot)" >&2
+    fail=1
+    continue
   fi
   load_unit "$label" system "$DAEMONS_DIR/$label.plist" || fail=1
 done
