@@ -134,7 +134,8 @@ set -f
 # shellcheck disable=SC2086
 set -- $DBS_EXPLICIT
 set +f
-DBS_EXPLICIT="$(valid_names strict "$@")"
+# (valid_names runs in a subshell here, so its exit 2 must be propagated)
+DBS_EXPLICIT="$(valid_names strict "$@")" || exit 2
 DBS_EXPLICIT="${DBS_EXPLICIT% }"
 # Exit codes: 2 = cannot run at all (destination / iCloud root / unwritable /
 # lock — the environment, not the data); 1 = some store(s) failed to dump;
@@ -248,11 +249,12 @@ if [ -n "$DBS_EXPLICIT" ]; then
 elif [ "$CATALOG_OK" = yes ] && [ -n "$LIVE" ]; then
     DBS="$LIVE"
 elif [ "$CATALOG_OK" = yes ]; then
-    # Readable catalog with no snowline_* store: the wrong cluster (PGHOST /
-    # PGPORT leaking in, a fresh cluster before migration). Never exit 0 with
-    # nothing dumped: try the known stores, which then fail loudly (exit 1).
+    # Readable catalog with no usable snowline_* store: the wrong cluster
+    # (PGHOST / PGPORT leaking in, a fresh cluster before migration), or
+    # every name was filtered. Never exit 0 with nothing dumped: try the
+    # known stores, which then fail loudly (exit 1).
     DBS="$FALLBACK_DBS"
-    log "WARNING: the catalog holds no snowline_* store (wrong cluster?); trying the fallback list: $DBS" >&2
+    log "WARNING: the catalog holds no usable snowline_* store (wrong cluster?); trying the fallback list: $DBS" >&2
 else
     DBS="$FALLBACK_DBS"
     log "WARNING: could not list databases from the server ($(tr '\n' ' ' < "$CATALOG_ERR")); dumping the fallback list only: $DBS" >&2
