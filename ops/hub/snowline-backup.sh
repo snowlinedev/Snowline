@@ -144,6 +144,18 @@ z_dumps() {
     done
 }
 
+# has_word <word> <list...> — is <word> one of the space-separated words?
+has_word() { hw="$1"; shift; case " $* " in *" $hw "*) return 0 ;; esac; return 1; }
+
+# SNOWLINE_BACKUP_DBS, normalised ONCE (split on any whitespace with
+# globbing off, re-joined with single spaces) so --check and the run agree
+# on membership; validated further down, before anything side-effecting.
+set -f
+# shellcheck disable=SC2086
+set -- ${SNOWLINE_BACKUP_DBS:-}
+set +f
+DBS_EXPLICIT="$*"
+
 # store_wanted <name> — the ONE store rule, for the catalog pass and --check
 # alike: a snowline_* name that is not a scratch one. A bash regex match: no
 # fork per name.
@@ -205,8 +217,8 @@ case "${1:-}" in
         found=no
         while IFS="$TAB" read -r store s f; do
             [ -n "$f" ] || continue
-            if [ -n "${SNOWLINE_BACKUP_DBS:-}" ]; then
-                case " ${SNOWLINE_BACKUP_DBS} " in *" $store "*) ;; *) continue ;; esac
+            if [ -n "$DBS_EXPLICIT" ]; then
+                has_word "$store" $DBS_EXPLICIT || continue
             else
                 store_wanted "$store" || continue
             fi
@@ -226,12 +238,9 @@ esac
 # the split is done with globbing off so a stray `*` cannot expand against
 # the cwd, and each name must be a plain identifier (the catalog query
 # applies the same rule in SQL).
-DBS_EXPLICIT="${SNOWLINE_BACKUP_DBS:-}"
-set -f
+# (DBS_EXPLICIT was normalised above, before the query dispatch)
 # shellcheck disable=SC2086
 set -- $DBS_EXPLICIT
-set +f
-DBS_EXPLICIT="$*"
 for vn in "$@"; do
     case "$vn" in
         *[!A-Za-z0-9_]*) die "SNOWLINE_BACKUP_DBS entry is not a database name: '$vn'" ;;
@@ -327,9 +336,7 @@ LIVE="${LIVE# }"; UNCONNECTABLE="${UNCONNECTABLE# }"
 # "parked on purpose".
 FAILED=""
 for uc in $UNCONNECTABLE; do
-    if [ -n "$DBS_EXPLICIT" ]; then
-        case " $DBS_EXPLICIT " in *" $uc "*) ;; *) continue ;; esac
-    fi
+    if [ -n "$DBS_EXPLICIT" ] && ! has_word "$uc" $DBS_EXPLICIT; then continue; fi
     log "FAILED to back up ${uc}: this role cannot connect to it (parked? CONNECT revoked?)" >&2
     FAILED="$FAILED $uc"
 done
@@ -339,14 +346,16 @@ if [ -n "$DBS_EXPLICIT" ]; then
     DBS="$DBS_EXPLICIT"
     EXCLUDED=""
     for db in $LIVE; do
-        case " $DBS " in
-            *" $db "*) ;;
-            *) EXCLUDED="$EXCLUDED $db" ;;
-        esac
+        has_word "$db" $DBS || EXCLUDED="$EXCLUDED $db"
     done
     [ -z "$EXCLUDED" ] || log "note: SNOWLINE_BACKUP_DBS excludes live store(s):${EXCLUDED}" >&2
 elif [ "$CATALOG_OK" = yes ] && [ -n "$LIVE" ]; then
     DBS="$LIVE"
+elif [ "$CATALOG_OK" = yes ] && [ -n "$FAILED" ]; then
+    # every store is there but unconnectable: already recorded as FAILED
+    # above, nothing to dump, the run ends incomplete — a readable catalog
+    # is authoritative, no fallback pass to fail the same stores twice
+    DBS=""
 elif [ "$CATALOG_OK" = yes ]; then
     # Readable catalog with no usable snowline_* store: the wrong cluster
     # (PGHOST / PGPORT leaking in, a fresh cluster before migration), or
@@ -361,7 +370,6 @@ fi
 
 # UTC stamp so file names sort monotonically (no DST fold) and match the log.
 STAMP="$(date -u +%Y%m%d-%H%M%SZ)"
-FAILED="${FAILED:-}"
 
 # Word-split DBS once, with globbing off (names are validated above or
 # catalog-sourced). A SIGTERM mid-dump (the unit booted out, a logout, a

@@ -80,9 +80,15 @@ dump_evidence() {
 # at all and the line before it is consulted; anything else = FAIL), so an
 # old failure cannot outrank a later clean run and a run cut short by
 # SIGKILL (no line) is NONE, not OK.
+# log_lines_since <stamp> — the agent's own stamped log lines at or after
+# <stamp> (pg_dump's unstamped stderr shares the file and is dropped): the
+# ONE reader of the log format, for log_verdict and the in-flight start.
+log_lines_since() {
+  awk -v s="$1" '$1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ && $1 >= s' "$log_file" 2>/dev/null
+}
 log_verdict() {
   LOGSAYS=NONE
-  for lv_code in $(awk -v s="$1" '$1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ && $1 >= s && $2 == "run" && $3 == "exit" { print $4 }' "$log_file" 2>/dev/null | tail -r); do
+  for lv_code in $(log_lines_since "$1" | awk '$2 == "run" && $3 == "exit" { print $4 }' | tail -r); do
     case "$lv_code" in
       3) continue ;;
       0) LOGSAYS=OK; return ;;
@@ -168,7 +174,7 @@ prove_run() {
     # "run exit" line (or, failing that, 15 min ago)
     echo "   a run is already in flight; judging that one"
     runs_before=$((UNIT_RUNS - 1))
-    started="$(awk '$2 == "run" && $3 == "exit" { s = ""; next } $1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ && s == "" { s = $1 } END { print s }' "$log_file" 2>/dev/null)"
+    started="$(log_lines_since 0 | awk '$2 == "run" && $3 == "exit" { s = ""; next } s == "" { s = $1 } END { print s }')"
     started_epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$started" +%s 2>/dev/null)" || started_epoch=""
     if [ -n "$started" ] && [ -n "$started_epoch" ]; then run_stamp="$started"; run_epoch="$started_epoch"; else run_epoch=$((run_epoch - 900)); run_stamp="$(date -u -v-15M +%FT%TZ)"; fi
   elif ! launchctl kickstart "$domain/$label"; then
