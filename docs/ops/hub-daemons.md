@@ -350,8 +350,10 @@ dumps themselves still need the owner's session, because Postgres is the
 owner's per-user agent and iCloud syncs per session — after a FileVault boot
 that session always exists. Before the move it was a login-only LaunchAgent.
 The install waits for the unit's first (RunAtLoad) dump and fails if it did
-not exit 0; a rollback with `uninstall-daemons.sh` restores the agent plist,
-and leaves the daemon in place if there is none to restore.
+not exit 0 or 3, restoring the per-user agent when one exists; a rollback
+with `uninstall-daemons.sh` restores the agent plist, and leaves the daemon
+in place if there is none to restore. Both scripts share
+`ops/hub/launchdaemons/lib.sh` (autocut guard, agent restore, Postgres wait).
 
 **What runs.** `ops/hub/launchdaemons/dev.snowline.backup.plist` fires
 `ops/hub/snowline-backup.sh` every 3600 s and once on load. The script:
@@ -363,10 +365,10 @@ and leaves the daemon in place if there is none to restore.
   `pg_dump -Fc`, verifies each archive with `pg_restore -l`, then renames
   `.partial` to the final name — one store failing does not skip the others,
   and the run exits 1 if any did;
-- cross-checks that list against every `*_DATABASE_URL` in
-  `~/.config/snowline/*.env` and in the `dev.snowline.*` plists
-  (`*_TEST_*` / `*_DRYRUN_*` URLs are ignored); with the default list, a
-  configured store that is missing is logged as a WARNING and fails the run,
+- cross-checks that list against the server's own catalog (every
+  non-template database except `*_test*`, `*_dryrun*`, `*_e2e*` and the
+  legacy `snowline_dev`); with the default list, a live store that is
+  missing is logged as a WARNING and the run exits 3 (dumps still landed),
   so a new service cannot go unbacked-up silently. Setting
   `SNOWLINE_BACKUP_DBS` explicitly is a deliberate exclusion and only notes it;
 - refuses to run if the iCloud Drive root is missing (`mkdir -p` would
@@ -387,13 +389,15 @@ The `.env` secrets are deliberately not backed up.
 
 **Rolling out this change on the hub.** The hub checkout had an untracked
 hand-restored copy of `ops/hub/snowline-backup.sh` from 2026-10-23 (the
-#223 script, kept running while the PR was open). A tracked file at the same
-path arrives with this merge, so before pulling: remove that untracked copy
-(or the `.git/info/exclude` entry that hides it) and then `git pull
---ff-only`; the per-user agent keeps dumping from the same path, now with
-the hardened script. Then, when convenient, `sudo ops/hub/install-daemons.sh`
-moves the unit to the system domain (it waits for the first dump and puts
-the agent back if that fails).
+#223 script, kept running while the PR was open), hidden from `git status`
+by a `.git/info/exclude` entry. Git replaces an ignored file in place on
+checkout, so a plain `git pull --ff-only` is the whole step: the tracked
+script lands atomically and the per-user agent keeps dumping from the same
+path, now with the hardened script. Afterwards drop the stale exclude line.
+Do NOT delete the copy first: the hourly agent would spawn a missing program
+in the meantime (EX_CONFIG, penalty box). Then, when convenient,
+`sudo ops/hub/install-daemons.sh` moves the unit to the system domain (it
+waits for the first dump and puts the agent back if that fails).
 
 **Is it alive?** Do this whenever you touch the hub — the job has silently
 died twice (2026-07-09 to 09-04 after the repo move; 2026-09-13 to 10-23
@@ -404,9 +408,11 @@ sudo launchctl print system/dev.snowline.backup | grep -E 'last exit code|runs =
 ls -t ~/Library/Mobile\ Documents/com~apple~CloudDocs/Snowline/db-backups | head -6
 ```
 
-`last exit code = 0` and a dump under an hour old is healthy. `78: EX_CONFIG`
+`last exit code = 0` and a dump under an hour old is healthy. Exit 3 means
+the dumps landed but a live store is missing from the script's default list
+(add it). Exit 1 with log lines says which store failed. `78: EX_CONFIG`
 means launchd could not spawn the program (script path missing — check the
-checkout). A non-zero exit with log lines says which store failed.
+checkout).
 
 **Restore.** To inspect first (recommended):
 

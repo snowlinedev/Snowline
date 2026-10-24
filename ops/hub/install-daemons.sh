@@ -24,38 +24,8 @@ DEST=/Library/LaunchDaemons
 AGENTS="$OWNER_HOME/Library/LaunchAgents"
 STAMP="$(date +%Y%m%d)"
 
-# --- autocut in-flight guard (#258) ---
-# `launchctl bootout system/dev.snowline.autocut` SIGTERMs a running cut (~6
-# min, hourly). The cut holds a flock on AUTOCUT_LOCK for its whole run, so
-# test it first and refuse while it is held. `--wait` polls up to 15 min
-# instead. (A fire that starts between this check and the bootout is not
-# covered; the window is a few seconds.)
-AUTOCUT_LOCK="$OWNER_HOME/Library/Application Support/Snowline/autocut.lock"
-AUTOCUT_LOG="$OWNER_HOME/Library/Logs/snowline-autocut.log"
-autocut_lock_held() {
-  [ -e "$AUTOCUT_LOCK" ] || return 1
-  /usr/bin/python3 -c 'import fcntl, os, sys
-fd = os.open(sys.argv[1], os.O_RDONLY)
-try:
-    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-except OSError:
-    sys.exit(0)
-sys.exit(1)' "$AUTOCUT_LOCK"
-}
-autocut_guard() {
-  waited=0
-  while autocut_lock_held; do
-    if [ "${1:-}" != "--wait" ] || [ "$waited" -ge 900 ]; then
-      echo "refusing: an autocut is running (lock held: $AUTOCUT_LOCK)." >&2
-      echo "  booting the timer out now would kill the cut mid-publish." >&2
-      echo "  follow it in $AUTOCUT_LOG, then re-run (or pass --wait)." >&2
-      exit 75
-    fi
-    echo "   autocut running (lock held); waiting (${waited}s)"
-    sleep 15
-    waited=$((waited + 15))
-  done
-}
+# shellcheck disable=SC1091
+. "$SRC/lib.sh"
 autocut_guard "$@"
 
 # install_unit <name> <kick:yes|no> — the same steps for a service and a timer;
@@ -84,38 +54,21 @@ install_unit() {
   return 0
 }
 
-# restore_agent <name> — undo install_unit for a unit that had a per-user
-# agent: boot the daemon out, put the newest .disabled-* plist back and load
-# it. Used when the install of that unit cannot be trusted.
-restore_agent() {
-  label="dev.snowline.$1"
-  launchctl bootout "system/$label" 2>/dev/null || true
-  rm -f "${DEST:?}/${label:?}.plist"
-  disabled="$(ls -1 "$AGENTS/$label.plist.disabled-"* 2>/dev/null | sort | tail -n 1)"
-  if [ -n "$disabled" ]; then
-    mv "$disabled" "$AGENTS/$label.plist"
-    chown "$OWNER_UID" "$AGENTS/$label.plist"
-    launchctl bootstrap "gui/$OWNER_UID" "$AGENTS/$label.plist" || true
-    echo "   restored and loaded the per-user agent $AGENTS/$label.plist" >&2
-  else
-    echo "   no per-user agent plist to restore for $label — NO backup unit is loaded" >&2
-  fi
-}
-
+fail=0
 for svc in $SERVICES; do
-  install_unit "$svc" yes || true   # /health poll below reports it
+  install_unit "$svc" yes || fail=1   # the /health poll below reports it too
 done
 
 backup_loaded=yes
 for timer in $TIMERS; do
   if ! install_unit "$timer" no; then
+    fail=1
     [ "$timer" = backup ] && backup_loaded=no
   fi
 done
 
 echo "== waiting up to 60s for /health"
 urls="platform|http://100.81.176.75:8850/health pm|http://127.0.0.1:8802/health governance|http://127.0.0.1:8801/health memory|http://127.0.0.1:8803/health"
-fail=0
 for entry in $urls; do
   name="${entry%%|*}"
   url="${entry#*|}"
@@ -131,9 +84,11 @@ for entry in $urls; do
 done
 
 # The backup timer's RunAtLoad dump proves the path end to end: wait for the
-# run to finish (it waits up to 120s for Postgres itself) and FAIL the install
-# if it exited non-zero — the old agent has already been retired above, so a
-# daemon that cannot dump must not pass silently.
+# run to finish (it waits up to 120s for Postgres itself). Exit 0 = dumps
+# landed; exit 3 = dumps landed but the store list has drifted (a warning the
+# restored agent would hit identically, so NOT a reason to roll back); any
+# other outcome = the daemon cannot dump, so put the per-user agent back if
+# one exists (restore_agent leaves the daemon when there is none) and fail.
 echo "== dev.snowline.backup (RunAtLoad dump)"
 code=""
 i=0
@@ -146,16 +101,17 @@ if [ "$backup_loaded" = yes ]; then
   done
   tail -n 8 "$OWNER_HOME/Library/Logs/snowline-backup.log" 2>/dev/null | sed 's/^/   /'
 fi
-if [ "$code" = "0" ]; then
-  echo "   backup: OK (exit 0)"
-else
-  if [ "$backup_loaded" != yes ]; then
-    echo "   backup: FAILED (daemon did not bootstrap)" >&2
-  else
-    echo "   backup: FAILED (exit ${code:-still running after ${i}s}) — see $OWNER_HOME/Library/Logs/snowline-backup.log" >&2
-  fi
-  # Do not leave the hub without a loaded backup unit: put the agent back.
-  restore_agent backup
-  fail=1
-fi
+case "$code" in
+  0) echo "   backup: OK (exit 0)" ;;
+  3) echo "   backup: OK, dumps landed, but the store list needs updating (exit 3; see the WARNING above)" ;;
+  *)
+    if [ "$backup_loaded" != yes ]; then
+      echo "   backup: FAILED (daemon did not bootstrap)" >&2
+    else
+      echo "   backup: FAILED (exit ${code:-still running after ${i}s}) — see $OWNER_HOME/Library/Logs/snowline-backup.log" >&2
+    fi
+    restore_agent backup || true
+    fail=1
+    ;;
+esac
 exit "$fail"

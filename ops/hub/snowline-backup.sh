@@ -34,10 +34,10 @@ export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 umask 077
 
 # Space-separated list of databases to dump. Every live store on the hub —
-# the four services plus musher and marketing. The cross-check below refuses
-# to let the DEFAULT list drift from the *_DATABASE_URL values the hub's
-# units actually run against; an explicit SNOWLINE_BACKUP_DBS is the
-# operator's deliberate choice and only gets a note in the log.
+# the four services plus musher and marketing. The cross-check below asks
+# the server itself which databases exist and refuses to let the DEFAULT
+# list drift from that; an explicit SNOWLINE_BACKUP_DBS is the operator's
+# deliberate choice and only gets a note in the log.
 DBS_EXPLICIT="${SNOWLINE_BACKUP_DBS:-}"
 DBS="${DBS_EXPLICIT:-snowline_platform snowline_pm snowline_governance snowline_memory snowline_musher snowline_marketing}"
 ICLOUD_ROOT="$HOME/Library/Mobile Documents/com~apple~CloudDocs"
@@ -65,53 +65,44 @@ case "$DEST" in
         [ -d "$ICLOUD_ROOT" ] || die "iCloud Drive root missing ($ICLOUD_ROOT); refusing to write local-only backups — is iCloud Drive set up for this user?"
         ;;
 esac
-[ -d "$(dirname "$DEST")" ] || die "backup destination parent missing: $(dirname "$DEST")"
+# Under a verified iCloud root the leaf folders may be created freely; for
+# any other destination (external volume, rsync target) the parent must
+# already exist, or an unmounted volume would be silently replaced by a
+# local directory.
+case "$DEST" in
+    "$ICLOUD_ROOT"/*) ;;
+    *) [ -d "$(dirname "$DEST")" ] || die "backup destination parent missing: $(dirname "$DEST")" ;;
+esac
 mkdir -p "$DEST" || die "cannot create backup destination: $DEST"
 [ -w "$DEST" ] || die "backup destination not writable: $DEST"
 chmod 700 "$DEST" 2>/dev/null || true   # best effort: an iCloud folder may refuse
 
-# --- wait for Postgres (bounded) ---
-# Postgres on the hub is a per-user LaunchAgent (homebrew.mxcl.postgresql@16
-# in gui/501), so at boot this daemon can fire before the owner's session has
-# started it, and the RunAtLoad dump would fail for every store. Same bounded
-# wait as run-service.sh; after it, the dumps are attempted anyway and a
-# failure is logged loudly (the next hourly tick retries).
-waited=0
-until pg_isready -q; do
-    if [ "$waited" -ge 120 ]; then
-        echo "$(now) postgres not ready after ${waited}s; attempting the dumps anyway" >&2
-        break
-    fi
-    sleep 5
-    waited=$((waited + 5))
-done
+# --- wait for Postgres (bounded; see lib.sh) ---
+# shellcheck disable=SC1091
+. "$(dirname "$0")/launchdaemons/lib.sh"
+wait_for_postgres || true
 
-# --- cross-check: every store a hub unit is configured against must be listed ---
-# Sources: the service env files and the per-unit EnvironmentVariables of
-# every dev.snowline.* launchd plist (musher / marketing carry their URL there).
-# *_TEST_* / *_DRYRUN_* URLs are scratch stores and are ignored in both
-# sources. A store that is configured but not in DBS is reported; with the
-# default list that fails the run — the "exit 0 while the live store is
-# unprotected" failure class — while an explicit SNOWLINE_BACKUP_DBS is
-# taken as the operator's deliberate exclusion and only gets a note.
-configured_dbs() {
-    {
-        # env files: optional `export`, optional quotes around the value
-        # (value runs to the first whitespace, so a trailing `# comment` is dropped)
-        sed -n -E "s/^(export[[:space:]]+)?([A-Z_]+_DATABASE_URL)=[\"']?([^\"'[:space:]]*)[\"']?([[:space:]]+#.*)?[[:space:]]*$/\\2=\\3/p" \
-            "$HOME"/.config/snowline/*.env 2>/dev/null
-        # plists: <key>NAME_DATABASE_URL</key> followed by its <string> value
-        for plist in "$HOME"/Library/LaunchAgents/dev.snowline.*.plist /Library/LaunchDaemons/dev.snowline.*.plist; do
-            [ -f "$plist" ] || continue
-            grep -A1 -E '<key>[A-Z_]+_DATABASE_URL</key>' "$plist" 2>/dev/null \
-                | tr -d '\n' | sed -E 's#</string>#\n#g' \
-                | sed -n -E 's#.*<key>([A-Z_]+_DATABASE_URL)</key>[[:space:]]*<string>([^<]*)#\1=\2#p'
-        done
-    } | grep -v -E '^[A-Z_]*(TEST|DRYRUN)[A-Z_]*_DATABASE_URL=' \
-      | cut -d= -f2- | sed -e 's#[?].*##' -e 's#.*/##' | grep -v '^$' | sort -u
+# --- cross-check: every live store on this server must be listed ---
+# The authoritative list is the server's own catalog, not any config file:
+# every non-template database except the scratch patterns (`*_test*`,
+# `*_dryrun*`, `*_e2e*`, and the legacy `snowline_dev`). A store that exists
+# but is not in DBS is reported; with the default list that fails the run
+# with exit 3 — the "exit 0 while a live store is unprotected" failure class,
+# distinguishable from a dump failure (exit 1) — while an explicit
+# SNOWLINE_BACKUP_DBS is taken as the operator's deliberate exclusion and
+# only gets a note. A catalog query failure is reported and treated as "no
+# cross-check", never as "all clear".
+SCRATCH_RE='(_test|_dryrun|_e2e|^snowline_dev$)'
+live_dbs() {
+    psql -At -d postgres -c "select datname from pg_database where not datistemplate and datname <> 'postgres' order by 1" 2>/dev/null \
+        | grep -v -E "$SCRATCH_RE"
 }
 UNLISTED=""
-for db in $(configured_dbs); do
+LIVE="$(live_dbs)" || LIVE=""
+if [ -z "$LIVE" ]; then
+    echo "$(now) WARNING: could not list databases from the server; store-list cross-check skipped" >&2
+fi
+for db in $LIVE; do
     case " $DBS " in
         *" $db "*) ;;
         *) UNLISTED="$UNLISTED $db" ;;
@@ -119,9 +110,9 @@ for db in $(configured_dbs); do
 done
 if [ -n "$UNLISTED" ]; then
     if [ -n "$DBS_EXPLICIT" ]; then
-        echo "$(now) note: SNOWLINE_BACKUP_DBS excludes configured store(s):${UNLISTED}" >&2
+        echo "$(now) note: SNOWLINE_BACKUP_DBS excludes live store(s):${UNLISTED}" >&2
     else
-        echo "$(now) WARNING: configured but not in the default store list:${UNLISTED} — add them to DBS in this script (or set SNOWLINE_BACKUP_DBS to exclude them deliberately)" >&2
+        echo "$(now) WARNING: live store(s) not in the default list:${UNLISTED} — add them to DBS in this script (or set SNOWLINE_BACKUP_DBS to exclude them deliberately)" >&2
     fi
 fi
 
@@ -166,5 +157,6 @@ if [ -n "$FAILED" ]; then
     echo "$(now) run incomplete; failed:${FAILED}" >&2
     exit 1
 fi
-# Default list missing a configured store: fail loudly (see cross-check).
-[ -z "$UNLISTED" ] || [ -n "$DBS_EXPLICIT" ] || exit 1
+# Default list missing a live store: fail loudly with a distinct code (see
+# cross-check; install-daemons.sh treats 3 as "dumps landed, list drifted").
+[ -z "$UNLISTED" ] || [ -n "$DBS_EXPLICIT" ] || exit 3
