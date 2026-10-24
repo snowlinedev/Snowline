@@ -1,6 +1,7 @@
 #!/bin/sh
-# Move the hub's four services from per-user LaunchAgents to system
-# LaunchDaemons so they start at boot without a login (#239 / 239ec238).
+# Move the hub's four services (and the hourly DB backup timer) from per-user
+# LaunchAgents to system LaunchDaemons so they run at boot without a login
+# (#239 / 239ec238; backup: decision c68ec655, item f304ec06).
 # Idempotent. Run:  sudo ops/hub/install-daemons.sh [--wait]
 # Refuses (exit 75) while an autocut is running; --wait waits up to 15 min.
 # Rollback:        sudo ops/hub/uninstall-daemons.sh
@@ -12,6 +13,12 @@ SERVICES="platform pm governance memory"
 # Interval timers (#258): installed + bootstrapped, never kickstarted — a
 # kickstart would fire an immediate run (for autocut, a ~6-minute cut).
 TIMERS="autocut"
+# Timers that replace a per-user LaunchAgent of the same label (the backup job
+# predates the daemon move). Bootstrapped like TIMERS, and additionally the
+# old agent is booted out and its plist moved aside — a timer loaded in both
+# domains would dump twice an hour. RunAtLoad on the backup plist means the
+# bootstrap itself takes one backup, which proves the path end to end.
+AGENT_TIMERS="backup"
 OWNER_UID=501
 OWNER_HOME=/Users/seanlynch
 SRC="$(cd "$(dirname "$0")" && pwd)/launchdaemons"
@@ -72,9 +79,18 @@ for svc in $SERVICES; do
   launchctl kickstart -k "system/$label"
 done
 
-for timer in $TIMERS; do
+for timer in $TIMERS $AGENT_TIMERS; do
   label="dev.snowline.$timer"
   echo "== $label (timer; not kickstarted)"
+  case " $AGENT_TIMERS " in
+    *" $timer "*)
+      launchctl bootout "gui/$OWNER_UID/$label" 2>/dev/null || true
+      if [ -f "$AGENTS/$label.plist" ]; then
+        mv "$AGENTS/$label.plist" "$AGENTS/$label.plist.disabled-$STAMP"
+        echo "   agent plist -> $label.plist.disabled-$STAMP"
+      fi
+      ;;
+  esac
   launchctl bootout "system/$label" 2>/dev/null || true
   cp "$SRC/$label.plist" "$DEST/$label.plist"
   chown root:wheel "$DEST/$label.plist"
@@ -98,4 +114,10 @@ for entry in $urls; do
   echo "   $name $url: $([ "$ok" = yes ] && echo UP || echo DOWN)"
   [ "$ok" = yes ] || fail=1
 done
+
+# The backup timer's RunAtLoad dump: give it a moment, then show the verdict.
+echo "== dev.snowline.backup (RunAtLoad dump)"
+sleep 5
+launchctl print system/dev.snowline.backup 2>/dev/null | grep -E "last exit code|runs =" | sed 's/^/   /'
+tail -n 6 "$OWNER_HOME/Library/Logs/snowline-backup.log" 2>/dev/null | sed 's/^/   /'
 exit "$fail"

@@ -7,6 +7,7 @@
 
 SERVICES="platform pm governance memory"
 TIMERS="autocut"  # system-only; no LaunchAgent predecessor to restore
+AGENT_TIMERS="backup"  # had a per-user agent before the daemon move: restore it
 OWNER_UID=501
 OWNER_HOME=/Users/seanlynch
 DEST=/Library/LaunchDaemons
@@ -53,7 +54,7 @@ for timer in $TIMERS; do
   rm -f "$DEST/$label.plist"
 done
 
-for svc in $SERVICES; do
+for svc in $SERVICES $AGENT_TIMERS; do
   label="dev.snowline.$svc"
   echo "== $label"
   launchctl bootout "system/$label" 2>/dev/null || true
@@ -69,7 +70,10 @@ for svc in $SERVICES; do
   fi
   if [ -f "$AGENTS/$label.plist" ]; then
     launchctl bootstrap "gui/$OWNER_UID" "$AGENTS/$label.plist" || true
-    launchctl kickstart -k "gui/$OWNER_UID/$label" || true
+    case " $AGENT_TIMERS " in
+      *" $svc "*) ;;  # a timer: bootstrap (RunAtLoad) is enough, never kickstart
+      *) launchctl kickstart -k "gui/$OWNER_UID/$label" || true ;;
+    esac
   fi
 done
 echo "done; check the four /health URLs (docs/ops/hub-daemons.md)"

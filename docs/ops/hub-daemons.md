@@ -24,6 +24,12 @@ each of platform / pm / governance / memory:
    then `launchctl kickstart -k system/dev.snowline.<svc>`.
 4. Polls the four `/health` URLs for up to 60s and prints UP/DOWN.
 
+It then installs the timers from `ops/hub/launchdaemons/` the same way, but
+only bootstraps them (never kickstarts): `dev.snowline.autocut` (below) and
+`dev.snowline.backup` ("DB backups", below). The backup timer had a per-user
+LaunchAgent before this move, so the install also boots that agent out and
+moves its plist aside, exactly as for a service; the uninstall restores it.
+
 The daemons run as `UserName=seanlynch`, `GroupName=staff`, so the mode-600
 env files in `~/.config/snowline/` stay readable. Logs are unchanged
 (`~/Library/Logs/snowline-<svc>.log`). `KeepAlive` is plain `true` with
@@ -333,3 +339,68 @@ first test the flock on `~/Library/Application Support/Snowline/autocut.lock`.
 While a cut holds it they refuse with exit 75, naming the lock and the log.
 `--wait` polls every 15s for up to 15 minutes instead. A fire that starts in
 the few seconds between the check and the bootout is not covered.
+
+## DB backups (hourly, `dev.snowline.backup`)
+
+Decision c68ec655 (supersedes e4578136): every live Postgres store on the hub
+is dumped every hour into iCloud Drive. The unit is a system LaunchDaemon
+(installed by `install-daemons.sh`, runs as `UserName=seanlynch`) so a backup
+is taken whether or not anyone is logged in; before the move it was a
+login-only LaunchAgent.
+
+**What runs.** `ops/hub/launchdaemons/dev.snowline.backup.plist` fires
+`ops/hub/snowline-backup.sh` every 3600 s and once on load. The script:
+
+- dumps `snowline_platform pm governance memory musher marketing` with
+  `pg_dump -Fc` (override the list with `SNOWLINE_BACKUP_DBS`), verifies each
+  archive with `pg_restore -l`, then renames `.partial` to the final name —
+  one store failing does not skip the others, and the run exits 1 if any did;
+- cross-checks the list against every `*_DATABASE_URL` in
+  `~/.config/snowline/*.env` and in the `dev.snowline.*` plists; a configured
+  store that is not in the list is logged as a WARNING and fails the run, so
+  a new service cannot go unbacked-up silently;
+- refuses to run if the iCloud Drive root is missing (`mkdir -p` would
+  otherwise recreate the folder locally and every run would "succeed" while
+  nothing left the machine);
+- writes owner-only (umask 077, destination 0700): the platform dump carries
+  the live replication HMAC secrets, so a dump is as sensitive as the hub;
+- prunes each store's dumps older than `SNOWLINE_BACKUP_RETENTION_DAYS`
+  (30), including iCloud-evicted `.NAME.icloud` placeholders; the legacy
+  `snowline_dev-*` dumps are never touched.
+
+Dumps land in `~/Library/Mobile Documents/com~apple~CloudDocs/Snowline/db-backups/`
+as `<store>-<YYYYMMDD-HHMMSS>Z.dump` (UTC). Log: `~/Library/Logs/snowline-backup.log`.
+The `.env` secrets are deliberately not backed up.
+
+**Is it alive?** Do this whenever you touch the hub — the job has silently
+died twice (2026-07-09 to 09-04 after the repo move; 2026-09-13 to 10-23
+while the script existed only on an unmerged branch):
+
+```sh
+sudo launchctl print system/dev.snowline.backup | grep -E 'last exit code|runs ='
+ls -t ~/Library/Mobile\ Documents/com~apple~CloudDocs/Snowline/db-backups | head -6
+```
+
+`last exit code = 0` and a dump under an hour old is healthy. `78: EX_CONFIG`
+means launchd could not spawn the program (script path missing — check the
+checkout). A non-zero exit with log lines says which store failed.
+
+**Restore.** To inspect first (recommended):
+
+```sh
+createdb snowline_restore
+pg_restore --no-owner -d snowline_restore <dump>
+```
+
+To overwrite the live store (destructive; stop that service first):
+
+```sh
+pg_restore --clean --if-exists --no-owner -d snowline_pm <dump>
+```
+
+**Manual run / reload.** `bash ops/hub/snowline-backup.sh` takes a backup now.
+To restart the unit after editing the plist: `sudo launchctl bootout
+system/dev.snowline.backup && sudo launchctl bootstrap system
+/Library/LaunchDaemons/dev.snowline.backup.plist` (the bootstrap itself takes
+a backup). Do not `kickstart -k` a timer that launchd has put in its penalty
+box after repeated spawn failures — it hangs; bootout/bootstrap instead.
