@@ -396,9 +396,8 @@ set -f
 # shellcheck disable=SC2086
 set -- $DBS
 set +f
-# prune_all <store> — delete this store's Z-stamped dumps and
-# placeholders whose name stamp is older than RETENTION_DAYS (string
-# comparison against one cutoff stamp; no fork per file).
+# The retention cutoff: one stamp, compared against each dump's name stamp
+# as a string (fixed-width UTC; no fork per file).
 PRUNE_CUTOFF="$(date -u -v-"${RETENTION_DAYS}"d +%Y%m%d-%H%M%S 2>/dev/null)" || PRUNE_CUTOFF=""
 [ -n "$PRUNE_CUTOFF" ] || log "WARNING: cannot compute the retention cutoff for $RETENTION_DAYS days; NOT pruning this run (the folder grows until this is fixed)" >&2
 # Retention, ONE pass over the folder for EVERY store found there — not just
