@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Hourly pg_dump of every live Snowline store (decision c68ec655). A
+     one-shot timer — NOT KeepAlive: it dumps, verifies, prunes and exits; the
+     timer fires it again on schedule, so a failed run is simply a skipped run
+     (no retry storm). Installed by ops/hub/install-daemons.sh (which also
+     retires the older per-user LaunchAgent of the same label); see
+     docs/ops/hub-daemons.md "DB backups".
+
+     A system LaunchDaemon, like the services and the autocut timer: the
+     timer itself does not depend on a login session. What it dumps does —
+     Postgres on the hub is the owner's per-user LaunchAgent
+     (homebrew.mxcl.postgresql@16) and iCloud Drive syncs per session — so
+     the script waits up to 120 s for pg_isready (as run-service.sh does)
+     and the dumps are only guaranteed while the owner is logged in. After a
+     FileVault boot that is always the case, which is why the services are
+     daemons too (docs/ops/hub-daemons.md "Why"). It runs as
+     UserName=seanlynch with HOME set so pg_dump reaches the owner's Postgres
+     role over the local socket and the dumps land in the owner's iCloud
+     Drive folder.
+
+     RunAtLoad is true: loading the unit takes one backup immediately, which
+     install-daemons.sh waits for and reports (a non-zero exit fails the
+     install). A dump of all stores takes a few seconds. No WorkingDirectory:
+     the script does not use it, and a missing directory would make launchd
+     refuse to spawn (EX_CONFIG) — exactly the silent-failure mode this unit
+     exists to avoid. The script sets its own PATH. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.snowline.backup</string>
+    <key>UserName</key>
+    <string>seanlynch</string>
+    <key>GroupName</key>
+    <string>staff</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/seanlynch/Projects/snowline-platform/ops/hub/snowline-backup.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/seanlynch</string>
+        <!-- Overrides the script accepts here (none are set, so the script's
+             defaults apply and there is a single place to change them):
+             SNOWLINE_BACKUP_DIR — where dumps land (default: iCloud Drive,
+               off-machine durability for free; a non-iCloud path such as an
+               external volume or a tailnet rsync target skips the iCloud
+               root check);
+             SNOWLINE_BACKUP_RETENTION_DAYS — default 30;
+             SNOWLINE_BACKUP_DBS — space-separated store list (default: every
+               live store); a configured store you leave out is noted in the
+               log but does not fail the run, since setting this is a
+               deliberate choice. -->
+    </dict>
+    <!-- Hourly (3600s). The stores change throughout the day (every work item,
+         decision, artifact, memory, musher run), so cap losable work at about
+         an hour. StartInterval fires from load and catches up once after a
+         sleep/wake if an interval elapsed. Six dumps total ~8 MB, so a month
+         of hourly history is cheap. -->
+    <key>StartInterval</key>
+    <integer>3600</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/seanlynch/Library/Logs/snowline-backup.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/seanlynch/Library/Logs/snowline-backup.log</string>
+</dict>
+</plist>
