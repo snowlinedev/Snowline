@@ -220,7 +220,11 @@ load_unit() {
 # die with EX_CONFIG when it is deleted — the #220 failure mode). The
 # install refuses to load the unit when nothing is at that path.
 backup_agent_script() {
-  plutil -extract ProgramArguments.1 raw -o - "$LAUNCHAGENTS_SRC/dev.snowline.backup.plist" 2>/dev/null
+  # the LAST ProgramArguments entry: the script, whether or not argv[0] is
+  # an interpreter
+  bas_n="$(plutil -extract ProgramArguments raw -o - "$LAUNCHAGENTS_SRC/dev.snowline.backup.plist" 2>/dev/null)" || return 1
+  [ "${bas_n:-0}" -gt 0 ] || return 1
+  plutil -extract "ProgramArguments.$((bas_n - 1))" raw -o - "$LAUNCHAGENTS_SRC/dev.snowline.backup.plist" 2>/dev/null
 }
 
 # ---- per-user agent restore (the services' rollback) ----
@@ -233,7 +237,10 @@ backup_agent_script() {
 restore_agent() {
   label="dev.snowline.$1"
   launchctl bootout "system/$label" 2>/dev/null || true
-  wait_unloaded "system/$label" || echo "   $label still registered after 30s; continuing" >&2
+  if ! wait_unloaded "system/$label"; then
+    echo "   daemon $label still registered after 30s; NOT starting the agent on top of it — re-run" >&2
+    return 1
+  fi
   rm -f "${DAEMONS_DIR:?}/${label:?}.plist"
   disabled="$(ls -1 "$AGENTS/$label.plist.disabled-"* 2>/dev/null | sort | tail -n 1)"
   if [ -f "$AGENTS/$label.plist" ]; then

@@ -463,8 +463,8 @@ a `WorkingDirectory` and an explicit `SNOWLINE_BACKUP_DIR` equal to the
 default; the tracked one runs it via `/bin/bash` with neither. Same
 behaviour, different bytes: the next `sudo ops/hub/install-daemons.sh`
 will therefore replace and reload it once (one dump, judged) — run it from
-the canonical checkout after the pull; from any other checkout it refuses
-until the two scripts match.
+the canonical checkout after the pull; from any other checkout or worktree
+it refuses to touch the backup unit.
 
 **Is it alive?** Do this whenever you touch the hub — the job has silently
 died twice (2026-07-09 to 09-04 after the repo move; 2026-09-13 to 10-23

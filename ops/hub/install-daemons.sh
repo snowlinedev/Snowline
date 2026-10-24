@@ -125,19 +125,18 @@ if [ -z "$script" ] || [ ! -f "$script" ]; then
   fail=1
   exit "$fail"
 fi
-# The unit will run the CANONICAL script; this install was written against
-# ITS OWN copy. They must be the same file, or an install run from a branch
-# or worktree before the canonical checkout pulled it would install a unit
-# running different code — and the queries below (--print-dest, --check)
-# would be sent to a script that may not know them and would take a real
-# backup instead. Refuse until the canonical checkout is current.
-if ! cmp -s "$OPS_HUB/snowline-backup.sh" "$script"; then
-  echo "   $script differs from $OPS_HUB/snowline-backup.sh (the canonical checkout has not pulled this version?); NOT touching the backup unit until they match" >&2
+# The unit runs the CANONICAL script, which sources the canonical lib.sh and
+# backup.env. This install must therefore BE the canonical checkout (same
+# file, not merely equal bytes): from a branch or worktree it would install
+# a unit running other code and send the queries below to a script that may
+# not know them. Refuse otherwise.
+if [ ! "$OPS_HUB/snowline-backup.sh" -ef "$script" ]; then
+  echo "   this install runs from $OPS_HUB, but the unit runs $script; run the install from the canonical checkout (after pulling) — NOT touching the backup unit" >&2
   fail=1
   exit "$fail"
 fi
 echo "   unit runs $script"
-as_owner() { sudo -u "#$OWNER_UID" -H /bin/bash "$OPS_HUB/snowline-backup.sh" "$@"; }
+as_owner() { sudo -u "#$OWNER_UID" -H /bin/bash "$script" "$@"; }
 dest="$(as_owner --print-dest 2>/dev/null)" || dest="(unknown: --print-dest failed)"
 # judge_dump <minutes> — OK / NONE / UNKNOWN for a dump newer than <minutes>;
 # the token comes from the script's stdout, so a sudo or script failure
@@ -198,8 +197,8 @@ judge_run() {
     running="$UNIT_RUNNING"
     [ "$running" = yes ] && seen=yes
     if [ "$running" = no ] && { [ "$seen" = yes ] || [ "$UNIT_RUNS" -gt "$jr_before" ]; }; then
-      code="$UNIT_EXIT"
-      [ -n "$code" ] && break
+      code="$UNIT_EXIT"   # may be empty: the run died by a signal; judged below
+      break
     fi
     sleep 2
     i=$((i + 2))

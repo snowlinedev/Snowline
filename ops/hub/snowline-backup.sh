@@ -73,7 +73,7 @@ fi
 # target, an external volume, etc.
 DEST="${SNOWLINE_BACKUP_DIR:-$BACKUP_DIR}"
 RETENTION_DAYS="${SNOWLINE_BACKUP_RETENTION_DAYS:-30}"
-case "$RETENTION_DAYS" in ''|*[!0-9]*) log "SNOWLINE_BACKUP_RETENTION_DAYS is not a number of days: '$RETENTION_DAYS'" >&2; exit 2 ;; esac
+case "$RETENTION_DAYS" in ''|*[!0-9]*|0) log "SNOWLINE_BACKUP_RETENTION_DAYS must be a whole number of days, at least 1: '$RETENTION_DAYS'" >&2; exit 2 ;; esac
 # name_stamp <path> — the YYYYMMDD-HHMMSS UTC stamp of a Z-named dump or
 # placeholder (…-YYYYMMDD-HHMMSSZ.dump[.icloud]); fails for any other name.
 # Parameter expansion only: it runs once per file in --check and prune.
@@ -84,6 +84,18 @@ name_stamp() {
         [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]) printf '%s\n' "$ns" ;;
         *) return 1 ;;
     esac
+}
+# z_dumps <name-prefix> — one "<stamp>\t<path>" line per Z-named dump or
+# placeholder of that prefix in DEST (`*` for every store). The ONE rule
+# --check (evidence) and the prune (retention) share. find's stderr goes
+# to Z_DUMPS_ERR for the caller to inspect.
+Z_DUMPS_ERR="$(mktemp -t snowline-backup-find)"
+z_dumps() {
+    find "$DEST" -maxdepth 1 \( -name "$1-[0-9]*Z.dump" -o -name ".$1-[0-9]*Z.dump.icloud" \) -type f 2>"$Z_DUMPS_ERR" \
+    | while IFS= read -r zf; do
+        zs="$(name_stamp "$zf")" || continue
+        printf '%s\t%s\n' "$zs" "$zf"
+    done
 }
 
 # Queries install-daemons.sh makes by running this script AS THE OWNER
@@ -109,17 +121,16 @@ case "${1:-}" in
         mins="${2:-}"
         case "$mins" in ''|*[!0-9]*) echo "--check needs a number of minutes" >&2; exit 2 ;; esac
         [ -d "$DEST" ] || { echo NONE; exit 1; }
-        cutoff="$(date -u -v-"${mins}"M +%Y%m%d-%H%M%S)"
-        err="$(mktemp -t snowline-backup-check)"
+        cutoff="$(date -u -v-"${mins}"M +%Y%m%d-%H%M%S 2>/dev/null)" || { echo UNREADABLE; exit 2; }
+        [ -n "$cutoff" ] || { echo UNREADABLE; exit 2; }
         found=no
-        while IFS= read -r f; do
-            s="$(name_stamp "$f")" || continue
+        while IFS="$(printf '\t')" read -r s _; do
             [ "$s" \< "$cutoff" ] || found=yes
-        done <<EOF_FIND
-$(find "$DEST" -maxdepth 1 \( -name '*-[0-9]*Z.dump' -o -name '.*-[0-9]*Z.dump.icloud' \) -type f 2>"$err")
-EOF_FIND
-        if [ -s "$err" ]; then rm -f "$err"; echo UNREADABLE; exit 2; fi
-        rm -f "$err"
+        done <<EOF_Z
+$(z_dumps '*')
+EOF_Z
+        if [ -s "$Z_DUMPS_ERR" ]; then rm -f "$Z_DUMPS_ERR"; echo UNREADABLE; exit 2; fi
+        rm -f "$Z_DUMPS_ERR"
         [ "$found" = yes ] && { echo OK; exit 0; }
         echo NONE; exit 1
         ;;
@@ -224,11 +235,10 @@ rm -f "$PROBE"
 # and dumps that iCloud re-materialises are tightened each run — a few
 # hundred stats an hour. Best effort on an iCloud folder, but say so.
 chmod 700 "$DEST" 2>/dev/null || log "WARNING: could not chmod 700 $DEST" >&2
-# only touch anything when a loose file actually exists (one cheap find)
-if [ -n "$(find "$DEST" -maxdepth 1 -name '*.dump' -type f -perm +044 -print -quit 2>/dev/null)" ]; then
-    find "$DEST" -maxdepth 1 -name '*.dump' -type f -perm +044 -exec chmod 600 {} + 2>/dev/null \
-        || log "WARNING: could not tighten permissions on existing dumps in $DEST" >&2
-fi
+# (`-exec … {} +` runs nothing when nothing matches: one walk, no chmod
+# unless a loose file exists)
+find "$DEST" -maxdepth 1 -name '*.dump' -type f -perm +044 -exec chmod 600 {} + 2>/dev/null \
+    || log "WARNING: could not tighten permissions on existing dumps in $DEST" >&2
 
 # --- wait for Postgres (bounded; see lib.sh) ---
 wait_for_postgres || true
@@ -297,11 +307,10 @@ set +f
 # prune_by_name <store> — delete this store's Z-stamped dumps and
 # placeholders whose name stamp is older than RETENTION_DAYS (string
 # comparison against one cutoff stamp; no fork per file).
-PRUNE_CUTOFF="$(date -u -v-"${RETENTION_DAYS}"d +%Y%m%d-%H%M%S)"
+PRUNE_CUTOFF="$(date -u -v-"${RETENTION_DAYS}"d +%Y%m%d-%H%M%S 2>/dev/null)" || PRUNE_CUTOFF=""
 prune_by_name() {
-    find "$DEST" -maxdepth 1 \( -name "$1-[0-9]*Z.dump" -o -name ".$1-[0-9]*Z.dump.icloud" \) -type f 2>/dev/null \
-    | while IFS= read -r pb_f; do
-        pb_stamp="$(name_stamp "$pb_f")" || continue
+    [ -n "$PRUNE_CUTOFF" ] || return 0   # no cutoff, no pruning (never over-delete)
+    z_dumps "$1" | while IFS="$(printf '\t')" read -r pb_stamp pb_f; do
         [ "$pb_stamp" \< "$PRUNE_CUTOFF" ] && rm -f "$pb_f"
     done
     return 0
@@ -351,6 +360,7 @@ for DB in "$@"; do
     find "$DEST" -maxdepth 1 \( -name "${DB}-*[0-9].dump" -o -name ".${DB}-*[0-9].dump.icloud" \) -type f -mtime +"$RETENTION_DAYS" -delete 2>/dev/null || true
 done
 trap - TERM INT
+rm -f "$Z_DUMPS_ERR"
 
 # Stale .partial leftovers from any store.
 find "$DEST" -maxdepth 1 -name '*.partial' -type f -mtime +1 -delete || true
