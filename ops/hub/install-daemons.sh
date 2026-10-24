@@ -161,6 +161,26 @@ judge_dump() {
   JUDGE_MSG="$(printf '%s\n' "$JUDGE_MSG" | tail -n 1)"
   case $jd_rc in 0) JUDGE=OK ;; 1) JUDGE=NONE ;; *) JUDGE=UNKNOWN ;; esac
 }
+# dump_evidence <minutes> <since-stamp> — the ONE evidence rule: sets
+# EVIDENCE to OK (a dump newer than <minutes> in the destination), NONE (the
+# destination is readable and holds none), LOG_OK / LOG_FAIL (the
+# destination cannot be read from this context, so the agent's own log
+# lines since <since-stamp> decide) or UNKNOWN (neither source says
+# anything); EVIDENCE_MSG carries the --check failure reason.
+dump_evidence() {
+  judge_dump "$1"
+  EVIDENCE_MSG="$JUDGE_MSG"
+  case "$JUDGE" in
+    OK|NONE) EVIDENCE="$JUDGE" ;;
+    *)
+      log_since "$2"
+      case "$LOGSAYS" in
+        OK)   EVIDENCE=LOG_OK ;;
+        FAIL) EVIDENCE=LOG_FAIL ;;
+        *)    EVIDENCE=UNKNOWN ;;
+      esac ;;
+  esac
+}
 # log_since <YYYY-MM-DDTHH:MM:SSZ> — sets LOGSAYS to OK / FAIL / NONE from the
 # backup log's lines stamped at or after that instant (the agent's own
 # account of a run, written from its own launchd session — the fallback
@@ -188,19 +208,13 @@ else
     *) why="last run exited $UNIT_EXIT" ;;
   esac
   if [ -z "$why" ]; then
-    judge_dump 120
-    case "$JUDGE" in
-      OK)   echo "   unchanged and loaded, dumped within 2 h; left as it is" ;;
-      NONE) why="no dump in the last 2 h in $dest" ;;
-      *)
-        # this install's context cannot read the destination (ssh without
-        # Full Disk Access, say): fall back to the agent's own log
-        log_since "$(date -u -v-120M +%FT%TZ)"
-        case "$LOGSAYS" in
-          OK)   echo "   unchanged and loaded; the log shows a dump within 2 h (destination not checkable from here: $JUDGE_MSG); left as it is" ;;
-          FAIL) why="the log shows a failed run within 2 h" ;;
-          *)    echo "   unchanged and loaded; could not check $dest ($JUDGE_MSG) and the log shows no run within 2 h — check by hand: ls -t '$dest' | head" >&2; fail=1 ;;
-        esac ;;
+    dump_evidence 120 "$(date -u -v-120M +%FT%TZ)"
+    case "$EVIDENCE" in
+      OK)       echo "   unchanged and loaded, dumped within 2 h; left as it is" ;;
+      LOG_OK)   echo "   unchanged and loaded; the log shows a dump within 2 h (destination not checkable from here: $EVIDENCE_MSG); left as it is" ;;
+      NONE)     why="no dump in the last 2 h in $dest" ;;
+      LOG_FAIL) why="the log shows a failed run within 2 h" ;;
+      *)        echo "   unchanged and loaded; could not check $dest ($EVIDENCE_MSG) and the log shows no run within 2 h — check by hand: ls -t '$dest' | head" >&2; fail=1 ;;
     esac
   fi
 fi
@@ -236,7 +250,7 @@ if [ "$backup_loaded" = yes ]; then
     fail=1
   else
     code=""; i=0
-    while [ "$i" -lt 420 ]; do   # 120 s Postgres wait + dumps + a lock wait
+    while [ "$i" -lt 600 ]; do   # 120 s Postgres wait + up to 60 s lock wait per store + the dumps
       unit_snapshot "gui/$OWNER_UID/$label" || break   # unit gone
       if [ "$UNIT_RUNNING" = no ] && [ "$UNIT_RUNS" -gt "$runs_before" ]; then
         code="$UNIT_EXIT"; break
@@ -245,22 +259,22 @@ if [ "$backup_loaded" = yes ]; then
       i=$((i + 2))
     done
     if [ "$code" = 3 ]; then
-      echo "   stepped aside (an hourly run held the lock); waiting for that run and judging its dump instead"
+      # the run that held the lock stamped its files when IT started, before
+      # this kickstart: judge against a window that reaches back to it
+      echo "   stepped aside (another run held the lock); waiting for that run and judging its dump instead"
       unit_busy_wait backup 600 || true
+      run_epoch=$((run_epoch - 900)); run_stamp="$(date -u -v-15M +%FT%TZ)"
       code=0
     fi
     tail -n 8 "$log_file" 2>/dev/null | sed 's/^/   /'
     if [ "$code" = 0 ]; then
-      judge_dump $(( ($(date +%s) - run_epoch) / 60 + 1 ))
-      case "$JUDGE" in
-        OK)   echo "   OK (exit 0; dump landed in $dest)" ;;
-        NONE) echo "   exit 0 but NO new dump in $dest — not trusting it; check $log_file" >&2; fail=1 ;;
-        *)
-          log_since "$run_stamp"
-          case "$LOGSAYS" in
-            OK) echo "   OK (exit 0; the log shows the dump — destination not checkable from this context: $JUDGE_MSG)" ;;
-            *)  echo "   exit 0, UNCONFIRMED: could not check $dest ($JUDGE_MSG) and the log shows no dump — verify by hand: ls -t '$dest' | head" >&2; fail=1 ;;
-          esac ;;
+      dump_evidence $(( ($(date +%s) - run_epoch) / 60 + 1 )) "$run_stamp"
+      case "$EVIDENCE" in
+        OK)       echo "   OK (exit 0; dump landed in $dest)" ;;
+        LOG_OK)   echo "   OK (exit 0; the log shows the dump — destination not checkable from this context: $EVIDENCE_MSG)" ;;
+        NONE)     echo "   exit 0 but NO new dump in $dest — not trusting it; check $log_file" >&2; fail=1 ;;
+        LOG_FAIL) echo "   exit 0 but the log shows a failed run — check $log_file" >&2; fail=1 ;;
+        *)        echo "   exit 0, UNCONFIRMED: could not check $dest ($EVIDENCE_MSG) and the log shows no dump — verify by hand: ls -t '$dest' | head" >&2; fail=1 ;;
       esac
     elif [ -z "$code" ]; then
       echo "   no result after ${i}s (still running, never spawned, or killed by a signal) — check $log_file and 'launchctl print gui/$OWNER_UID/$label'" >&2

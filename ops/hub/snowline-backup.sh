@@ -84,7 +84,7 @@ if [ -f "$BACKUP_ENV" ]; then
     env_dir="${SNOWLINE_BACKUP_DIR:-}"; env_days="${SNOWLINE_BACKUP_RETENTION_DAYS:-}"; env_dbs="${SNOWLINE_BACKUP_DBS:-}"
     set -a
     # shellcheck disable=SC1090
-    . "$BACKUP_ENV"
+    . "$BACKUP_ENV" || die "cannot source $BACKUP_ENV (syntax error?); refusing to run half-configured"
     set +a
     [ -z "$env_dir" ]  || SNOWLINE_BACKUP_DIR="$env_dir"
     [ -z "$env_days" ] || SNOWLINE_BACKUP_RETENTION_DAYS="$env_days"
@@ -146,7 +146,15 @@ case "${1:-}" in
         # 2, so a caller can tell "no dump" from "could not even run".
         mins="${2:-}"
         case "$mins" in ''|*[!0-9]*) echo "--check needs a number of minutes" >&2; exit 2 ;; esac
-        [ -d "$DEST" ] || { echo UNREADABLE; exit 2; }   # same contract as a run: missing = cannot run here
+        # Same destination rule as a run: under a present iCloud root the leaf
+        # may simply not exist yet (no dump yet -> NONE); a missing iCloud
+        # root or a missing non-iCloud destination is "cannot run here".
+        if [ ! -d "$DEST" ]; then
+            case "$DEST" in
+                "$ICLOUD_ROOT"/*) [ -d "$ICLOUD_ROOT" ] && { echo NONE; exit 1; } ;;
+            esac
+            echo UNREADABLE; exit 2
+        fi
         cutoff="$(date -u -v-"${mins}"M +%Y%m%d-%H%M%S 2>/dev/null)" || { echo UNREADABLE; exit 2; }
         [ -n "$cutoff" ] || { echo UNREADABLE; exit 2; }
         found=no
@@ -337,11 +345,11 @@ for DB in "$@"; do
     if [ "$dump_rc" -eq 0 ] \
         && pg_restore -l "$OUT.partial" > /dev/null \
         && mv "$OUT.partial" "$OUT"; then
-        OUT=""   # landed: the interrupt trap must not name it any more
         # Size is best-effort (an iCloud file can be evicted to a placeholder
         # the instant it lands, making du error).
         SIZE="$(du -h "$OUT" 2>/dev/null | cut -f1 || true)"
         log "backed up ${DB} -> ${OUT} (${SIZE:-size unknown})"
+        OUT=""   # landed: the interrupt trap must not name it any more
     else
         rm -f "$OUT.partial"; OUT=""
         log "FAILED to back up ${DB} (pg_dump, archive check, or rename failed)" >&2
