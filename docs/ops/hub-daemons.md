@@ -81,9 +81,10 @@ All four must answer. If one does not, read
 `sudo ops/hub/uninstall-daemons.sh` boots out the system daemons, removes the
 plists from `/Library/LaunchDaemons`, restores the newest `.disabled-*` agent
 plists and bootstraps them back into `gui/501`. One exception: the backup
-timer `dev.snowline.backup` is left in the system domain when there is no
-agent plist to restore, so a rollback never leaves the hub without a backup
-unit ("DB backups" below). Both scripts wait for a running backup to finish
+timer `dev.snowline.backup` falls back to the tracked agent plist in
+`ops/hub/launchagents/` when no `.disabled-*` copy exists, and is left in
+the system domain only if no agent plist exists from any source, so a
+rollback never leaves the hub without a backup unit ("DB backups" below). Both scripts wait for a running backup to finish
 before booting its unit out.
 
 ## Deploy routine change
@@ -359,10 +360,12 @@ dumps themselves still need the owner's session, because Postgres is the
 owner's per-user agent and iCloud syncs per session — after a FileVault boot
 that session always exists. Before the move it was a login-only LaunchAgent.
 The install waits for the unit's first (RunAtLoad) dump and fails if it did
-not exit 0, restoring the per-user agent when one exists; a rollback with
-`uninstall-daemons.sh` restores the agent plist, and leaves the daemon in
-place if there is none to restore. The scripts and `run-service.sh` share
-`ops/hub/launchdaemons/lib.sh` (autocut guard, agent restore, Postgres wait).
+not exit 0, restoring the per-user agent when the daemon cannot run at all;
+a rollback with `uninstall-daemons.sh` restores the agent plist, falling back
+to the tracked copy in `ops/hub/launchagents/`, and leaves the daemon in
+place only if no agent plist exists from any source. The scripts and
+`run-service.sh` share `ops/hub/launchdaemons/lib.sh` (unit lists, autocut
+guard, agent restore, Postgres wait).
 
 **What runs.** `ops/hub/launchdaemons/dev.snowline.backup.plist` fires
 `ops/hub/snowline-backup.sh` every 3600 s and once on load. The script:
@@ -374,10 +377,11 @@ place if there is none to restore. The scripts and `run-service.sh` share
   `snowline_marketing`) with `pg_dump -Fc`, verifies each archive with
   `pg_restore -l`, then renames `.partial` to the final name — one store
   failing does not skip the others, and the run exits 1 if any did;
-- the store list comes from the server's own catalog: every non-template
+- the store list comes from the server's own catalog: every `snowline_*`
   database except `*_test*`, `*_dryrun*`, `*_e2e*`, `*_restore*` and the
   legacy `snowline_dev`, so a new service's store is backed up from its
-  first hour without a code change. If the catalog cannot be read the run
+  first hour without a code change (other projects' databases on the same
+  cluster are not this job's to dump). If the catalog cannot be read the run
   falls back to the six known stores and says so. Setting
   `SNOWLINE_BACKUP_DBS` explicitly replaces the list; live stores it leaves
   out are noted in the log;
@@ -387,8 +391,9 @@ place if there is none to restore. The scripts and `run-service.sh` share
   is turned off with "keep a copy", the folder stays and the guard cannot
   tell, so confirm from another device now and then that a recent dump is
   actually in iCloud;
-- writes owner-only (umask 077, destination 0700): the platform dump carries
-  the live replication HMAC secrets, so a dump is as sensitive as the hub;
+- writes owner-only (umask 077, destination 0700, and existing 0644 dumps
+  are tightened to 0600 on each run): the platform dump carries the live
+  replication HMAC secrets, so a dump is as sensitive as the hub;
 - prunes each store's dumps older than `SNOWLINE_BACKUP_RETENTION_DAYS`
   (30), including iCloud-evicted `.NAME.icloud` placeholders; the legacy
   `snowline_dev-*` dumps are never touched.

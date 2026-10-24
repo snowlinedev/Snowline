@@ -42,9 +42,11 @@ umask 077
 # (FALLBACK_DBS) and says so, never silently dumping nothing.
 DBS_EXPLICIT="${SNOWLINE_BACKUP_DBS:-}"
 FALLBACK_DBS="snowline_platform snowline_pm snowline_governance snowline_memory snowline_musher snowline_marketing"
-# Scratch databases that are never backed up: test / dry-run / e2e stores,
-# the legacy snowline_dev, and `*_restore` (the documented inspect-first
-# restore target).
+# Only Snowline's own stores (`snowline_*`) — the hub's cluster may host other
+# projects' databases, which are not this job's to dump — minus the scratch
+# patterns: test / dry-run / e2e stores, the legacy snowline_dev, and
+# `*_restore` (the documented inspect-first restore target).
+STORE_RE='^snowline_'
 SCRATCH_RE='(_test|_dryrun|_e2e|_restore|^snowline_dev$)'
 ICLOUD_ROOT="$HOME/Library/Mobile Documents/com~apple~CloudDocs"
 # Off-machine by default: iCloud Drive replicates the dumps off this host, so a
@@ -83,7 +85,11 @@ case "$DEST" in
 esac
 mkdir -p "$DEST" || die "cannot create backup destination: $DEST"
 [ -w "$DEST" ] || die "backup destination not writable: $DEST"
-chmod 700 "$DEST" 2>/dev/null || true   # best effort: an iCloud folder may refuse
+# Owner-only posture for the folder AND for dumps written before this script
+# enforced it (they were 0644). Best effort on an iCloud folder, but say so.
+chmod 700 "$DEST" 2>/dev/null || echo "$(now) WARNING: could not chmod 700 $DEST" >&2
+find "$DEST" -maxdepth 1 -name '*.dump' -type f -perm +044 -exec chmod 600 {} + 2>/dev/null \
+    || echo "$(now) WARNING: could not tighten permissions on existing dumps in $DEST" >&2
 
 # --- wait for Postgres (bounded; see lib.sh) ---
 # shellcheck disable=SC1091
@@ -96,8 +102,9 @@ wait_for_postgres || true
 # unreachable" (fallback + WARNING) is distinguishable from "every database
 # is scratch" (nothing to dump, which is then reported per store).
 CATALOG_OK=yes
-CATALOG="$(psql -X -At -d postgres -c "select datname from pg_database where not datistemplate and datname <> 'postgres' order by 1" 2>/dev/null)" || CATALOG_OK=no
-LIVE="$(printf '%s\n' "$CATALOG" | grep -v -E "$SCRATCH_RE" | grep -v '^$' || true)"
+CATALOG_ERR="$(mktemp -t snowline-backup-psql)"
+CATALOG="$(psql -X -At -d postgres -c "select datname from pg_database where not datistemplate and datname <> 'postgres' order by 1" 2>"$CATALOG_ERR")" || CATALOG_OK=no
+LIVE="$(printf '%s\n' "$CATALOG" | grep -E "$STORE_RE" | grep -v -E "$SCRATCH_RE" | grep -v '^$' || true)"
 if [ -n "$DBS_EXPLICIT" ]; then
     DBS="$DBS_EXPLICIT"
     EXCLUDED=""
@@ -113,8 +120,9 @@ elif [ "$CATALOG_OK" = yes ]; then
     [ -n "$LIVE" ] || echo "$(now) WARNING: the catalog holds no non-scratch database; nothing to dump" >&2
 else
     DBS="$FALLBACK_DBS"
-    echo "$(now) WARNING: could not list databases from the server; dumping the fallback list only: $DBS" >&2
+    echo "$(now) WARNING: could not list databases from the server ($(tr '\n' ' ' < "$CATALOG_ERR")); dumping the fallback list only: $DBS" >&2
 fi
+rm -f "$CATALOG_ERR"
 
 # UTC stamp so file names sort monotonically (no DST fold) and match the log.
 STAMP="$(date -u +%Y%m%d-%H%M%SZ)"

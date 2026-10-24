@@ -5,34 +5,15 @@
 # Idempotent. Run:  sudo ops/hub/install-daemons.sh [--wait]
 # Refuses (exit 75) while an autocut is running; --wait waits up to 15 min.
 # Rollback:        sudo ops/hub/uninstall-daemons.sh
-# See docs/ops/hub-daemons.md.
+# See docs/ops/hub-daemons.md. Unit lists and helpers: launchdaemons/lib.sh.
 
 [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
 
-SERVICES="platform pm governance memory"
-# Interval timers (#258, c68ec655): installed + bootstrapped, never
-# kickstarted — a kickstart would fire an immediate run (for autocut, a
-# ~6-minute cut). Any per-user LaunchAgent of the same label is booted out and
-# its plist moved aside first (the backup job predates the daemon move; a
-# timer loaded in both domains would dump twice an hour) — no-ops for a timer
-# that never had one.
-TIMERS="autocut backup"
-# Timers that replaced a per-user agent and prove themselves on load: their
-# RunAtLoad run is waited for and judged below, and the agent is put back if
-# the daemon cannot run at all. Same list as in uninstall-daemons.sh.
-AGENT_TIMERS="backup"
-OWNER_UID=501
-OWNER_HOME=/Users/seanlynch
-SRC="$(cd "$(dirname "$0")" && pwd)/launchdaemons"
-DEST=/Library/LaunchDaemons
-DAEMONS_DIR="$DEST"
-AGENTS="$OWNER_HOME/Library/LaunchAgents"
-STAMP="$(date +%Y%m%d)"
-
 # shellcheck disable=SC1091
-. "$SRC/lib.sh"
+. "$(cd "$(dirname "$0")" && pwd)/launchdaemons/lib.sh"
 autocut_guard "$@"
-backup_guard || true
+
+STAMP="$(date +%Y%m%d)"
 
 # install_unit <name> <kick:yes|no> — the same steps for a service and a timer;
 # only the trailing kickstart differs (a timer must never be kickstarted: that
@@ -40,6 +21,8 @@ backup_guard || true
 install_unit() {
   label="dev.snowline.$1"
   echo "== $label$([ "$2" = yes ] || echo ' (timer; not kickstarted)')"
+  # 0. a unit that dumps on a timer: never boot it out mid-run
+  case " $AGENT_TIMERS " in *" $1 "*) backup_guard || true ;; esac
   # 1. stop the agent (ignore: it may not be loaded) ...
   launchctl bootout "gui/$OWNER_UID/$label" 2>/dev/null || true
   # 2. ... and move its plist aside so it cannot reload at login and double-bind
@@ -51,10 +34,10 @@ install_unit() {
   #    wait for the old instance to be gone so the bootstrap cannot race it)
   launchctl bootout "system/$label" 2>/dev/null || true
   wait_unloaded "system/$label" || echo "   $label still registered after 30s; trying anyway" >&2
-  cp "$SRC/$label.plist" "$DEST/$label.plist"
-  chown root:wheel "$DEST/$label.plist"
-  chmod 644 "$DEST/$label.plist"
-  if ! launchctl bootstrap system "$DEST/$label.plist"; then
+  cp "$LAUNCHDAEMONS_SRC/$label.plist" "$DAEMONS_DIR/$label.plist"
+  chown root:wheel "$DAEMONS_DIR/$label.plist"
+  chmod 644 "$DAEMONS_DIR/$label.plist"
+  if ! launchctl bootstrap system "$DAEMONS_DIR/$label.plist"; then
     echo "   bootstrap FAILED for $label" >&2
     return 1
   fi
@@ -68,7 +51,7 @@ for svc in $SERVICES; do
 done
 
 not_loaded=""
-for timer in $TIMERS; do
+for timer in $SYSTEM_TIMERS $AGENT_TIMERS; do
   if ! install_unit "$timer" no; then
     fail=1
     not_loaded="$not_loaded $timer"
@@ -98,20 +81,21 @@ done
 #   exit 2            the daemon cannot run at all in the system domain (no
 #                     destination / no iCloud root / cannot write — e.g. TCC,
 #                     see docs/ops/hub-daemons.md "DB backups"): put the
-#                     per-user agent back (restore_agent keeps the daemon when
-#                     there is none) and fail the install
+#                     per-user agent back and fail the install
 #   exit 1            some store(s) failed to dump — transient, identical
 #                     under the agent: fail the install, do NOT roll back
 #   still running     fail the install, do NOT roll back (a healthy in-flight
 #                     dump must not be booted out)
 #   never ran / killed (no pid, no exit code): treated like exit 2
+#   did not bootstrap the daemon plist is removed and the agent put back
+#                     (nothing was loaded, so there is no daemon to keep)
 for timer in $AGENT_TIMERS; do
   label="dev.snowline.$timer"
   echo "== $label (RunAtLoad run)"
   case " $not_loaded " in
     *" $timer "*)
-      echo "   $timer: FAILED (daemon did not bootstrap)" >&2
-      restore_agent "$timer" keep-daemon-if-none || true
+      echo "   $timer: FAILED (daemon did not bootstrap); removing its plist and restoring the per-user agent" >&2
+      restore_agent "$timer" || true
       fail=1
       continue
       ;;
@@ -121,7 +105,7 @@ for timer in $AGENT_TIMERS; do
     info="$(launchctl print "system/$label" 2>/dev/null)"
     code="$(printf '%s\n' "$info" | sed -n 's/.*last exit code = \([0-9][0-9]*\).*/\1/p' | head -n 1)"
     [ -n "$code" ] && break
-    if printf '%s\n' "$info" | grep -q -E '^\s*(state = running|pid = [0-9])'; then
+    if printf '%s\n' "$info" | grep -q -E '^[[:space:]]*(state = running|pid = [0-9])'; then
       running=yes
     else
       running=no
