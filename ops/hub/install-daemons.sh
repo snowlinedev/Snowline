@@ -16,10 +16,7 @@
 autocut_guard "$@"
 
 STAMP="$(date +%Y%m%d)"
-# A file older than anything this install produces: the backup check below
-# requires a dump NEWER than it, not just an exit code.
-START_MARK="$(mktemp -t snowline-install)"
-trap 'rm -f "$START_MARK"' EXIT
+START_EPOCH="$(date +%s)"   # the backup check below wants a dump newer than this install
 fail=0
 
 # --- the services: per-user agent -> system daemon, kickstarted ---
@@ -72,6 +69,10 @@ for timer in $TIMERS; do
     if launchctl print "system/$label" >/dev/null 2>&1; then
       echo "   in-process autocut host is enabled AND this timer is loaded: two cutters — remove one (docs 'Auto-cut')" >&2
       fail=1
+    elif [ -f "$DAEMONS_DIR/$label.plist" ]; then
+      # a stale plist would be loaded again at the next boot, next to the host
+      rm -f "${DAEMONS_DIR:?}/${label:?}.plist"
+      echo "   in-process autocut host is enabled; removed the stale (unloaded) timer plist $DAEMONS_DIR/$label.plist"
     else
       echo "   in-process autocut host is enabled; timer not installed"
     fi
@@ -128,28 +129,18 @@ done
 # backup.lock) is waited for first; the hourly fire landing in the instant
 # between the last probe and the bootout would lose that hour's dump, which
 # the RunAtLoad dump then replaces.
+# Everything that looks at the destination is asked of the script itself,
+# run as the owner (`--print-dest`, `--check <minutes>`): same backup.env,
+# same TCC grant, same path — root never reads the owner's iCloud folder.
 label="dev.snowline.backup"
 log_file="$OWNER_HOME/Library/Logs/snowline-backup.log"
 echo "== $label (per-user agent)"
-# the destination as the SCRIPT resolves it (backup.env read as the owner);
-# a failure here is shown, not papered over with the default
-dest_err="$(mktemp -t snowline-install-dest)"
-if dest="$(sudo -u "#$OWNER_UID" -H /bin/bash "$OPS_HUB/snowline-backup.sh" --print-dest 2>"$dest_err")" && [ -n "$dest" ]; then
-  :
-else
-  echo "   could not resolve the backup destination via --print-dest ($(head -n 1 "$dest_err")); assuming $BACKUP_DIR" >&2
-  dest="$BACKUP_DIR"
-  fail=1
-fi
-rm -f "$dest_err"
-# dump_since <find time predicate...> — a dump (or its iCloud-evicted
-# placeholder) in $dest matching the predicate; prints its name, "?" when
-# this (root, Terminal-spawned) shell may not read the destination, or nothing
-dump_since() {
-  err="$(mktemp -t snowline-install-find)"
-  name="$(find "$dest" -maxdepth 1 \( -name '*.dump' -o -name '.*.dump.icloud' \) -type f "$@" 2>"$err" | head -n 1)"
-  if [ -n "$name" ]; then basename "$name"; elif [ -s "$err" ]; then echo "?"; fi
-  rm -f "$err"
+as_owner() { sudo -u "#$OWNER_UID" -H /bin/bash "$OPS_HUB/snowline-backup.sh" "$@"; }
+dest="$(as_owner --print-dest 2>/dev/null)" || dest="(unknown: --print-dest failed)"
+# judge_dump <minutes> — prints OK / NONE / UNKNOWN for a dump newer than <minutes>
+judge_dump() {
+  as_owner --check "$1" >/dev/null 2>&1
+  case $? in 0) echo OK ;; 1) echo NONE ;; *) echo UNKNOWN ;; esac
 }
 why=""
 if ! cmp -s "$LAUNCHAGENTS_SRC/$label.plist" "$AGENTS/$label.plist" 2>/dev/null; then
@@ -163,31 +154,37 @@ else
     *) why="last run exited $code" ;;
   esac
   if [ -z "$why" ]; then
-    case "$(dump_since -mmin -120)" in
-      "")  why="no dump in the last 2 h in $dest" ;;
-      "?") echo "   unchanged and loaded; could not confirm a recent dump in $dest from this shell — check by hand: ls -t '$dest' | head" >&2; fail=1 ;;
-      *)   echo "   unchanged and loaded, dumped within 2 h; left as it is" ;;
+    case "$(judge_dump 120)" in
+      OK)   echo "   unchanged and loaded, dumped within 2 h; left as it is" ;;
+      NONE) why="no dump in the last 2 h in $dest" ;;
+      *)    echo "   unchanged and loaded; could not check $dest for a recent dump (as the owner) — check by hand: ls -t '$dest' | head" >&2; fail=1 ;;
     esac
   fi
 fi
 backup_loaded=no
 if [ -n "$why" ]; then
   echo "   reloading ($why)"
-  if unit_busy_wait backup 600; then
-    launchctl bootout "gui/$OWNER_UID/$label" 2>/dev/null || true
-    wait_unloaded "gui/$OWNER_UID/$label" || true
-    cp "$LAUNCHAGENTS_SRC/$label.plist" "$AGENTS/$label.plist"
-    chown "$OWNER_UID" "$AGENTS/$label.plist"
-    chmod 644 "$AGENTS/$label.plist"
-    if launchctl bootstrap "gui/$OWNER_UID" "$AGENTS/$label.plist"; then
-      backup_loaded=yes
-    else
-      echo "   could NOT load $label into gui/$OWNER_UID (no login session?); it loads at the next login" >&2
-      fail=1
-    fi
-  else
+  if ! unit_busy_wait backup 600; then
     echo "   a dump is still running; leaving $label as it is (plist NOT replaced) — re-run the install after it finishes" >&2
     fail=1
+  else
+    launchctl bootout "gui/$OWNER_UID/$label" 2>/dev/null || true
+    if ! wait_unloaded "gui/$OWNER_UID/$label"; then
+      # the plist on disk is left untouched, so the next run still sees
+      # "plist changed" instead of mistaking the old registration for current
+      echo "   old registration of $label still loaded after 30s; plist NOT replaced — re-run the install" >&2
+      fail=1
+    else
+      cp "$LAUNCHAGENTS_SRC/$label.plist" "$AGENTS/$label.plist"
+      chown "$OWNER_UID" "$AGENTS/$label.plist"
+      chmod 644 "$AGENTS/$label.plist"
+      if launchctl bootstrap "gui/$OWNER_UID" "$AGENTS/$label.plist"; then
+        backup_loaded=yes
+      else
+        echo "   could NOT load $label into gui/$OWNER_UID (no login session?); it loads at the next login" >&2
+        fail=1
+      fi
+    fi
   fi
 fi
 
@@ -196,37 +193,43 @@ fi
 # A fresh registration carries no exit code until its run ends, so the code
 # read here is this run's; launchd may hold a freshly loaded job a moment
 # before its first spawn, so the only early exit is the unit vanishing.
-# Evidence is a fresh *.dump (or its iCloud-evicted placeholder) in the
-# destination, not the exit code alone; when this shell cannot read the
-# destination the result is unconfirmed and fails too.
+# Evidence is a dump newer than this install (asked of the script as the
+# owner), not the exit code alone. Exit 3 ("stepped aside": a manual run
+# took the lock first) is a retry, not a failure: wait for that run, then
+# look for its dump.
 if [ "$backup_loaded" = yes ]; then
   echo "== $label (RunAtLoad dump)"
   code=""; running=no; i=0
   while [ "$i" -lt 300 ]; do
-    if ! launchctl print "gui/$OWNER_UID/$label" >/dev/null 2>&1; then
-      break   # unit gone
-    elif unit_running "gui/$OWNER_UID/$label"; then
+    info="$(launchctl print "gui/$OWNER_UID/$label" 2>/dev/null)" || break   # unit gone
+    if printf '%s\n' "$info" | grep -q -E '^[[:space:]]*(state = running|pid = [0-9])'; then
       running=yes
     else
       running=no
-      code="$(unit_last_exit "gui/$OWNER_UID/$label")"
+      code="$(printf '%s\n' "$info" | sed -n 's/.*last exit code = \([0-9][0-9]*\).*/\1/p' | head -n 1)"
       [ -n "$code" ] && break
     fi
     sleep 2
     i=$((i + 2))
   done
   tail -n 8 "$log_file" 2>/dev/null | sed 's/^/   /'
+  if [ "$code" = 3 ]; then
+    echo "   stepped aside (another run held the lock); waiting for that run instead"
+    unit_busy_wait backup 600 || true
+    code=0
+  fi
   if [ "$code" = 0 ]; then
-    case "$(dump_since -newer "$START_MARK")" in
-      "")  echo "   exit 0 but NO new dump in $dest — not trusting it; check $log_file" >&2; fail=1 ;;
-      "?") echo "   exit 0, UNCONFIRMED: this shell may not read $dest — verify by hand: ls -t '$dest' | head" >&2; fail=1 ;;
-      *)   echo "   OK (exit 0, fresh dump $(dump_since -newer "$START_MARK"))" ;;
+    mins=$(( ($(date +%s) - START_EPOCH) / 60 + 1 ))
+    case "$(judge_dump "$mins")" in
+      OK)   echo "   OK (dump landed in $dest since this install started)" ;;
+      NONE) echo "   exit 0 but NO new dump in $dest — not trusting it; check $log_file" >&2; fail=1 ;;
+      *)    echo "   exit 0, UNCONFIRMED: could not check $dest (as the owner) — verify by hand: ls -t '$dest' | head" >&2; fail=1 ;;
     esac
   elif [ -z "$code" ] && [ "$running" = yes ]; then
     echo "   still running after ${i}s — check $log_file and 'launchctl print gui/$OWNER_UID/$label'" >&2
     fail=1
   else
-    echo "   FAILED (${code:+exit $code}${code:-never ran, or killed by a signal}) — see $log_file (1: a store failed; 2: cannot run here; 3: another run held the lock)" >&2
+    echo "   FAILED (${code:+exit $code}${code:-never ran, or killed by a signal}) — see $log_file (1: a store failed; 2: cannot run here)" >&2
     fail=1
   fi
 fi

@@ -16,7 +16,11 @@ TIMERS="autocut"
 # ops/hub/launchagents/ and install-daemons.sh installs it.
 
 OWNER_UID=501
-OWNER_HOME=/Users/seanlynch
+# The hub owner's home. The root-run ops scripts need it fixed; the backup
+# script sets SNOWLINE_OWNER_HOME=$HOME before sourcing so that, run by any
+# user anywhere (a developer testing it), its lock and default destination
+# are under that user's home.
+OWNER_HOME="${SNOWLINE_OWNER_HOME:-/Users/seanlynch}"
 DAEMONS_DIR=/Library/LaunchDaemons           # not DEST: the backup script's dump dir
 AGENTS="$OWNER_HOME/Library/LaunchAgents"
 OPS_HUB="$(cd "$(dirname "$0")" && pwd)"      # the calling script's directory

@@ -53,6 +53,7 @@ SCRATCH_RE='(_(test|dryrun|e2e|restore)(_|$)|^snowline_dev$)'
 # Shared helpers and constants (log, wait_for_postgres, ICLOUD_ROOT,
 # BACKUP_DIR, BACKUP_LOCK, LOCKS_DIR); lib.sh only defines things. A checkout
 # without it cannot run at all: exit 2, not a store failure.
+SNOWLINE_OWNER_HOME="$HOME"
 # shellcheck disable=SC1091
 . "$(dirname "$0")/launchdaemons/lib.sh" || { echo "$(date -u +%FT%TZ) cannot source $(dirname "$0")/launchdaemons/lib.sh; is this a complete checkout?" >&2; exit 2; }
 # Operator overrides live in ~/.config/snowline/backup.env (optional; sourced
@@ -72,14 +73,29 @@ fi
 # target, an external volume, etc.
 DEST="${SNOWLINE_BACKUP_DIR:-$BACKUP_DIR}"
 RETENTION_DAYS="${SNOWLINE_BACKUP_RETENTION_DAYS:-30}"
-# `--print-dest`: print the resolved destination and exit — how
-# install-daemons.sh learns where to look for a fresh dump, by asking this
-# script as the owner instead of re-reading backup.env as root. Checked
-# here, before anything below touches the positional parameters.
-if [ "${1:-}" = --print-dest ]; then
-    printf '%s\n' "$DEST"
-    exit 0
-fi
+# Queries install-daemons.sh makes by running this script AS THE OWNER
+# (so backup.env, TCC consent and the destination are exactly this
+# script's), checked before anything below touches the positional params:
+#   --print-dest        print the resolved destination
+#   --check <minutes>   exit 0 if a dump (or its iCloud-evicted placeholder)
+#                       newer than <minutes> exists in the destination,
+#                       1 if none, 2 if the destination cannot be read
+case "${1:-}" in
+    --print-dest)
+        printf '%s\n' "$DEST"
+        exit 0
+        ;;
+    --check)
+        mins="${2:-}"
+        case "$mins" in ''|*[!0-9]*) echo "--check needs a number of minutes" >&2; exit 2 ;; esac
+        [ -d "$DEST" ] || exit 2
+        err="$(mktemp -t snowline-backup-check)"
+        found="$(find "$DEST" -maxdepth 1 \( -name '*.dump' -o -name '.*.dump.icloud' \) -type f -mmin "-$mins" 2>"$err" | head -n 1)"
+        if [ -n "$found" ]; then rm -f "$err"; exit 0; fi
+        if [ -s "$err" ]; then rm -f "$err"; exit 2; fi
+        rm -f "$err"; exit 1
+        ;;
+esac
 # An explicit store list is validated here, before anything slow or
 # side-effecting: a whitespace-only value is "unset", not "dump nothing";
 # the split is done with globbing off so a stray `*` cannot expand against
@@ -213,9 +229,17 @@ rm -f "$CATALOG_ERR"
 STAMP="$(date -u +%Y%m%d-%H%M%SZ)"
 FAILED=""
 
-set -f   # word-split DBS with globbing off (names are validated above / catalog-sourced)
-for DB in $DBS; do
-    set +f
+# Word-split DBS once, with globbing off (names are validated above or
+# catalog-sourced). A SIGTERM mid-dump (the unit booted out, a logout, a
+# shutdown) logs itself and removes the partial it was writing, so the log
+# shows a kill rather than a hang.
+set -f
+# shellcheck disable=SC2086
+set -- $DBS
+set +f
+OUT=""
+trap 'log "interrupted (SIGTERM/SIGINT); removing ${OUT:+$OUT.partial}" >&2; [ -z "$OUT" ] || rm -f "$OUT.partial"; exit 143' TERM INT
+for DB in "$@"; do
     OUT="$DEST/${DB}-${STAMP}.dump"
     # Dump to a .partial name, verify the archive is readable, then atomically
     # rename — an interrupted or truncated dump (machine sleep, OOM, iCloud
@@ -244,7 +268,7 @@ for DB in $DBS; do
     find "$DEST" -maxdepth 1 -name "${DB}-*.dump" -type f -mtime +"$RETENTION_DAYS" -delete || true
     find "$DEST" -maxdepth 1 -name ".${DB}-*.dump.icloud" -type f -mtime +"$RETENTION_DAYS" -delete || true
 done
-set +f
+trap - TERM INT
 
 # Stale .partial leftovers from any store.
 find "$DEST" -maxdepth 1 -name '*.partial' -type f -mtime +1 -delete || true

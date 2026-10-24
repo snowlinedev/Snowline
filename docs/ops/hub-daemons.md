@@ -39,11 +39,12 @@ each of platform / pm / governance / memory:
    Operator overrides live in `~/.config/snowline/backup.env`, never in the
    plist. It stays a per-user agent on purpose ("DB backups" below).
 7. If step 6 (re)loaded the backup agent, waits (up to 5 min) for its
-   RunAtLoad dump and fails the install unless it exited 0 AND a fresh
-   `*.dump` was confirmed in the destination (a destination this shell
-   cannot read is reported as unconfirmed and also fails, with the command
-   to check by hand). An unchanged, loaded agent is left alone only when
-   its last run was fine (exit 0, or 3 = stepped aside) AND a dump landed
+   RunAtLoad dump and fails the install unless it exited 0 AND a dump newer
+   than the install was confirmed in the destination (checked by running
+   the script as the owner; "could not check" also fails, with the command
+   to check by hand). An exit 3 (a manual run held the lock) is waited out
+   and judged by the same evidence. An unchanged, loaded agent is left
+   alone only when its last run was fine (exit 0, or 3) AND a dump landed
    in the last two hours.
 
 The daemons run as `UserName=seanlynch`, `GroupName=staff`, so the mode-600
@@ -369,7 +370,7 @@ Decision c68ec655 (supersedes e4578136): every live Postgres store on the hub
 is dumped every hour into iCloud Drive. The unit is the owner's **per-user
 LaunchAgent**, `~/Library/LaunchAgents/dev.snowline.backup.plist`, tracked
 at `ops/hub/launchagents/dev.snowline.backup.plist` and installed by
-`install-daemons.sh` (step 5 above) — the #220 root cause was exactly that
+`install-daemons.sh` (step 6 above) — the #220 root cause was exactly that
 this unit's files lived outside main.
 
 **Why it is not a system daemon like the services.** A dump needs the
@@ -431,7 +432,9 @@ must already exist — it is never created, so an unplugged volume cannot be
 replaced by a local folder), `SNOWLINE_BACKUP_RETENTION_DAYS`,
 `SNOWLINE_BACKUP_DBS` (plain identifiers, space-separated).
 `bash ops/hub/snowline-backup.sh --print-dest` prints the destination the
-script resolves; the install uses it (as the owner) to know where to look.
+script resolves and `--check <minutes>` reports (exit 0/1/2) whether a dump
+newer than that many minutes exists there; the install runs both as the
+owner, so root never reads the owner's iCloud folder.
 
 **Rolling out this change on the hub.** The hub checkout had an untracked
 hand-restored copy of `ops/hub/snowline-backup.sh` from 2026-10-23 (the
@@ -459,6 +462,9 @@ log lines says which store failed. Exit 2 means the run could not start at
 all (destination missing or unwritable, iCloud root absent, lib.sh missing,
 lock file unopenable). Exit 3 means the run stepped aside because another
 backup run held the lock (RunAtLoad racing the hourly fire; harmless once).
+A log line "interrupted (SIGTERM/SIGINT)" (exit 143, or `(never exited)`
+in launchctl) means the run was killed mid-dump — a bootout, logout or
+shutdown; its partial was removed and the next tick dumps again.
 `78: EX_CONFIG` means launchd could not spawn the program (script path
 missing — check the checkout).
 

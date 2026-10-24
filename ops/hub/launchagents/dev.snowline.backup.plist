@@ -27,10 +27,11 @@
          silent-failure mode this unit exists to avoid. The script sets its
          own PATH.
 
-         Overrides the script accepts (none set, so its defaults apply):
+         Overrides the script accepts, in ~/.config/snowline/backup.env (never
+         here: the install replaces this file with the tracked copy):
            SNOWLINE_BACKUP_DIR — where dumps land (default: iCloud Drive; a
-             non-iCloud path skips the iCloud root check, its parent must
-             exist);
+             non-iCloud path skips the iCloud root check and must already
+             exist — it is never created);
            SNOWLINE_BACKUP_RETENTION_DAYS — default 30;
            SNOWLINE_BACKUP_DBS — space-separated store list (default: every
              live snowline_* store from the catalog).
