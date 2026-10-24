@@ -209,7 +209,11 @@ load_unit() {
     fi
     return 1
   fi
-  [ "$lu_kick" = yes ] && launchctl kickstart -k "$lu_domain/$lu_label"
+  if [ "$lu_kick" = yes ] && ! launchctl kickstart -k "$lu_domain/$lu_label"; then
+    echo "   kickstart of $lu_label failed (spawn throttled?); it is loaded but not started" >&2
+    UNIT_RESULT=not-started
+    return 1
+  fi
   UNIT_RESULT=installed
   return 0
 }

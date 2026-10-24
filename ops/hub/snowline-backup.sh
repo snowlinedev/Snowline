@@ -56,6 +56,15 @@ SCRATCH_RE='(_(test|dryrun|e2e|restore)(_|$)|^snowline_dev$)'
 SNOWLINE_OWNER_HOME="$HOME"
 # shellcheck disable=SC1091
 . "$(dirname "$0")/launchdaemons/lib.sh" || { echo "$(date -u +%FT%TZ) cannot source $(dirname "$0")/launchdaemons/lib.sh; is this a complete checkout?" >&2; exit 2; }
+# Exit codes: 2 = cannot run at all (destination / iCloud root / unwritable /
+# lock / bad configuration — the environment, not the data); 1 = some
+# store(s) failed to dump; 3 = another run held the lock (stepped aside).
+# install-daemons.sh reads them; nothing is rolled back on any of them.
+die() { log "$*" >&2; exit 2; }
+# Temp files used by the catalog read and the dump listing: created lazily,
+# removed on every exit path.
+CATALOG_ERR=""; Z_DUMPS_ERR=""
+trap 'rm -f "$CATALOG_ERR" "$Z_DUMPS_ERR"' EXIT
 # Operator overrides live in ~/.config/snowline/backup.env (optional; sourced
 # here), NOT in the launchd plist: install-daemons.sh replaces the plist with
 # the tracked copy whenever it differs, so anything put there would be lost.
@@ -73,15 +82,17 @@ fi
 # target, an external volume, etc.
 DEST="${SNOWLINE_BACKUP_DIR:-$BACKUP_DIR}"
 RETENTION_DAYS="${SNOWLINE_BACKUP_RETENTION_DAYS:-30}"
-case "$RETENTION_DAYS" in ''|*[!0-9]*|0) log "SNOWLINE_BACKUP_RETENTION_DAYS must be a whole number of days, at least 1: '$RETENTION_DAYS'" >&2; exit 2 ;; esac
-# name_stamp <path> — the YYYYMMDD-HHMMSS UTC stamp of a Z-named dump or
-# placeholder (…-YYYYMMDD-HHMMSSZ.dump[.icloud]); fails for any other name.
-# Parameter expansion only: it runs once per file in --check and prune.
+case "$RETENTION_DAYS" in ''|*[!0-9]*) die "SNOWLINE_BACKUP_RETENTION_DAYS must be a whole number of days, at least 1: '$RETENTION_DAYS'" ;; esac
+[ "$RETENTION_DAYS" -ge 1 ] || die "SNOWLINE_BACKUP_RETENTION_DAYS must be at least 1: '$RETENTION_DAYS'"
+# name_stamp <path> — sets NAME_STAMP to the YYYYMMDD-HHMMSS UTC stamp of a
+# Z-named dump or placeholder (…-YYYYMMDD-HHMMSSZ.dump[.icloud]); fails for
+# any other name. Parameter expansion only, result in a variable: no fork
+# per file in --check and prune.
 name_stamp() {
-    ns="${1##*/}"; ns="${ns%.icloud}"; ns="${ns%Z.dump}"
-    ns="${ns#"${ns%???????????????}"}"   # last 15 chars
-    case "$ns" in
-        [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]) printf '%s\n' "$ns" ;;
+    NAME_STAMP="${1##*/}"; NAME_STAMP="${NAME_STAMP%.icloud}"; NAME_STAMP="${NAME_STAMP%Z.dump}"
+    NAME_STAMP="${NAME_STAMP#"${NAME_STAMP%???????????????}"}"   # last 15 chars
+    case "$NAME_STAMP" in
+        [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -89,12 +100,13 @@ name_stamp() {
 # placeholder of that prefix in DEST (`*` for every store). The ONE rule
 # --check (evidence) and the prune (retention) share. find's stderr goes
 # to Z_DUMPS_ERR for the caller to inspect.
-Z_DUMPS_ERR="$(mktemp -t snowline-backup-find)"
+TAB=$'\t'
 z_dumps() {
+    Z_DUMPS_ERR="${Z_DUMPS_ERR:-$(mktemp -t snowline-backup-find)}"
     find "$DEST" -maxdepth 1 \( -name "$1-[0-9]*Z.dump" -o -name ".$1-[0-9]*Z.dump.icloud" \) -type f 2>"$Z_DUMPS_ERR" \
     | while IFS= read -r zf; do
-        zs="$(name_stamp "$zf")" || continue
-        printf '%s\t%s\n' "$zs" "$zf"
+        name_stamp "$zf" || continue
+        printf '%s\t%s\n' "$NAME_STAMP" "$zf"
     done
 }
 
@@ -124,18 +136,17 @@ case "${1:-}" in
         cutoff="$(date -u -v-"${mins}"M +%Y%m%d-%H%M%S 2>/dev/null)" || { echo UNREADABLE; exit 2; }
         [ -n "$cutoff" ] || { echo UNREADABLE; exit 2; }
         found=no
-        while IFS="$(printf '\t')" read -r s _; do
+        while IFS="$TAB" read -r s _; do
             [ "$s" \< "$cutoff" ] || found=yes
         done <<EOF_Z
 $(z_dumps '*')
 EOF_Z
-        if [ -s "$Z_DUMPS_ERR" ]; then rm -f "$Z_DUMPS_ERR"; echo UNREADABLE; exit 2; fi
-        rm -f "$Z_DUMPS_ERR"
+        if [ -s "$Z_DUMPS_ERR" ]; then echo UNREADABLE; exit 2; fi
         [ "$found" = yes ] && { echo OK; exit 0; }
         echo NONE; exit 1
         ;;
     "") ;;   # no arguments: a real run
-    *) log "unknown argument '$1' (this script takes no arguments except --print-dest and --check <minutes>); refusing to run" >&2; exit 2 ;;
+    *) die "unknown argument '$1' (this script takes no arguments except --print-dest and --check <minutes>); refusing to run" ;;
 esac
 # An explicit store list is validated here, before anything slow or
 # side-effecting: a whitespace-only value is "unset", not "dump nothing";
@@ -151,7 +162,7 @@ valid_names() {
         case "$vn" in
             *[!A-Za-z0-9_]*)
                 if [ "$vn_mode" = strict ]; then
-                    log "SNOWLINE_BACKUP_DBS entry is not a database name: '$vn'" >&2; exit 2
+                    die "SNOWLINE_BACKUP_DBS entry is not a database name: '$vn'"
                 fi
                 log "WARNING: skipping database with a non-identifier name: '$vn'" >&2 ;;
             *) printf '%s ' "$vn" ;;
@@ -249,7 +260,7 @@ wait_for_postgres || true
 # unreachable" (fallback + WARNING) is distinguishable from "every database
 # is scratch" (nothing to dump, which is then reported per store).
 CATALOG_OK=yes
-CATALOG_ERR="$(mktemp -t snowline-backup-psql)"
+CATALOG_ERR="$(mktemp -t snowline-backup-psql)"   # removed by the EXIT trap
 # Only databases this role can actually connect to: a parked store
 # (datallowconn = false) or one without CONNECT would otherwise fail every
 # hourly run with exit 1 until someone hand-writes SNOWLINE_BACKUP_DBS.
@@ -310,7 +321,7 @@ set +f
 PRUNE_CUTOFF="$(date -u -v-"${RETENTION_DAYS}"d +%Y%m%d-%H%M%S 2>/dev/null)" || PRUNE_CUTOFF=""
 prune_by_name() {
     [ -n "$PRUNE_CUTOFF" ] || return 0   # no cutoff, no pruning (never over-delete)
-    z_dumps "$1" | while IFS="$(printf '\t')" read -r pb_stamp pb_f; do
+    z_dumps "$1" | while IFS="$TAB" read -r pb_stamp pb_f; do
         [ "$pb_stamp" \< "$PRUNE_CUTOFF" ] && rm -f "$pb_f"
     done
     return 0

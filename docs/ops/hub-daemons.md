@@ -43,14 +43,14 @@ each of platform / pm / governance / memory:
    checkout ever moves.
    Operator overrides live in `~/.config/snowline/backup.env`, never in the
    plist. It stays a per-user agent on purpose ("DB backups" below).
-7. If step 6 (re)loaded the backup agent, waits (up to 5 min) for its
-   RunAtLoad dump and fails the install unless it exited 0 AND a dump newer
-   than the install was confirmed in the destination (checked by running
-   the script as the owner; "could not check" also fails, with the command
-   to check by hand). An exit 3 (a manual run held the lock) is waited out
-   and judged by the same evidence. An unchanged, loaded agent is left
-   alone only when its last run was fine (exit 0, or 3) AND a dump landed
-   in the last two hours.
+7. If step 6 (re)loaded the backup agent, proves it by running the script
+   once synchronously as the owner and fails the install unless that run
+   exited 0 AND a dump newer than it was confirmed in the destination
+   ("could not check" also fails, with the command to check by hand). An
+   exit 3 (an hourly fire held the lock) is waited out and the run
+   repeated once. An unchanged, loaded agent is left alone only when its
+   last run was fine (exit 0, or 3) AND a dump landed in the last two
+   hours.
 
 The daemons run as `UserName=seanlynch`, `GroupName=staff`, so the mode-600
 env files in `~/.config/snowline/` stay readable. Logs are unchanged
@@ -388,8 +388,8 @@ therefore add no coverage, while a system-domain process writing into
 prompt. So the agent stays (item f304ec06 asked for the daemon; this is the
 reasoned answer).
 
-**What runs.** The plist fires `ops/hub/snowline-backup.sh` every 3600 s and
-once on load. The script:
+**What runs.** The plist fires `ops/hub/snowline-backup.sh` every 3600 s (no
+RunAtLoad; the first timed run is an hour after loading). The script:
 
 - takes a flock on `~/Library/Application Support/Snowline/backup.lock` for
   the whole run (a second run steps aside with exit 3);
@@ -508,7 +508,9 @@ pg_restore --clean --if-exists --no-owner -d snowline_pm <dump>
 now (as the owner — never with sudo, or the lock file ends up root-owned
 and every later run exits 2). To reload the unit after editing the plist:
 `launchctl bootout gui/501/dev.snowline.backup; launchctl bootstrap gui/501
-~/Library/LaunchAgents/dev.snowline.backup.plist` (the bootstrap itself
-takes a backup), or just re-run `sudo ops/hub/install-daemons.sh`. Do not
-`kickstart -k` a timer that launchd has put in its penalty box after
-repeated spawn failures — it hangs; bootout/bootstrap instead.
+~/Library/LaunchAgents/dev.snowline.backup.plist` (no RunAtLoad: the first
+timed run is an hour after loading; run the script by hand if you want a
+dump now), or just re-run `sudo ops/hub/install-daemons.sh`, which proves
+the unit with one run. Do not `kickstart -k` a timer that launchd has put
+in its penalty box after repeated spawn failures — it hangs;
+bootout/bootstrap instead.

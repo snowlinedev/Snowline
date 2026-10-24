@@ -20,12 +20,14 @@
 
          One-shot, NOT KeepAlive: it dumps, verifies, prunes and exits; the
          timer fires it again on schedule, so a failed run is simply a
-         skipped run (no retry storm). RunAtLoad: loading the unit takes one
-         backup immediately, which the install waits for and judges. No
-         WorkingDirectory: the script does not use it, and a missing
-         directory would make launchd refuse to spawn (EX_CONFIG) — the
-         silent-failure mode this unit exists to avoid. The script sets its
-         own PATH.
+         skipped run (no retry storm). No RunAtLoad: the install proves the
+         script by running it synchronously as the owner and reading its
+         exit code, and a load must not start a dump behind the operator's
+         back (StartInterval fires from load, so the first timed run is an
+         hour after loading). No WorkingDirectory: the script does not use
+         it, and a missing directory would make launchd refuse to spawn
+         (EX_CONFIG) — the silent-failure mode this unit exists to avoid.
+         The script sets its own PATH.
 
          Overrides the script accepts, in ~/.config/snowline/backup.env (never
          here: the install replaces this file with the tracked copy):

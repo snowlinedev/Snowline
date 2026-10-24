@@ -110,7 +110,7 @@ done
 # code alone is not evidence: a unit launchd stopped firing still shows its
 # old exit 0). A dump in progress (it holds backup.lock) is waited for
 # first; the hourly fire landing in the instant between the last probe and
-# the bootout would lose that hour's dump, which the RunAtLoad dump then
+# the bootout would lose that hour's dump, which the proving run below then
 # replaces.
 # Everything that looks at the destination is asked of the script itself,
 # run as the owner (`--print-dest`, `--check <minutes>`): same backup.env,
@@ -177,58 +177,35 @@ if [ -n "$why" ]; then
   fi
 fi
 
-# --- the backup's RunAtLoad dump, if this install (re)loaded it ---
-# The script may wait 120s for Postgres, then dump every store: allow 5 min.
-# A fresh registration carries no exit code until its run ends, so the code
-# read here is this run's; launchd may hold a freshly loaded job a moment
-# before its first spawn, so the only early exit is the unit vanishing.
-# Evidence is a dump newer than this install (asked of the script as the
-# owner), not the exit code alone. Exit 3 ("stepped aside": a manual run
-# took the lock first) is retried once: wait for that run, kickstart the
-# unit, and judge THAT run by its own exit code and evidence.
-# judge_run <runs-before> — wait for a run that launchd has not necessarily
-# spawned yet: an exit code is only accepted once `runs` has advanced past
-# <runs-before> (or the unit was seen running), so a stale code from the
-# previous run is never taken for this one.
-judge_run() {
-  jr_before="$1"; code=""; running=no; seen=no; i=0
-  while [ "$i" -lt 300 ]; do
-    unit_snapshot "gui/$OWNER_UID/$label" || break   # unit gone
-    running="$UNIT_RUNNING"
-    [ "$running" = yes ] && seen=yes
-    if [ "$running" = no ] && { [ "$seen" = yes ] || [ "$UNIT_RUNS" -gt "$jr_before" ]; }; then
-      code="$UNIT_EXIT"   # may be empty: the run died by a signal; judged below
-      break
-    fi
-    sleep 2
-    i=$((i + 2))
-  done
-  tail -n 8 "$log_file" 2>/dev/null | sed 's/^/   /'
-}
+# --- prove the backup, if this install (re)loaded it ---
+# Not by watching launchd run it (RunAtLoad is off): the script is run
+# synchronously as the owner, so its exit code and its log are read
+# directly, then the destination is asked for a dump newer than that run
+# (the agent, when launchd fires it hourly, runs in the same user session
+# with the same files; what this proves is the script, the configuration,
+# the destination and Postgres, which is everything that can be wrong). An
+# hourly fire landing meanwhile steps aside (exit 3) harmlessly; the
+# reverse — this run finding the lock held — is waited out once.
 if [ "$backup_loaded" = yes ]; then
-  echo "== $label (RunAtLoad dump)"
-  judge_run 0   # a fresh registration starts at runs = 0
-  if [ "$code" = 3 ]; then
-    echo "   stepped aside (another run held the lock); waiting for that run, then firing the unit once more"
+  echo "== $label (proving run, as the owner)"
+  run_epoch="$(date +%s)"
+  as_owner; rc=$?
+  if [ "$rc" = 3 ]; then
+    echo "   an hourly run held the lock; waiting for it, then running once more"
     unit_busy_wait backup 600 || true
-    unit_snapshot "gui/$OWNER_UID/$label"; runs_before="$UNIT_RUNS"
-    run_mark=$(date +%s)
-    launchctl kickstart "gui/$OWNER_UID/$label"
-    judge_run "$runs_before"
-    START_EPOCH=$run_mark
+    run_epoch="$(date +%s)"
+    as_owner; rc=$?
   fi
-  if [ "$code" = 0 ]; then
-    mins=$(( ($(date +%s) - START_EPOCH) / 60 + 1 ))
+  tail -n 8 "$log_file" 2>/dev/null | sed 's/^/   /'
+  if [ "$rc" = 0 ]; then
+    mins=$(( ($(date +%s) - run_epoch) / 60 + 1 ))
     case "$(judge_dump "$mins")" in
-      OK)   echo "   OK (exit 0; dump landed in $dest since this install started)" ;;
+      OK)   echo "   OK (exit 0; dump landed in $dest)" ;;
       NONE) echo "   exit 0 but NO new dump in $dest — not trusting it; check $log_file" >&2; fail=1 ;;
       *)    echo "   exit 0, UNCONFIRMED: could not check $dest (as the owner) — verify by hand: ls -t '$dest' | head" >&2; fail=1 ;;
     esac
-  elif [ -z "$code" ] && [ "$running" = yes ]; then
-    echo "   still running after ${i}s — check $log_file and 'launchctl print gui/$OWNER_UID/$label'" >&2
-    fail=1
   else
-    echo "   FAILED (${code:+exit $code}${code:-never ran, or killed by a signal}) — see $log_file (1: a store failed; 2: cannot run here; 3: lock held twice in a row)" >&2
+    echo "   FAILED (exit $rc) — see $log_file (1: a store failed; 2: cannot run here; 3: lock held twice in a row)" >&2
     fail=1
   fi
 fi
