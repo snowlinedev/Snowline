@@ -107,6 +107,8 @@ case "${1:-}" in
         fi
         echo NONE; exit 1
         ;;
+    "") ;;   # no arguments: a real run
+    *) log "unknown argument '$1' (this script takes no arguments except --print-dest and --check <minutes>); refusing to run" >&2; exit 2 ;;
 esac
 # An explicit store list is validated here, before anything slow or
 # side-effecting: a whitespace-only value is "unset", not "dump nothing";
@@ -206,8 +208,11 @@ rm -f "$PROBE"
 # and dumps that iCloud re-materialises are tightened each run — a few
 # hundred stats an hour. Best effort on an iCloud folder, but say so.
 chmod 700 "$DEST" 2>/dev/null || log "WARNING: could not chmod 700 $DEST" >&2
-find "$DEST" -maxdepth 1 -name '*.dump' -type f -perm +044 -exec chmod 600 {} + 2>/dev/null \
-    || log "WARNING: could not tighten permissions on existing dumps in $DEST" >&2
+# only touch anything when a loose file actually exists (one cheap find)
+if [ -n "$(find "$DEST" -maxdepth 1 -name '*.dump' -type f -perm +044 -print -quit 2>/dev/null)" ]; then
+    find "$DEST" -maxdepth 1 -name '*.dump' -type f -perm +044 -exec chmod 600 {} + 2>/dev/null \
+        || log "WARNING: could not tighten permissions on existing dumps in $DEST" >&2
+fi
 
 # --- wait for Postgres (bounded; see lib.sh) ---
 wait_for_postgres || true
@@ -273,6 +278,19 @@ set -f
 # shellcheck disable=SC2086
 set -- $DBS
 set +f
+# prune_by_name <store> — delete this store's Z-stamped dumps and
+# placeholders whose name stamp is older than RETENTION_DAYS.
+prune_by_name() {
+    pb_cutoff=$(( $(date -u +%s) - RETENTION_DAYS * 86400 ))
+    find "$DEST" -maxdepth 1 \( -name "$1-[0-9]*Z.dump" -o -name ".$1-[0-9]*Z.dump.icloud" \) -type f 2>/dev/null \
+    | while IFS= read -r pb_f; do
+        pb_stamp="$(printf '%s' "$pb_f" | sed -n 's#.*-\([0-9]\{8\}-[0-9]\{6\}\)Z\.dump\(\.icloud\)\{0,1\}$#\1#p')"
+        [ -n "$pb_stamp" ] || continue
+        pb_epoch="$(date -j -u -f '%Y%m%d-%H%M%S' "$pb_stamp" +%s 2>/dev/null)" || continue
+        [ "$pb_epoch" -lt "$pb_cutoff" ] && rm -f "$pb_f"
+    done
+    return 0
+}
 OUT=""; DUMP_PID=""
 # bash runs a trap only once the foreground command returns, so pg_dump is
 # started in the background and waited for: `wait` is interruptible, the
@@ -309,10 +327,12 @@ for DB in "$@"; do
     # dumps of stores no longer in the list (e.g. the legacy snowline_dev
     # history) are left alone. iCloud evicts old files to `.NAME.icloud`
     # placeholders, which must be pruned by the same rule or the folder grows
-    # without bound. Non-fatal: a malformed RETENTION_DAYS or a find hiccup
-    # must not make a run whose dump already succeeded read as failed.
-    find "$DEST" -maxdepth 1 -name "${DB}-*.dump" -type f -mtime +"$RETENTION_DAYS" -delete || true
-    find "$DEST" -maxdepth 1 -name ".${DB}-*.dump.icloud" -type f -mtime +"$RETENTION_DAYS" -delete || true
+    # without bound. Age comes from the UTC stamp in the NAME (same rule as
+    # --check: a placeholder's mtime is eviction time, not dump time); the
+    # old pre-Z names are local time and go by mtime. Non-fatal: a find
+    # hiccup must not make a run whose dump already succeeded read as failed.
+    prune_by_name "$DB" || true
+    find "$DEST" -maxdepth 1 -name "${DB}-*[0-9].dump" -type f -mtime +"$RETENTION_DAYS" -delete 2>/dev/null || true
 done
 trap - TERM INT
 

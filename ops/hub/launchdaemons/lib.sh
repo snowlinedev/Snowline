@@ -61,15 +61,23 @@ wait_for_postgres() {
   return 0
 }
 
-# unit_running <domain/label> — is a run of the unit in progress right now?
-unit_running() {
-  launchctl print "$1" 2>/dev/null | grep -q -E '^[[:space:]]*(state = running|pid = [0-9])'
+# unit_snapshot <domain/label> — one launchctl read; sets UNIT_LOADED
+# (yes/no), UNIT_RUNNING (yes/no) and UNIT_EXIT (the numeric exit code of
+# the last completed run, or empty: never ran, or ended by a signal), all
+# describing the same instant.
+unit_snapshot() {
+  UNIT_LOADED=no; UNIT_RUNNING=no; UNIT_EXIT=""
+  us_info="$(launchctl print "$1" 2>/dev/null)" || return 1
+  UNIT_LOADED=yes
+  if printf '%s\n' "$us_info" | grep -q -E '^[[:space:]]*(state = running|pid = [0-9])'; then
+    UNIT_RUNNING=yes
+  fi
+  UNIT_EXIT="$(printf '%s\n' "$us_info" | sed -n 's/.*last exit code = \([0-9][0-9]*\).*/\1/p' | head -n 1)"
+  return 0
 }
 # unit_last_exit <domain/label> — the numeric exit code of the unit's last
 # completed run, or nothing (never ran, or ended by a signal).
-unit_last_exit() {
-  launchctl print "$1" 2>/dev/null | sed -n 's/.*last exit code = \([0-9][0-9]*\).*/\1/p' | head -n 1
-}
+unit_last_exit() { unit_snapshot "$1" >/dev/null 2>&1; printf '%s\n' "$UNIT_EXIT"; }
 
 # wait_unloaded <domain/label> — after a bootout, wait (up to 30 s) until
 # launchd no longer knows the label, so an immediate bootstrap of the same
@@ -114,7 +122,6 @@ lock_state() {
 }
 # lock_held <path> — true unless the lock is known to be free.
 lock_held() { [ "$(lock_state "$1")" != free ]; }
-autocut_lock_held() { lock_held "$AUTOCUT_LOCK"; }
 
 # unit_busy_wait <name> [bound_s] — wait (default up to 10 min) while
 # <name>.lock is held; the ops scripts call it right before booting that
@@ -173,10 +180,12 @@ autocut_guard() {
 # Boot the label out of <domain>, wait for it to be gone, copy <src> to
 # <dst> (creating the directory, owned by <owner>), bootstrap it, and
 # kickstart it when <kick> is yes (never for a timer: that fires a run).
-# Sets UNIT_RESULT: installed | still-old (bootstrap refused and the old
-# registration is still loaded, so the OLD definition keeps running; the
-# plist on disk is left as it was) | not-loaded (bootstrap refused, nothing
-# loaded). Returns 0 only for installed.
+# Sets UNIT_RESULT: installed | still-old (the old registration never went
+# away, or bootstrap was refused with it still loaded: the OLD definition
+# keeps running; when the teardown wait failed the plist on disk is left as
+# it was) | not-loaded (plist installed, bootstrap refused, nothing loaded —
+# a gui-domain unit then loads at the next login). Returns 0 only for
+# installed.
 load_unit() {
   lu_label="$1"; lu_domain="$2"; lu_src="$3"; lu_dst="$4"; lu_owner="$5"; lu_kick="$6"
   launchctl bootout "$lu_domain/$lu_label" 2>/dev/null || true
@@ -194,7 +203,7 @@ load_unit() {
       echo "   bootstrap of $lu_label refused and an old registration is still loaded (old definition keeps running) — re-run, or reboot" >&2
       UNIT_RESULT=still-old
     else
-      echo "   bootstrap of $lu_label FAILED (nothing loaded)" >&2
+      echo "   bootstrap of $lu_label refused (no session for $lu_domain?); the plist is installed at $lu_dst and loads when that domain next comes up — nothing runs for $lu_label until then" >&2
       UNIT_RESULT=not-loaded
     fi
     return 1
@@ -204,12 +213,13 @@ load_unit() {
   return 0
 }
 
-# render_backup_agent_plist <out> — the tracked agent plist with the
-# script path rendered from THIS checkout (OPS_HUB), so a moved or renamed
-# checkout gets a matching unit at the next install instead of EX_CONFIG.
-render_backup_agent_plist() {
-  sed "s#<string>/Users/seanlynch/Projects/snowline-platform/ops/hub/snowline-backup.sh</string>#<string>$OPS_HUB/snowline-backup.sh</string>#" \
-    "$LAUNCHAGENTS_SRC/dev.snowline.backup.plist" > "$1"
+# backup_agent_script — the script path the tracked backup agent plist runs
+# (the canonical hub checkout, deliberately fixed: a unit rendered from
+# whichever checkout runs the install could point at a scratch worktree and
+# die with EX_CONFIG when it is deleted — the #220 failure mode). The
+# install refuses to load the unit when nothing is at that path.
+backup_agent_script() {
+  plutil -extract ProgramArguments.1 raw -o - "$LAUNCHAGENTS_SRC/dev.snowline.backup.plist" 2>/dev/null
 }
 
 # ---- per-user agent restore (the services' rollback) ----

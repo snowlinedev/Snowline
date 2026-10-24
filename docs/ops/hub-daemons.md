@@ -36,9 +36,11 @@ each of platform / pm / governance / memory:
    it to `~/Library/LaunchAgents/` at that moment) when the tracked plist
    differs, the unit is not loaded, its last run exited with anything other
    than 0 or 3, or no dump landed in the last two hours — waiting first for
-   a dump in progress. The plist is rendered with this checkout's path for
-   the script, so a moved checkout gets a matching unit at the next
-   install.
+   a dump in progress. The plist carries the canonical checkout path for
+   the script on purpose (a path rendered from whichever checkout runs the
+   install could be a scratch worktree); the install refuses to load the
+   unit when nothing is at that path — edit the tracked plist if the hub
+   checkout ever moves.
    Operator overrides live in `~/.config/snowline/backup.env`, never in the
    plist. It stays a per-user agent on purpose ("DB backups" below).
 7. If step 6 (re)loaded the backup agent, waits (up to 5 min) for its
@@ -424,8 +426,11 @@ once on load. The script:
   in the folder is tightened to 0600 each run): the platform dump carries
   the live replication HMAC secrets, so a dump is as sensitive as the hub;
 - prunes each store's dumps older than `SNOWLINE_BACKUP_RETENTION_DAYS`
-  (30), including iCloud-evicted `.NAME.icloud` placeholders; the legacy
-  `snowline_dev-*` dumps are never touched.
+  (30) by the UTC stamp in the name (the same rule `--check` uses; an
+  iCloud placeholder's mtime is eviction time), including evicted
+  `.NAME.icloud` placeholders; the legacy `snowline_dev-*` dumps are never
+  touched. Any argument other than `--print-dest` / `--check` is refused
+  (exit 2) so a typo cannot start a real run.
 
 Dumps land in `~/Library/Mobile Documents/com~apple~CloudDocs/Snowline/db-backups/`
 as `<store>-<YYYYMMDD-HHMMSS>Z.dump` (UTC). Log: `~/Library/Logs/snowline-backup.log`.

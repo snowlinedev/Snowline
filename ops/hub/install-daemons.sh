@@ -116,10 +116,15 @@ done
 label="dev.snowline.backup"
 log_file="$OWNER_HOME/Library/Logs/snowline-backup.log"
 echo "== $label (per-user agent)"
-rendered="$(mktemp -t snowline-backup-plist)"
-trap 'rm -f "$rendered"' EXIT
-render_backup_agent_plist "$rendered"
-as_owner() { sudo -u "#$OWNER_UID" -H /bin/bash "$OPS_HUB/snowline-backup.sh" "$@"; }
+plist_src="$LAUNCHAGENTS_SRC/$label.plist"
+script="$(backup_agent_script)"
+if [ -z "$script" ] || [ ! -f "$script" ]; then
+  echo "   the tracked agent plist runs '$script', which is not on this hub (checkout moved? then edit ops/hub/launchagents/$label.plist); NOT installing a unit that would fail with EX_CONFIG" >&2
+  fail=1
+  exit "$fail"
+fi
+echo "   unit runs $script"
+as_owner() { sudo -u "#$OWNER_UID" -H /bin/bash "$script" "$@"; }
 dest="$(as_owner --print-dest 2>/dev/null)" || dest="(unknown: --print-dest failed)"
 # judge_dump <minutes> — OK / NONE / UNKNOWN for a dump newer than <minutes>;
 # the token comes from the script's stdout, so a sudo or script failure
@@ -129,15 +134,15 @@ judge_dump() {
   case "$jd" in OK) echo OK ;; NONE) echo NONE ;; *) echo UNKNOWN ;; esac
 }
 why=""
-if ! cmp -s "$rendered" "$AGENTS/$label.plist" 2>/dev/null; then
+if ! cmp -s "$plist_src" "$AGENTS/$label.plist" 2>/dev/null; then
   why="plist changed"
 elif ! launchctl print "gui/$OWNER_UID/$label" >/dev/null 2>&1; then
   why="not loaded"
 else
-  code="$(unit_last_exit "gui/$OWNER_UID/$label")"
-  case "$code" in
+  unit_snapshot "gui/$OWNER_UID/$label"
+  case "$UNIT_EXIT" in
     ""|0|3) ;;
-    *) why="last run exited $code" ;;
+    *) why="last run exited $UNIT_EXIT" ;;
   esac
   if [ -z "$why" ]; then
     case "$(judge_dump 120)" in
@@ -153,7 +158,7 @@ if [ -n "$why" ]; then
   if ! unit_busy_wait backup 600; then
     echo "   a dump is still running (or its lock cannot be probed); leaving $label as it is — re-run the install later" >&2
     fail=1
-  elif load_unit "$label" "gui/$OWNER_UID" "$rendered" "$AGENTS/$label.plist" "$OWNER_UID" no; then
+  elif load_unit "$label" "gui/$OWNER_UID" "$plist_src" "$AGENTS/$label.plist" "$OWNER_UID" no; then
     backup_loaded=yes
   else
     fail=1
@@ -167,34 +172,38 @@ fi
 # before its first spawn, so the only early exit is the unit vanishing.
 # Evidence is a dump newer than this install (asked of the script as the
 # owner), not the exit code alone. Exit 3 ("stepped aside": a manual run
-# took the lock first) is a retry, not a failure: wait for that run, then
-# look for its dump.
-if [ "$backup_loaded" = yes ]; then
-  echo "== $label (RunAtLoad dump)"
+# took the lock first) is retried once: wait for that run, kickstart the
+# unit, and judge THAT run by its own exit code and evidence.
+judge_run() {
   code=""; running=no; i=0
   while [ "$i" -lt 300 ]; do
-    # one launchctl read per tick: running and exit code describe the same instant
-    info="$(launchctl print "gui/$OWNER_UID/$label" 2>/dev/null)" || break   # unit gone
-    if printf '%s\n' "$info" | grep -q -E '^[[:space:]]*(state = running|pid = [0-9])'; then
-      running=yes
-    else
-      running=no
-      code="$(printf '%s\n' "$info" | sed -n 's/.*last exit code = \([0-9][0-9]*\).*/\1/p' | head -n 1)"
+    unit_snapshot "gui/$OWNER_UID/$label" || break   # unit gone
+    running="$UNIT_RUNNING"
+    if [ "$running" = no ]; then
+      code="$UNIT_EXIT"
       [ -n "$code" ] && break
     fi
     sleep 2
     i=$((i + 2))
   done
   tail -n 8 "$log_file" 2>/dev/null | sed 's/^/   /'
+}
+if [ "$backup_loaded" = yes ]; then
+  echo "== $label (RunAtLoad dump)"
+  judge_run
   if [ "$code" = 3 ]; then
-    echo "   stepped aside (another run held the lock); waiting for that run instead"
+    echo "   stepped aside (another run held the lock); waiting for that run, then firing the unit once more"
     unit_busy_wait backup 600 || true
-    code=0
+    run_mark=$(date +%s)
+    launchctl kickstart "gui/$OWNER_UID/$label"
+    sleep 2
+    judge_run
+    START_EPOCH=$run_mark
   fi
   if [ "$code" = 0 ]; then
     mins=$(( ($(date +%s) - START_EPOCH) / 60 + 1 ))
     case "$(judge_dump "$mins")" in
-      OK)   echo "   OK (dump landed in $dest since this install started)" ;;
+      OK)   echo "   OK (exit 0; dump landed in $dest since this install started)" ;;
       NONE) echo "   exit 0 but NO new dump in $dest — not trusting it; check $log_file" >&2; fail=1 ;;
       *)    echo "   exit 0, UNCONFIRMED: could not check $dest (as the owner) — verify by hand: ls -t '$dest' | head" >&2; fail=1 ;;
     esac
@@ -202,7 +211,7 @@ if [ "$backup_loaded" = yes ]; then
     echo "   still running after ${i}s — check $log_file and 'launchctl print gui/$OWNER_UID/$label'" >&2
     fail=1
   else
-    echo "   FAILED (${code:+exit $code}${code:-never ran, or killed by a signal}) — see $log_file (1: a store failed; 2: cannot run here)" >&2
+    echo "   FAILED (${code:+exit $code}${code:-never ran, or killed by a signal}) — see $log_file (1: a store failed; 2: cannot run here; 3: lock held twice in a row)" >&2
     fail=1
   fi
 fi
