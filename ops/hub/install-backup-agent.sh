@@ -174,7 +174,9 @@ prove_run() {
     # "run exit" line (or, failing that, 15 min ago)
     echo "   a run is already in flight; judging that one"
     runs_before=$((UNIT_RUNS - 1))
-    started="$(log_lines_since 0 | awk '$2 == "run" && $3 == "exit" { s = ""; next } s == "" { s = $1 } END { print s }')"
+    # (only a line that FOLLOWS a "run exit" line can be this run's start; a
+    # log with no such line yet gives nothing, and the 15-minute fallback)
+    started="$(log_lines_since 0 | awk '$2 == "run" && $3 == "exit" { seen = 1; s = ""; next } seen && s == "" { s = $1 } END { print s }')"
     started_epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$started" +%s 2>/dev/null)" || started_epoch=""
     if [ -n "$started" ] && [ -n "$started_epoch" ]; then run_stamp="$started"; run_epoch="$started_epoch"; else run_epoch=$((run_epoch - 900)); run_stamp="$(date -u -v-15M +%FT%TZ)"; fi
   elif ! launchctl kickstart "$domain/$label"; then

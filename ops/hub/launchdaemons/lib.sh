@@ -44,14 +44,9 @@ backup_script() {
 }
 
 # ---- logging ----
-# Helpers log through `log`. A caller that defines its own log() FUNCTION
-# before sourcing keeps it; otherwise a default UTC-stamped one is defined
-# here. Tested with `type` (not `command -v`, which finds /usr/bin/log on
-# macOS) at source time, with no `head` in the pipe so pipefail callers
-# cannot see a SIGPIPE.
-if ! type log 2>/dev/null | grep -q 'function'; then
-  log() { echo "$(date -u +%FT%TZ) $*"; }
-fi
+# Helpers and callers log through `log`: one UTC-stamped line. (A shell
+# function, so it shadows macOS's /usr/bin/log for everything sourcing this.)
+log() { echo "$(date -u +%FT%TZ) $*"; }
 
 # ---- waits ----
 # wait_for_postgres — bounded wait (120 s, 5 s steps) for pg_isready on the

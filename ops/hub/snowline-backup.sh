@@ -31,8 +31,11 @@
 #   createdb snowline_restore && pg_restore --no-owner -d snowline_restore <dump>
 set -uo pipefail
 # The command line, captured before anything below touches the positional
-# parameters (the store-list normalisation re-sets them).
+# parameters (the store-list normalisation re-sets them). A query
+# (--print-dest, --check) is quiet: it never logs a "run exit" line, even
+# when it dies on a refused configuration before reaching the dispatch.
 ARG1="${1:-}"; ARG2="${2:-}"
+case "$ARG1" in --print-dest|--check) QUIET_EXIT=yes ;; *) QUIET_EXIT=no ;; esac
 export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 umask 077
 
@@ -58,7 +61,12 @@ SCRATCH_RE='(_(test|dryrun|e2e|restore)(_|$)|^snowline_dev$)'
 # without it cannot run at all: exit 2, not a store failure.
 SNOWLINE_OWNER_HOME="$HOME"
 # shellcheck disable=SC1091
-. "$(dirname "$0")/launchdaemons/lib.sh" || { echo "$(date -u +%FT%TZ) cannot source $(dirname "$0")/launchdaemons/lib.sh; is this a complete checkout?" >&2; exit 2; }
+. "$(dirname "$0")/launchdaemons/lib.sh" || {
+    # the one exit path before the EXIT trap exists: write its line by hand
+    echo "$(date -u +%FT%TZ) cannot source $(dirname "$0")/launchdaemons/lib.sh; is this a complete checkout?" >&2
+    [ "$QUIET_EXIT" = yes ] || echo "$(date -u +%FT%TZ) run exit 2"
+    exit 2
+}
 # Exit codes: 2 = cannot run at all (destination / iCloud root / unwritable /
 # lock / bad configuration — the environment, not the data); 1 = some
 # store(s) failed to dump; 3 = another run held the lock (stepped aside).
@@ -71,8 +79,8 @@ die() { log "$*" >&2; exit 2; }
 # by the EXIT trap whatever the path (success, a refusal, a step-aside, an
 # interrupt — armed before anything below can fail): install-backup-agent.sh
 # reads the LAST such line to judge a run when it cannot see the
-# destination itself. Queries (--print-dest, --check) do not log one.
-QUIET_EXIT=no
+# destination itself. Queries (--print-dest, --check) do not log one
+# (QUIET_EXIT, decided with the command line above).
 CATALOG_ERR=""; Z_DUMPS_ERR=""; PROBE=""   # temp files, set below; removed on every exit
 on_exit() {
     oe_rc=$?
@@ -158,6 +166,15 @@ set -f
 set -- ${SNOWLINE_BACKUP_DBS:-}
 set +f
 DBS_EXPLICIT="$*"
+# ... and validated here, cheap and side-effect free, so a query and a run
+# refuse the same bad value: each name must be a plain identifier (the
+# catalog query applies the same rule in SQL); a whitespace-only value is
+# "unset", not "dump nothing".
+for vn in "$@"; do
+    case "$vn" in
+        *[!A-Za-z0-9_]*) die "SNOWLINE_BACKUP_DBS entry is not a database name: '$vn'" ;;
+    esac
+done
 
 # store_wanted <name> — the ONE store rule, for the catalog pass and --check
 # alike: a snowline_* name that is not a scratch one. A bash regex match: no
@@ -189,12 +206,10 @@ dest_state() {
 #                       1 if none, 2 if the destination cannot be read
 case "$ARG1" in
     --print-dest)
-        QUIET_EXIT=yes
         printf '%s\n' "$DEST"
         exit 0
         ;;
     --check)
-        QUIET_EXIT=yes
         # A dump counts by the UTC stamp in its NAME (this script writes
         # <store>-YYYYMMDD-HHMMSSZ.dump), not by mtime: an iCloud-evicted
         # placeholder carries eviction time, and old pre-Z names are local
@@ -236,19 +251,8 @@ EOF_Z
     "") ;;   # no arguments: a real run
     *) die "unknown argument '$ARG1' (this script takes no arguments except --print-dest and --check <minutes>); refusing to run" ;;
 esac
-# An explicit store list is validated here, before anything slow or
-# side-effecting: a whitespace-only value is "unset", not "dump nothing";
-# the split is done with globbing off so a stray `*` cannot expand against
-# the cwd, and each name must be a plain identifier (the catalog query
-# applies the same rule in SQL).
-# (DBS_EXPLICIT was normalised above, before the query dispatch)
-# shellcheck disable=SC2086
-set -- $DBS_EXPLICIT
-for vn in "$@"; do
-    case "$vn" in
-        *[!A-Za-z0-9_]*) die "SNOWLINE_BACKUP_DBS entry is not a database name: '$vn'" ;;
-    esac
-done
+# (the explicit store list was normalised and validated above, before the
+# query dispatch)
 # --- run lock: a flock on $BACKUP_LOCK, held for the whole run ---
 # fd 9 is opened on the lock file for the life of this process; flock_fd
 # (lib.sh, perl) takes the flock on that inherited fd (the lock lives on the
@@ -343,10 +347,19 @@ for uc in $UNCONNECTABLE; do
     log "FAILED to back up ${uc}: this role cannot connect to it (parked? CONNECT revoked?)" >&2
     FAILED="$FAILED $uc"
 done
-[ "$CATALOG_OK" = yes ] || [ -z "$DBS_EXPLICIT" ] || log "WARNING: could not list databases from the server ($(tr '\n' ' ' < "$CATALOG_ERR")); the connectability check and the exclusion note are skipped this run" >&2
+if [ "$CATALOG_OK" != yes ]; then
+    if [ -n "$DBS_EXPLICIT" ]; then catalog_clause="the connectability check and the exclusion note are skipped this run"; else catalog_clause="dumping the fallback list only: $FALLBACK_DBS"; fi
+    log "WARNING: could not list databases from the server ($(tr '\n' ' ' < "$CATALOG_ERR")); $catalog_clause" >&2
+fi
 # (LIVE was built above, in the same pass)
 if [ -n "$DBS_EXPLICIT" ]; then
-    DBS="$DBS_EXPLICIT"
+    # (an unconnectable name on the list was already recorded as FAILED
+    # above; it is not dumped a second time to fail twice)
+    DBS=""
+    for db in $DBS_EXPLICIT; do
+        has_word "$db" $UNCONNECTABLE || DBS="$DBS $db"
+    done
+    DBS="${DBS# }"
     EXCLUDED=""
     for db in $LIVE; do
         has_word "$db" $DBS || EXCLUDED="$EXCLUDED $db"
@@ -367,8 +380,7 @@ elif [ "$CATALOG_OK" = yes ]; then
     DBS="$FALLBACK_DBS"
     log "WARNING: the catalog holds no usable snowline_* store (wrong cluster?); trying the fallback list: $DBS" >&2
 else
-    DBS="$FALLBACK_DBS"
-    log "WARNING: could not list databases from the server ($(tr '\n' ' ' < "$CATALOG_ERR")); dumping the fallback list only: $DBS" >&2
+    DBS="$FALLBACK_DBS"   # (warned above)
 fi
 
 # UTC stamp so file names sort monotonically (no DST fold) and match the log.
