@@ -29,6 +29,7 @@ LAUNCHDAEMONS_SRC="$OPS_HUB/launchdaemons"
 LAUNCHAGENTS_SRC="$OPS_HUB/launchagents"
 ICLOUD_ROOT="$OWNER_HOME/Library/Mobile Documents/com~apple~CloudDocs"
 BACKUP_DIR="$ICLOUD_ROOT/Snowline/db-backups"   # the backup script's default destination
+BACKUP_LOG="$OWNER_HOME/Library/Logs/snowline-backup.log"   # the agent plist's StandardOut/ErrorPath
 
 # ---- logging ----
 # Helpers log through `log`. A caller that defines its own log() FUNCTION
@@ -105,19 +106,38 @@ LOCKS_DIR="$OWNER_HOME/Library/Application Support/Snowline"
 BACKUP_LOCK="$LOCKS_DIR/backup.lock"
 AUTOCUT_LOCK="$LOCKS_DIR/autocut.lock"
 AUTOCUT_LOG="$OWNER_HOME/Library/Logs/snowline-autocut.log"
-# lock_state <path> — prints held / free / unknown. A shared non-blocking
-# flock probe in /usr/bin/perl (base macOS; no Command Line Tools needed,
-# unlike the python3 stub): it fails only while an exclusive holder runs and
-# never leaves the probe owning the lock. "unknown" = the probe itself could
-# not run (unreadable file, perl missing): a guard that cannot tell must
-# refuse, not wave through, so callers treat it like held — but without
-# waiting on it.
+# flock_fd <fd> <sh|ex> <tries> — the ONE flock implementation (in
+# /usr/bin/perl: base macOS, no Command Line Tools stub). Non-blocking;
+# with <tries> > 1 it retries once a second. Exit 0 = acquired (the lock
+# stays on the fd's open file description, i.e. as long as the caller keeps
+# the fd), 1 = held by someone else, 2 = the flock itself failed (fd not
+# open, filesystem without flock).
+flock_fd() {
+  /usr/bin/perl -e 'use Fcntl qw(:flock);
+    my ($fd, $mode, $tries) = @ARGV;
+    open(my $fh, ($mode eq "ex" ? ">>&=" : "<&="), $fd) or exit 2;
+    my $op = ($mode eq "ex" ? LOCK_EX : LOCK_SH) | LOCK_NB;
+    for (1..$tries) {
+        exit 0 if flock($fh, $op);
+        exit 2 unless $!{EWOULDBLOCK} || $!{EAGAIN};
+        sleep 1 if $_ < $tries;
+    }
+    exit 1;' "$1" "$2" "$3" 2>/dev/null
+}
+
+# lock_state <path> — prints held / free / unknown: a shared non-blocking
+# probe through flock_fd on a read fd, released at once. It fails only while
+# an exclusive holder runs and never leaves the probe owning the lock.
+# "unknown" = the probe itself could not run (unreadable file, perl
+# missing): a guard that cannot tell must refuse, not wave through, so
+# callers treat it like held — but without waiting on it.
 lock_state() {
   [ -e "$1" ] || { echo free; return; }
-  /usr/bin/perl -e 'use Fcntl qw(:flock); open(my $fh, "<", $ARGV[0]) or exit 2;
-    exit 1 if flock($fh, LOCK_SH | LOCK_NB);
-    exit(($!{EWOULDBLOCK} || $!{EAGAIN}) ? 0 : 2);' "$1" 2>/dev/null
-  case $? in 0) echo held ;; 1) echo free ;; *) echo unknown ;; esac
+  if ! exec 8<"$1" 2>/dev/null; then echo unknown; return; fi
+  flock_fd 8 sh 1
+  ls_rc=$?
+  exec 8<&-
+  case $ls_rc in 0) echo free ;; 1) echo held ;; *) echo unknown ;; esac
 }
 # lock_held <path> — true unless the lock is known to be free.
 lock_held() { [ "$(lock_state "$1")" != free ]; }

@@ -18,7 +18,7 @@ for timer in $TIMERS; do
   label="dev.snowline.$timer"
   echo "== $label"
   if lock_held "$LOCKS_DIR/$timer.lock"; then
-    echo "   $timer is running now; leaving $label as it is — re-run after it finishes" >&2
+    echo "   $timer is running now (or its lock cannot be probed); leaving $label as it is — re-run after it finishes" >&2
     fail=1
     continue
   fi

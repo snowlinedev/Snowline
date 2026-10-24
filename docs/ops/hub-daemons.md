@@ -406,9 +406,10 @@ RunAtLoad; the first timed run is an hour after loading). The script:
   database this role can connect to, except scratch ones — a name with a `_test`, `_dryrun`, `_e2e`
   or `_restore` component (as a whole component: `snowline_pm_test_sp` and
   `snowline_restore` are scratch, `snowline_testimonials` would be a store)
-  and the legacy `snowline_dev` — so a new service's store is backed up
-  from its first hour without a code change (other projects' databases on
-  the same cluster are not this job's to dump). A readable catalog with no
+  and the legacy `snowline_dev`; only plain-identifier names — so a new
+  service's store is backed up from its first hour without a code change
+  (other projects' databases on the same cluster are not this job's to
+  dump). A readable catalog with no
   `snowline_*` store at all is treated as the wrong cluster: the known
   stores are tried and the run fails loudly rather than exiting 0 with
   nothing dumped. If the catalog cannot be read the run falls back to the

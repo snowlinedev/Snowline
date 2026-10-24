@@ -118,8 +118,14 @@ done
 # launchd session, so a denial here is reported as "could not check", not
 # as a dead unit.)
 label="dev.snowline.backup"
-log_file="$OWNER_HOME/Library/Logs/snowline-backup.log"
+log_file="$BACKUP_LOG"
 echo "== $label (per-user agent)"
+# the log must belong to the owner (the agent opens it as uid 501); the
+# proving run below appends to it from this root shell, so create it first
+# as the owner rather than let the redirection create it root-owned
+if [ ! -e "$log_file" ]; then
+  touch "$log_file" && chown "$OWNER_UID" "$log_file"
+fi
 plist_src="$LAUNCHAGENTS_SRC/$label.plist"
 script="$(backup_agent_script)"
 if [ -z "$script" ] || [ ! -f "$script" ]; then
@@ -139,13 +145,20 @@ if [ ! "$OPS_HUB/snowline-backup.sh" -ef "$script" ]; then
 fi
 echo "   unit runs $script"
 as_owner() { sudo -u "#$OWNER_UID" -H /bin/bash "$script" "$@"; }
-dest="$(as_owner --print-dest 2>/dev/null)" || dest="(unknown: --print-dest failed)"
-# judge_dump <minutes> — OK / NONE / UNKNOWN for a dump newer than <minutes>;
-# the token comes from the script's stdout, so a sudo or script failure
-# (nothing printed) is UNKNOWN, never mistaken for "no dump"
+# the destination, as the script resolves it; a failure (a bad backup.env
+# line, a sudo problem) is shown with the script's own message
+if ! dest="$(as_owner --print-dest 2>&1)"; then
+  echo "   --print-dest failed: $(printf '%s\n' "$dest" | tail -n 1)" >&2
+  dest="(unknown)"
+fi
+# judge_dump <minutes> — OK / NONE / UNKNOWN for a dump newer than
+# <minutes>, by the script's EXIT CODE (0/1/other), with its last output
+# line kept in JUDGE_MSG so a failure says why (a backup.env error, sudo,
+# TCC) instead of a guess
 judge_dump() {
-  jd="$(as_owner --check "$1" 2>/dev/null)"
-  case "$jd" in OK) echo OK ;; NONE) echo NONE ;; *) echo UNKNOWN ;; esac
+  JUDGE_MSG="$(as_owner --check "$1" 2>&1)"; jd_rc=$?
+  JUDGE_MSG="$(printf '%s\n' "$JUDGE_MSG" | tail -n 1)"
+  case $jd_rc in 0) echo OK ;; 1) echo NONE ;; *) echo UNKNOWN ;; esac
 }
 why=""
 if ! cmp -s "$plist_src" "$AGENTS/$label.plist" 2>/dev/null; then
@@ -162,7 +175,7 @@ else
     case "$(judge_dump 120)" in
       OK)   echo "   unchanged and loaded, dumped within 2 h; left as it is" ;;
       NONE) why="no dump in the last 2 h in $dest" ;;
-      *)    echo "   unchanged and loaded; could not check $dest for a recent dump from this install's context (TCC? sudo?) — check by hand: ls -t '$dest' | head" >&2; fail=1 ;;
+      *)    echo "   unchanged and loaded; could not check $dest for a recent dump ($JUDGE_MSG) — check by hand: ls -t '$dest' | head" >&2; fail=1 ;;
     esac
   fi
 fi
@@ -204,7 +217,7 @@ if [ "$backup_loaded" = yes ]; then
     case "$(judge_dump "$mins")" in
       OK)   echo "   OK (exit 0; dump landed in $dest)" ;;
       NONE) echo "   exit 0 but NO new dump in $dest — not trusting it; check $log_file" >&2; fail=1 ;;
-      *)    echo "   exit 0, UNCONFIRMED: could not check $dest from this install's context (TCC? sudo?) — verify by hand: ls -t '$dest' | head" >&2; fail=1 ;;
+      *)    echo "   exit 0, UNCONFIRMED: could not check $dest ($JUDGE_MSG) — verify by hand: ls -t '$dest' | head" >&2; fail=1 ;;
     esac
   else
     echo "   FAILED (exit $rc) — see $log_file (1: a store failed; 2: cannot run here; 3: lock held twice in a row)" >&2

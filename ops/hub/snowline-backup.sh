@@ -67,6 +67,12 @@ die() { log "$*" >&2; exit 2; }
 CATALOG_ERR="$(mktemp -t snowline-backup-psql)"
 Z_DUMPS_ERR="$(mktemp -t snowline-backup-find)"
 trap 'rm -f "$CATALOG_ERR" "$Z_DUMPS_ERR"' EXIT
+# A SIGTERM/SIGINT at ANY point (a bootout during the Postgres wait, a
+# logout, a shutdown) logs itself; once a dump is in flight (OUT/DUMP_PID
+# set below) it is killed and its partial removed. Armed here, not just
+# around the dump loop, so a run never vanishes without a log line.
+OUT=""; DUMP_PID=""
+trap 'log "interrupted (SIGTERM/SIGINT)${OUT:+; removing $OUT.partial}" >&2; [ -z "$DUMP_PID" ] || kill "$DUMP_PID" 2>/dev/null; [ -z "$OUT" ] || rm -f "$OUT.partial"; exit 143' TERM INT
 # Operator overrides live in ~/.config/snowline/backup.env (optional; sourced
 # here), NOT in the launchd plist: install-daemons.sh replaces the plist with
 # the tracked copy whenever it differs, so anything put there would be lost.
@@ -154,18 +160,12 @@ esac
 # the split is done with globbing off so a stray `*` cannot expand against
 # the cwd, and each name must be a plain identifier (valid_names, below,
 # is the one rule for every source of names).
-# valid_names <mode:strict|skip> <names...> — prints the identifiers; in
-# strict mode a bad name is fatal (exit 2), in skip mode it is logged and
-# dropped.
+# valid_names <names...> — prints the names; a non-identifier is fatal
+# (exit 2). The catalog applies the same rule in SQL.
 valid_names() {
-    vn_mode="$1"; shift
     for vn in "$@"; do
         case "$vn" in
-            *[!A-Za-z0-9_]*)
-                if [ "$vn_mode" = strict ]; then
-                    die "SNOWLINE_BACKUP_DBS entry is not a database name: '$vn'"
-                fi
-                log "WARNING: skipping database with a non-identifier name: '$vn'" >&2 ;;
+            *[!A-Za-z0-9_]*) die "SNOWLINE_BACKUP_DBS entry is not a database name: '$vn'" ;;
             *) printf '%s ' "$vn" ;;
         esac
     done
@@ -176,7 +176,7 @@ set -f
 set -- $DBS_EXPLICIT
 set +f
 # (valid_names runs in a subshell here, so its exit 2 must be propagated)
-DBS_EXPLICIT="$(valid_names strict "$@")" || exit 2
+DBS_EXPLICIT="$(valid_names "$@")" || exit 2
 DBS_EXPLICIT="${DBS_EXPLICIT% }"
 # --- run lock: a flock on $BACKUP_LOCK, held for the whole run ---
 # fd 9 is opened on the lock file for the life of this process; a one-line
@@ -191,19 +191,13 @@ DBS_EXPLICIT="${DBS_EXPLICIT% }"
 # other flock error (an fs without flock, a bad fd) is exit 2.
 mkdir -p "$(dirname "$BACKUP_LOCK")"
 exec 9>>"$BACKUP_LOCK" || die "cannot open the run lock $BACKUP_LOCK (root-owned from a sudo run?); fix its ownership"
-# /usr/bin/perl ships with base macOS (the python3 there is a Command Line
-# Tools stub); it flocks the inherited fd 9 in place, so the lock outlives it.
-/usr/bin/perl -e 'use Fcntl qw(:flock);
-    open(my $fh, ">>&=", 9) or exit 2;
-    for (1..5) {
-        exit 0 if flock($fh, LOCK_EX | LOCK_NB);
-        exit 2 unless $!{EWOULDBLOCK} || $!{EAGAIN};
-        sleep 1;   # a lock_state probe holds it for an instant; a real run for minutes
-    }
-    exit 3;'
+# flock_fd (lib.sh) flocks the inherited fd 9 in place, so the lock
+# outlives the helper; five tries a second apart, because a lock_state probe
+# holds the file for an instant while a real run holds it for minutes.
+flock_fd 9 ex 5
 case $? in
     0) ;;
-    3) log "another backup run holds $BACKUP_LOCK; stepping aside"; exit 3 ;;
+    1) log "another backup run holds $BACKUP_LOCK; stepping aside"; exit 3 ;;
     *) die "cannot take the run lock $BACKUP_LOCK (flock failed)" ;;
 esac
 
@@ -258,20 +252,11 @@ CATALOG_OK=yes
 # Only databases this role can actually connect to: a parked store
 # (datallowconn = false) or one without CONNECT would otherwise fail every
 # hourly run with exit 1 until someone hand-writes SNOWLINE_BACKUP_DBS.
-CATALOG="$(psql -X -At -d postgres -c "select datname from pg_database where not datistemplate and datname <> 'postgres' and datallowconn and has_database_privilege(datname, 'CONNECT') order by 1" 2>"$CATALOG_ERR")" || CATALOG_OK=no
+# (and only plain-identifier names: a quoted name with a space or dash
+# would split into bogus stores; the same rule as for SNOWLINE_BACKUP_DBS)
+CATALOG="$(psql -X -At -d postgres -c "select datname from pg_database where not datistemplate and datname <> 'postgres' and datallowconn and has_database_privilege(datname, 'CONNECT') and datname ~ '^[A-Za-z0-9_]+\$' order by 1" 2>"$CATALOG_ERR")" || CATALOG_OK=no
 LIVE="$(printf '%s\n' "$CATALOG" | grep -E "$STORE_RE" | grep -v -E "$SCRATCH_RE" | grep -v '^$' || true)"
-# Catalog names go through the same identifier rule (skip-and-warn): a
-# quoted name with a space would otherwise split into two bogus stores.
-# Split on newlines with globbing off; LIVE is one name per line.
-set -f
-IFS_SAVE="$IFS"; IFS='
-'
-# shellcheck disable=SC2086
-set -- $LIVE
-IFS="$IFS_SAVE"
-set +f
-LIVE="$(valid_names skip "$@")"
-LIVE="${LIVE% }"
+LIVE="$(printf '%s\n' "$LIVE" | tr '\n' ' ')"; LIVE="${LIVE% }"
 if [ -n "$DBS_EXPLICIT" ]; then
     DBS="$DBS_EXPLICIT"
     EXCLUDED=""
@@ -312,18 +297,18 @@ set +f
 # placeholders whose name stamp is older than RETENTION_DAYS (string
 # comparison against one cutoff stamp; no fork per file).
 PRUNE_CUTOFF="$(date -u -v-"${RETENTION_DAYS}"d +%Y%m%d-%H%M%S 2>/dev/null)" || PRUNE_CUTOFF=""
+[ -n "$PRUNE_CUTOFF" ] || log "WARNING: cannot compute the retention cutoff for $RETENTION_DAYS days; NOT pruning this run (the folder grows until this is fixed)" >&2
 prune_by_name() {
-    [ -n "$PRUNE_CUTOFF" ] || return 0   # no cutoff, no pruning (never over-delete)
+    [ -n "$PRUNE_CUTOFF" ] || return 0   # no cutoff, no pruning (never over-delete; warned above)
     z_dumps "$1" | while IFS="$TAB" read -r pb_stamp pb_f; do
         [ "$pb_stamp" \< "$PRUNE_CUTOFF" ] && rm -f "$pb_f"
     done
     return 0
 }
-OUT=""; DUMP_PID=""
 # bash runs a trap only once the foreground command returns, so pg_dump is
 # started in the background and waited for: `wait` is interruptible, the
-# handler runs at once, kills the dump and removes its partial.
-trap 'log "interrupted (SIGTERM/SIGINT); removing ${OUT:+$OUT.partial}" >&2; [ -z "$DUMP_PID" ] || kill "$DUMP_PID" 2>/dev/null; [ -z "$OUT" ] || rm -f "$OUT.partial"; exit 143' TERM INT
+# TERM/INT handler armed at the top runs at once, kills the dump and
+# removes its partial.
 for DB in "$@"; do
     OUT="$DEST/${DB}-${STAMP}.dump"
     # Dump to a .partial name, verify the archive is readable, then atomically
