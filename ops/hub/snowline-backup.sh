@@ -61,11 +61,28 @@ RETENTION_DAYS="${SNOWLINE_BACKUP_RETENTION_DAYS:-30}"
 # Shared helpers (log, wait_for_postgres); lib.sh only defines things.
 # shellcheck disable=SC1091
 . "$(dirname "$0")/launchdaemons/lib.sh"
-now() { date -u +%FT%TZ; }
 # Exit codes: 2 = cannot run at all (destination / iCloud root / unwritable —
 # the environment, not the data); 1 = some store(s) failed to dump.
 # install-daemons.sh rolls the unit back to the per-user agent only on 2.
 die() { log "$*" >&2; exit 2; }
+
+# --- run lock: one backup at a time, and a signal to the ops scripts ---
+# A directory created atomically with mkdir, holding this pid; lib.sh's
+# backup_guard waits on it before booting this unit out. A second run while
+# one is in progress (RunAtLoad racing the hourly fire) just steps aside —
+# the running one's dumps land. A stale lock (crashed run, pid gone) is taken
+# over.
+mkdir -p "$(dirname "$BACKUP_LOCK")"
+if ! mkdir "$BACKUP_LOCK" 2>/dev/null; then
+    if backup_lock_held; then
+        log "another backup run (pid $pid) is in progress; skipping this one"
+        exit 0
+    fi
+    rm -rf "${BACKUP_LOCK:?}"
+    mkdir "$BACKUP_LOCK" || die "cannot take the run lock $BACKUP_LOCK"
+fi
+echo $$ > "$BACKUP_LOCK/pid"
+trap 'rm -rf "${BACKUP_LOCK:?}"' EXIT
 
 # --- destination: refuse to write "backups" that never leave the machine ---
 # `mkdir -p` of the full default path would silently recreate the iCloud
@@ -97,9 +114,9 @@ PROBE="$DEST/.probe.$$"
 rm -f "$PROBE"
 # Owner-only posture for the folder AND for dumps written before this script
 # enforced it (they were 0644). Best effort on an iCloud folder, but say so.
-chmod 700 "$DEST" 2>/dev/null || echo "$(now) WARNING: could not chmod 700 $DEST" >&2
+chmod 700 "$DEST" 2>/dev/null || log "WARNING: could not chmod 700 $DEST" >&2
 find "$DEST" -maxdepth 1 -name '*.dump' -type f -perm +044 -exec chmod 600 {} + 2>/dev/null \
-    || echo "$(now) WARNING: could not tighten permissions on existing dumps in $DEST" >&2
+    || log "WARNING: could not tighten permissions on existing dumps in $DEST" >&2
 
 # --- wait for Postgres (bounded; see lib.sh) ---
 wait_for_postgres || true
@@ -122,13 +139,18 @@ if [ -n "$DBS_EXPLICIT" ]; then
             *) EXCLUDED="$EXCLUDED $db" ;;
         esac
     done
-    [ -z "$EXCLUDED" ] || echo "$(now) note: SNOWLINE_BACKUP_DBS excludes live store(s):${EXCLUDED}" >&2
-elif [ "$CATALOG_OK" = yes ]; then
+    [ -z "$EXCLUDED" ] || log "note: SNOWLINE_BACKUP_DBS excludes live store(s):${EXCLUDED}" >&2
+elif [ "$CATALOG_OK" = yes ] && [ -n "$LIVE" ]; then
     DBS="$(printf '%s\n' "$LIVE" | tr '\n' ' ')"
-    [ -n "$LIVE" ] || echo "$(now) WARNING: the catalog holds no non-scratch database; nothing to dump" >&2
+elif [ "$CATALOG_OK" = yes ]; then
+    # Readable catalog with no snowline_* store: the wrong cluster (PGHOST /
+    # PGPORT leaking in, a fresh cluster before migration). Never exit 0 with
+    # nothing dumped: try the known stores, which then fail loudly (exit 1).
+    DBS="$FALLBACK_DBS"
+    log "WARNING: the catalog holds no snowline_* store (wrong cluster?); trying the fallback list: $DBS" >&2
 else
     DBS="$FALLBACK_DBS"
-    echo "$(now) WARNING: could not list databases from the server ($(tr '\n' ' ' < "$CATALOG_ERR")); dumping the fallback list only: $DBS" >&2
+    log "WARNING: could not list databases from the server ($(tr '\n' ' ' < "$CATALOG_ERR")); dumping the fallback list only: $DBS" >&2
 fi
 rm -f "$CATALOG_ERR"
 
@@ -148,10 +170,10 @@ for DB in $DBS; do
         # Size is best-effort (an iCloud file can be evicted to a placeholder
         # the instant it lands, making du error).
         SIZE="$(du -h "$OUT" 2>/dev/null | cut -f1 || true)"
-        echo "$(now) backed up ${DB} -> ${OUT} (${SIZE:-size unknown})"
+        log "backed up ${DB} -> ${OUT} (${SIZE:-size unknown})"
     else
         rm -f "$OUT.partial"
-        echo "$(now) FAILED to back up ${DB} (pg_dump, archive check, or rename failed)" >&2
+        log "FAILED to back up ${DB} (pg_dump, archive check, or rename failed)" >&2
         FAILED="$FAILED $DB"
         continue
     fi
@@ -170,6 +192,6 @@ done
 find "$DEST" -maxdepth 1 -name '*.partial' -type f -mtime +1 -delete || true
 
 if [ -n "$FAILED" ]; then
-    echo "$(now) run incomplete; failed:${FAILED}" >&2
+    log "run incomplete; failed:${FAILED}" >&2
     exit 1
 fi

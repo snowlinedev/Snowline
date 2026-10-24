@@ -25,7 +25,12 @@ install_unit() {
   # 0. never boot a unit out mid-run: the backup mid-dump, autocut mid-cut
   #    (re-checked here, right before the bootout, not only at script start)
   case " $AGENT_TIMERS " in *" $1 "*) backup_guard || true ;; esac
-  [ "$1" = autocut ] && autocut_guard "$GUARD_ARG"
+  if [ "$1" = autocut ] && autocut_lock_held; then
+    # A cut started since the pre-flight guard at the top: skip this unit
+    # rather than refuse mid-install (the services are already cycled).
+    echo "   an autocut is running now (lock held); leaving $label as it is — re-run the install after it finishes" >&2
+    return 1
+  fi
   # 1./2. units that had a per-user agent (the services, the agent-backed
   #    timers): stop the agent (ignore: it may not be loaded) and move its
   #    plist aside so it cannot reload at login and double-bind. A

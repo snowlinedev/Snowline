@@ -84,8 +84,10 @@ plists and bootstraps them back into `gui/501`. One exception: the backup
 timer `dev.snowline.backup` falls back to the tracked agent plist in
 `ops/hub/launchagents/` when no `.disabled-*` copy exists, and is left in
 the system domain only if no agent plist exists from any source, so a
-rollback never leaves the hub without a backup unit ("DB backups" below). Both scripts wait for a running backup to finish
-before booting its unit out.
+rollback never leaves the hub without a backup unit ("DB backups" below). Both scripts wait up to 10 minutes for a running
+backup (it holds `~/Library/Application Support/Snowline/backup.lock`) before
+booting its unit out, then proceed regardless, in which case that hour's
+dump may be lost.
 
 ## Deploy routine change
 
@@ -378,10 +380,15 @@ guard, agent restore, Postgres wait).
   `pg_restore -l`, then renames `.partial` to the final name — one store
   failing does not skip the others, and the run exits 1 if any did;
 - the store list comes from the server's own catalog: every `snowline_*`
-  database except `*_test*`, `*_dryrun*`, `*_e2e*`, `*_restore*` and the
-  legacy `snowline_dev`, so a new service's store is backed up from its
-  first hour without a code change (other projects' databases on the same
-  cluster are not this job's to dump). If the catalog cannot be read the run
+  database except scratch ones — a name with a `_test`, `_dryrun`, `_e2e`
+  or `_restore` component (as a whole component: `snowline_pm_test_sp` and
+  `snowline_restore` are scratch, `snowline_testimonials` would be a store)
+  and the legacy `snowline_dev` — so a new service's store is backed up
+  from its first hour without a code change (other projects' databases on
+  the same cluster are not this job's to dump). A readable catalog with no
+  `snowline_*` store at all is treated as the wrong cluster: the known
+  stores are tried and the run fails loudly rather than exiting 0 with
+  nothing dumped. If the catalog cannot be read the run
   falls back to the six known stores and says so. Setting
   `SNOWLINE_BACKUP_DBS` explicitly replaces the list; live stores it leaves
   out are noted in the log;
@@ -452,7 +459,7 @@ pg_restore --no-owner -d snowline_restore <dump>
 dropdb snowline_restore
 ```
 
-(`*_restore` databases are excluded from the hourly dump, so a lingering
+(A `*_restore` database is excluded from the hourly dump, so a lingering
 inspect database costs nothing but disk; drop it when done anyway.)
 
 To overwrite the live store (destructive; stop that service first):

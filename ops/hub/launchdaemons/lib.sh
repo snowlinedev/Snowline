@@ -56,18 +56,29 @@ wait_for_postgres() {
   return 0
 }
 
-# backup_guard — wait (up to 2 min) for a running snowline-backup.sh to finish
-# before anything boots its unit out: a SIGTERM mid-dump leaves a .partial in
-# iCloud and loses that hour's dump of the store it was on. Call it right
-# before the bootout, not minutes earlier.
+# backup_lock_held — is a backup run in progress? snowline-backup.sh holds
+# BACKUP_LOCK (a directory, created atomically with mkdir, holding its pid)
+# for its whole run and removes it on exit; a stale lock from a crashed run
+# (pid gone) does not count.
+BACKUP_LOCK="$OWNER_HOME/Library/Application Support/Snowline/backup.lock"
+backup_lock_held() {
+  [ -d "$BACKUP_LOCK" ] || return 1
+  pid="$(cat "$BACKUP_LOCK/pid" 2>/dev/null)"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+# backup_guard — wait (up to 10 min) for a running backup to finish before
+# anything boots its unit out: a SIGTERM mid-dump leaves a .partial in iCloud
+# and loses that hour's dump of the store it was on. Call it right before the
+# bootout, not minutes earlier. After the bound it returns 1 and the caller
+# proceeds (and says so).
 backup_guard() {
   waited=0
-  while pgrep -f 'ops/hub/snowline-backup.sh' >/dev/null 2>&1; do
-    if [ "$waited" -ge 120 ]; then
-      echo "   a backup run is still going after ${waited}s; continuing (its .partial is swept later)" >&2
+  while backup_lock_held; do
+    if [ "$waited" -ge 600 ]; then
+      echo "   a backup run is still going after ${waited}s; proceeding anyway (that hour's dump may be lost)" >&2
       return 1
     fi
-    echo "   backup run in progress; waiting (${waited}s)"
+    echo "   backup run in progress (pid $pid); waiting (${waited}s)"
     sleep 5
     waited=$((waited + 5))
   done
@@ -147,6 +158,7 @@ restore_agent() {
     return 1
   fi
   launchctl bootout "system/$label" 2>/dev/null || true
+  wait_unloaded "system/$label" || echo "   $label still registered after 30s; continuing" >&2
   rm -f "${DAEMONS_DIR:?}/${label:?}.plist"
   # A live agent plist (put there by hand since the daemon move) wins over
   # the older .disabled-* copy; the copy is only moved back when nothing
