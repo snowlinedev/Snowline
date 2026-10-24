@@ -55,7 +55,10 @@ DEST="${SNOWLINE_BACKUP_DIR:-$ICLOUD_ROOT/Snowline/db-backups}"
 RETENTION_DAYS="${SNOWLINE_BACKUP_RETENTION_DAYS:-30}"
 
 now() { date -u +%FT%TZ; }
-die() { echo "$(now) $*" >&2; exit 1; }
+# Exit codes: 2 = cannot run at all (destination / iCloud root / unwritable —
+# the environment, not the data); 1 = some store(s) failed to dump.
+# install-daemons.sh rolls the unit back to the per-user agent only on 2.
+die() { echo "$(now) $*" >&2; exit 2; }
 
 # --- destination: refuse to write "backups" that never leave the machine ---
 # `mkdir -p` of the full default path would silently recreate the iCloud
@@ -89,11 +92,12 @@ wait_for_postgres || true
 
 # --- the store list: the server's catalog is the authority ---
 # `-X` so a ~/.psqlrc (\timing etc.) cannot inject tokens into the list.
-live_dbs() {
-    psql -X -At -d postgres -c "select datname from pg_database where not datistemplate and datname <> 'postgres' order by 1" 2>/dev/null \
-        | grep -v -E "$SCRATCH_RE"
-}
-LIVE="$(live_dbs)" || LIVE=""
+# The catalog read and the scratch filter are separate steps so "server
+# unreachable" (fallback + WARNING) is distinguishable from "every database
+# is scratch" (nothing to dump, which is then reported per store).
+CATALOG_OK=yes
+CATALOG="$(psql -X -At -d postgres -c "select datname from pg_database where not datistemplate and datname <> 'postgres' order by 1" 2>/dev/null)" || CATALOG_OK=no
+LIVE="$(printf '%s\n' "$CATALOG" | grep -v -E "$SCRATCH_RE" | grep -v '^$' || true)"
 if [ -n "$DBS_EXPLICIT" ]; then
     DBS="$DBS_EXPLICIT"
     EXCLUDED=""
@@ -104,8 +108,9 @@ if [ -n "$DBS_EXPLICIT" ]; then
         esac
     done
     [ -z "$EXCLUDED" ] || echo "$(now) note: SNOWLINE_BACKUP_DBS excludes live store(s):${EXCLUDED}" >&2
-elif [ -n "$LIVE" ]; then
+elif [ "$CATALOG_OK" = yes ]; then
     DBS="$(printf '%s\n' "$LIVE" | tr '\n' ' ')"
+    [ -n "$LIVE" ] || echo "$(now) WARNING: the catalog holds no non-scratch database; nothing to dump" >&2
 else
     DBS="$FALLBACK_DBS"
     echo "$(now) WARNING: could not list databases from the server; dumping the fallback list only: $DBS" >&2

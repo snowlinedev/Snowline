@@ -17,6 +17,10 @@ SERVICES="platform pm governance memory"
 # timer loaded in both domains would dump twice an hour) — no-ops for a timer
 # that never had one.
 TIMERS="autocut backup"
+# Timers that replaced a per-user agent and prove themselves on load: their
+# RunAtLoad run is waited for and judged below, and the agent is put back if
+# the daemon cannot run at all. Same list as in uninstall-daemons.sh.
+AGENT_TIMERS="backup"
 OWNER_UID=501
 OWNER_HOME=/Users/seanlynch
 SRC="$(cd "$(dirname "$0")" && pwd)/launchdaemons"
@@ -28,6 +32,7 @@ STAMP="$(date +%Y%m%d)"
 # shellcheck disable=SC1091
 . "$SRC/lib.sh"
 autocut_guard "$@"
+backup_guard || true
 
 # install_unit <name> <kick:yes|no> — the same steps for a service and a timer;
 # only the trailing kickstart differs (a timer must never be kickstarted: that
@@ -42,8 +47,10 @@ install_unit() {
     mv "$AGENTS/$label.plist" "$AGENTS/$label.plist.disabled-$STAMP"
     echo "   agent plist -> $label.plist.disabled-$STAMP"
   fi
-  # 3. install the daemon plist (replace a previously loaded daemon cleanly)
+  # 3. install the daemon plist (replace a previously loaded daemon cleanly;
+  #    wait for the old instance to be gone so the bootstrap cannot race it)
   launchctl bootout "system/$label" 2>/dev/null || true
+  wait_unloaded "system/$label" || echo "   $label still registered after 30s; trying anyway" >&2
   cp "$SRC/$label.plist" "$DEST/$label.plist"
   chown root:wheel "$DEST/$label.plist"
   chmod 644 "$DEST/$label.plist"
@@ -60,11 +67,11 @@ for svc in $SERVICES; do
   install_unit "$svc" yes || fail=1   # the /health poll below reports it too
 done
 
-backup_loaded=yes
+not_loaded=""
 for timer in $TIMERS; do
   if ! install_unit "$timer" no; then
     fail=1
-    [ "$timer" = backup ] && backup_loaded=no
+    not_loaded="$not_loaded $timer"
   fi
 done
 
@@ -84,39 +91,59 @@ for entry in $urls; do
   [ "$ok" = yes ] || fail=1
 done
 
-# The backup timer's RunAtLoad dump proves the path end to end: wait for the
-# run to finish — it may itself wait up to 120s for Postgres, then dump every
-# store, so allow 5 minutes. Exit 0 = dumps landed. A non-zero exit = the
-# daemon cannot dump (e.g. the system domain lacks access to the owner's
-# iCloud folder, see docs/ops/hub-daemons.md "DB backups"): put the per-user
-# agent back if one exists (restore_agent keeps the daemon when there is
-# none) and fail. A run still in progress after the wait is reported and
-# fails the install but is NOT rolled back — booting a healthy in-flight
-# dump out would be worse than asking the operator to look.
-echo "== dev.snowline.backup (RunAtLoad dump)"
-code=""
-i=0
-if [ "$backup_loaded" = yes ]; then
+# Each AGENT_TIMERS unit proves itself on load: wait for its RunAtLoad run to
+# finish — the backup script may wait 120s for Postgres first, then dump
+# every store, so allow 5 minutes — and judge it:
+#   exit 0            dumps landed
+#   exit 2            the daemon cannot run at all in the system domain (no
+#                     destination / no iCloud root / cannot write — e.g. TCC,
+#                     see docs/ops/hub-daemons.md "DB backups"): put the
+#                     per-user agent back (restore_agent keeps the daemon when
+#                     there is none) and fail the install
+#   exit 1            some store(s) failed to dump — transient, identical
+#                     under the agent: fail the install, do NOT roll back
+#   still running     fail the install, do NOT roll back (a healthy in-flight
+#                     dump must not be booted out)
+#   never ran / killed (no pid, no exit code): treated like exit 2
+for timer in $AGENT_TIMERS; do
+  label="dev.snowline.$timer"
+  echo "== $label (RunAtLoad run)"
+  case " $not_loaded " in
+    *" $timer "*)
+      echo "   $timer: FAILED (daemon did not bootstrap)" >&2
+      restore_agent "$timer" keep-daemon-if-none || true
+      fail=1
+      continue
+      ;;
+  esac
+  code=""; running=no; i=0
   while [ "$i" -lt 300 ]; do
-    code="$(launchctl print system/dev.snowline.backup 2>/dev/null | sed -n 's/.*last exit code = \([0-9]*\).*/\1/p' | head -n 1)"
+    info="$(launchctl print "system/$label" 2>/dev/null)"
+    code="$(printf '%s\n' "$info" | sed -n 's/.*last exit code = \([0-9][0-9]*\).*/\1/p' | head -n 1)"
     [ -n "$code" ] && break
+    if printf '%s\n' "$info" | grep -q -E '^\s*(state = running|pid = [0-9])'; then
+      running=yes
+    else
+      running=no
+      # not running and no exit code: it never spawned or died by signal
+      [ "$i" -ge 10 ] && break
+    fi
     sleep 2
     i=$((i + 2))
   done
-  tail -n 8 "$OWNER_HOME/Library/Logs/snowline-backup.log" 2>/dev/null | sed 's/^/   /'
-fi
-if [ "$code" = 0 ]; then
-  echo "   backup: OK (exit 0)"
-elif [ "$backup_loaded" = yes ] && [ -z "$code" ]; then
-  echo "   backup: still running after ${i}s; not rolling back — check $OWNER_HOME/Library/Logs/snowline-backup.log and 'launchctl print system/dev.snowline.backup'" >&2
-  fail=1
-else
-  if [ "$backup_loaded" != yes ]; then
-    echo "   backup: FAILED (daemon did not bootstrap)" >&2
+  tail -n 8 "$OWNER_HOME/Library/Logs/snowline-$timer.log" 2>/dev/null | sed 's/^/   /'
+  if [ "$code" = 0 ]; then
+    echo "   $timer: OK (exit 0)"
+  elif [ "$code" = 1 ]; then
+    echo "   $timer: FAILED (exit 1: some store(s) failed; not rolling back — see $OWNER_HOME/Library/Logs/snowline-$timer.log)" >&2
+    fail=1
+  elif [ -z "$code" ] && [ "$running" = yes ]; then
+    echo "   $timer: still running after ${i}s; not rolling back — check $OWNER_HOME/Library/Logs/snowline-$timer.log and 'launchctl print system/$label'" >&2
+    fail=1
   else
-    echo "   backup: FAILED (exit $code) — see $OWNER_HOME/Library/Logs/snowline-backup.log" >&2
+    echo "   $timer: FAILED (${code:+exit $code}${code:-never ran, or killed by a signal}) — the daemon cannot run here; restoring the per-user agent" >&2
+    restore_agent "$timer" keep-daemon-if-none || true
+    fail=1
   fi
-  restore_agent backup keep-daemon-if-none || true
-  fail=1
-fi
+done
 exit "$fail"

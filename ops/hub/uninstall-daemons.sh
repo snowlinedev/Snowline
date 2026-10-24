@@ -21,6 +21,7 @@ SRC="$(cd "$(dirname "$0")" && pwd)/launchdaemons"
 # shellcheck disable=SC1091
 . "$SRC/lib.sh"
 autocut_guard "$@"
+backup_guard || true
 
 for timer in $TIMERS; do
   label="dev.snowline.$timer"

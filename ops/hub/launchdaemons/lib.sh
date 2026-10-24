@@ -11,17 +11,52 @@
 # anyway: launchd's KeepAlive, or the next timer tick, retries). Postgres on
 # the hub is the owner's per-user LaunchAgent, so anything that can start
 # before the login session must wait for it.
+# Logs through the caller's `log` function when one is defined (run-service.sh
+# prefixes its lines), else a UTC-stamped line of its own.
+_lib_log() {
+  if command -v log >/dev/null 2>&1; then log "$*"; else echo "$(date -u +%FT%TZ) $*"; fi
+}
 wait_for_postgres() {
   if [ -n "${1:-}" ]; then set -- -h "$1"; else set --; fi
   waited=0
   until pg_isready -q "$@"; do
     if [ "$waited" -ge 120 ]; then
-      echo "$(date -u +%FT%TZ) postgres not ready after ${waited}s; continuing anyway" >&2
+      _lib_log "postgres not ready after ${waited}s; continuing anyway (launchd / the next tick retries)"
       return 1
     fi
-    echo "$(date -u +%FT%TZ) waiting for postgres (${waited}s)"
+    _lib_log "waiting for postgres (${waited}s)"
     sleep 5
     waited=$((waited + 5))
+  done
+  return 0
+}
+
+# backup_guard — wait (up to 2 min) for a running snowline-backup.sh to
+# finish before anything boots its unit out: a SIGTERM mid-dump leaves a
+# .partial in iCloud and loses that hour's dump of the store it was on.
+backup_guard() {
+  waited=0
+  while pgrep -f 'ops/hub/snowline-backup.sh' >/dev/null 2>&1; do
+    if [ "$waited" -ge 120 ]; then
+      echo "   a backup run is still going after ${waited}s; continuing (its .partial is swept later)" >&2
+      return 1
+    fi
+    echo "   backup run in progress; waiting (${waited}s)"
+    sleep 5
+    waited=$((waited + 5))
+  done
+  return 0
+}
+
+# wait_unloaded <domain/label> — after a bootout, wait (up to 30 s) until
+# launchd no longer knows the label, so an immediate bootstrap of the same
+# label cannot race the teardown ("Operation already in progress").
+wait_unloaded() {
+  waited=0
+  while launchctl print "$1" >/dev/null 2>&1; do
+    [ "$waited" -ge 30 ] && return 1
+    sleep 1
+    waited=$((waited + 1))
   done
   return 0
 }
@@ -84,8 +119,11 @@ restore_agent() {
     echo "   restored $AGENTS/$label.plist"
   fi
   if [ -f "$AGENTS/$label.plist" ]; then
-    launchctl bootstrap "gui/$OWNER_UID" "$AGENTS/$label.plist" || true
-    return 0
+    if launchctl bootstrap "gui/$OWNER_UID" "$AGENTS/$label.plist"; then
+      return 0
+    fi
+    echo "   agent plist for $label is back on disk but could NOT be loaded into gui/$OWNER_UID (no login session?); it loads at the next login — nothing is running for $label until then" >&2
+    return 1
   fi
   echo "   no agent plist for $label; daemon removed, nothing loaded" >&2
   return 1

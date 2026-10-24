@@ -43,7 +43,7 @@ if [ -n "$dburl" ]; then
   # and let launchd's KeepAlive retry
   # shellcheck disable=SC1091
   . "$(dirname "$0")/lib.sh"
-  wait_for_postgres "$pghost" || log "postgres not ready; starting anyway (launchd will retry)"
+  wait_for_postgres "$pghost" || true   # it logs the timeout itself, via log()
 fi
 
 # --- platform: wait for the tailnet address to exist locally ---

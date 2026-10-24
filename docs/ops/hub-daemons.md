@@ -30,9 +30,10 @@ each of platform / pm / governance / memory:
    RunAtLoad dump starts here and runs while the next step polls.
 5. Polls the four `/health` URLs for up to 60s and prints UP/DOWN.
 6. Waits (up to 5 min) for the backup timer's first dump and fails the
-   install if it did not exit 0, restoring the per-user agent when one
-   exists; a dump still running at the deadline fails the install but is
-   not rolled back.
+   install if it did not exit 0. The per-user agent is restored only when
+   the daemon cannot run at all (exit 2, or it never ran); a store-level
+   failure (exit 1) or a dump still running at the deadline fails the
+   install without rolling back.
 
 The daemons run as `UserName=seanlynch`, `GroupName=staff`, so the mode-600
 env files in `~/.config/snowline/` stay readable. Logs are unchanged
@@ -79,7 +80,11 @@ All four must answer. If one does not, read
 
 `sudo ops/hub/uninstall-daemons.sh` boots out the system daemons, removes the
 plists from `/Library/LaunchDaemons`, restores the newest `.disabled-*` agent
-plists and bootstraps them back into `gui/501`.
+plists and bootstraps them back into `gui/501`. One exception: the backup
+timer `dev.snowline.backup` is left in the system domain when there is no
+agent plist to restore, so a rollback never leaves the hub without a backup
+unit ("DB backups" below). Both scripts wait for a running backup to finish
+before booting its unit out.
 
 ## Deploy routine change
 
@@ -408,11 +413,15 @@ One thing only that first install can tell: macOS treats `~/Library/Mobile
 Documents` as a protected location (Files and Folders → iCloud Drive). The
 per-user agent writes there today; a process in the system domain has no
 session to receive a consent prompt, so its first dump may die with
-"Operation not permitted". The install catches that (exit 1 → agent
-restored). If it happens, grant Full Disk Access to `/bin/bash` in System
-Settings → Privacy & Security, or point `SNOWLINE_BACKUP_DIR` at a
-non-protected folder that iCloud or another sync covers, then re-run the
-install.
+"Operation not permitted". The install catches that (exit 2 → the per-user
+agent is restored and keeps dumping). If it happens, the honest options in
+order: keep the per-user agent (it works, and the FileVault boot means the
+session is always there) and note it on item f304ec06; or set
+`SNOWLINE_BACKUP_DIR` in the daemon plist to a folder outside the protected
+tree that another sync covers. Granting Full Disk Access to `/bin/bash`
+would also work but widens TCC for every bash script on the hub, so treat
+it as a last resort and, if used, give it to a dedicated copy of the
+interpreter used only by this unit.
 
 **Is it alive?** Do this whenever you touch the hub — the job has silently
 died twice (2026-07-09 to 09-04 after the repo move; 2026-09-13 to 10-23
@@ -424,8 +433,10 @@ ls -t ~/Library/Mobile\ Documents/com~apple~CloudDocs/Snowline/db-backups | head
 ```
 
 `last exit code = 0` and a dump under an hour old is healthy. Exit 1 with
-log lines says which store failed. `78: EX_CONFIG` means launchd could not
-spawn the program (script path missing — check the checkout).
+log lines says which store failed. Exit 2 means the run could not start at
+all (destination missing or unwritable, iCloud root absent). `78: EX_CONFIG`
+means launchd could not spawn the program (script path missing — check the
+checkout).
 
 **Restore.** To inspect first (recommended):
 
