@@ -58,9 +58,10 @@ ICLOUD_ROOT="$HOME/Library/Mobile Documents/com~apple~CloudDocs"
 DEST="${SNOWLINE_BACKUP_DIR:-$ICLOUD_ROOT/Snowline/db-backups}"
 RETENTION_DAYS="${SNOWLINE_BACKUP_RETENTION_DAYS:-30}"
 
-# Shared helpers (log, wait_for_postgres); lib.sh only defines things.
+# Shared helpers (log, wait_for_postgres); lib.sh only defines things. A
+# checkout without it cannot run at all: exit 2, not a store failure.
 # shellcheck disable=SC1091
-. "$(dirname "$0")/launchdaemons/lib.sh"
+. "$(dirname "$0")/launchdaemons/lib.sh" || { echo "$(date -u +%FT%TZ) cannot source $(dirname "$0")/launchdaemons/lib.sh; is this a complete checkout?" >&2; exit 2; }
 # Exit codes: 2 = cannot run at all (destination / iCloud root / unwritable —
 # the environment, not the data); 1 = some store(s) failed to dump.
 # install-daemons.sh rolls the unit back to the per-user agent only on 2.
@@ -80,11 +81,17 @@ if [ -z "${SNOWLINE_BACKUP_LOCK_FD:-}" ]; then
     exec /usr/bin/python3 -c '
 import datetime, fcntl, os, sys
 lock, script, args = sys.argv[1], sys.argv[2], sys.argv[3:]
-fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+try:
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+except OSError as e:
+    # cannot even open the lock file (root-owned from a sudo run, dir
+    # unwritable): the environment, not the data -> exit 2
+    print("%s cannot open the run lock %s (%s); fix its ownership" % (stamp, lock, e), file=sys.stderr)
+    sys.exit(2)
 try:
     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 except OSError:
-    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     print("%s another backup run holds %s; stepping aside" % (stamp, lock), file=sys.stderr)
     sys.exit(3)
 os.set_inheritable(fd, True)
@@ -126,7 +133,7 @@ rm -f "$PROBE"
 # marker, not a stat of thousands of iCloud entries every hour. Best effort
 # on an iCloud folder, but say so.
 chmod 700 "$DEST" 2>/dev/null || log "WARNING: could not chmod 700 $DEST" >&2
-PERMS_MARK="$LOCKS_DIR/backup-perms-tightened"
+PERMS_MARK="$LOCKS_DIR/backup-perms-tightened.$(printf '%s' "$DEST" | cksum | cut -d' ' -f1)"   # per destination
 if [ ! -e "$PERMS_MARK" ]; then
     if find "$DEST" -maxdepth 1 -name '*.dump' -type f -perm +044 -exec chmod 600 {} + 2>/dev/null; then
         : > "$PERMS_MARK"
@@ -147,9 +154,16 @@ CATALOG_OK=yes
 CATALOG_ERR="$(mktemp -t snowline-backup-psql)"
 CATALOG="$(psql -X -At -d postgres -c "select datname from pg_database where not datistemplate and datname <> 'postgres' order by 1" 2>"$CATALOG_ERR")" || CATALOG_OK=no
 LIVE="$(printf '%s\n' "$CATALOG" | grep -E "$STORE_RE" | grep -v -E "$SCRATCH_RE" | grep -v '^$' || true)"
-# A whitespace-only SNOWLINE_BACKUP_DBS is "unset", not "dump nothing".
-set -- $DBS_EXPLICIT
+# A whitespace-only SNOWLINE_BACKUP_DBS is "unset", not "dump nothing"; the
+# split is done with globbing off so a stray `*` cannot expand against the
+# cwd, and each name must be a plain identifier.
+set -f; set -- $DBS_EXPLICIT; set +f
 DBS_EXPLICIT="$*"
+for db in $DBS_EXPLICIT; do
+    case "$db" in
+        *[!A-Za-z0-9_]*) die "SNOWLINE_BACKUP_DBS entry is not a database name: '$db'" ;;
+    esac
+done
 if [ -n "$DBS_EXPLICIT" ]; then
     DBS="$DBS_EXPLICIT"
     EXCLUDED=""
@@ -178,7 +192,9 @@ rm -f "$CATALOG_ERR"
 STAMP="$(date -u +%Y%m%d-%H%M%SZ)"
 FAILED=""
 
+set -f   # word-split DBS with globbing off (names are validated above / catalog-sourced)
 for DB in $DBS; do
+    set +f
     OUT="$DEST/${DB}-${STAMP}.dump"
     # Dump to a .partial name, verify the archive is readable, then atomically
     # rename — an interrupted or truncated dump (machine sleep, OOM, iCloud
@@ -207,6 +223,7 @@ for DB in $DBS; do
     find "$DEST" -maxdepth 1 -name "${DB}-*.dump" -type f -mtime +"$RETENTION_DAYS" -delete || true
     find "$DEST" -maxdepth 1 -name ".${DB}-*.dump.icloud" -type f -mtime +"$RETENTION_DAYS" -delete || true
 done
+set +f
 
 # Stale .partial leftovers from any store.
 find "$DEST" -maxdepth 1 -name '*.partial' -type f -mtime +1 -delete || true

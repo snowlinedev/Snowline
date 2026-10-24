@@ -26,13 +26,24 @@ trap 'rm -f "$START_MARK"' EXIT
 install_unit() {
   label="dev.snowline.$1"
   echo "== $label$([ "$2" = yes ] || echo ' (timer; not kickstarted)')"
-  # 0. never boot a unit out mid-run: wait on the unit's own run lock
-  #    (<name>.lock — autocut holds it for the cut, the backup for the dump;
-  #    a service has none). Still busy after the bound: skip this unit and
-  #    say so, rather than killing a run or refusing mid-install.
-  if ! unit_busy_wait "$1"; then
+  # 0. never boot a unit out mid-run: the backup waits on backup.lock (a
+  #    dump is minutes at most); autocut was refused up front by
+  #    autocut_guard (exit 75 / --wait), so a cut that started since is a
+  #    plain check here — still running means skip this unit and say so,
+  #    rather than killing the cut or refusing mid-install.
+  case "$1" in autocut) bound=0 ;; *) bound=600 ;; esac
+  if ! unit_busy_wait "$1" "$bound"; then
     echo "   leaving $label as it is — re-run the install after it finishes" >&2
     return 1
+  fi
+  # A timer whose installed plist is byte-identical and which is loaded is
+  # left alone: re-bootstrapping it would only fire a pointless RunAtLoad run
+  # (and, for the backup, a 5-minute verdict wait). Services are always
+  # cycled — this script is the deploy path and a restart picks up new code.
+  if [ "$2" != yes ] && cmp -s "$LAUNCHDAEMONS_SRC/$label.plist" "$DAEMONS_DIR/$label.plist" \
+     && launchctl print "system/$label" >/dev/null 2>&1; then
+    echo "   unchanged and loaded; left as it is"
+    return 0
   fi
   # 1./2. units that had a per-user agent (the services, the agent-backed
   #    timers): stop the agent (ignore: it may not be loaded) and move its
@@ -56,15 +67,19 @@ install_unit() {
   chown root:wheel "$DAEMONS_DIR/$label.plist"
   chmod 644 "$DAEMONS_DIR/$label.plist"
   if ! launchctl bootstrap system "$DAEMONS_DIR/$label.plist"; then
-    # A service whose old registration never finished tearing down is still
-    # loaded: restart it onto the new plist rather than leave the old code
-    # running behind an UP /health. Never for a timer (a kickstart fires a run).
-    if [ "$2" = yes ] && launchctl print "system/$label" >/dev/null 2>&1; then
-      echo "   bootstrap refused but $label is still loaded; restarting it" >&2
-      launchctl kickstart -k "system/$label" && return 0
+    # The old registration may not have finished tearing down: boot it out
+    # again, wait again, retry once. (A kickstart would only restart the OLD
+    # cached definition, so it is no substitute for a successful bootstrap.)
+    launchctl bootout "system/$label" 2>/dev/null || true
+    wait_unloaded "system/$label" || true
+    if ! launchctl bootstrap system "$DAEMONS_DIR/$label.plist"; then
+      if launchctl print "system/$label" >/dev/null 2>&1; then
+        echo "   bootstrap FAILED for $label and its OLD registration is still loaded (old definition keeps running) — re-run, or reboot" >&2
+      else
+        echo "   bootstrap FAILED for $label (nothing loaded)" >&2
+      fi
+      return 1
     fi
-    echo "   bootstrap FAILED for $label" >&2
-    return 1
   fi
   [ "$2" = yes ] && launchctl kickstart -k "system/$label"
   return 0
@@ -99,9 +114,9 @@ for entry in $urls; do
   [ "$ok" = yes ] || fail=1
 done
 
-# Each AGENT_TIMERS unit proves itself on load: wait for its RunAtLoad run to
-# finish — the backup script may wait 120s for Postgres first, then dump
-# every store, so allow 5 minutes — and judge it:
+# verify_backup — the backup unit proves itself on load: wait for its
+# RunAtLoad run to finish — the script may wait 120s for Postgres first,
+# then dump every store, so allow 5 minutes — and judge it:
 #   exit 0            dumps landed — and a fresh *.dump in the destination
 #                     proves it (an exit code alone is not evidence)
 #   exit 3            stepped aside because another backup run held the lock:
@@ -115,17 +130,24 @@ done
 #   still running     fail the install, do NOT roll back (a healthy in-flight
 #                     dump must not be booted out)
 #   never ran / killed (no pid, no exit code): treated like exit 2
-#   did not bootstrap the daemon plist is removed and the agent put back
-#                     (nothing was loaded, so there is no daemon to keep)
-for timer in $AGENT_TIMERS; do
+#   did not bootstrap if the OLD registration is still loaded it keeps running
+#                     and is left alone (re-run later); if nothing is loaded
+#                     the daemon plist is removed and the agent put back
+# Each AGENT_TIMERS unit needs its own verifier; today only the backup has one.
+verify_backup() {
+  timer=backup
   label="dev.snowline.$timer"
   echo "== $label (RunAtLoad run)"
   case " $not_loaded " in
     *" $timer "*)
-      echo "   $timer: FAILED (daemon did not bootstrap); removing its plist and restoring the per-user agent" >&2
-      restore_agent "$timer" || true
+      if launchctl print "system/$label" >/dev/null 2>&1; then
+        echo "   $timer: bootstrap was refused but the previously loaded daemon is still running; leaving it — re-run the install later" >&2
+      else
+        echo "   $timer: FAILED (daemon did not bootstrap, nothing loaded); removing its plist and restoring the per-user agent" >&2
+        restore_agent "$timer" || true
+      fi
       fail=1
-      continue
+      return
       ;;
   esac
   code=""; running=no; i=0
@@ -146,12 +168,20 @@ for timer in $AGENT_TIMERS; do
   tail -n 8 "$OWNER_HOME/Library/Logs/snowline-$timer.log" 2>/dev/null | sed 's/^/   /'
   if [ "$code" = 0 ]; then
     dest="$(plutil -extract EnvironmentVariables.SNOWLINE_BACKUP_DIR raw -o - "$DAEMONS_DIR/$label.plist" 2>/dev/null || echo "$BACKUP_DIR")"
-    if find "$dest" -maxdepth 1 -name '*.dump' -type f -newer "$START_MARK" 2>/dev/null | grep -q .; then
-      echo "   $timer: OK (exit 0, fresh dump in $dest)"
+    # Evidence: a fresh dump. The destination is in the owner's iCloud tree,
+    # which TCC may hide from this (root, Terminal-spawned) process; a find
+    # that ERRORS is "could not verify", not "no dump".
+    find_err="$(mktemp -t snowline-install-find)"
+    fresh="$(find "$dest" -maxdepth 1 -name '*.dump' -type f -newer "$START_MARK" 2>"$find_err" | head -n 1)"
+    if [ -n "$fresh" ]; then
+      echo "   $timer: OK (exit 0, fresh dump $(basename "$fresh"))"
+    elif [ -s "$find_err" ]; then
+      echo "   $timer: exit 0, but this shell could not read $dest to confirm a fresh dump ($(head -n 1 "$find_err")); verify by hand: ls -t '$dest' | head" >&2
     else
       echo "   $timer: exit 0 but NO new dump in $dest — not trusting it; check $OWNER_HOME/Library/Logs/snowline-$timer.log" >&2
       fail=1
     fi
+    rm -f "$find_err"
   elif [ "$code" = 3 ]; then
     echo "   $timer: inconclusive (exit 3: another backup run held the lock; nothing dumped by this unit yet); not rolling back — re-check in an hour" >&2
     fail=1
@@ -166,5 +196,12 @@ for timer in $AGENT_TIMERS; do
     restore_agent "$timer" keep-daemon-if-none || true
     fail=1
   fi
+}
+
+for timer in $AGENT_TIMERS; do
+  case "$timer" in
+    backup) verify_backup ;;
+    *) echo "== dev.snowline.$timer: no verifier for this unit; check it by hand" >&2; fail=1 ;;
+  esac
 done
 exit "$fail"

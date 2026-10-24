@@ -67,25 +67,30 @@ wait_for_postgres() {
 LOCKS_DIR="$OWNER_HOME/Library/Application Support/Snowline"
 BACKUP_LOCK="$LOCKS_DIR/backup.lock"
 BACKUP_DIR="$OWNER_HOME/Library/Mobile Documents/com~apple~CloudDocs/Snowline/db-backups"
+# Probes with a SHARED non-blocking lock (as autocut's own lock_state does):
+# it fails only while an exclusive holder runs, and never leaves the probe
+# owning the exclusive lock for an instant.
 lock_held() {
   [ -e "$1" ] || return 1
   /usr/bin/python3 -c 'import fcntl, os, sys
 fd = os.open(sys.argv[1], os.O_RDONLY)
 try:
-    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
 except OSError:
     sys.exit(0)
 sys.exit(1)' "$1"
 }
-# unit_busy_wait <name> — wait (up to 10 min) while <name>.lock is held; the
-# ops scripts call it right before booting that unit out. Returns 1 if still
-# held after the bound (the caller then skips the unit rather than killing a
-# run). A unit with no lock file is never busy.
+# unit_busy_wait <name> [bound_s] — wait (default up to 10 min) while
+# <name>.lock is held; the ops scripts call it right before booting that unit
+# out. Returns 1 if still held after the bound (the caller then skips the
+# unit rather than killing a run). A bound of 0 is a plain check. A unit
+# with no lock file is never busy.
 unit_busy_wait() {
   lock="$LOCKS_DIR/$1.lock"
+  bound="${2:-600}"
   busy_waited=0
   while lock_held "$lock"; do
-    if [ "$busy_waited" -ge 600 ]; then
+    if [ "$busy_waited" -ge "$bound" ]; then
       echo "   $1 is still running after ${busy_waited}s ($lock held)" >&2
       return 1
     fi

@@ -400,9 +400,11 @@ guard, agent restore, Postgres wait).
   is turned off with "keep a copy", the folder stays and the guard cannot
   tell, so confirm from another device now and then that a recent dump is
   actually in iCloud;
-- writes owner-only (umask 077, destination 0700, and existing 0644 dumps
-  are tightened to 0600 on each run): the platform dump carries the live
-  replication HMAC secrets, so a dump is as sensitive as the hub;
+- writes owner-only (umask 077, destination 0700; dumps that predate this
+  posture are tightened to 0600 once per destination, recorded by a marker
+  under `~/Library/Application Support/Snowline/`): the platform dump
+  carries the live replication HMAC secrets, so a dump is as sensitive as
+  the hub;
 - prunes each store's dumps older than `SNOWLINE_BACKUP_RETENTION_DAYS`
   (30), including iCloud-evicted `.NAME.icloud` placeholders; the legacy
   `snowline_dev-*` dumps are never touched.
