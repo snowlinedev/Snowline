@@ -26,16 +26,14 @@ LAUNCHDAEMONS_SRC="$OPS_HUB/launchdaemons"
 LAUNCHAGENTS_SRC="$OPS_HUB/launchagents"
 
 # ---- logging ----
-# Through the caller's `log` shell FUNCTION when one is defined (run-service.sh
-# prefixes its lines), else a UTC-stamped line of its own. `command -v log`
-# would find /usr/bin/log on macOS, so test for a function explicitly.
-_lib_log() {
-  if type log 2>/dev/null | head -n 1 | grep -q 'function'; then
-    log "$*"
-  else
-    echo "$(date -u +%FT%TZ) $*"
-  fi
-}
+# Helpers log through `log`. A caller that defines its own log() FUNCTION
+# before sourcing (run-service.sh prefixes its lines) keeps it; otherwise a
+# default UTC-stamped one is defined here. Tested with `type` (not
+# `command -v`, which finds /usr/bin/log on macOS) at source time, with no
+# `head` in the pipe so pipefail callers cannot see a SIGPIPE.
+if ! type log 2>/dev/null | grep -q 'function'; then
+  log() { echo "$(date -u +%FT%TZ) $*"; }
+fi
 
 # ---- waits ----
 # wait_for_postgres [host] — bounded wait (120 s, 5 s steps) for pg_isready;
@@ -48,10 +46,10 @@ wait_for_postgres() {
   waited=0
   until pg_isready -q "$@"; do
     if [ "$waited" -ge 120 ]; then
-      _lib_log "postgres not ready after ${waited}s; continuing anyway (launchd / the next tick retries)"
+      log "postgres not ready after ${waited}s; continuing anyway (launchd / the next tick retries)"
       return 1
     fi
-    _lib_log "waiting for postgres (${waited}s)"
+    log "waiting for postgres (${waited}s)"
     sleep 5
     waited=$((waited + 5))
   done
@@ -150,11 +148,16 @@ restore_agent() {
   fi
   launchctl bootout "system/$label" 2>/dev/null || true
   rm -f "${DAEMONS_DIR:?}/${label:?}.plist"
-  if [ -n "$disabled" ]; then
+  # A live agent plist (put there by hand since the daemon move) wins over
+  # the older .disabled-* copy; the copy is only moved back when nothing
+  # else is there.
+  if [ -f "$AGENTS/$label.plist" ]; then
+    [ -z "$disabled" ] || echo "   keeping the live $AGENTS/$label.plist (leaving $disabled aside)"
+  elif [ -n "$disabled" ]; then
     mv "$disabled" "$AGENTS/$label.plist"
     chown "$OWNER_UID" "$AGENTS/$label.plist"
     echo "   restored $AGENTS/$label.plist"
-  elif [ ! -f "$AGENTS/$label.plist" ] && [ -f "$tracked" ]; then
+  elif [ -f "$tracked" ]; then
     cp "$tracked" "$AGENTS/$label.plist"
     chown "$OWNER_UID" "$AGENTS/$label.plist"
     chmod 644 "$AGENTS/$label.plist"

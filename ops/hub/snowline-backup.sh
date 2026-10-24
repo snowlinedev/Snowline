@@ -47,7 +47,9 @@ FALLBACK_DBS="snowline_platform snowline_pm snowline_governance snowline_memory 
 # patterns: test / dry-run / e2e stores, the legacy snowline_dev, and
 # `*_restore` (the documented inspect-first restore target).
 STORE_RE='^snowline_'
-SCRATCH_RE='(_test|_dryrun|_e2e|_restore|^snowline_dev$)'
+# Anchored as whole name components, so a real store whose name merely
+# contains one of these words (snowline_testimonials) is not dropped.
+SCRATCH_RE='(_(test|dryrun|e2e|restore)(_|$)|^snowline_dev$)'
 ICLOUD_ROOT="$HOME/Library/Mobile Documents/com~apple~CloudDocs"
 # Off-machine by default: iCloud Drive replicates the dumps off this host, so a
 # disk failure / theft doesn't take the backups with it. Override with the
@@ -56,11 +58,14 @@ ICLOUD_ROOT="$HOME/Library/Mobile Documents/com~apple~CloudDocs"
 DEST="${SNOWLINE_BACKUP_DIR:-$ICLOUD_ROOT/Snowline/db-backups}"
 RETENTION_DAYS="${SNOWLINE_BACKUP_RETENTION_DAYS:-30}"
 
+# Shared helpers (log, wait_for_postgres); lib.sh only defines things.
+# shellcheck disable=SC1091
+. "$(dirname "$0")/launchdaemons/lib.sh"
 now() { date -u +%FT%TZ; }
 # Exit codes: 2 = cannot run at all (destination / iCloud root / unwritable —
 # the environment, not the data); 1 = some store(s) failed to dump.
 # install-daemons.sh rolls the unit back to the per-user agent only on 2.
-die() { echo "$(now) $*" >&2; exit 2; }
+die() { log "$*" >&2; exit 2; }
 
 # --- destination: refuse to write "backups" that never leave the machine ---
 # `mkdir -p` of the full default path would silently recreate the iCloud
@@ -84,7 +89,12 @@ case "$DEST" in
         ;;
 esac
 mkdir -p "$DEST" || die "cannot create backup destination: $DEST"
-[ -w "$DEST" ] || die "backup destination not writable: $DEST"
+# A real create, not `[ -w ]`: access(2) does not see a TCC denial (a
+# system-domain process without iCloud Drive consent) or a full/read-only
+# volume, and those must be exit 2 ("cannot run here"), not a per-store 1.
+PROBE="$DEST/.probe.$$"
+( : > "$PROBE" ) 2>/dev/null || die "backup destination not writable: $DEST (TCC consent? full or read-only volume?)"
+rm -f "$PROBE"
 # Owner-only posture for the folder AND for dumps written before this script
 # enforced it (they were 0644). Best effort on an iCloud folder, but say so.
 chmod 700 "$DEST" 2>/dev/null || echo "$(now) WARNING: could not chmod 700 $DEST" >&2
@@ -92,8 +102,6 @@ find "$DEST" -maxdepth 1 -name '*.dump' -type f -perm +044 -exec chmod 600 {} + 
     || echo "$(now) WARNING: could not tighten permissions on existing dumps in $DEST" >&2
 
 # --- wait for Postgres (bounded; see lib.sh) ---
-# shellcheck disable=SC1091
-. "$(dirname "$0")/launchdaemons/lib.sh"
 wait_for_postgres || true
 
 # --- the store list: the server's catalog is the authority ---

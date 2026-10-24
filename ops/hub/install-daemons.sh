@@ -11,7 +11,8 @@
 
 # shellcheck disable=SC1091
 . "$(cd "$(dirname "$0")" && pwd)/launchdaemons/lib.sh"
-autocut_guard "$@"
+GUARD_ARG="${1:-}"
+autocut_guard "$GUARD_ARG"
 
 STAMP="$(date +%Y%m%d)"
 
@@ -21,15 +22,24 @@ STAMP="$(date +%Y%m%d)"
 install_unit() {
   label="dev.snowline.$1"
   echo "== $label$([ "$2" = yes ] || echo ' (timer; not kickstarted)')"
-  # 0. a unit that dumps on a timer: never boot it out mid-run
+  # 0. never boot a unit out mid-run: the backup mid-dump, autocut mid-cut
+  #    (re-checked here, right before the bootout, not only at script start)
   case " $AGENT_TIMERS " in *" $1 "*) backup_guard || true ;; esac
-  # 1. stop the agent (ignore: it may not be loaded) ...
-  launchctl bootout "gui/$OWNER_UID/$label" 2>/dev/null || true
-  # 2. ... and move its plist aside so it cannot reload at login and double-bind
-  if [ -f "$AGENTS/$label.plist" ]; then
-    mv "$AGENTS/$label.plist" "$AGENTS/$label.plist.disabled-$STAMP"
-    echo "   agent plist -> $label.plist.disabled-$STAMP"
-  fi
+  [ "$1" = autocut ] && autocut_guard "$GUARD_ARG"
+  # 1./2. units that had a per-user agent (the services, the agent-backed
+  #    timers): stop the agent (ignore: it may not be loaded) and move its
+  #    plist aside so it cannot reload at login and double-bind. A
+  #    system-only timer never had one, so any same-label agent plist is
+  #    somebody's experiment and is left alone.
+  case " $SERVICES $AGENT_TIMERS " in
+    *" $1 "*)
+      launchctl bootout "gui/$OWNER_UID/$label" 2>/dev/null || true
+      if [ -f "$AGENTS/$label.plist" ]; then
+        mv "$AGENTS/$label.plist" "$AGENTS/$label.plist.disabled-$STAMP"
+        echo "   agent plist -> $label.plist.disabled-$STAMP"
+      fi
+      ;;
+  esac
   # 3. install the daemon plist (replace a previously loaded daemon cleanly;
   #    wait for the old instance to be gone so the bootstrap cannot race it)
   launchctl bootout "system/$label" 2>/dev/null || true
