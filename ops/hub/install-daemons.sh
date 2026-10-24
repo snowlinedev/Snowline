@@ -100,9 +100,11 @@ done
 # the dumps need the owner's session anyway (Postgres is the owner's agent,
 # iCloud syncs per session), so a daemon would add no coverage, only a TCC
 # problem. Operator overrides live in ~/.config/snowline/backup.env, never
-# in the plist. The plist is rendered with THIS checkout's script path. The
-# unit is (re)loaded — plist copied in at that point, never before — when
-# the rendered plist differs from the installed one, the unit is not
+# in the plist. The plist carries the canonical checkout path for the script
+# (never a path taken from whichever checkout runs this install), and is not
+# loaded at all when nothing is at that path. The unit is (re)loaded — plist
+# copied in at that point, never before — when the tracked plist differs
+# from the installed one, the unit is not
 # loaded, its last run exited with anything but 0 or 3 (3 = "stepped
 # aside" is harmless), or no dump has landed in the last two hours (an exit
 # code alone is not evidence: a unit launchd stopped firing still shows its
