@@ -66,7 +66,8 @@ die() { log "$*" >&2; exit 2; }
 # would never reach the trap), removed on every exit path.
 CATALOG_ERR="$(mktemp -t snowline-backup-psql)"
 Z_DUMPS_ERR="$(mktemp -t snowline-backup-find)"
-trap 'rm -f "$CATALOG_ERR" "$Z_DUMPS_ERR"' EXIT
+PROBE=""   # the destination write probe, set below; removed on every exit too
+trap 'rm -f "$CATALOG_ERR" "$Z_DUMPS_ERR" ${PROBE:+"$PROBE"}' EXIT
 # A SIGTERM/SIGINT at ANY point (a bootout during the Postgres wait, a
 # logout, a shutdown) logs itself; once a dump is in flight (OUT/DUMP_PID
 # set below) it is killed and its partial removed. Armed here, not just
@@ -160,24 +161,18 @@ esac
 # the split is done with globbing off so a stray `*` cannot expand against
 # the cwd, and each name must be a plain identifier (valid_names, below,
 # is the one rule for every source of names).
-# valid_names <names...> — prints the names; a non-identifier is fatal
-# (exit 2). The catalog applies the same rule in SQL.
-valid_names() {
-    for vn in "$@"; do
-        case "$vn" in
-            *[!A-Za-z0-9_]*) die "SNOWLINE_BACKUP_DBS entry is not a database name: '$vn'" ;;
-            *) printf '%s ' "$vn" ;;
-        esac
-    done
-}
+# (the catalog query applies the same identifier rule in SQL)
 DBS_EXPLICIT="${SNOWLINE_BACKUP_DBS:-}"
 set -f
 # shellcheck disable=SC2086
 set -- $DBS_EXPLICIT
 set +f
-# (valid_names runs in a subshell here, so its exit 2 must be propagated)
-DBS_EXPLICIT="$(valid_names "$@")" || exit 2
-DBS_EXPLICIT="${DBS_EXPLICIT% }"
+DBS_EXPLICIT="$*"
+for vn in "$@"; do
+    case "$vn" in
+        *[!A-Za-z0-9_]*) die "SNOWLINE_BACKUP_DBS entry is not a database name: '$vn'" ;;
+    esac
+done
 # --- run lock: a flock on $BACKUP_LOCK, held for the whole run ---
 # fd 9 is opened on the lock file for the life of this process; a one-line
 # python takes the flock on that inherited fd (the lock lives on the open
@@ -229,7 +224,7 @@ esac
 # volume, and those must be exit 2 ("cannot run here"), not a per-store 1.
 PROBE="$DEST/.probe.$$"
 ( : > "$PROBE" ) 2>/dev/null || die "backup destination not writable: $DEST (TCC consent? full or read-only volume?)"
-rm -f "$PROBE"
+rm -f "$PROBE"; PROBE=""
 # Owner-only posture for the folder and for every dump in it: new dumps are
 # written under umask 077; older ones (0644 before this script enforced it)
 # and dumps that iCloud re-materialises are tightened each run — a few
@@ -310,6 +305,18 @@ prune_by_name() {
 # TERM/INT handler armed at the top runs at once, kills the dump and
 # removes its partial.
 for DB in "$@"; do
+    # Prune FIRST, and for every store whether or not its dump then succeeds:
+    # a full destination (iCloud quota, disk) must be able to free itself.
+    # Per-store pattern, so dumps of stores no longer in the list (e.g. the
+    # legacy snowline_dev history) are left alone. iCloud evicts old files
+    # to `.NAME.icloud` placeholders, which are pruned by the same rule or
+    # the folder grows without bound. Age comes from the UTC stamp in the
+    # NAME (same rule as --check: a placeholder's mtime is eviction time,
+    # not dump time); the old pre-Z names are local time and go by mtime.
+    # Non-fatal: a find hiccup must not fail the run.
+    prune_by_name "$DB" || true
+    # (-mtime +N means "older than N+1 days"; +N-1 gives the same window as the stamp rule)
+    find "$DEST" -maxdepth 1 \( -name "${DB}-*[0-9].dump" -o -name ".${DB}-*[0-9].dump.icloud" \) -type f -mtime +"$((RETENTION_DAYS - 1))" -delete 2>/dev/null || true
     OUT="$DEST/${DB}-${STAMP}.dump"
     # Dump to a .partial name, verify the archive is readable, then atomically
     # rename — an interrupted or truncated dump (machine sleep, OOM, iCloud

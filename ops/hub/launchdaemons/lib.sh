@@ -42,15 +42,14 @@ if ! type log 2>/dev/null | grep -q 'function'; then
 fi
 
 # ---- waits ----
-# wait_for_postgres [host] — bounded wait (120 s, 5 s steps) for pg_isready;
-# returns 0 when ready, 1 after the bound (callers go on anyway: the next
-# timer tick retries). Postgres on the hub is the owner's per-user
-# LaunchAgent, so anything that can start before the login session must
-# wait for it.
+# wait_for_postgres — bounded wait (120 s, 5 s steps) for pg_isready on the
+# local socket; returns 0 when ready, 1 after the bound (callers go on
+# anyway: the next timer tick retries). Postgres on the hub is the owner's
+# per-user LaunchAgent, so anything that can start before the login session
+# must wait for it.
 wait_for_postgres() {
-  if [ -n "${1:-}" ]; then set -- -h "$1"; else set --; fi
   waited=0
-  until pg_isready -q "$@"; do
+  until pg_isready -q; do
     if [ "$waited" -ge 120 ]; then
       log "postgres not ready after ${waited}s; continuing anyway (the next tick retries)"
       return 1
@@ -133,7 +132,7 @@ flock_fd() {
 # callers treat it like held — but without waiting on it.
 lock_state() {
   [ -e "$1" ] || { echo free; return; }
-  if ! exec 8<"$1" 2>/dev/null; then echo unknown; return; fi
+  if ! { exec 8<"$1"; } 2>/dev/null; then echo unknown; return; fi
   flock_fd 8 sh 1
   ls_rc=$?
   exec 8<&-

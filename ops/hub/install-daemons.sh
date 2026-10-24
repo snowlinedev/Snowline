@@ -120,9 +120,8 @@ done
 label="dev.snowline.backup"
 log_file="$BACKUP_LOG"
 echo "== $label (per-user agent)"
-# the log must belong to the owner (the agent opens it as uid 501); the
-# proving run below appends to it from this root shell, so create it first
-# as the owner rather than let the redirection create it root-owned
+# the log must belong to the owner (the agent opens it as uid 501); make
+# sure it exists with that owner before anything tails or judges it
 if [ ! -e "$log_file" ]; then
   touch "$log_file" && chown "$OWNER_UID" "$log_file"
 fi
@@ -145,20 +144,37 @@ if [ ! "$OPS_HUB/snowline-backup.sh" -ef "$script" ]; then
 fi
 echo "   unit runs $script"
 as_owner() { sudo -u "#$OWNER_UID" -H /bin/bash "$script" "$@"; }
-# the destination, as the script resolves it; a failure (a bad backup.env
-# line, a sudo problem) is shown with the script's own message
-if ! dest="$(as_owner --print-dest 2>&1)"; then
-  echo "   --print-dest failed: $(printf '%s\n' "$dest" | tail -n 1)" >&2
+# the destination, as the script resolves it (stdout only: one line); a
+# failure (a bad backup.env line, a sudo problem) is shown with the
+# script's own last line
+dest_err="$(mktemp -t snowline-install-dest)"
+if ! dest="$(as_owner --print-dest 2>"$dest_err")" || [ -z "$dest" ]; then
+  echo "   --print-dest failed: $(tail -n 1 "$dest_err")" >&2
   dest="(unknown)"
 fi
-# judge_dump <minutes> — OK / NONE / UNKNOWN for a dump newer than
-# <minutes>, by the script's EXIT CODE (0/1/other), with its last output
-# line kept in JUDGE_MSG so a failure says why (a backup.env error, sudo,
-# TCC) instead of a guess
+rm -f "$dest_err"
+# judge_dump <minutes> — sets JUDGE to OK / NONE / UNKNOWN for a dump newer
+# than <minutes>, by the script's EXIT CODE (0/1/other), and JUDGE_MSG to
+# its last output line so a failure says why (a backup.env error, sudo,
+# TCC). A plain command, not a substitution: the variables must reach the
+# caller.
 judge_dump() {
   JUDGE_MSG="$(as_owner --check "$1" 2>&1)"; jd_rc=$?
   JUDGE_MSG="$(printf '%s\n' "$JUDGE_MSG" | tail -n 1)"
-  case $jd_rc in 0) echo OK ;; 1) echo NONE ;; *) echo UNKNOWN ;; esac
+  case $jd_rc in 0) JUDGE=OK ;; 1) JUDGE=NONE ;; *) JUDGE=UNKNOWN ;; esac
+}
+# log_since <YYYY-MM-DDTHH:MM:SSZ> — sets LOGSAYS to OK / FAIL / NONE from the
+# backup log's lines stamped at or after that instant (the agent's own
+# account of a run, written from its own launchd session — the fallback
+# when this install's context cannot read the destination)
+log_since() {
+  LOGSAYS=NONE
+  ls_lines="$(awk -v s="$1" '$1 >= s' "$log_file" 2>/dev/null)"
+  if printf '%s\n' "$ls_lines" | grep -q -E 'FAILED|run incomplete|interrupted|cannot|not writable|missing'; then
+    LOGSAYS=FAIL
+  elif printf '%s\n' "$ls_lines" | grep -q 'backed up'; then
+    LOGSAYS=OK
+  fi
 }
 why=""
 if ! cmp -s "$plist_src" "$AGENTS/$label.plist" 2>/dev/null; then
@@ -172,10 +188,19 @@ else
     *) why="last run exited $UNIT_EXIT" ;;
   esac
   if [ -z "$why" ]; then
-    case "$(judge_dump 120)" in
+    judge_dump 120
+    case "$JUDGE" in
       OK)   echo "   unchanged and loaded, dumped within 2 h; left as it is" ;;
       NONE) why="no dump in the last 2 h in $dest" ;;
-      *)    echo "   unchanged and loaded; could not check $dest for a recent dump ($JUDGE_MSG) — check by hand: ls -t '$dest' | head" >&2; fail=1 ;;
+      *)
+        # this install's context cannot read the destination (ssh without
+        # Full Disk Access, say): fall back to the agent's own log
+        log_since "$(date -u -v-120M +%FT%TZ)"
+        case "$LOGSAYS" in
+          OK)   echo "   unchanged and loaded; the log shows a dump within 2 h (destination not checkable from here: $JUDGE_MSG); left as it is" ;;
+          FAIL) why="the log shows a failed run within 2 h" ;;
+          *)    echo "   unchanged and loaded; could not check $dest ($JUDGE_MSG) and the log shows no run within 2 h — check by hand: ls -t '$dest' | head" >&2; fail=1 ;;
+        esac ;;
     esac
   fi
 fi
@@ -193,35 +218,57 @@ if [ -n "$why" ]; then
 fi
 
 # --- prove the backup, if this install (re)loaded it ---
-# Not by watching launchd run it (RunAtLoad is off): the script is run
-# synchronously as the owner, so its exit code and its log are read
-# directly, then the destination is asked for a dump newer than that run
-# (the agent, when launchd fires it hourly, runs in the same user session
-# with the same files; what this proves is the script, the configuration,
-# the destination and Postgres, which is everything that can be wrong). An
-# hourly fire landing meanwhile steps aside (exit 3) harmlessly; the
-# reverse — this run finding the lock held — is waited out once.
+# Through launchd (`kickstart`), so the run happens in the agent's OWN
+# session — its TCC posture, its environment — not this install's (an ssh
+# session without Full Disk Access could not even write the destination).
+# Completion is seen in launchd's run counter and the run's exit code is
+# the agent's; evidence is a dump newer than the run (asked of the script
+# as the owner) or, when this context cannot read the destination, the
+# agent's own log lines for the run. Exit 3 (an hourly fire held the lock)
+# is waited out once and judged by the same evidence: a dump newer than the
+# run start is what matters, whichever run made it.
 if [ "$backup_loaded" = yes ]; then
-  echo "== $label (proving run, as the owner)"
-  run_epoch="$(date +%s)"
-  as_owner >>"$log_file" 2>&1; rc=$?   # its lines go where the hourly runs' do
-  if [ "$rc" = 3 ]; then
-    echo "   an hourly run held the lock; waiting for it, then running once more"
-    unit_busy_wait backup 600 || true
-    run_epoch="$(date +%s)"
-    as_owner >>"$log_file" 2>&1; rc=$?
-  fi
-  tail -n 8 "$log_file" 2>/dev/null | sed 's/^/   /'
-  if [ "$rc" = 0 ]; then
-    mins=$(( ($(date +%s) - run_epoch) / 60 + 1 ))
-    case "$(judge_dump "$mins")" in
-      OK)   echo "   OK (exit 0; dump landed in $dest)" ;;
-      NONE) echo "   exit 0 but NO new dump in $dest — not trusting it; check $log_file" >&2; fail=1 ;;
-      *)    echo "   exit 0, UNCONFIRMED: could not check $dest ($JUDGE_MSG) — verify by hand: ls -t '$dest' | head" >&2; fail=1 ;;
-    esac
-  else
-    echo "   FAILED (exit $rc) — see $log_file (1: a store failed; 2: cannot run here; 3: lock held twice in a row)" >&2
+  echo "== $label (proving run, via launchd)"
+  unit_snapshot "gui/$OWNER_UID/$label"; runs_before="$UNIT_RUNS"
+  run_stamp="$(date -u +%FT%TZ)"; run_epoch="$(date +%s)"
+  if ! launchctl kickstart "gui/$OWNER_UID/$label"; then
+    echo "   kickstart refused; the unit is loaded but unproven — run 'bash $script' by hand as the owner" >&2
     fail=1
+  else
+    code=""; i=0
+    while [ "$i" -lt 420 ]; do   # 120 s Postgres wait + dumps + a lock wait
+      unit_snapshot "gui/$OWNER_UID/$label" || break   # unit gone
+      if [ "$UNIT_RUNNING" = no ] && [ "$UNIT_RUNS" -gt "$runs_before" ]; then
+        code="$UNIT_EXIT"; break
+      fi
+      sleep 2
+      i=$((i + 2))
+    done
+    if [ "$code" = 3 ]; then
+      echo "   stepped aside (an hourly run held the lock); waiting for that run and judging its dump instead"
+      unit_busy_wait backup 600 || true
+      code=0
+    fi
+    tail -n 8 "$log_file" 2>/dev/null | sed 's/^/   /'
+    if [ "$code" = 0 ]; then
+      judge_dump $(( ($(date +%s) - run_epoch) / 60 + 1 ))
+      case "$JUDGE" in
+        OK)   echo "   OK (exit 0; dump landed in $dest)" ;;
+        NONE) echo "   exit 0 but NO new dump in $dest — not trusting it; check $log_file" >&2; fail=1 ;;
+        *)
+          log_since "$run_stamp"
+          case "$LOGSAYS" in
+            OK) echo "   OK (exit 0; the log shows the dump — destination not checkable from this context: $JUDGE_MSG)" ;;
+            *)  echo "   exit 0, UNCONFIRMED: could not check $dest ($JUDGE_MSG) and the log shows no dump — verify by hand: ls -t '$dest' | head" >&2; fail=1 ;;
+          esac ;;
+      esac
+    elif [ -z "$code" ]; then
+      echo "   no result after ${i}s (still running, never spawned, or killed by a signal) — check $log_file and 'launchctl print gui/$OWNER_UID/$label'" >&2
+      fail=1
+    else
+      echo "   FAILED (exit $code) — see $log_file (1: a store failed; 2: cannot run here)" >&2
+      fail=1
+    fi
   fi
 fi
 exit "$fail"

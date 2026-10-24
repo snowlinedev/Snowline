@@ -43,14 +43,15 @@ each of platform / pm / governance / memory:
    checkout ever moves.
    Operator overrides live in `~/.config/snowline/backup.env`, never in the
    plist. It stays a per-user agent on purpose ("DB backups" below).
-7. If step 6 (re)loaded the backup agent, proves it by running the script
-   once synchronously as the owner and fails the install unless that run
-   exited 0 AND a dump newer than it was confirmed in the destination
-   ("could not check" also fails, with the command to check by hand). An
-   exit 3 (an hourly fire held the lock) is waited out and the run
-   repeated once. An unchanged, loaded agent is left alone only when its
-   last run was fine (exit 0, or 3) AND a dump landed in the last two
-   hours.
+7. If step 6 (re)loaded the backup agent, proves it by firing one run
+   through launchd (`kickstart`, so it runs in the agent's own session) and
+   fails the install unless that run exited 0 AND a dump newer than it was
+   confirmed — in the destination, or, when the install's own context
+   cannot read it (ssh without Full Disk Access), in the agent's log lines
+   for the run. An exit 3 (an hourly fire held the lock) is waited out and
+   judged by the same evidence. An unchanged, loaded agent is left alone
+   only when its last run was fine (exit 0, or 3) AND a dump landed in the
+   last two hours (by the same two sources).
 
 The daemons run as `UserName=seanlynch`, `GroupName=staff`, so the mode-600
 env files in `~/.config/snowline/` stay readable. Logs are unchanged
@@ -511,8 +512,8 @@ now (as the owner — never with sudo, or the lock file ends up root-owned
 and every later run exits 2). To reload the unit after editing the plist:
 `launchctl bootout gui/501/dev.snowline.backup; launchctl bootstrap gui/501
 ~/Library/LaunchAgents/dev.snowline.backup.plist` (no RunAtLoad: the first
-timed run is an hour after loading; run the script by hand if you want a
-dump now), or just re-run `sudo ops/hub/install-daemons.sh`, which proves
-the unit with one run. Do not `kickstart -k` a timer that launchd has put
+timed run is an hour after loading; `launchctl kickstart
+gui/501/dev.snowline.backup` fires one now), or just re-run
+`sudo ops/hub/install-daemons.sh`, which proves the unit with one run. Do not `kickstart -k` a timer that launchd has put
 in its penalty box after repeated spawn failures — it hangs;
 bootout/bootstrap instead.
