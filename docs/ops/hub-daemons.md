@@ -27,14 +27,18 @@ each of platform / pm / governance / memory:
    unchanged and loaded, skipped (non-zero exit) if a cut is running.
 5. Installs the hourly DB backup agent: copies
    `ops/hub/launchagents/dev.snowline.backup.plist` to
-   `~/Library/LaunchAgents/` if it differs and (re)loads it into `gui/501`
-   when the plist changed or it was not loaded — waiting first for a dump
-   in progress. It stays a per-user agent on purpose ("DB backups" below).
+   `~/Library/LaunchAgents/` if it differs (operator overrides live in
+   `~/.config/snowline/backup.env`, never in the plist, so nothing is lost)
+   and (re)loads it into `gui/501` when the plist changed, it was not
+   loaded, or its last run exited 1 or 2 — waiting first for a dump in
+   progress. It stays a per-user agent on purpose ("DB backups" below).
 6. Polls the four `/health` URLs for up to 60s and prints UP/DOWN.
 7. If step 5 (re)loaded the backup agent, waits (up to 5 min) for its
    RunAtLoad dump and fails the install unless it exited 0 AND a fresh
-   `*.dump` landed in the destination. An unchanged, loaded agent is not
-   re-run, but a non-zero last exit code fails the install.
+   `*.dump` was confirmed in the destination (a destination this shell
+   cannot read is reported as unconfirmed and also fails, with the command
+   to check by hand). An unchanged, loaded agent whose last run was fine
+   (exit 0, or 3 = stepped aside) is left alone.
 
 The daemons run as `UserName=seanlynch`, `GroupName=staff`, so the mode-600
 env files in `~/.config/snowline/` stay readable. Logs are unchanged
@@ -86,7 +90,10 @@ of the move and is left as it is. Neither script boots the autocut timer out
 mid-cut: a running cut is refused up front (exit 75, or waited for with
 `--wait`) and, if one starts during the install, the autocut unit is skipped
 with a message and a non-zero exit. The backup agent is only reloaded after
-a dump in progress (it holds `backup.lock`) has finished.
+a dump in progress (it holds `backup.lock`) has finished, with the lock
+re-checked right before the bootout; a fire landing in the remaining
+instant would lose that hour's dump (the RunAtLoad dump that follows
+replaces it).
 
 ## Deploy routine change
 
@@ -411,10 +418,12 @@ once on load. The script:
 
 Dumps land in `~/Library/Mobile Documents/com~apple~CloudDocs/Snowline/db-backups/`
 as `<store>-<YYYYMMDD-HHMMSS>Z.dump` (UTC). Log: `~/Library/Logs/snowline-backup.log`.
-The `.env` secrets are deliberately not backed up. Overrides go in the
-plist's `EnvironmentVariables`: `SNOWLINE_BACKUP_DIR` (a non-iCloud path
-skips the iCloud root check but its parent must exist),
-`SNOWLINE_BACKUP_RETENTION_DAYS`, `SNOWLINE_BACKUP_DBS`.
+The `.env` secrets are deliberately not backed up. Overrides go in
+`~/.config/snowline/backup.env` (sourced by the script; never in the plist,
+which the install replaces with the tracked copy): `SNOWLINE_BACKUP_DIR` (a
+non-iCloud path skips the iCloud root check but its parent must exist),
+`SNOWLINE_BACKUP_RETENTION_DAYS`, `SNOWLINE_BACKUP_DBS` (plain identifiers,
+space-separated).
 
 **Rolling out this change on the hub.** The hub checkout had an untracked
 hand-restored copy of `ops/hub/snowline-backup.sh` from 2026-10-23 (the

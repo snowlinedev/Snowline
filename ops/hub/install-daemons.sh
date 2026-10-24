@@ -26,8 +26,11 @@ fail=0
 for svc in $SERVICES; do
   label="dev.snowline.$svc"
   echo "== $label"
-  # 1. stop the agent (ignore: it may not be loaded) ...
+  # 1. stop the agent (ignore: it may not be loaded) and wait for it to be
+  #    gone — a service runs its whole startup before binding, so the daemon
+  #    must never start while the agent is still shutting down ...
   launchctl bootout "gui/$OWNER_UID/$label" 2>/dev/null || true
+  wait_unloaded "gui/$OWNER_UID/$label" || echo "   agent $label still registered after 30s; continuing" >&2
   # 2. ... and move its plist aside so it cannot reload at login and double-bind
   if [ -f "$AGENTS/$label.plist" ]; then
     mv "$AGENTS/$label.plist" "$AGENTS/$label.plist.disabled-$STAMP"
@@ -81,9 +84,12 @@ done
 # A per-user agent on purpose (docs "DB backups"): the dumps need the
 # owner's session anyway (Postgres is the owner's agent, iCloud syncs per
 # session), so a daemon would add no coverage, only a TCC problem. The plist
-# is copied only when it differs; the unit is (re)loaded when its plist
-# changed or it is not loaded, waiting first for a dump in progress (it
-# holds backup.lock). RunAtLoad means a load takes one dump, judged below.
+# is copied only when it differs (operator overrides live in
+# ~/.config/snowline/backup.env, never in the plist, so nothing is lost);
+# the unit is (re)loaded when its plist changed, it is not loaded, or its
+# last run failed (exit 1 or 2 — exit 3, "stepped aside", is harmless),
+# waiting first for a dump in progress (it holds backup.lock). RunAtLoad
+# means a load takes one dump, judged below.
 label="dev.snowline.backup"
 echo "== $label (per-user agent)"
 backup_loaded=skip
@@ -95,9 +101,17 @@ if ! cmp -s "$LAUNCHAGENTS_SRC/$label.plist" "$AGENTS/$label.plist" 2>/dev/null;
   backup_loaded=reload
 elif ! launchctl print "gui/$OWNER_UID/$label" >/dev/null 2>&1; then
   backup_loaded=reload
+else
+  code="$(unit_last_exit "gui/$OWNER_UID/$label")"
+  case "$code" in
+    ""|0|3) echo "   unchanged and loaded; left as it is" ;;
+    *) echo "   unchanged and loaded, but its last run exited $code — reloading to judge a fresh run" >&2; backup_loaded=reload ;;
+  esac
 fi
 if [ "$backup_loaded" = reload ]; then
-  if unit_busy_wait backup 600; then
+  # wait for a dump in progress, and re-check right before the bootout: an
+  # hourly fire in that gap would otherwise be killed mid-dump
+  if unit_busy_wait backup 600 && ! lock_held "$BACKUP_LOCK"; then
     launchctl bootout "gui/$OWNER_UID/$label" 2>/dev/null || true
     wait_unloaded "gui/$OWNER_UID/$label" || true
     if launchctl bootstrap "gui/$OWNER_UID" "$AGENTS/$label.plist"; then
@@ -108,17 +122,10 @@ if [ "$backup_loaded" = reload ]; then
       fail=1
     fi
   else
-    echo "   a dump is still running; leaving $label as it is — re-run the install after it finishes" >&2
+    echo "   a dump is running; leaving $label as it is — re-run the install after it finishes" >&2
     backup_loaded=no
     fail=1
   fi
-else
-  # unchanged and loaded: nothing to reload, but it must be healthy
-  code="$(launchctl print "gui/$OWNER_UID/$label" 2>/dev/null | sed -n 's/.*last exit code = \([0-9][0-9]*\).*/\1/p' | head -n 1)"
-  case "$code" in
-    ""|0) echo "   unchanged and loaded; left as it is" ;;
-    *) echo "   unchanged and loaded, but its last run exited $code — see $OWNER_HOME/Library/Logs/snowline-backup.log" >&2; fail=1 ;;
-  esac
 fi
 
 echo "== waiting up to 60s for /health"
@@ -141,18 +148,18 @@ done
 # The script may wait 120s for Postgres, then dump every store: allow 5 min.
 # A fresh registration carries no exit code until its run ends, so the code
 # read here is this run's. Evidence is a fresh *.dump (or its iCloud-evicted
-# placeholder) in the destination, not the exit code alone.
+# placeholder) in the destination, not the exit code alone; when this shell
+# cannot read the destination the result is a warning, not a pass.
 if [ "$backup_loaded" = yes ]; then
   echo "== $label (RunAtLoad dump)"
   log_file="$OWNER_HOME/Library/Logs/snowline-backup.log"
   code=""; running=no; i=0
   while [ "$i" -lt 300 ]; do
-    info="$(launchctl print "gui/$OWNER_UID/$label" 2>/dev/null)"
-    if printf '%s\n' "$info" | grep -q -E '^[[:space:]]*(state = running|pid = [0-9])'; then
+    if unit_running "gui/$OWNER_UID/$label"; then
       running=yes
     else
       running=no
-      code="$(printf '%s\n' "$info" | sed -n 's/.*last exit code = \([0-9][0-9]*\).*/\1/p' | head -n 1)"
+      code="$(unit_last_exit "gui/$OWNER_UID/$label")"
       [ -n "$code" ] && break
       [ "$i" -ge 10 ] && break   # not running, no exit code: never spawned / signalled
     fi
@@ -160,14 +167,16 @@ if [ "$backup_loaded" = yes ]; then
     i=$((i + 2))
   done
   tail -n 8 "$log_file" 2>/dev/null | sed 's/^/   /'
-  dest="$(plutil -extract EnvironmentVariables.SNOWLINE_BACKUP_DIR raw -o - "$AGENTS/$label.plist" 2>/dev/null || echo "$BACKUP_DIR")"
+  # the destination, as the script computes it: backup.env override, else default
+  dest="$(sh -c '[ -f "$1" ] && . "$1"; echo "${SNOWLINE_BACKUP_DIR:-$2}"' sh "$OWNER_HOME/.config/snowline/backup.env" "$BACKUP_DIR" 2>/dev/null)"
   if [ "$code" = 0 ]; then
     find_err="$(mktemp -t snowline-install-find)"
     fresh="$(find "$dest" -maxdepth 1 \( -name '*.dump' -o -name '.*.dump.icloud' \) -type f -newer "$START_MARK" 2>"$find_err" | head -n 1)"
     if [ -n "$fresh" ]; then
       echo "   OK (exit 0, fresh dump $(basename "$fresh"))"
     elif [ -s "$find_err" ]; then
-      echo "   exit 0; this shell may not read $dest to confirm a fresh dump — verify by hand: ls -t '$dest' | head" >&2
+      echo "   exit 0, UNCONFIRMED: this shell may not read $dest ($(head -n 1 "$find_err")) — verify by hand: ls -t '$dest' | head" >&2
+      fail=1
     else
       echo "   exit 0 but NO new dump in $dest — not trusting it; check $log_file" >&2
       fail=1

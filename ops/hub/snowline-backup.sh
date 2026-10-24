@@ -50,62 +50,77 @@ STORE_RE='^snowline_'
 # Anchored as whole name components, so a real store whose name merely
 # contains one of these words (snowline_testimonials) is not dropped.
 SCRATCH_RE='(_(test|dryrun|e2e|restore)(_|$)|^snowline_dev$)'
-RETENTION_DAYS="${SNOWLINE_BACKUP_RETENTION_DAYS:-30}"
 
 # Shared helpers and constants (log, wait_for_postgres, ICLOUD_ROOT,
 # BACKUP_DIR, BACKUP_LOCK, LOCKS_DIR); lib.sh only defines things. A checkout
 # without it cannot run at all: exit 2, not a store failure.
 # shellcheck disable=SC1091
 . "$(dirname "$0")/launchdaemons/lib.sh" || { echo "$(date -u +%FT%TZ) cannot source $(dirname "$0")/launchdaemons/lib.sh; is this a complete checkout?" >&2; exit 2; }
+# Operator overrides live in ~/.config/snowline/backup.env (optional; sourced
+# here), NOT in the launchd plist: install-daemons.sh replaces the plist with
+# the tracked copy whenever it differs, so anything put there would be lost.
+BACKUP_ENV="$HOME/.config/snowline/backup.env"
+if [ -f "$BACKUP_ENV" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$BACKUP_ENV"
+    set +a
+fi
 # Off-machine by default: iCloud Drive replicates the dumps off this host, so a
 # disk failure / theft doesn't take the backups with it. The default lives in
 # lib.sh (BACKUP_DIR) so install-daemons.sh judges the same folder. Override
-# with the SNOWLINE_BACKUP_DIR env var in the plist to point at a tailnet
-# rsync target, an external volume, etc.
+# with SNOWLINE_BACKUP_DIR (in backup.env) to point at a tailnet rsync
+# target, an external volume, etc.
 DEST="${SNOWLINE_BACKUP_DIR:-$BACKUP_DIR}"
+RETENTION_DAYS="${SNOWLINE_BACKUP_RETENTION_DAYS:-30}"
+# An explicit store list is validated here, before anything slow or
+# side-effecting: a whitespace-only value is "unset", not "dump nothing";
+# the split is done with globbing off so a stray `*` cannot expand against
+# the cwd, and each name must be a plain identifier.
+DBS_EXPLICIT="${SNOWLINE_BACKUP_DBS:-}"
+set -f; set -- $DBS_EXPLICIT; set +f
+DBS_EXPLICIT="$*"
+for db in $DBS_EXPLICIT; do
+    case "$db" in
+        *[!A-Za-z0-9_]*) log "SNOWLINE_BACKUP_DBS entry is not a database name: '$db'" >&2; exit 2 ;;
+    esac
+done
 # Exit codes: 2 = cannot run at all (destination / iCloud root / unwritable —
 # the environment, not the data); 1 = some store(s) failed to dump.
 # install-daemons.sh rolls the unit back to the per-user agent only on 2.
 die() { log "$*" >&2; exit 2; }
 
 # --- run lock: a flock on $BACKUP_LOCK, held for the whole run ---
-# Taken by re-executing this script under a tiny python wrapper that opens
-# the lock file, takes a non-blocking flock and execs bash with that fd
-# inherited: the lock lives exactly as long as this process, the kernel
-# drops it on exit or crash, so there is no stale lock and no pid to trust.
-# lib.sh's unit_busy_wait probes the same file before the ops scripts boot
-# this unit out (a probe holds a shared lock for an instant, so the acquire
-# retries a few times before giving up). A second run while one holds the
-# lock (RunAtLoad racing the hourly fire) steps aside with exit 3, which
-# install-daemons.sh never mistakes for "dumps landed".
-if [ -z "${SNOWLINE_BACKUP_LOCK_FD:-}" ]; then
-    mkdir -p "$(dirname "$BACKUP_LOCK")"
-    exec /usr/bin/python3 -c '
-import datetime, fcntl, os, sys
-lock, script, args = sys.argv[1], sys.argv[2], sys.argv[3:]
-stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-try:
-    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
-except OSError as e:
-    # cannot even open the lock file (root-owned from a sudo run, dir
-    # unwritable): the environment, not the data -> exit 2
-    print("%s cannot open the run lock %s (%s); fix its ownership" % (stamp, lock, e), file=sys.stderr)
-    sys.exit(2)
-import time
+# fd 9 is opened on the lock file for the life of this process; a one-line
+# python takes the flock on that inherited fd (the lock lives on the open
+# file description, so it stays held after python exits, for as long as
+# this script keeps fd 9). The kernel drops it on exit or crash: no stale
+# lock, no pid to trust. lib.sh's unit_busy_wait probes the same file before
+# the ops scripts boot this unit out (a probe holds a shared lock for an
+# instant, so the acquire retries over a few seconds). A second run while
+# one holds the lock (RunAtLoad racing the hourly fire) steps aside with
+# exit 3, which install-daemons.sh never mistakes for "dumps landed"; any
+# other flock error (an fs without flock, a bad fd) is exit 2.
+mkdir -p "$(dirname "$BACKUP_LOCK")"
+exec 9>>"$BACKUP_LOCK" || die "cannot open the run lock $BACKUP_LOCK (root-owned from a sudo run?); fix its ownership"
+/usr/bin/python3 -c '
+import errno, fcntl, sys, time
 for attempt in range(5):
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        break
-    except OSError:
+        fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        sys.exit(0)
+    except OSError as e:
+        if e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
+            print("flock failed on the run lock: %s" % e, file=sys.stderr)
+            sys.exit(2)
         time.sleep(1)   # a lock_held probe holds it for an instant; a real run for minutes
-else:
-    print("%s another backup run holds %s; stepping aside" % (stamp, lock), file=sys.stderr)
-    sys.exit(3)
-os.set_inheritable(fd, True)
-os.environ["SNOWLINE_BACKUP_LOCK_FD"] = str(fd)
-os.execv("/bin/bash", ["/bin/bash", script] + args)
-' "$BACKUP_LOCK" "$0" ${1+"$@"}
-fi
+sys.exit(3)
+'
+case $? in
+    0) ;;
+    3) log "another backup run holds $BACKUP_LOCK; stepping aside"; exit 3 ;;
+    *) die "cannot take the run lock $BACKUP_LOCK" ;;
+esac
 
 # --- destination: refuse to write "backups" that never leave the machine ---
 # `mkdir -p` of the full default path would silently recreate the iCloud

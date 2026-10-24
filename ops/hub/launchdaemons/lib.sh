@@ -57,6 +57,16 @@ wait_for_postgres() {
   return 0
 }
 
+# unit_running <domain/label> — is a run of the unit in progress right now?
+unit_running() {
+  launchctl print "$1" 2>/dev/null | grep -q -E '^[[:space:]]*(state = running|pid = [0-9])'
+}
+# unit_last_exit <domain/label> — the numeric exit code of the unit's last
+# completed run, or nothing (never ran, or ended by a signal).
+unit_last_exit() {
+  launchctl print "$1" 2>/dev/null | sed -n 's/.*last exit code = \([0-9][0-9]*\).*/\1/p' | head -n 1
+}
+
 # wait_unloaded <domain/label> — after a bootout, wait (up to 30 s) until
 # launchd no longer knows the label, so an immediate bootstrap of the same
 # label cannot race the teardown ("Operation already in progress").
