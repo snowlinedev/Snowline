@@ -1,7 +1,7 @@
 #!/bin/bash
 # Hourly dump of EVERY live Snowline Postgres store on the hub. Launched by
-# ops/hub/launchdaemons/dev.snowline.backup.plist (a system LaunchDaemon
-# installed by ops/hub/install-daemons.sh, running as the owner); see
+# ops/hub/launchagents/dev.snowline.backup.plist (the owner's per-user
+# LaunchAgent, installed by ops/hub/install-daemons.sh); see
 # docs/ops/hub-daemons.md "DB backups". One-shot: launchd's timer fires it on
 # schedule, so a failed run is simply a skipped run (no retry storm) — the
 # next scheduled run takes a fresh dump.
@@ -74,9 +74,10 @@ die() { log "$*" >&2; exit 2; }
 # inherited: the lock lives exactly as long as this process, the kernel
 # drops it on exit or crash, so there is no stale lock and no pid to trust.
 # lib.sh's unit_busy_wait probes the same file before the ops scripts boot
-# this unit out. A second run while one holds the lock (RunAtLoad racing the
-# hourly fire) steps aside with exit 3, which install-daemons.sh treats as
-# inconclusive — never as "dumps landed".
+# this unit out (a probe holds a shared lock for an instant, so the acquire
+# retries a few times before giving up). A second run while one holds the
+# lock (RunAtLoad racing the hourly fire) steps aside with exit 3, which
+# install-daemons.sh never mistakes for "dumps landed".
 if [ -z "${SNOWLINE_BACKUP_LOCK_FD:-}" ]; then
     mkdir -p "$(dirname "$BACKUP_LOCK")"
     exec /usr/bin/python3 -c '
@@ -90,9 +91,14 @@ except OSError as e:
     # unwritable): the environment, not the data -> exit 2
     print("%s cannot open the run lock %s (%s); fix its ownership" % (stamp, lock, e), file=sys.stderr)
     sys.exit(2)
-try:
-    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-except OSError:
+import time
+for attempt in range(5):
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+    except OSError:
+        time.sleep(1)   # a lock_held probe holds it for an instant; a real run for minutes
+else:
     print("%s another backup run holds %s; stepping aside" % (stamp, lock), file=sys.stderr)
     sys.exit(3)
 os.set_inheritable(fd, True)
@@ -129,19 +135,13 @@ mkdir -p "$DEST" || die "cannot create backup destination: $DEST"
 PROBE="$DEST/.probe.$$"
 ( : > "$PROBE" ) 2>/dev/null || die "backup destination not writable: $DEST (TCC consent? full or read-only volume?)"
 rm -f "$PROBE"
-# Owner-only posture for the folder, and a one-time sweep of dumps written
-# before this script enforced it (they were 0644) — once, recorded by a
-# marker, not a stat of thousands of iCloud entries every hour. Best effort
-# on an iCloud folder, but say so.
+# Owner-only posture for the folder and for every dump in it: new dumps are
+# written under umask 077; older ones (0644 before this script enforced it)
+# and dumps that iCloud re-materialises are tightened each run — a few
+# hundred stats an hour. Best effort on an iCloud folder, but say so.
 chmod 700 "$DEST" 2>/dev/null || log "WARNING: could not chmod 700 $DEST" >&2
-PERMS_MARK="$LOCKS_DIR/backup-perms-tightened.$(printf '%s' "$DEST" | cksum | cut -d' ' -f1)"   # per destination
-if [ ! -e "$PERMS_MARK" ]; then
-    if find "$DEST" -maxdepth 1 -name '*.dump' -type f -perm +044 -exec chmod 600 {} + 2>/dev/null; then
-        : > "$PERMS_MARK"
-    else
-        log "WARNING: could not tighten permissions on existing dumps in $DEST (will retry next run)" >&2
-    fi
-fi
+find "$DEST" -maxdepth 1 -name '*.dump' -type f -perm +044 -exec chmod 600 {} + 2>/dev/null \
+    || log "WARNING: could not tighten permissions on existing dumps in $DEST" >&2
 
 # --- wait for Postgres (bounded; see lib.sh) ---
 wait_for_postgres || true

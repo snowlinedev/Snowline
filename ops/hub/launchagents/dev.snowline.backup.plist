@@ -6,16 +6,35 @@
     <key>Label</key>
     <string>dev.snowline.backup</string>
 
-    <!-- The PER-USER form of the hourly backup timer (gui/501). The system
-         LaunchDaemon under ../launchdaemons/ is the preferred unit; this one
-         is what install-daemons.sh / uninstall-daemons.sh fall back to
-         (restore_agent in launchdaemons/lib.sh) when the daemon cannot run
-         in the system domain (e.g. no access to the owner's iCloud folder)
-         and no previously-installed agent plist is left to restore. Tracked
-         here so the fallback never depends on an untracked file — the #220
-         root cause. Same script, same destination, same cadence; see
-         docs/ops/hub-daemons.md "DB backups".
-         Manual install: cp to ~/Library/LaunchAgents/ then
+    <!-- Hourly pg_dump of every live Snowline store (decision c68ec655). The
+         owner's PER-USER LaunchAgent (gui/501), installed and (re)loaded by
+         ops/hub/install-daemons.sh from this tracked file — the #220 root
+         cause was this unit's files living outside main.
+
+         A per-user agent on purpose, not a system daemon like the services:
+         a dump needs the owner's session anyway (Postgres on the hub is the
+         owner's per-user agent; iCloud Drive syncs per session), so the
+         system domain would add no coverage and would raise a TCC question
+         for writing into ~/Library/Mobile Documents with no session to
+         answer it. See docs/ops/hub-daemons.md "DB backups".
+
+         One-shot, NOT KeepAlive: it dumps, verifies, prunes and exits; the
+         timer fires it again on schedule, so a failed run is simply a
+         skipped run (no retry storm). RunAtLoad: loading the unit takes one
+         backup immediately, which the install waits for and judges. No
+         WorkingDirectory: the script does not use it, and a missing
+         directory would make launchd refuse to spawn (EX_CONFIG) — the
+         silent-failure mode this unit exists to avoid. The script sets its
+         own PATH.
+
+         Overrides the script accepts (none set, so its defaults apply):
+           SNOWLINE_BACKUP_DIR — where dumps land (default: iCloud Drive; a
+             non-iCloud path skips the iCloud root check, its parent must
+             exist);
+           SNOWLINE_BACKUP_RETENTION_DAYS — default 30;
+           SNOWLINE_BACKUP_DBS — space-separated store list (default: every
+             live snowline_* store from the catalog).
+         Manual install, if ever needed: cp to ~/Library/LaunchAgents/ then
            launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.snowline.backup.plist -->
     <key>ProgramArguments</key>
     <array>
