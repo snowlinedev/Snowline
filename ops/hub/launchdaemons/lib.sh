@@ -251,10 +251,11 @@ load_unit() {
 # ---- per-user agent restore (the services' rollback) ----
 # restore_agent <name> — boot the system daemon out, remove its plist, put
 # the newest `.disabled-*` agent plist back (a live one already there is
-# kept) and load it into gui/501. Returns 0 when an agent is loaded; the
-# caller kickstarts it. In that order on purpose: a service runs its whole
-# startup (migrations, registration) before binding its port, so two
-# instances must never start together.
+# kept) and load it into gui/501 (the agents are RunAtLoad + KeepAlive: the
+# bootstrap starts them; no kickstart). Returns 0 when an agent is loaded.
+# In that order on purpose: a service runs its whole startup (migrations,
+# registration) before binding its port, so two instances must never start
+# together.
 restore_agent() {
   label="dev.snowline.$1"
   launchctl bootout "system/$label" 2>/dev/null || true
