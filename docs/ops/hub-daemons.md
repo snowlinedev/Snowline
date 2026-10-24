@@ -85,11 +85,13 @@ plists and bootstraps them back into `gui/501`. One exception: the backup
 timer `dev.snowline.backup` falls back to the tracked agent plist in
 `ops/hub/launchagents/` when no `.disabled-*` copy exists, and is left in
 the system domain only if no agent plist exists from any source, so a
-rollback never leaves the hub without a backup unit ("DB backups" below). Both scripts wait up to 10 minutes for a running
-timer (autocut holds `autocut.lock`, the backup `backup.lock`, both under
-`~/Library/Application Support/Snowline/`, as flocks) before booting its unit
-out, and skip that unit if it is still running, so a run is never killed
-mid-way.
+rollback never leaves the hub without a backup unit ("DB backups" below). Neither script boots a timer out mid-run: the
+backup holds `backup.lock` and autocut `autocut.lock` (flocks under
+`~/Library/Application Support/Snowline/`). A running backup is waited for
+(up to 10 minutes) and the unit skipped if it is still going; a running
+autocut is refused up front (exit 75, or waited for with `--wait`) and, if
+one starts during the install, the autocut unit is skipped with a message.
+A skipped unit means a non-zero exit and a re-run later.
 
 ## Deploy routine change
 
@@ -367,9 +369,11 @@ The install waits for the unit's first (RunAtLoad) dump and fails if it did
 not exit 0, restoring the per-user agent when the daemon cannot run at all;
 a rollback with `uninstall-daemons.sh` restores the agent plist, falling back
 to the tracked copy in `ops/hub/launchagents/`, and leaves the daemon in
-place only if no agent plist exists from any source. The scripts and
-`run-service.sh` share `ops/hub/launchdaemons/lib.sh` (unit lists, autocut
-guard, agent restore, Postgres wait).
+place only if no agent plist exists from any source. The two scripts and the backup share
+`ops/hub/launchdaemons/lib.sh` (unit lists, autocut guard, agent restore,
+Postgres wait); `run-service.sh`, the services' boot wrapper, deliberately
+keeps its own inline Postgres wait so it has no file dependency beyond
+itself.
 
 **What runs.** `ops/hub/launchdaemons/dev.snowline.backup.plist` fires
 `ops/hub/snowline-backup.sh` every 3600 s and once on load. The script:

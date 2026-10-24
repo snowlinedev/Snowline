@@ -66,7 +66,8 @@ wait_for_postgres() {
 # nothing to take over, no false "in progress" after a reboot.
 LOCKS_DIR="$OWNER_HOME/Library/Application Support/Snowline"
 BACKUP_LOCK="$LOCKS_DIR/backup.lock"
-BACKUP_DIR="$OWNER_HOME/Library/Mobile Documents/com~apple~CloudDocs/Snowline/db-backups"
+ICLOUD_ROOT="$OWNER_HOME/Library/Mobile Documents/com~apple~CloudDocs"
+BACKUP_DIR="$ICLOUD_ROOT/Snowline/db-backups"   # the backup script's default destination
 # Probes with a SHARED non-blocking lock (as autocut's own lock_state does):
 # it fails only while an exclusive holder runs, and never leaves the probe
 # owning the exclusive lock for an instant.
@@ -145,31 +146,25 @@ agent_loaded() {
 }
 
 # restore_agent <name> [keep-daemon-if-none] — put a unit back in the per-user
-# domain: boot the system daemon out, remove its plist, then load the agent
-# plist found in this order: the newest `.disabled-*` copy (moved back), a
-# live one already in ~/Library/LaunchAgents, or the tracked copy under
-# ops/hub/launchagents/ (installed fresh). No kickstart: a timer's RunAtLoad
-# is enough, a service is kickstarted by the caller if wanted. An agent that
-# is already loaded counts as success. Returns 0 when an agent is loaded.
-# With `keep-daemon-if-none` and no agent plist from ANY source, the system
-# daemon is LEFT IN PLACE and the function returns 1 — for the backup timer,
-# so a rollback can never leave the hub without the unit. Without it (the
-# services) the daemon is removed regardless, as a rollback must.
+# domain. The agent plist comes from, in order: a live one already in
+# ~/Library/LaunchAgents (kept as is), the newest `.disabled-*` copy (moved
+# back), or the tracked copy under ops/hub/launchagents/ (installed fresh).
+# Order of operations: the agent is LOADED FIRST, and only then is the system
+# daemon booted out and its plist removed — labels are per domain, so a brief
+# overlap is harmless (the services bind the same ports only after the
+# daemon is gone; the backup's flock makes an overlapping fire step aside),
+# and a failed agent load leaves the daemon running instead of leaving
+# nothing. No kickstart: a timer's RunAtLoad is enough, a service is
+# kickstarted by the caller. Returns 0 when the agent is loaded and the
+# daemon removed.
+# With `keep-daemon-if-none` and no agent plist from any source, the daemon
+# is left in place and the function returns 1 (the backup timer: a rollback
+# can never leave the hub without the unit). Without it (the services) the
+# daemon is removed even when no agent could be found, as a rollback must.
 restore_agent() {
   label="dev.snowline.$1"
   disabled="$(ls -1 "$AGENTS/$label.plist.disabled-"* 2>/dev/null | sort | tail -n 1)"
   tracked="$LAUNCHAGENTS_SRC/$label.plist"
-  if [ -z "$disabled" ] && [ ! -f "$AGENTS/$label.plist" ] && [ ! -f "$tracked" ] \
-     && [ "${2:-}" = keep-daemon-if-none ]; then
-    echo "   no agent plist to restore for $label (no .disabled-*, none live, none tracked); LEAVING the system daemon in place" >&2
-    return 1
-  fi
-  launchctl bootout "system/$label" 2>/dev/null || true
-  wait_unloaded "system/$label" || echo "   $label still registered after 30s; continuing" >&2
-  rm -f "${DAEMONS_DIR:?}/${label:?}.plist"
-  # A live agent plist (put there by hand since the daemon move) wins over
-  # the older .disabled-* copy; the copy is only moved back when nothing
-  # else is there.
   if [ -f "$AGENTS/$label.plist" ]; then
     [ -z "$disabled" ] || echo "   keeping the live $AGENTS/$label.plist (leaving $disabled aside)"
   elif [ -n "$disabled" ]; then
@@ -181,18 +176,26 @@ restore_agent() {
     chown "$OWNER_UID" "$AGENTS/$label.plist"
     chmod 644 "$AGENTS/$label.plist"
     echo "   installed the tracked agent plist $tracked -> $AGENTS/$label.plist"
-  fi
-  if [ ! -f "$AGENTS/$label.plist" ]; then
-    echo "   no agent plist for $label; daemon removed, nothing loaded" >&2
+  elif [ "${2:-}" = keep-daemon-if-none ]; then
+    echo "   no agent plist to restore for $label (no .disabled-*, none live, none tracked); LEAVING the system daemon in place" >&2
+    return 1
+  else
+    echo "   no agent plist for $label from any source; removing the daemon anyway" >&2
+    launchctl bootout "system/$label" 2>/dev/null || true
+    rm -f "${DAEMONS_DIR:?}/${label:?}.plist"
     return 1
   fi
-  if agent_loaded "$1"; then
-    echo "   agent $label already loaded in gui/$OWNER_UID"
-    return 0
+  # 1. load the agent (an already-loaded one counts)
+  if ! agent_loaded "$1" && ! launchctl bootstrap "gui/$OWNER_UID" "$AGENTS/$label.plist" && ! agent_loaded "$1"; then
+    if [ "${2:-}" = keep-daemon-if-none ]; then
+      echo "   agent plist for $label is on disk but could NOT be loaded into gui/$OWNER_UID (no login session?); LEAVING the system daemon in place; the agent loads at the next login" >&2
+      return 1
+    fi
+    echo "   agent plist for $label is on disk but could NOT be loaded into gui/$OWNER_UID (no login session?); it loads at the next login — removing the daemon as asked, nothing runs for $label until then" >&2
   fi
-  if launchctl bootstrap "gui/$OWNER_UID" "$AGENTS/$label.plist" || agent_loaded "$1"; then
-    return 0
-  fi
-  echo "   agent plist for $label is on disk but could NOT be loaded into gui/$OWNER_UID (no login session?); it loads at the next login — nothing is running for $label until then" >&2
-  return 1
+  # 2. now retire the daemon
+  launchctl bootout "system/$label" 2>/dev/null || true
+  wait_unloaded "system/$label" || echo "   $label still registered after 30s; continuing" >&2
+  rm -f "${DAEMONS_DIR:?}/${label:?}.plist"
+  agent_loaded "$1"
 }

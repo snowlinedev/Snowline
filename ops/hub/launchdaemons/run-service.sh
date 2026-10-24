@@ -39,11 +39,17 @@ if [ -n "$dburl" ]; then
   rest="${dburl#*://}"
   rest="${rest##*@}"
   pghost="$(printf '%s' "$rest" | sed -e 's#[/?].*##' -e 's#:.*##')"
-  # bounded wait shared with the backup timer (lib.sh); after it, start anyway
-  # and let launchd's KeepAlive retry
-  # shellcheck disable=SC1091
-  . "$(dirname "$0")/lib.sh"
-  wait_for_postgres "$pghost" || true   # it logs the timeout itself, via log()
+  if [ -n "$pghost" ]; then set -- -h "$pghost"; else set --; fi
+  waited=0
+  until pg_isready -q "$@"; do
+    if [ "$waited" -ge 120 ]; then
+      log "postgres not ready after ${waited}s; starting anyway (launchd will retry)"
+      break
+    fi
+    log "waiting for postgres (${waited}s)"
+    sleep 5
+    waited=$((waited + 5))
+  done
 fi
 
 # --- platform: wait for the tailnet address to exist locally ---

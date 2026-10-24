@@ -50,18 +50,19 @@ STORE_RE='^snowline_'
 # Anchored as whole name components, so a real store whose name merely
 # contains one of these words (snowline_testimonials) is not dropped.
 SCRATCH_RE='(_(test|dryrun|e2e|restore)(_|$)|^snowline_dev$)'
-ICLOUD_ROOT="$HOME/Library/Mobile Documents/com~apple~CloudDocs"
-# Off-machine by default: iCloud Drive replicates the dumps off this host, so a
-# disk failure / theft doesn't take the backups with it. Override with the
-# SNOWLINE_BACKUP_DIR env var in the plist to point at a tailnet rsync target,
-# an external volume, etc.
-DEST="${SNOWLINE_BACKUP_DIR:-$ICLOUD_ROOT/Snowline/db-backups}"
 RETENTION_DAYS="${SNOWLINE_BACKUP_RETENTION_DAYS:-30}"
 
-# Shared helpers (log, wait_for_postgres); lib.sh only defines things. A
-# checkout without it cannot run at all: exit 2, not a store failure.
+# Shared helpers and constants (log, wait_for_postgres, ICLOUD_ROOT,
+# BACKUP_DIR, BACKUP_LOCK, LOCKS_DIR); lib.sh only defines things. A checkout
+# without it cannot run at all: exit 2, not a store failure.
 # shellcheck disable=SC1091
 . "$(dirname "$0")/launchdaemons/lib.sh" || { echo "$(date -u +%FT%TZ) cannot source $(dirname "$0")/launchdaemons/lib.sh; is this a complete checkout?" >&2; exit 2; }
+# Off-machine by default: iCloud Drive replicates the dumps off this host, so a
+# disk failure / theft doesn't take the backups with it. The default lives in
+# lib.sh (BACKUP_DIR) so install-daemons.sh judges the same folder. Override
+# with the SNOWLINE_BACKUP_DIR env var in the plist to point at a tailnet
+# rsync target, an external volume, etc.
+DEST="${SNOWLINE_BACKUP_DIR:-$BACKUP_DIR}"
 # Exit codes: 2 = cannot run at all (destination / iCloud root / unwritable —
 # the environment, not the data); 1 = some store(s) failed to dump.
 # install-daemons.sh rolls the unit back to the per-user agent only on 2.
