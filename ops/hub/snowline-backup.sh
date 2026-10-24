@@ -73,6 +73,7 @@ fi
 # target, an external volume, etc.
 DEST="${SNOWLINE_BACKUP_DIR:-$BACKUP_DIR}"
 RETENTION_DAYS="${SNOWLINE_BACKUP_RETENTION_DAYS:-30}"
+case "$RETENTION_DAYS" in ''|*[!0-9]*) log "SNOWLINE_BACKUP_RETENTION_DAYS is not a number of days: '$RETENTION_DAYS'" >&2; exit 2 ;; esac
 # Queries install-daemons.sh makes by running this script AS THE OWNER
 # (so backup.env, TCC consent and the destination are exactly this
 # script's), checked before anything below touches the positional params:
@@ -86,31 +87,55 @@ case "${1:-}" in
         exit 0
         ;;
     --check)
+        # A dump counts by the UTC stamp in its NAME (this script writes
+        # <store>-YYYYMMDD-HHMMSSZ.dump), not by mtime: an iCloud-evicted
+        # placeholder carries eviction time, and old pre-Z names are local
+        # time and are ignored. Prints OK / NONE / UNREADABLE on stdout as
+        # well as exiting 0 / 1 / 2, so a caller can tell "no dump" from
+        # "could not even run".
         mins="${2:-}"
         case "$mins" in ''|*[!0-9]*) echo "--check needs a number of minutes" >&2; exit 2 ;; esac
-        [ -d "$DEST" ] || exit 1   # no destination yet = no dump yet, not an error
+        [ -d "$DEST" ] || { echo NONE; exit 1; }
         err="$(mktemp -t snowline-backup-check)"
-        found="$(find "$DEST" -maxdepth 1 \( -name '*.dump' -o -name '.*.dump.icloud' \) -type f -mmin "-$mins" 2>"$err" | head -n 1)"
-        if [ -n "$found" ]; then rm -f "$err"; exit 0; fi
-        if [ -s "$err" ]; then rm -f "$err"; exit 2; fi
-        rm -f "$err"; exit 1
+        names="$(find "$DEST" -maxdepth 1 \( -name '*-[0-9]*Z.dump' -o -name '.*-[0-9]*Z.dump.icloud' \) -type f 2>"$err" \
+            | sed -n 's#.*-\([0-9]\{8\}-[0-9]\{6\}\)Z\.dump\(\.icloud\)\{0,1\}$#\1#p' | sort -u | tail -n 1)"
+        if [ -s "$err" ]; then rm -f "$err"; echo UNREADABLE; exit 2; fi
+        rm -f "$err"
+        cutoff=$(( $(date -u +%s) - mins * 60 ))
+        if [ -n "$names" ] && [ "$(date -j -u -f '%Y%m%d-%H%M%S' "$names" +%s 2>/dev/null || echo 0)" -ge "$cutoff" ]; then
+            echo OK; exit 0
+        fi
+        echo NONE; exit 1
         ;;
 esac
 # An explicit store list is validated here, before anything slow or
 # side-effecting: a whitespace-only value is "unset", not "dump nothing";
 # the split is done with globbing off so a stray `*` cannot expand against
-# the cwd, and each name must be a plain identifier.
+# the cwd, and each name must be a plain identifier (valid_names, below,
+# is the one rule for every source of names).
+# valid_names <mode:strict|skip> <names...> — prints the identifiers; in
+# strict mode a bad name is fatal (exit 2), in skip mode it is logged and
+# dropped.
+valid_names() {
+    vn_mode="$1"; shift
+    for vn in "$@"; do
+        case "$vn" in
+            *[!A-Za-z0-9_]*)
+                if [ "$vn_mode" = strict ]; then
+                    log "SNOWLINE_BACKUP_DBS entry is not a database name: '$vn'" >&2; exit 2
+                fi
+                log "WARNING: skipping database with a non-identifier name: '$vn'" >&2 ;;
+            *) printf '%s ' "$vn" ;;
+        esac
+    done
+}
 DBS_EXPLICIT="${SNOWLINE_BACKUP_DBS:-}"
 set -f
 # shellcheck disable=SC2086
 set -- $DBS_EXPLICIT
-DBS_EXPLICIT="$*"
-for db in "$@"; do
-    case "$db" in
-        *[!A-Za-z0-9_]*) log "SNOWLINE_BACKUP_DBS entry is not a database name: '$db'" >&2; exit 2 ;;
-    esac
-done
 set +f
+DBS_EXPLICIT="$(valid_names strict "$@")"
+DBS_EXPLICIT="${DBS_EXPLICIT% }"
 # Exit codes: 2 = cannot run at all (destination / iCloud root / unwritable /
 # lock — the environment, not the data); 1 = some store(s) failed to dump;
 # 3 = another run held the lock (stepped aside). install-daemons.sh reads
@@ -198,6 +223,18 @@ CATALOG_ERR="$(mktemp -t snowline-backup-psql)"
 # hourly run with exit 1 until someone hand-writes SNOWLINE_BACKUP_DBS.
 CATALOG="$(psql -X -At -d postgres -c "select datname from pg_database where not datistemplate and datname <> 'postgres' and datallowconn and has_database_privilege(datname, 'CONNECT') order by 1" 2>"$CATALOG_ERR")" || CATALOG_OK=no
 LIVE="$(printf '%s\n' "$CATALOG" | grep -E "$STORE_RE" | grep -v -E "$SCRATCH_RE" | grep -v '^$' || true)"
+# Catalog names go through the same identifier rule (skip-and-warn): a
+# quoted name with a space would otherwise split into two bogus stores.
+# Split on newlines with globbing off; LIVE is one name per line.
+set -f
+IFS_SAVE="$IFS"; IFS='
+'
+# shellcheck disable=SC2086
+set -- $LIVE
+IFS="$IFS_SAVE"
+set +f
+LIVE="$(valid_names skip "$@")"
+LIVE="${LIVE% }"
 if [ -n "$DBS_EXPLICIT" ]; then
     DBS="$DBS_EXPLICIT"
     EXCLUDED=""
@@ -209,18 +246,7 @@ if [ -n "$DBS_EXPLICIT" ]; then
     done
     [ -z "$EXCLUDED" ] || log "note: SNOWLINE_BACKUP_DBS excludes live store(s):${EXCLUDED}" >&2
 elif [ "$CATALOG_OK" = yes ] && [ -n "$LIVE" ]; then
-    # catalog names get the same identifier rule as an explicit list — a
-    # quoted name with a space would otherwise split into two bogus stores
-    DBS=""
-    while IFS= read -r db; do
-        case "$db" in
-            *[!A-Za-z0-9_]*) log "WARNING: skipping catalog database with a non-identifier name: '$db'" >&2 ;;
-            *) DBS="$DBS $db" ;;
-        esac
-    done <<EOF_LIVE
-$LIVE
-EOF_LIVE
-    DBS="${DBS# }"
+    DBS="$LIVE"
 elif [ "$CATALOG_OK" = yes ]; then
     # Readable catalog with no snowline_* store: the wrong cluster (PGHOST /
     # PGPORT leaking in, a fresh cluster before migration). Never exit 0 with
@@ -256,7 +282,10 @@ for DB in "$@"; do
     # rename — an interrupted or truncated dump (machine sleep, OOM, iCloud
     # hiccup) never leaves a file that looks like a complete backup. One store
     # failing must not skip the others: record it and keep going.
-    pg_dump -Fc "$DB" > "$OUT.partial" &
+    # --lock-wait-timeout: a dump wants ACCESS SHARE on every table; a service
+    # mid-migration (ACCESS EXCLUSIVE) must not be blocked by it for long —
+    # better a store failure this hour than a stalled migration.
+    pg_dump -Fc --lock-wait-timeout=60000 "$DB" > "$OUT.partial" &
     DUMP_PID=$!
     wait "$DUMP_PID"; dump_rc=$?
     DUMP_PID=""

@@ -36,8 +36,9 @@ each of platform / pm / governance / memory:
    it to `~/Library/LaunchAgents/` at that moment) when the tracked plist
    differs, the unit is not loaded, its last run exited with anything other
    than 0 or 3, or no dump landed in the last two hours — waiting first for
-   a dump in progress, and never while a service is DOWN (its RunAtLoad
-   dump would hold ACCESS SHARE across a boot migration).
+   a dump in progress. The plist is rendered with this checkout's path for
+   the script, so a moved checkout gets a matching unit at the next
+   install.
    Operator overrides live in `~/.config/snowline/backup.env`, never in the
    plist. It stays a per-user agent on purpose ("DB backups" below).
 7. If step 6 (re)loaded the backup agent, waits (up to 5 min) for its
@@ -394,7 +395,9 @@ once on load. The script:
   LaunchAgent, so at boot it can start after this agent fires), then dumps
   every store (today `snowline_platform`, `snowline_pm`,
   `snowline_governance`, `snowline_memory`, `snowline_musher`,
-  `snowline_marketing`) with `pg_dump -Fc`, verifies each archive with
+  `snowline_marketing`) with `pg_dump -Fc --lock-wait-timeout=60000` (a
+  dump never blocks a service's migration for more than a minute; that
+  store is then a failure for the hour), verifies each archive with
   `pg_restore -l`, then renames `.partial` to the final name — one store
   failing does not skip the others, and the run exits 1 if any did;
 - the store list comes from the server's own catalog: every `snowline_*`
@@ -434,9 +437,11 @@ must already exist — it is never created, so an unplugged volume cannot be
 replaced by a local folder), `SNOWLINE_BACKUP_RETENTION_DAYS`,
 `SNOWLINE_BACKUP_DBS` (plain identifiers, space-separated).
 `bash ops/hub/snowline-backup.sh --print-dest` prints the destination the
-script resolves and `--check <minutes>` reports (exit 0/1/2) whether a dump
-newer than that many minutes exists there; the install runs both as the
-owner, so root never reads the owner's iCloud folder.
+script resolves and `--check <minutes>` reports (OK / NONE / UNREADABLE, exit 0/1/2)
+whether a dump newer than that many minutes exists there, judged by the
+UTC stamp in the file name (an iCloud placeholder's mtime is eviction
+time); the install runs both as the owner, so root never reads the owner's
+iCloud folder.
 
 **Rolling out this change on the hub.** The hub checkout had an untracked
 hand-restored copy of `ops/hub/snowline-backup.sh` from 2026-10-23 (the

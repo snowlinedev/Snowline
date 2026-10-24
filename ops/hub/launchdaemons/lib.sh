@@ -149,11 +149,13 @@ unit_busy_wait() {
 # install re-checks the lock right before touching the autocut unit.)
 autocut_guard() {
   waited=0
-  while autocut_lock_held; do
-    if [ "$(lock_state "$AUTOCUT_LOCK")" = unknown ]; then
-      echo "refusing: cannot probe the autocut lock $AUTOCUT_LOCK (perl missing? unreadable?)." >&2
-      exit 75
-    fi
+  while :; do
+    case "$(lock_state "$AUTOCUT_LOCK")" in
+      free) return 0 ;;
+      unknown)
+        echo "refusing: cannot probe the autocut lock $AUTOCUT_LOCK (perl missing? unreadable?)." >&2
+        exit 75 ;;
+    esac
     if [ "${1:-}" != "--wait" ] || [ "$waited" -ge 900 ]; then
       echo "refusing: an autocut is running (lock held: $AUTOCUT_LOCK)." >&2
       echo "  booting the timer out now would kill the cut mid-publish." >&2
@@ -164,6 +166,50 @@ autocut_guard() {
     sleep 15
     waited=$((waited + 15))
   done
+}
+
+# ---- loading a unit ----
+# load_unit <label> <domain> <src-plist> <dst-plist> <owner> <kick:yes|no>
+# Boot the label out of <domain>, wait for it to be gone, copy <src> to
+# <dst> (creating the directory, owned by <owner>), bootstrap it, and
+# kickstart it when <kick> is yes (never for a timer: that fires a run).
+# Sets UNIT_RESULT: installed | still-old (bootstrap refused and the old
+# registration is still loaded, so the OLD definition keeps running; the
+# plist on disk is left as it was) | not-loaded (bootstrap refused, nothing
+# loaded). Returns 0 only for installed.
+load_unit() {
+  lu_label="$1"; lu_domain="$2"; lu_src="$3"; lu_dst="$4"; lu_owner="$5"; lu_kick="$6"
+  launchctl bootout "$lu_domain/$lu_label" 2>/dev/null || true
+  if ! wait_unloaded "$lu_domain/$lu_label"; then
+    echo "   old registration of $lu_label still loaded after 30s; plist NOT replaced — re-run" >&2
+    UNIT_RESULT=still-old
+    return 1
+  fi
+  mkdir -p "$(dirname "$lu_dst")" && chown "$lu_owner" "$(dirname "$lu_dst")"
+  cp "$lu_src" "$lu_dst"
+  chown "$lu_owner" "$lu_dst"
+  chmod 644 "$lu_dst"
+  if ! launchctl bootstrap "$lu_domain" "$lu_dst"; then
+    if launchctl print "$lu_domain/$lu_label" >/dev/null 2>&1; then
+      echo "   bootstrap of $lu_label refused and an old registration is still loaded (old definition keeps running) — re-run, or reboot" >&2
+      UNIT_RESULT=still-old
+    else
+      echo "   bootstrap of $lu_label FAILED (nothing loaded)" >&2
+      UNIT_RESULT=not-loaded
+    fi
+    return 1
+  fi
+  [ "$lu_kick" = yes ] && launchctl kickstart -k "$lu_domain/$lu_label"
+  UNIT_RESULT=installed
+  return 0
+}
+
+# render_backup_agent_plist <out> — the tracked agent plist with the
+# script path rendered from THIS checkout (OPS_HUB), so a moved or renamed
+# checkout gets a matching unit at the next install instead of EX_CONFIG.
+render_backup_agent_plist() {
+  sed "s#<string>/Users/seanlynch/Projects/snowline-platform/ops/hub/snowline-backup.sh</string>#<string>$OPS_HUB/snowline-backup.sh</string>#" \
+    "$LAUNCHAGENTS_SRC/dev.snowline.backup.plist" > "$1"
 }
 
 # ---- per-user agent restore (the services' rollback) ----
