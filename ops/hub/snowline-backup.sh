@@ -199,7 +199,9 @@ dest_state() {
 
 # Queries install-backup-agent.sh makes by running this script AS THE OWNER
 # (so backup.env, TCC consent and the destination are exactly this
-# script's), checked before anything below touches the positional params:
+# script's). The positional parameters are ALREADY the store list here (the
+# normalisation above re-set them); only ARG1/ARG2, captured at the top,
+# describe the command line:
 #   --print-dest        print the resolved destination
 #   --check <minutes>   exit 0 if a dump (or its iCloud-evicted placeholder)
 #                       newer than <minutes> exists in the destination,
@@ -251,8 +253,8 @@ EOF_Z
     "") ;;   # no arguments: a real run
     *) die "unknown argument '$ARG1' (this script takes no arguments except --print-dest and --check <minutes>); refusing to run" ;;
 esac
-# (the explicit store list was normalised and validated above, before the
-# query dispatch)
+# (the explicit store list was normalised and validated at the top, before
+# the query dispatch; the positional parameters hold it)
 # --- run lock: a flock on $BACKUP_LOCK, held for the whole run ---
 # fd 9 is opened on the lock file for the life of this process; flock_fd
 # (lib.sh, perl) takes the flock on that inherited fd (the lock lives on the
@@ -399,35 +401,34 @@ set +f
 # comparison against one cutoff stamp; no fork per file).
 PRUNE_CUTOFF="$(date -u -v-"${RETENTION_DAYS}"d +%Y%m%d-%H%M%S 2>/dev/null)" || PRUNE_CUTOFF=""
 [ -n "$PRUNE_CUTOFF" ] || log "WARNING: cannot compute the retention cutoff for $RETENTION_DAYS days; NOT pruning this run (the folder grows until this is fixed)" >&2
-# Whatever the age, the newest KEEP_MIN dumps of a store are never pruned:
-# a store whose dump keeps failing must not lose its last good copy once it
-# ages out (the prune runs before each dump, so a full destination can free
-# itself; this is the other side of that).
+# Retention, ONE pass over the folder for EVERY store found there — not just
+# this run's list, or a store dropped from the list (SNOWLINE_BACKUP_DBS, a
+# retired service) would accrue forever and fill the destination. Whatever
+# the age, the newest KEEP_MIN dumps of a store are never pruned: a store
+# whose dump keeps failing must not lose its last good copy once it ages
+# out. The legacy snowline_dev history is left alone. Runs BEFORE the dumps
+# so a full destination can free itself.
 KEEP_MIN=3
-prune_by_name() {
+prune_all() {
     [ -n "$PRUNE_CUTOFF" ] || return 0   # no cutoff, no pruning (never over-delete; warned above)
-    z_dumps "$1" all | sort -t "$TAB" -k2,2r | awk -F"$TAB" -v cutoff="$PRUNE_CUTOFF" -v keep="$KEEP_MIN" \
-        'NR > keep && $2 < cutoff { print $3 }' \
-    | while IFS= read -r pb_f; do rm -f "$pb_f"; done
+    z_dumps '*' all | sort -t "$TAB" -k1,1 -k2,2r \
+    | awk -F"$TAB" -v cutoff="$PRUNE_CUTOFF" -v keep="$KEEP_MIN" '
+        $1 == "snowline_dev" { next }
+        $1 != store { store = $1; n = 0 }
+        { n++; if (n > keep && $2 < cutoff) print $3 }' \
+    | while IFS= read -r pa_f; do rm -f "$pa_f"; done
     return 0
 }
 # bash runs a trap only once the foreground command returns, so pg_dump is
 # started in the background and waited for: `wait` is interruptible, the
 # TERM/INT handler armed at the top runs at once, kills the dump and
 # removes its partial.
+# Prune first (prune_all above: every store in the folder, newest three
+# kept, iCloud `.NAME.icloud` placeholders by the same rule — age is the
+# stamp in the NAME, a placeholder's mtime being eviction time). Non-fatal:
+# a find hiccup must not fail the run.
+prune_all || true
 for DB in "$@"; do
-    # Prune FIRST, and for every store whether or not its dump then succeeds:
-    # a full destination (iCloud quota, disk) must be able to free itself —
-    # while the newest KEEP_MIN of a store are always kept, so a store whose
-    # dump keeps failing never loses its last good copy. Per-store pattern,
-    # so dumps of stores no longer in the list (e.g. the legacy snowline_dev
-    # history) are left alone. iCloud evicts old files to `.NAME.icloud`
-    # placeholders, which are pruned by the same rule or the folder grows
-    # without bound. Age comes from the stamp in the NAME (same rule as
-    # --check: a placeholder's mtime is eviction time, not dump time), for
-    # the pre-#319 local-time names too. Non-fatal: a find hiccup must not
-    # fail the run.
-    prune_by_name "$DB" || true
     OUT="$DEST/${DB}-${STAMP}.dump"
     # Dump to a .partial name, verify the archive is readable, then atomically
     # rename — an interrupted or truncated dump (machine sleep, OOM, iCloud
@@ -442,12 +443,13 @@ for DB in "$@"; do
     DUMP_PID=""
     if [ "$dump_rc" -eq 0 ] \
         && pg_restore -l "$OUT.partial" > /dev/null \
-        && mv "$OUT.partial" "$OUT"; then
+        && mv "$OUT.partial" "$OUT" && { LANDED="$OUT"; OUT=""; }; then
+        # (OUT is cleared in the same breath as the rename: a signal between
+        # the two must not make the trap report a landed dump as removed.)
         # Size is best-effort (an iCloud file can be evicted to a placeholder
         # the instant it lands, making du error).
-        SIZE="$(du -h "$OUT" 2>/dev/null | awk '{ print $1 }' || true)"
-        log "backed up ${DB} -> ${OUT} (${SIZE:-size unknown})"
-        OUT=""   # landed: the interrupt trap must not name it any more
+        SIZE="$(du -h "$LANDED" 2>/dev/null | awk '{ print $1 }' || true)"
+        log "backed up ${DB} -> ${LANDED} (${SIZE:-size unknown})"
     else
         rm -f "$OUT.partial"; OUT=""
         log "FAILED to back up ${DB} (pg_dump, archive check, or rename failed)" >&2

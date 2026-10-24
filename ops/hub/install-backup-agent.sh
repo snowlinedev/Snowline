@@ -54,17 +54,27 @@ echo "== $label (per-user agent; unit runs $BACKUP_SCRIPT)"
 query() { env -u SNOWLINE_BACKUP_DIR -u SNOWLINE_BACKUP_RETENTION_DAYS -u SNOWLINE_BACKUP_DBS /bin/bash "$BACKUP_SCRIPT" "$@"; }
 dest="$(query --print-dest 2>/dev/null)" || dest="(unknown: --print-dest failed)"
 # dump_evidence <minutes> — sets EVIDENCE to OK (a dump newer than <minutes>
-# in the destination), NONE (readable, none there), LOG_OK / LOG_FAIL (the
-# destination cannot be read from this context — Terminal or ssh without
-# Full Disk Access — so LOGSAYS, from a log_verdict the caller ran first,
-# stands in), or UNKNOWN; EVIDENCE_MSG carries the --check reason.
+# in the destination), NONE (readable, none there), CONFIG_FAIL (the script
+# refused its own configuration: it cannot run at all now), LOG_OK /
+# LOG_FAIL (the destination cannot be read from this context — Terminal or
+# ssh without Full Disk Access — so LOGSAYS, from a log_verdict the caller
+# ran first, stands in), or UNKNOWN; EVIDENCE_MSG carries the --check reason.
 dump_evidence() {
-  EVIDENCE_MSG="$(query --check "$1" 2>&1)"; de_rc=$?
-  EVIDENCE_MSG="$(printf '%s\n' "$EVIDENCE_MSG" | tail -n 1)"
+  de_err="$(mktemp -t snowline-install-check)"
+  de_out="$(query --check "$1" 2>"$de_err")"; de_rc=$?
+  EVIDENCE_MSG="$(tail -n 1 "$de_err")"; rm -f "$de_err"
   case $de_rc in
     0) EVIDENCE=OK; return ;;
     1) EVIDENCE=NONE; return ;;
   esac
+  # exit 2 is either "destination unreadable from here" (the script says
+  # UNREADABLE on stdout) or the script REFUSING its configuration (a die
+  # on stderr, nothing on stdout) — the latter is a failure of the unit
+  # itself, never a reason to fall back to old log evidence
+  if [ "$de_out" != UNREADABLE ]; then
+    EVIDENCE=CONFIG_FAIL
+    return
+  fi
   # destination not readable from here: the caller's log_verdict (computed
   # once, before this) stands in
   case "$LOGSAYS" in
@@ -127,6 +137,7 @@ else
     log_verdict "$since"   # the unit's own account; a manual run leaves no line here
     dump_evidence 120
     case "$EVIDENCE:$LOGSAYS" in
+      CONFIG_FAIL:*)   echo "   the script refuses its configuration ($EVIDENCE_MSG) — every run will exit 2 until it is fixed; nothing to reload or prove" >&2; fail=1 ;;
       OK:OK|LOG_OK:OK) echo "   unchanged, confirmed loaded, the unit dumped within 2 h; left as it is" ;;
       OK:NONE)         action=reprove; why="a dump landed within 2 h but the unit's log shows no run (a manual dump? the unit not firing?)" ;;
       NONE:*)          action=reprove; why="no dump in the last 2 h in $dest" ;;
@@ -215,6 +226,7 @@ prove_run() {
       LOG_OK)   echo "   OK (exit 0; the log shows the dump — destination not checkable from this context: $EVIDENCE_MSG)" ;;
       NONE)     echo "   exit 0 but NO new dump in $dest — not trusting it; check $log_file" >&2; fail=1 ;;
       LOG_FAIL) echo "   exit 0 but the log's last run failed — check $log_file" >&2; fail=1 ;;
+      CONFIG_FAIL) echo "   exit 0, but the script now refuses its configuration ($EVIDENCE_MSG) — the next run will exit 2" >&2; fail=1 ;;
       *)        echo "   exit 0, UNCONFIRMED: could not check $dest ($EVIDENCE_MSG) and the log shows no run — verify by hand: ls -t '$dest' | head" >&2; fail=1 ;;
     esac
   elif [ -z "$code" ]; then

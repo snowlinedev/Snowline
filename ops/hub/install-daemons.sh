@@ -58,7 +58,10 @@ done
 for timer in $TIMERS; do
   label="dev.snowline.$timer"
   echo "== $label (timer; not kickstarted)"
-  if [ "$timer" = autocut ] && [ -e "$OWNER_HOME/.config/snowline/autocut.enabled" ]; then
+  # (autocut.disabled, the kill switch, wins over autocut.enabled: with it
+  # present no cutter is active and a loaded timer is not a fault)
+  if [ "$timer" = autocut ] && [ -e "$OWNER_HOME/.config/snowline/autocut.enabled" ] \
+     && [ ! -e "$OWNER_HOME/.config/snowline/autocut.disabled" ]; then
     if launchctl print "system/$label" >/dev/null 2>&1; then
       echo "   in-process autocut host is enabled AND this timer is loaded: two cutters — remove one (docs 'Auto-cut')" >&2
       fail=1

@@ -240,17 +240,21 @@ record_loaded() {
 # starts right there; nothing is kickstarted: a kick after the bootstrap
 # would only kill the instance launchd just spawned, mid-startup) and
 # record its checksum as the confirmed-loaded definition.
-# Sets UNIT_RESULT: installed | still-old (the old registration did not go
-# away within 30 s, or bootstrap was refused with it still loaded: it keeps
-# running the OLD definition — re-run) | not-loaded (bootstrap refused,
-# nothing loaded — a gui-domain unit then loads at the next login).
+# Sets UNIT_RESULT: installed | still-old (the old registration was still
+# tearing down after 60 s — nothing re-registers it, re-run once it is gone
+# — or bootstrap was refused with it still loaded, in which case the OLD
+# definition keeps running) | not-loaded (bootstrap refused, nothing loaded
+# — a gui-domain unit then loads at the next login).
 # Returns 0 only for installed.
 load_unit() {
   lu_label="$1"; lu_domain="$2"; lu_dst="$3"
   rm -f "$LOCKS_DIR/$lu_label.loaded"   # whatever runs from here on is unconfirmed until bootstrap succeeds
   launchctl bootout "$lu_domain/$lu_label" 2>/dev/null || true
-  if ! wait_unloaded "$lu_domain/$lu_label"; then
-    echo "   old registration of $lu_label still loaded after 30s (it keeps running the old definition; the new plist is on disk) — re-run" >&2
+  # the bootout is issued: the old instance is going down and nothing will
+  # re-register it, so give a slow teardown a second 30 s rather than leave
+  # the unit with no replacement
+  if ! wait_unloaded "$lu_domain/$lu_label" && ! wait_unloaded "$lu_domain/$lu_label"; then
+    echo "   old registration of $lu_label still tearing down after 60s; it will NOT come back by itself and the new one is not loaded — re-run once it is gone" >&2
     UNIT_RESULT=still-old
     return 1
   fi
