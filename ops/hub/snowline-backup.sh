@@ -85,13 +85,16 @@ fi
 # the split is done with globbing off so a stray `*` cannot expand against
 # the cwd, and each name must be a plain identifier.
 DBS_EXPLICIT="${SNOWLINE_BACKUP_DBS:-}"
-set -f; set -- $DBS_EXPLICIT; set +f
+set -f
+# shellcheck disable=SC2086
+set -- $DBS_EXPLICIT
 DBS_EXPLICIT="$*"
-for db in $DBS_EXPLICIT; do
+for db in "$@"; do
     case "$db" in
         *[!A-Za-z0-9_]*) log "SNOWLINE_BACKUP_DBS entry is not a database name: '$db'" >&2; exit 2 ;;
     esac
 done
+set +f
 # Exit codes: 2 = cannot run at all (destination / iCloud root / unwritable /
 # lock — the environment, not the data); 1 = some store(s) failed to dump;
 # 3 = another run held the lock (stepped aside). install-daemons.sh reads
@@ -139,19 +142,20 @@ esac
 # the folder (and its contents) when iCloud Drive is turned off with "keep a
 # copy", and nothing here can tell that apart from a healthy mount. Confirm
 # off-machine arrival from another device now and then (docs/ops/hub-daemons.md).
-# Under a verified iCloud root the leaf folders may be created freely; for
-# any other destination (external volume, rsync target) the parent must
-# already exist, or an unmounted volume would be silently replaced by a
-# local directory.
+# Under a verified iCloud root the leaf folders may be created freely; any
+# other destination (external volume, rsync target) must already EXIST and
+# is never created here — a destination that is itself a mount point
+# (/Volumes/Backups) would otherwise be silently recreated as a plain local
+# directory while the disk is unplugged.
 case "$DEST" in
     "$ICLOUD_ROOT"/*)
         [ -d "$ICLOUD_ROOT" ] || die "iCloud Drive root missing ($ICLOUD_ROOT); refusing to write local-only backups — is iCloud Drive set up for this user?"
+        mkdir -p "$DEST" || die "cannot create backup destination: $DEST"
         ;;
     *)
-        [ -d "$(dirname "$DEST")" ] || die "backup destination parent missing: $(dirname "$DEST")"
+        [ -d "$DEST" ] || die "backup destination missing: $DEST (not mounted? it is never created by this script)"
         ;;
 esac
-mkdir -p "$DEST" || die "cannot create backup destination: $DEST"
 # A real create, not `[ -w ]`: access(2) does not see a TCC denial (a
 # system-domain process without iCloud Drive consent) or a full/read-only
 # volume, and those must be exit 2 ("cannot run here"), not a per-store 1.
@@ -176,7 +180,10 @@ wait_for_postgres || true
 # is scratch" (nothing to dump, which is then reported per store).
 CATALOG_OK=yes
 CATALOG_ERR="$(mktemp -t snowline-backup-psql)"
-CATALOG="$(psql -X -At -d postgres -c "select datname from pg_database where not datistemplate and datname <> 'postgres' order by 1" 2>"$CATALOG_ERR")" || CATALOG_OK=no
+# Only databases this role can actually connect to: a parked store
+# (datallowconn = false) or one without CONNECT would otherwise fail every
+# hourly run with exit 1 until someone hand-writes SNOWLINE_BACKUP_DBS.
+CATALOG="$(psql -X -At -d postgres -c "select datname from pg_database where not datistemplate and datname <> 'postgres' and datallowconn and has_database_privilege(datname, 'CONNECT') order by 1" 2>"$CATALOG_ERR")" || CATALOG_OK=no
 LIVE="$(printf '%s\n' "$CATALOG" | grep -E "$STORE_RE" | grep -v -E "$SCRATCH_RE" | grep -v '^$' || true)"
 if [ -n "$DBS_EXPLICIT" ]; then
     DBS="$DBS_EXPLICIT"

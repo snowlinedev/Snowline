@@ -97,7 +97,25 @@ for timer in $TIMERS; do
   launchctl bootstrap system "$DAEMONS_DIR/$label.plist" || { echo "   bootstrap FAILED for $label" >&2; fail=1; }
 done
 
+echo "== waiting up to 60s for /health"
+urls="platform|http://100.81.176.75:8850/health pm|http://127.0.0.1:8802/health governance|http://127.0.0.1:8801/health memory|http://127.0.0.1:8803/health"
+for entry in $urls; do
+  name="${entry%%|*}"
+  url="${entry#*|}"
+  i=0
+  ok=no
+  while [ "$i" -lt 60 ]; do
+    if curl -fsS -m 2 -o /dev/null "$url" 2>/dev/null; then ok=yes; break; fi
+    sleep 1
+    i=$((i + 1))
+  done
+  echo "   $name $url: $([ "$ok" = yes ] && echo UP || echo DOWN)"
+  [ "$ok" = yes ] || fail=1
+done
+
 # --- the backup agent: tracked plist -> ~/Library/LaunchAgents, loaded ---
+# After the services are up: the agent's RunAtLoad pg_dump holds ACCESS
+# SHARE on every table, which would block a service's boot migration.
 # A per-user agent on purpose (docs "DB backups"): the dumps need the
 # owner's session anyway (Postgres is the owner's agent, iCloud syncs per
 # session), so a daemon would add no coverage, only a TCC problem. Operator
@@ -109,18 +127,27 @@ done
 # stopped firing still shows its old exit 0). A dump in progress (it holds
 # backup.lock) is waited for first; the hourly fire landing in the instant
 # between the last probe and the bootout would lose that hour's dump, which
-# the RunAtLoad dump then replaces. RunAtLoad means a load takes one dump,
-# judged below.
+# the RunAtLoad dump then replaces.
 label="dev.snowline.backup"
 log_file="$OWNER_HOME/Library/Logs/snowline-backup.log"
 echo "== $label (per-user agent)"
-# the destination as the SCRIPT resolves it (backup.env read as the owner)
-dest="$(sudo -u "#$OWNER_UID" -H /bin/bash "$OPS_HUB/snowline-backup.sh" --print-dest 2>/dev/null || echo "$BACKUP_DIR")"
-# recent_dump — a dump (or its iCloud-evicted placeholder) in the last 2 h;
-# prints its name, "?" when this shell may not read the destination, or nothing
-recent_dump() {
+# the destination as the SCRIPT resolves it (backup.env read as the owner);
+# a failure here is shown, not papered over with the default
+dest_err="$(mktemp -t snowline-install-dest)"
+if dest="$(sudo -u "#$OWNER_UID" -H /bin/bash "$OPS_HUB/snowline-backup.sh" --print-dest 2>"$dest_err")" && [ -n "$dest" ]; then
+  :
+else
+  echo "   could not resolve the backup destination via --print-dest ($(head -n 1 "$dest_err")); assuming $BACKUP_DIR" >&2
+  dest="$BACKUP_DIR"
+  fail=1
+fi
+rm -f "$dest_err"
+# dump_since <find time predicate...> — a dump (or its iCloud-evicted
+# placeholder) in $dest matching the predicate; prints its name, "?" when
+# this (root, Terminal-spawned) shell may not read the destination, or nothing
+dump_since() {
   err="$(mktemp -t snowline-install-find)"
-  name="$(find "$dest" -maxdepth 1 \( -name '*.dump' -o -name '.*.dump.icloud' \) -type f -mmin -120 2>"$err" | head -n 1)"
+  name="$(find "$dest" -maxdepth 1 \( -name '*.dump' -o -name '.*.dump.icloud' \) -type f "$@" 2>"$err" | head -n 1)"
   if [ -n "$name" ]; then basename "$name"; elif [ -s "$err" ]; then echo "?"; fi
   rm -f "$err"
 }
@@ -136,7 +163,7 @@ else
     *) why="last run exited $code" ;;
   esac
   if [ -z "$why" ]; then
-    case "$(recent_dump)" in
+    case "$(dump_since -mmin -120)" in
       "")  why="no dump in the last 2 h in $dest" ;;
       "?") echo "   unchanged and loaded; could not confirm a recent dump in $dest from this shell — check by hand: ls -t '$dest' | head" >&2; fail=1 ;;
       *)   echo "   unchanged and loaded, dumped within 2 h; left as it is" ;;
@@ -164,57 +191,37 @@ if [ -n "$why" ]; then
   fi
 fi
 
-echo "== waiting up to 60s for /health"
-urls="platform|http://100.81.176.75:8850/health pm|http://127.0.0.1:8802/health governance|http://127.0.0.1:8801/health memory|http://127.0.0.1:8803/health"
-for entry in $urls; do
-  name="${entry%%|*}"
-  url="${entry#*|}"
-  i=0
-  ok=no
-  while [ "$i" -lt 60 ]; do
-    if curl -fsS -m 2 -o /dev/null "$url" 2>/dev/null; then ok=yes; break; fi
-    sleep 1
-    i=$((i + 1))
-  done
-  echo "   $name $url: $([ "$ok" = yes ] && echo UP || echo DOWN)"
-  [ "$ok" = yes ] || fail=1
-done
-
 # --- the backup's RunAtLoad dump, if this install (re)loaded it ---
 # The script may wait 120s for Postgres, then dump every store: allow 5 min.
 # A fresh registration carries no exit code until its run ends, so the code
-# read here is this run's. Evidence is a fresh *.dump (or its iCloud-evicted
-# placeholder) in the destination, not the exit code alone; when this shell
-# cannot read the destination the result is a warning, not a pass.
+# read here is this run's; launchd may hold a freshly loaded job a moment
+# before its first spawn, so the only early exit is the unit vanishing.
+# Evidence is a fresh *.dump (or its iCloud-evicted placeholder) in the
+# destination, not the exit code alone; when this shell cannot read the
+# destination the result is unconfirmed and fails too.
 if [ "$backup_loaded" = yes ]; then
   echo "== $label (RunAtLoad dump)"
   code=""; running=no; i=0
   while [ "$i" -lt 300 ]; do
-    if unit_running "gui/$OWNER_UID/$label"; then
+    if ! launchctl print "gui/$OWNER_UID/$label" >/dev/null 2>&1; then
+      break   # unit gone
+    elif unit_running "gui/$OWNER_UID/$label"; then
       running=yes
     else
       running=no
       code="$(unit_last_exit "gui/$OWNER_UID/$label")"
       [ -n "$code" ] && break
-      [ "$i" -ge 10 ] && break   # not running, no exit code: never spawned / signalled
     fi
     sleep 2
     i=$((i + 2))
   done
   tail -n 8 "$log_file" 2>/dev/null | sed 's/^/   /'
   if [ "$code" = 0 ]; then
-    find_err="$(mktemp -t snowline-install-find)"
-    fresh="$(find "$dest" -maxdepth 1 \( -name '*.dump' -o -name '.*.dump.icloud' \) -type f -newer "$START_MARK" 2>"$find_err" | head -n 1)"
-    if [ -n "$fresh" ]; then
-      echo "   OK (exit 0, fresh dump $(basename "$fresh"))"
-    elif [ -s "$find_err" ]; then
-      echo "   exit 0, UNCONFIRMED: this shell may not read $dest ($(head -n 1 "$find_err")) — verify by hand: ls -t '$dest' | head" >&2
-      fail=1
-    else
-      echo "   exit 0 but NO new dump in $dest — not trusting it; check $log_file" >&2
-      fail=1
-    fi
-    rm -f "$find_err"
+    case "$(dump_since -newer "$START_MARK")" in
+      "")  echo "   exit 0 but NO new dump in $dest — not trusting it; check $log_file" >&2; fail=1 ;;
+      "?") echo "   exit 0, UNCONFIRMED: this shell may not read $dest — verify by hand: ls -t '$dest' | head" >&2; fail=1 ;;
+      *)   echo "   OK (exit 0, fresh dump $(dump_since -newer "$START_MARK"))" ;;
+    esac
   elif [ -z "$code" ] && [ "$running" = yes ]; then
     echo "   still running after ${i}s — check $log_file and 'launchctl print gui/$OWNER_UID/$label'" >&2
     fail=1

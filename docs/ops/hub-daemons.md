@@ -29,15 +29,16 @@ each of platform / pm / governance / memory:
    timer is not installed, and a loaded timer next to an enabled host is
    reported as a fault. Left alone when unchanged and loaded, skipped
    (non-zero exit) if a cut is running.
-5. Installs the hourly DB backup agent: (re)loads
+5. Polls the four `/health` URLs for up to 60s and prints UP/DOWN.
+6. Installs the hourly DB backup agent (after the services are up, so its
+   RunAtLoad dump cannot block a boot migration): (re)loads
    `ops/hub/launchagents/dev.snowline.backup.plist` into `gui/501` (copying
    it to `~/Library/LaunchAgents/` at that moment) when the tracked plist
    differs, the unit is not loaded, its last run exited 1 or 2, or no dump
    landed in the last two hours — waiting first for a dump in progress.
    Operator overrides live in `~/.config/snowline/backup.env`, never in the
    plist. It stays a per-user agent on purpose ("DB backups" below).
-6. Polls the four `/health` URLs for up to 60s and prints UP/DOWN.
-7. If step 5 (re)loaded the backup agent, waits (up to 5 min) for its
+7. If step 6 (re)loaded the backup agent, waits (up to 5 min) for its
    RunAtLoad dump and fails the install unless it exited 0 AND a fresh
    `*.dump` was confirmed in the destination (a destination this shell
    cannot read is reported as unconfirmed and also fails, with the command
@@ -394,7 +395,7 @@ once on load. The script:
   `pg_restore -l`, then renames `.partial` to the final name — one store
   failing does not skip the others, and the run exits 1 if any did;
 - the store list comes from the server's own catalog: every `snowline_*`
-  database except scratch ones — a name with a `_test`, `_dryrun`, `_e2e`
+  database this role can connect to, except scratch ones — a name with a `_test`, `_dryrun`, `_e2e`
   or `_restore` component (as a whole component: `snowline_pm_test_sp` and
   `snowline_restore` are scratch, `snowline_testimonials` would be a store)
   and the legacy `snowline_dev` — so a new service's store is backed up

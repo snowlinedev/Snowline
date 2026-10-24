@@ -10,6 +10,7 @@
 # shellcheck disable=SC1091
 . "$(cd "$(dirname "$0")" && pwd)/launchdaemons/lib.sh"
 autocut_guard "$@"
+fail=0
 
 # System-only timers: no LaunchAgent predecessor; just remove (skipped, with
 # a message, if a run started since the guard above).
@@ -18,6 +19,7 @@ for timer in $TIMERS; do
   echo "== $label"
   if lock_held "$LOCKS_DIR/$timer.lock"; then
     echo "   $timer is running now; leaving $label as it is — re-run after it finishes" >&2
+    fail=1
     continue
   fi
   launchctl bootout "system/$label" 2>/dev/null || true
@@ -31,6 +33,9 @@ for svc in $SERVICES; do
   echo "== dev.snowline.$svc"
   if restore_agent "$svc"; then
     launchctl kickstart -k "gui/$OWNER_UID/dev.snowline.$svc" || true
+  else
+    fail=1
   fi
 done
 echo "done; check the four /health URLs (docs/ops/hub-daemons.md). The backup agent dev.snowline.backup was left as it is."
+exit "$fail"

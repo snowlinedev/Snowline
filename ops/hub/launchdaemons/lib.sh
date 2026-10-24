@@ -84,7 +84,7 @@ wait_unloaded() {
 # A timer that must not be booted out mid-run holds a flock on
 # $LOCKS_DIR/<name>.lock for its whole run: autocut for the cut (taken by
 # `snowline release autocut`), the backup for the dump (snowline-backup.sh
-# re-executes itself under a flock-holding wrapper). lock_held <path> probes
+# opens the file on fd 9 for its lifetime and flocks it). lock_held <path> probes
 # a lock without keeping it (a shared non-blocking lock, released at once;
 # the backup's acquire retries over a few seconds so a probe cannot make it
 # step aside). The kernel drops a flock with its process, so a file left by
