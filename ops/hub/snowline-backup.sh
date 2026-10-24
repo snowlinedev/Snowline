@@ -159,8 +159,8 @@ esac
 # An explicit store list is validated here, before anything slow or
 # side-effecting: a whitespace-only value is "unset", not "dump nothing";
 # the split is done with globbing off so a stray `*` cannot expand against
-# the cwd, and each name must be a plain identifier (valid_names, below,
-# is the one rule for every source of names).
+# the cwd, and each name must be a plain identifier (the catalog query
+# applies the same rule in SQL).
 # (the catalog query applies the same identifier rule in SQL)
 DBS_EXPLICIT="${SNOWLINE_BACKUP_DBS:-}"
 set -f
