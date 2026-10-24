@@ -125,8 +125,19 @@ if [ -z "$script" ] || [ ! -f "$script" ]; then
   fail=1
   exit "$fail"
 fi
+# The unit will run the CANONICAL script; this install was written against
+# ITS OWN copy. They must be the same file, or an install run from a branch
+# or worktree before the canonical checkout pulled it would install a unit
+# running different code — and the queries below (--print-dest, --check)
+# would be sent to a script that may not know them and would take a real
+# backup instead. Refuse until the canonical checkout is current.
+if ! cmp -s "$OPS_HUB/snowline-backup.sh" "$script"; then
+  echo "   $script differs from $OPS_HUB/snowline-backup.sh (the canonical checkout has not pulled this version?); NOT touching the backup unit until they match" >&2
+  fail=1
+  exit "$fail"
+fi
 echo "   unit runs $script"
-as_owner() { sudo -u "#$OWNER_UID" -H /bin/bash "$script" "$@"; }
+as_owner() { sudo -u "#$OWNER_UID" -H /bin/bash "$OPS_HUB/snowline-backup.sh" "$@"; }
 dest="$(as_owner --print-dest 2>/dev/null)" || dest="(unknown: --print-dest failed)"
 # judge_dump <minutes> — OK / NONE / UNKNOWN for a dump newer than <minutes>;
 # the token comes from the script's stdout, so a sudo or script failure
@@ -176,12 +187,17 @@ fi
 # owner), not the exit code alone. Exit 3 ("stepped aside": a manual run
 # took the lock first) is retried once: wait for that run, kickstart the
 # unit, and judge THAT run by its own exit code and evidence.
+# judge_run <runs-before> — wait for a run that launchd has not necessarily
+# spawned yet: an exit code is only accepted once `runs` has advanced past
+# <runs-before> (or the unit was seen running), so a stale code from the
+# previous run is never taken for this one.
 judge_run() {
-  code=""; running=no; i=0
+  jr_before="$1"; code=""; running=no; seen=no; i=0
   while [ "$i" -lt 300 ]; do
     unit_snapshot "gui/$OWNER_UID/$label" || break   # unit gone
     running="$UNIT_RUNNING"
-    if [ "$running" = no ]; then
+    [ "$running" = yes ] && seen=yes
+    if [ "$running" = no ] && { [ "$seen" = yes ] || [ "$UNIT_RUNS" -gt "$jr_before" ]; }; then
       code="$UNIT_EXIT"
       [ -n "$code" ] && break
     fi
@@ -192,14 +208,14 @@ judge_run() {
 }
 if [ "$backup_loaded" = yes ]; then
   echo "== $label (RunAtLoad dump)"
-  judge_run
+  judge_run 0   # a fresh registration starts at runs = 0
   if [ "$code" = 3 ]; then
     echo "   stepped aside (another run held the lock); waiting for that run, then firing the unit once more"
     unit_busy_wait backup 600 || true
+    unit_snapshot "gui/$OWNER_UID/$label"; runs_before="$UNIT_RUNS"
     run_mark=$(date +%s)
     launchctl kickstart "gui/$OWNER_UID/$label"
-    sleep 2
-    judge_run
+    judge_run "$runs_before"
     START_EPOCH=$run_mark
   fi
   if [ "$code" = 0 ]; then

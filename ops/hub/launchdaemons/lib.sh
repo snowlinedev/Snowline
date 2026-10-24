@@ -62,22 +62,21 @@ wait_for_postgres() {
 }
 
 # unit_snapshot <domain/label> — one launchctl read; sets UNIT_LOADED
-# (yes/no), UNIT_RUNNING (yes/no) and UNIT_EXIT (the numeric exit code of
-# the last completed run, or empty: never ran, or ended by a signal), all
-# describing the same instant.
+# (yes/no), UNIT_RUNNING (yes/no), UNIT_RUNS (launchd's run counter) and
+# UNIT_EXIT (the numeric exit code of the last completed run, or empty:
+# never ran, or ended by a signal), all describing the same instant.
 unit_snapshot() {
-  UNIT_LOADED=no; UNIT_RUNNING=no; UNIT_EXIT=""
+  UNIT_LOADED=no; UNIT_RUNNING=no; UNIT_RUNS=0; UNIT_EXIT=""
   us_info="$(launchctl print "$1" 2>/dev/null)" || return 1
   UNIT_LOADED=yes
   if printf '%s\n' "$us_info" | grep -q -E '^[[:space:]]*(state = running|pid = [0-9])'; then
     UNIT_RUNNING=yes
   fi
+  UNIT_RUNS="$(printf '%s\n' "$us_info" | sed -n 's/^[[:space:]]*runs = \([0-9][0-9]*\).*/\1/p' | head -n 1)"
+  UNIT_RUNS="${UNIT_RUNS:-0}"
   UNIT_EXIT="$(printf '%s\n' "$us_info" | sed -n 's/.*last exit code = \([0-9][0-9]*\).*/\1/p' | head -n 1)"
   return 0
 }
-# unit_last_exit <domain/label> — the numeric exit code of the unit's last
-# completed run, or nothing (never ran, or ended by a signal).
-unit_last_exit() { unit_snapshot "$1" >/dev/null 2>&1; printf '%s\n' "$UNIT_EXIT"; }
 
 # wait_unloaded <domain/label> — after a bootout, wait (up to 30 s) until
 # launchd no longer knows the label, so an immediate bootstrap of the same
@@ -194,10 +193,12 @@ load_unit() {
     UNIT_RESULT=still-old
     return 1
   fi
-  mkdir -p "$(dirname "$lu_dst")" && chown "$lu_owner" "$(dirname "$lu_dst")"
-  cp "$lu_src" "$lu_dst"
-  chown "$lu_owner" "$lu_dst"
-  chmod 644 "$lu_dst"
+  if ! { mkdir -p "$(dirname "$lu_dst")" && chown "$lu_owner" "$(dirname "$lu_dst")" \
+         && cp "$lu_src" "$lu_dst" && chown "$lu_owner" "$lu_dst" && chmod 644 "$lu_dst"; }; then
+    echo "   could not install $lu_src -> $lu_dst; $lu_label NOT loaded" >&2
+    UNIT_RESULT=copy-failed
+    return 1
+  fi
   if ! launchctl bootstrap "$lu_domain" "$lu_dst"; then
     if launchctl print "$lu_domain/$lu_label" >/dev/null 2>&1; then
       echo "   bootstrap of $lu_label refused and an old registration is still loaded (old definition keeps running) — re-run, or reboot" >&2

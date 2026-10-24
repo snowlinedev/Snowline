@@ -451,14 +451,20 @@ iCloud folder.
 **Rolling out this change on the hub.** The hub checkout had an untracked
 hand-restored copy of `ops/hub/snowline-backup.sh` from 2026-10-23 (the
 #223 script, kept running while the PR was open), hidden from `git status`
-by a `.git/info/exclude` entry. Git replaces an ignored file in place on
-checkout, so a plain `git pull --ff-only` is the whole step: the tracked
-script lands atomically and the agent keeps dumping from the same path, now
-with the hardened script. Afterwards drop the stale exclude line. Do NOT
-delete the copy first: the hourly agent would spawn a missing program in
-the meantime (EX_CONFIG, penalty box). The agent plist already installed on
-the hub differs from the tracked one only cosmetically; the next
-`sudo ops/hub/install-daemons.sh` replaces and reloads it (one dump, judged).
+by a `.git/info/exclude` entry. Git overwrites an ignored file on checkout
+(unlink and rewrite, a sub-second window), so a plain `git pull --ff-only`
+is the whole step: the tracked script lands and the agent keeps dumping
+from the same path, now with the hardened script; do the pull away from
+the top of the hour, when the agent fires. Afterwards drop the stale
+exclude line. Do NOT delete the copy first: the hourly agent would spawn a
+missing program in the meantime (EX_CONFIG, penalty box). The agent plist
+already installed on the hub (the #223 one) runs the script directly with
+a `WorkingDirectory` and an explicit `SNOWLINE_BACKUP_DIR` equal to the
+default; the tracked one runs it via `/bin/bash` with neither. Same
+behaviour, different bytes: the next `sudo ops/hub/install-daemons.sh`
+will therefore replace and reload it once (one dump, judged) — run it from
+the canonical checkout after the pull; from any other checkout it refuses
+until the two scripts match.
 
 **Is it alive?** Do this whenever you touch the hub — the job has silently
 died twice (2026-07-09 to 09-04 after the repo move; 2026-09-13 to 10-23

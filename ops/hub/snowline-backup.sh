@@ -74,6 +74,18 @@ fi
 DEST="${SNOWLINE_BACKUP_DIR:-$BACKUP_DIR}"
 RETENTION_DAYS="${SNOWLINE_BACKUP_RETENTION_DAYS:-30}"
 case "$RETENTION_DAYS" in ''|*[!0-9]*) log "SNOWLINE_BACKUP_RETENTION_DAYS is not a number of days: '$RETENTION_DAYS'" >&2; exit 2 ;; esac
+# name_stamp <path> — the YYYYMMDD-HHMMSS UTC stamp of a Z-named dump or
+# placeholder (…-YYYYMMDD-HHMMSSZ.dump[.icloud]); fails for any other name.
+# Parameter expansion only: it runs once per file in --check and prune.
+name_stamp() {
+    ns="${1##*/}"; ns="${ns%.icloud}"; ns="${ns%Z.dump}"
+    ns="${ns#"${ns%???????????????}"}"   # last 15 chars
+    case "$ns" in
+        [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]) printf '%s\n' "$ns" ;;
+        *) return 1 ;;
+    esac
+}
+
 # Queries install-daemons.sh makes by running this script AS THE OWNER
 # (so backup.env, TCC consent and the destination are exactly this
 # script's), checked before anything below touches the positional params:
@@ -90,21 +102,25 @@ case "${1:-}" in
         # A dump counts by the UTC stamp in its NAME (this script writes
         # <store>-YYYYMMDD-HHMMSSZ.dump), not by mtime: an iCloud-evicted
         # placeholder carries eviction time, and old pre-Z names are local
-        # time and are ignored. Prints OK / NONE / UNREADABLE on stdout as
-        # well as exiting 0 / 1 / 2, so a caller can tell "no dump" from
-        # "could not even run".
+        # time and are ignored. The stamps are fixed-width UTC, so they
+        # compare as strings against one cutoff stamp — no fork per file.
+        # Prints OK / NONE / UNREADABLE on stdout as well as exiting 0 / 1 /
+        # 2, so a caller can tell "no dump" from "could not even run".
         mins="${2:-}"
         case "$mins" in ''|*[!0-9]*) echo "--check needs a number of minutes" >&2; exit 2 ;; esac
         [ -d "$DEST" ] || { echo NONE; exit 1; }
+        cutoff="$(date -u -v-"${mins}"M +%Y%m%d-%H%M%S)"
         err="$(mktemp -t snowline-backup-check)"
-        names="$(find "$DEST" -maxdepth 1 \( -name '*-[0-9]*Z.dump' -o -name '.*-[0-9]*Z.dump.icloud' \) -type f 2>"$err" \
-            | sed -n 's#.*-\([0-9]\{8\}-[0-9]\{6\}\)Z\.dump\(\.icloud\)\{0,1\}$#\1#p' | sort -u | tail -n 1)"
+        found=no
+        while IFS= read -r f; do
+            s="$(name_stamp "$f")" || continue
+            [ "$s" \< "$cutoff" ] || found=yes
+        done <<EOF_FIND
+$(find "$DEST" -maxdepth 1 \( -name '*-[0-9]*Z.dump' -o -name '.*-[0-9]*Z.dump.icloud' \) -type f 2>"$err")
+EOF_FIND
         if [ -s "$err" ]; then rm -f "$err"; echo UNREADABLE; exit 2; fi
         rm -f "$err"
-        cutoff=$(( $(date -u +%s) - mins * 60 ))
-        if [ -n "$names" ] && [ "$(date -j -u -f '%Y%m%d-%H%M%S' "$names" +%s 2>/dev/null || echo 0)" -ge "$cutoff" ]; then
-            echo OK; exit 0
-        fi
+        [ "$found" = yes ] && { echo OK; exit 0; }
         echo NONE; exit 1
         ;;
     "") ;;   # no arguments: a real run
@@ -279,15 +295,14 @@ set -f
 set -- $DBS
 set +f
 # prune_by_name <store> — delete this store's Z-stamped dumps and
-# placeholders whose name stamp is older than RETENTION_DAYS.
+# placeholders whose name stamp is older than RETENTION_DAYS (string
+# comparison against one cutoff stamp; no fork per file).
+PRUNE_CUTOFF="$(date -u -v-"${RETENTION_DAYS}"d +%Y%m%d-%H%M%S)"
 prune_by_name() {
-    pb_cutoff=$(( $(date -u +%s) - RETENTION_DAYS * 86400 ))
     find "$DEST" -maxdepth 1 \( -name "$1-[0-9]*Z.dump" -o -name ".$1-[0-9]*Z.dump.icloud" \) -type f 2>/dev/null \
     | while IFS= read -r pb_f; do
-        pb_stamp="$(printf '%s' "$pb_f" | sed -n 's#.*-\([0-9]\{8\}-[0-9]\{6\}\)Z\.dump\(\.icloud\)\{0,1\}$#\1#p')"
-        [ -n "$pb_stamp" ] || continue
-        pb_epoch="$(date -j -u -f '%Y%m%d-%H%M%S' "$pb_stamp" +%s 2>/dev/null)" || continue
-        [ "$pb_epoch" -lt "$pb_cutoff" ] && rm -f "$pb_f"
+        pb_stamp="$(name_stamp "$pb_f")" || continue
+        [ "$pb_stamp" \< "$PRUNE_CUTOFF" ] && rm -f "$pb_f"
     done
     return 0
 }
@@ -332,7 +347,8 @@ for DB in "$@"; do
     # old pre-Z names are local time and go by mtime. Non-fatal: a find
     # hiccup must not make a run whose dump already succeeded read as failed.
     prune_by_name "$DB" || true
-    find "$DEST" -maxdepth 1 -name "${DB}-*[0-9].dump" -type f -mtime +"$RETENTION_DAYS" -delete 2>/dev/null || true
+    # legacy pre-Z names (local-time stamps) and their placeholders: by mtime
+    find "$DEST" -maxdepth 1 \( -name "${DB}-*[0-9].dump" -o -name ".${DB}-*[0-9].dump.icloud" \) -type f -mtime +"$RETENTION_DAYS" -delete 2>/dev/null || true
 done
 trap - TERM INT
 
