@@ -70,11 +70,7 @@ for timer in $TIMERS; do
   fi
   # autocut was refused up front by autocut_guard; a cut that started since
   # is a plain check here — still running means skip, never kill it
-  if lock_held "$LOCKS_DIR/$timer.lock"; then
-    echo "   $timer is running now (or its lock cannot be probed); leaving $label as it is — re-run the install after it finishes" >&2
-    fail=1
-    continue
-  fi
+  if timer_skip "$timer" "the install"; then fail=1; continue; fi
   load_unit "$label" system "$LAUNCHDAEMONS_SRC/$label.plist" "$DAEMONS_DIR/$label.plist" root:wheel no || fail=1
 done
 

@@ -86,6 +86,13 @@ if [ -f "$BACKUP_ENV" ]; then
     # shellcheck disable=SC1090
     . "$BACKUP_ENV" || die "cannot source $BACKUP_ENV (syntax error?); refusing to run half-configured"
     set -u; set +a
+    # (and say so when the file's value lost: the hub's pre-#319 agent plist
+    # exported SNOWLINE_BACKUP_DIR itself until install-backup-agent.sh
+    # replaced it, which made a backup.env value look ignored)
+    shadow() { [ -z "$2" ] || [ "$2" = "$3" ] || log "note: $1 from the environment ($2) overrides $BACKUP_ENV ($3)"; }
+    shadow SNOWLINE_BACKUP_DIR "$env_dir" "${SNOWLINE_BACKUP_DIR:-}"
+    shadow SNOWLINE_BACKUP_RETENTION_DAYS "$env_days" "${SNOWLINE_BACKUP_RETENTION_DAYS:-}"
+    shadow SNOWLINE_BACKUP_DBS "$env_dbs" "${SNOWLINE_BACKUP_DBS:-}"
     [ -z "$env_dir" ]  || SNOWLINE_BACKUP_DIR="$env_dir"
     [ -z "$env_days" ] || SNOWLINE_BACKUP_RETENTION_DAYS="$env_days"
     [ -z "$env_dbs" ]  || SNOWLINE_BACKUP_DBS="$env_dbs"
@@ -257,12 +264,16 @@ wait_for_postgres || true
 # unreachable" (fallback + WARNING) is distinguishable from "every database
 # is scratch" (nothing to dump, which is then reported per store).
 CATALOG_OK=yes
-# Only databases this role can actually connect to: a parked store
-# (datallowconn = false) or one without CONNECT would otherwise fail every
-# hourly run with exit 1 until someone hand-writes SNOWLINE_BACKUP_DBS.
-# (and only plain-identifier names: a quoted name with a space or dash
-# would split into bogus stores; the same rule as for SNOWLINE_BACKUP_DBS)
-CATALOG="$(psql -X -At -d postgres -c "select datname from pg_database where not datistemplate and datname <> 'postgres' and datallowconn and has_database_privilege(datname, 'CONNECT') and datname ~ '^[A-Za-z0-9_]+\$' order by 1" 2>"$CATALOG_ERR")" || CATALOG_OK=no
+# Only plain-identifier names (a quoted name with a space or dash would
+# split into bogus stores; the same rule as for SNOWLINE_BACKUP_DBS), and
+# only databases this role can actually connect to — but a snowline_* store
+# that is parked (datallowconn = false) or lost CONNECT is NAMED in the log,
+# never silently dropped from the backup set: the query returns
+# "<name>|<connectable>" and the unconnectable ones are reported below.
+CATALOG_ROWS="$(psql -X -At -d postgres -c "select datname, (datallowconn and has_database_privilege(datname, 'CONNECT')) from pg_database where not datistemplate and datname <> 'postgres' and datname ~ '^[A-Za-z0-9_]+\$' order by 1" 2>"$CATALOG_ERR")" || CATALOG_OK=no
+CATALOG="$(printf '%s\n' "$CATALOG_ROWS" | awk -F'|' '$2 == "t" { print $1 }')"
+UNCONNECTABLE="$(printf '%s\n' "$CATALOG_ROWS" | awk -F'|' '$2 != "t" { print $1 }' | grep -E "$STORE_RE" | grep -v -E "$SCRATCH_RE" | tr '\n' ' ')"
+[ -z "${UNCONNECTABLE% }" ] || log "WARNING: snowline store(s) this role cannot connect to, NOT backed up:${UNCONNECTABLE:+ ${UNCONNECTABLE% }} (parked? CONNECT revoked?)" >&2
 LIVE="$(printf '%s\n' "$CATALOG" | grep -E "$STORE_RE" | grep -v -E "$SCRATCH_RE" | grep -v '^$' || true)"
 LIVE="$(printf '%s\n' "$LIVE" | tr '\n' ' ')"; LIVE="${LIVE% }"
 if [ -n "$DBS_EXPLICIT" ]; then

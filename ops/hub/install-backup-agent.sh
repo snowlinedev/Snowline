@@ -28,17 +28,16 @@ fail=0
 # --- guards: the unit runs the canonical script; this install must BE it ---
 # The plist carries the canonical checkout path on purpose (a path taken
 # from whichever checkout runs this would make a scratch worktree the
-# permanent unit and die with EX_CONFIG when it is deleted). So: the plist
-# must name BACKUP_SCRIPT, that file must exist, and this install must run
-# from that very checkout (same file, not merely equal bytes — it sources
-# the canonical lib.sh and backup.env too).
-plist_script="$(plutil -extract "ProgramArguments.$(( $(plutil -extract ProgramArguments raw -o - "$plist_src" 2>/dev/null || echo 1) - 1 ))" raw -o - "$plist_src" 2>/dev/null)"
-if [ "$plist_script" != "$BACKUP_SCRIPT" ]; then
-  echo "the tracked agent plist runs '$plist_script' but lib.sh says the canonical script is $BACKUP_SCRIPT; fix one of them" >&2
+# permanent unit and die with EX_CONFIG when it is deleted). So: that file
+# must exist, and this install must run from that very checkout (same
+# file, not merely equal bytes — it sources the canonical lib.sh and
+# backup.env too).
+if [ -z "$BACKUP_SCRIPT" ]; then
+  echo "cannot read the script path from $plist_src (plutil? malformed plist?)" >&2
   exit 1
 fi
 if [ ! -f "$BACKUP_SCRIPT" ]; then
-  echo "$BACKUP_SCRIPT is not on this hub (checkout moved? then update BACKUP_SCRIPT in lib.sh and the tracked plist); NOT installing a unit that would fail with EX_CONFIG" >&2
+  echo "$BACKUP_SCRIPT is not on this hub (checkout moved? then update the path in the tracked plist); NOT installing a unit that would fail with EX_CONFIG" >&2
   exit 1
 fi
 if [ ! "$OPS_HUB/snowline-backup.sh" -ef "$BACKUP_SCRIPT" ]; then
@@ -63,15 +62,24 @@ dump_evidence() {
     0) EVIDENCE=OK; return ;;
     1) EVIDENCE=NONE; return ;;
   esac
-  # only the script's own stamped lines (pg_dump stderr shares the file,
-  # unstamped); the LAST stamped line in the window is the verdict, so an
-  # old failure cannot outrank a later clean run
-  de_last="$(awk -v s="$2" '$1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ && $1 >= s' "$log_file" 2>/dev/null | tail -n 1)"
-  case "$de_last" in
-    *"backed up"*) EVIDENCE=LOG_OK ;;
-    "") EVIDENCE=UNKNOWN ;;
-    *FAILED*|*"run incomplete"*|*interrupted*|*cannot*|*missing*|*"not writable"*|*refusing*|*"must be"*|*"is not a"*) EVIDENCE=LOG_FAIL ;;
-    *) EVIDENCE=UNKNOWN ;;
+  log_verdict "$2"
+  case "$LOGSAYS" in
+    OK)   EVIDENCE=LOG_OK ;;
+    FAIL) EVIDENCE=LOG_FAIL ;;
+    *)    EVIDENCE=UNKNOWN ;;
+  esac
+}
+# log_verdict <since-stamp> — sets LOGSAYS to OK / FAIL / NONE from the
+# agent's own stamped log lines since <since-stamp> (pg_dump stderr shares
+# the file, unstamped, and is ignored); the LAST line is the verdict, so
+# an old failure cannot outrank a later clean run
+log_verdict() {
+  lv_last="$(awk -v s="$1" '$1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ && $1 >= s' "$log_file" 2>/dev/null | tail -n 1)"
+  case "$lv_last" in
+    *"backed up"*) LOGSAYS=OK ;;
+    "") LOGSAYS=NONE ;;
+    *FAILED*|*"run incomplete"*|*interrupted*|*cannot*|*missing*|*"not writable"*|*refusing*|*"must be"*|*"is not a"*) LOGSAYS=FAIL ;;
+    *) LOGSAYS=NONE ;;
   esac
 }
 
@@ -143,18 +151,25 @@ if [ "$loaded" = yes ]; then
       sleep 2
       i=$((i + 2))
     done
+    deferred=no
     if [ "$code" = 3 ]; then
-      echo "   stepped aside (another run held the lock); waiting for that run and judging its dump instead"
+      # deferring to a concurrent run: wait for it, then its OWN outcome
+      # (the log's last run) must be clean before its dumps count
+      echo "   stepped aside (another run held the lock); deferring to that run"
       unit_busy_wait backup 600 || true
       run_epoch=$((run_epoch - 1800)); run_stamp="$(date -u -v-30M +%FT%TZ)"
-      code=0
+      deferred=yes; code=0
+      log_verdict "$run_stamp"
+      if [ "$LOGSAYS" = FAIL ]; then
+        code=1
+      fi
     fi
     tail -n 8 "$log_file" 2>/dev/null | sed 's/^/   /'
     if [ "$code" = 0 ]; then
       dump_evidence $(( ($(date +%s) - run_epoch) / 60 + 1 )) "$run_stamp"
       case "$EVIDENCE" in
-        OK)       echo "   OK (exit 0; dump landed in $dest)" ;;
-        LOG_OK)   echo "   OK (exit 0; the log shows the dump — destination not checkable from this context: $EVIDENCE_MSG)" ;;
+        OK)       echo "   OK ($([ "$deferred" = yes ] && echo "the concurrent run completed" || echo "exit 0"); dump landed in $dest)" ;;
+        LOG_OK)   echo "   OK ($([ "$deferred" = yes ] && echo "the concurrent run completed" || echo "exit 0"); the log shows the dump — destination not checkable from this context: $EVIDENCE_MSG)" ;;
         NONE)     echo "   exit 0 but NO new dump in $dest — not trusting it; check $log_file" >&2; fail=1 ;;
         LOG_FAIL) echo "   exit 0 but the log's last run failed — check $log_file" >&2; fail=1 ;;
         *)        echo "   exit 0, UNCONFIRMED: could not check $dest ($EVIDENCE_MSG) and the log shows no dump — verify by hand: ls -t '$dest' | head" >&2; fail=1 ;;
@@ -163,7 +178,7 @@ if [ "$loaded" = yes ]; then
       echo "   no result after ${i}s (still running, never spawned, or killed by a signal) — check $log_file and 'launchctl print $domain/$label'" >&2
       fail=1
     else
-      echo "   FAILED (exit $code) — see $log_file (1: a store failed; 2: cannot run here)" >&2
+      echo "   FAILED ($([ "$deferred" = yes ] && echo "the concurrent run's last line reports a failure" || echo "exit $code")) — see $log_file (1: a store failed; 2: cannot run here)" >&2
       fail=1
     fi
   fi

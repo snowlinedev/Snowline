@@ -407,7 +407,9 @@ RunAtLoad; the first timed run is an hour after loading). The script:
   `pg_restore -l`, then renames `.partial` to the final name — one store
   failing does not skip the others, and the run exits 1 if any did;
 - the store list comes from the server's own catalog: every `snowline_*`
-  database this role can connect to, except scratch ones — a name with a `_test`, `_dryrun`, `_e2e`
+  database this role can connect to (one it cannot — parked, or CONNECT
+  revoked — is named in the log as NOT backed up, never silently dropped),
+  except scratch ones — a name with a `_test`, `_dryrun`, `_e2e`
   or `_restore` component (as a whole component: `snowline_pm_test_sp` and
   `snowline_restore` are scratch, `snowline_testimonials` would be a store)
   and the legacy `snowline_dev`; only plain-identifier names — so a new
@@ -484,7 +486,9 @@ ls -t ~/Library/Mobile\ Documents/com~apple~CloudDocs/Snowline/db-backups | head
 `last exit code = 0` and a dump under an hour old is healthy. Exit 1 with
 log lines says which store failed. Exit 2 means the run could not start at
 all (destination missing or unwritable, iCloud root absent, lib.sh missing,
-lock file unopenable). Exit 3 means the run stepped aside because another
+lock file unopenable) or refused its configuration (a `backup.env` that
+does not source, a bad `SNOWLINE_BACKUP_RETENTION_DAYS` or
+`SNOWLINE_BACKUP_DBS`, an unknown argument) — the log line names which. Exit 3 means the run stepped aside because another
 backup run held the lock (a manual or proving run racing the hourly fire;
 harmless once).
 A log line "interrupted (SIGTERM/SIGINT)" (exit 143, or `(never exited)`

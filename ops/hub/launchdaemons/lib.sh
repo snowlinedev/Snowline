@@ -29,12 +29,12 @@ LAUNCHAGENTS_SRC="$OPS_HUB/launchagents"
 ICLOUD_ROOT="$OWNER_HOME/Library/Mobile Documents/com~apple~CloudDocs"
 BACKUP_DIR="$ICLOUD_ROOT/Snowline/db-backups"   # the backup script's default destination
 BACKUP_LOG="$OWNER_HOME/Library/Logs/snowline-backup.log"   # the agent plist's StandardOut/ErrorPath
-# The canonical hub checkout's backup script: what the tracked agent plist
-# runs (deliberately fixed — a path taken from whichever checkout runs an
+# The canonical hub checkout's backup script: whatever the tracked agent
+# plist runs (its last ProgramArguments entry) — the plist is the single
+# source, deliberately static (a path taken from whichever checkout runs an
 # install could be a scratch worktree, dying with EX_CONFIG when deleted).
-# install-backup-agent.sh checks the plist against this and refuses to run
-# from any other checkout.
-BACKUP_SCRIPT=/Users/seanlynch/Projects/snowline-platform/ops/hub/snowline-backup.sh
+# install-backup-agent.sh refuses to run from any other checkout.
+BACKUP_SCRIPT="$(plutil -extract ProgramArguments.1 raw -o - "$LAUNCHAGENTS_SRC/dev.snowline.backup.plist" 2>/dev/null)"
 
 # ---- logging ----
 # Helpers log through `log`. A caller that defines its own log() FUNCTION
@@ -146,13 +146,15 @@ lock_state() {
 # lock_held <path> — true unless the lock is known to be free.
 lock_held() { [ "$(lock_state "$1")" != free ]; }
 
-# unit_busy_wait <name> [bound_s] — wait (default up to 10 min) while
-# <name>.lock is held; the ops scripts call it right before booting that
-# unit out. Returns 1 if still held after the bound (the caller then skips
-# the unit rather than killing a run). A bound of 0 is a plain check.
+# unit_busy_wait <name> [bound_s] [step_s] — wait (default up to 10 min, in
+# 5 s steps) while <name>.lock is held; the ops scripts call it right before
+# booting that unit out. Returns 1 if still held after the bound (the
+# caller then skips the unit rather than killing a run) or if the lock
+# cannot be probed. A bound of 0 is a plain check.
 unit_busy_wait() {
   lock="$LOCKS_DIR/$1.lock"
   bound="${2:-600}"
+  step="${3:-5}"
   busy_waited=0
   while :; do
     case "$(lock_state "$lock")" in
@@ -164,9 +166,16 @@ unit_busy_wait() {
       return 1
     fi
     echo "   $1 run in progress; waiting (${busy_waited}s)"
-    sleep 5
-    busy_waited=$((busy_waited + 5))
+    sleep "$step"
+    busy_waited=$((busy_waited + step))
   done
+}
+# timer_skip <name> <what> — when <name>'s lock is held (or cannot be
+# probed) print why the unit is being left alone and return 0; the caller
+# then skips it. <what> names the action to repeat later.
+timer_skip() {
+  lock_held "$LOCKS_DIR/$1.lock" || return 1
+  echo "   $1 is running now (or its lock cannot be probed); leaving dev.snowline.$1 as it is — re-run $2 after it finishes" >&2
   return 0
 }
 
@@ -178,24 +187,14 @@ unit_busy_wait() {
 # between this check and the bootout is not covered by this guard; the
 # install re-checks the lock right before touching the autocut unit.)
 autocut_guard() {
-  waited=0
-  while :; do
-    case "$(lock_state "$AUTOCUT_LOCK")" in
-      free) return 0 ;;
-      unknown)
-        echo "refusing: cannot probe the autocut lock $AUTOCUT_LOCK (perl missing? unreadable?)." >&2
-        exit 75 ;;
-    esac
-    if [ "${1:-}" != "--wait" ] || [ "$waited" -ge 900 ]; then
-      echo "refusing: an autocut is running (lock held: $AUTOCUT_LOCK)." >&2
-      echo "  booting the timer out now would kill the cut mid-publish." >&2
-      echo "  follow it in $AUTOCUT_LOG, then re-run (or pass --wait)." >&2
-      exit 75
-    fi
-    echo "   autocut running (lock held); waiting (${waited}s)"
-    sleep 15
-    waited=$((waited + 15))
-  done
+  # one probe/wait loop for every unit: bound 0 refuses at once, --wait
+  # polls (15 s steps) for up to 15 min
+  if [ "${1:-}" = "--wait" ]; then ag_bound=900; else ag_bound=0; fi
+  unit_busy_wait autocut "$ag_bound" 15 && return 0
+  echo "refusing: an autocut is running (lock held: $AUTOCUT_LOCK), or its lock cannot be probed." >&2
+  echo "  booting the timer out now would kill the cut mid-publish." >&2
+  echo "  follow it in $AUTOCUT_LOG, then re-run (or pass --wait)." >&2
+  exit 75
 }
 
 # ---- loading a unit ----
