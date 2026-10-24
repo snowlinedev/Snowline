@@ -14,6 +14,7 @@ AGENT_TIMERS="backup"
 OWNER_UID=501
 OWNER_HOME=/Users/seanlynch
 DEST=/Library/LaunchDaemons
+DAEMONS_DIR="$DEST"
 AGENTS="$OWNER_HOME/Library/LaunchAgents"
 SRC="$(cd "$(dirname "$0")" && pwd)/launchdaemons"
 
@@ -28,17 +29,22 @@ for timer in $TIMERS; do
   rm -f "$DEST/$label.plist"
 done
 
-# Services and the backup timer: restore_agent (lib.sh) puts the newest
-# .disabled-* agent plist back and loads it, or leaves the daemon in place
-# when there is nothing to restore (never leave the hub without the unit).
-# A service is then kickstarted; a timer is not (RunAtLoad is enough).
-for svc in $SERVICES $AGENT_TIMERS; do
+# Services: restore_agent (lib.sh) removes the daemon, puts the newest
+# .disabled-* agent plist back (or uses a live one) and loads it; then
+# kickstart. The daemon is removed even when there is no agent to restore —
+# that is what a rollback of the daemon move means for a service.
+for svc in $SERVICES; do
   echo "== dev.snowline.$svc"
   if restore_agent "$svc"; then
-    case " $AGENT_TIMERS " in
-      *" $svc "*) ;;
-      *) launchctl kickstart -k "gui/$OWNER_UID/dev.snowline.$svc" || true ;;
-    esac
+    launchctl kickstart -k "gui/$OWNER_UID/dev.snowline.$svc" || true
   fi
+done
+
+# The backup timer: same, but never kickstarted (RunAtLoad is enough), and
+# if there is no agent plist to restore the daemon is LEFT IN PLACE — a
+# rollback must not leave the hub without a backup unit.
+for timer in $AGENT_TIMERS; do
+  echo "== dev.snowline.$timer"
+  restore_agent "$timer" keep-daemon-if-none || true
 done
 echo "done; check the four /health URLs and 'launchctl print gui/$OWNER_UID/dev.snowline.backup' (docs/ops/hub-daemons.md)"

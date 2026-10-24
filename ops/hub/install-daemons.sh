@@ -21,6 +21,7 @@ OWNER_UID=501
 OWNER_HOME=/Users/seanlynch
 SRC="$(cd "$(dirname "$0")" && pwd)/launchdaemons"
 DEST=/Library/LaunchDaemons
+DAEMONS_DIR="$DEST"
 AGENTS="$OWNER_HOME/Library/LaunchAgents"
 STAMP="$(date +%Y%m%d)"
 
@@ -84,16 +85,19 @@ for entry in $urls; do
 done
 
 # The backup timer's RunAtLoad dump proves the path end to end: wait for the
-# run to finish (it waits up to 120s for Postgres itself). Exit 0 = dumps
-# landed; exit 3 = dumps landed but the store list has drifted (a warning the
-# restored agent would hit identically, so NOT a reason to roll back); any
-# other outcome = the daemon cannot dump, so put the per-user agent back if
-# one exists (restore_agent leaves the daemon when there is none) and fail.
+# run to finish — it may itself wait up to 120s for Postgres, then dump every
+# store, so allow 5 minutes. Exit 0 = dumps landed. A non-zero exit = the
+# daemon cannot dump (e.g. the system domain lacks access to the owner's
+# iCloud folder, see docs/ops/hub-daemons.md "DB backups"): put the per-user
+# agent back if one exists (restore_agent keeps the daemon when there is
+# none) and fail. A run still in progress after the wait is reported and
+# fails the install but is NOT rolled back — booting a healthy in-flight
+# dump out would be worse than asking the operator to look.
 echo "== dev.snowline.backup (RunAtLoad dump)"
 code=""
 i=0
 if [ "$backup_loaded" = yes ]; then
-  while [ "$i" -lt 150 ]; do
+  while [ "$i" -lt 300 ]; do
     code="$(launchctl print system/dev.snowline.backup 2>/dev/null | sed -n 's/.*last exit code = \([0-9]*\).*/\1/p' | head -n 1)"
     [ -n "$code" ] && break
     sleep 2
@@ -101,17 +105,18 @@ if [ "$backup_loaded" = yes ]; then
   done
   tail -n 8 "$OWNER_HOME/Library/Logs/snowline-backup.log" 2>/dev/null | sed 's/^/   /'
 fi
-case "$code" in
-  0) echo "   backup: OK (exit 0)" ;;
-  3) echo "   backup: OK, dumps landed, but the store list needs updating (exit 3; see the WARNING above)" ;;
-  *)
-    if [ "$backup_loaded" != yes ]; then
-      echo "   backup: FAILED (daemon did not bootstrap)" >&2
-    else
-      echo "   backup: FAILED (exit ${code:-still running after ${i}s}) — see $OWNER_HOME/Library/Logs/snowline-backup.log" >&2
-    fi
-    restore_agent backup || true
-    fail=1
-    ;;
-esac
+if [ "$code" = 0 ]; then
+  echo "   backup: OK (exit 0)"
+elif [ "$backup_loaded" = yes ] && [ -z "$code" ]; then
+  echo "   backup: still running after ${i}s; not rolling back — check $OWNER_HOME/Library/Logs/snowline-backup.log and 'launchctl print system/dev.snowline.backup'" >&2
+  fail=1
+else
+  if [ "$backup_loaded" != yes ]; then
+    echo "   backup: FAILED (daemon did not bootstrap)" >&2
+  else
+    echo "   backup: FAILED (exit $code) — see $OWNER_HOME/Library/Logs/snowline-backup.log" >&2
+  fi
+  restore_agent backup keep-daemon-if-none || true
+  fail=1
+fi
 exit "$fail"

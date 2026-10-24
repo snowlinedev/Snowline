@@ -22,13 +22,17 @@ each of platform / pm / governance / memory:
 3. Copies `ops/hub/launchdaemons/dev.snowline.<svc>.plist` to
    `/Library/LaunchDaemons` (root:wheel, 644), `launchctl bootstrap system`,
    then `launchctl kickstart -k system/dev.snowline.<svc>`.
-4. Polls the four `/health` URLs for up to 60s and prints UP/DOWN.
-
-It then installs the timers from `ops/hub/launchdaemons/` the same way, but
-only bootstraps them (never kickstarts): `dev.snowline.autocut` (below) and
-`dev.snowline.backup` ("DB backups", below). The backup timer had a per-user
-LaunchAgent before this move, so the install also boots that agent out and
-moves its plist aside, exactly as for a service; the uninstall restores it.
+4. Installs the timers from `ops/hub/launchdaemons/` the same way, but only
+   bootstraps them (never kickstarts): `dev.snowline.autocut` (below) and
+   `dev.snowline.backup` ("DB backups", below). The backup timer had a
+   per-user LaunchAgent before this move, so the install also boots that
+   agent out and moves its plist aside, exactly as for a service; its
+   RunAtLoad dump starts here and runs while the next step polls.
+5. Polls the four `/health` URLs for up to 60s and prints UP/DOWN.
+6. Waits (up to 5 min) for the backup timer's first dump and fails the
+   install if it did not exit 0, restoring the per-user agent when one
+   exists; a dump still running at the deadline fails the install but is
+   not rolled back.
 
 The daemons run as `UserName=seanlynch`, `GroupName=staff`, so the mode-600
 env files in `~/.config/snowline/` stay readable. Logs are unchanged
@@ -350,9 +354,9 @@ dumps themselves still need the owner's session, because Postgres is the
 owner's per-user agent and iCloud syncs per session — after a FileVault boot
 that session always exists. Before the move it was a login-only LaunchAgent.
 The install waits for the unit's first (RunAtLoad) dump and fails if it did
-not exit 0 or 3, restoring the per-user agent when one exists; a rollback
-with `uninstall-daemons.sh` restores the agent plist, and leaves the daemon
-in place if there is none to restore. Both scripts share
+not exit 0, restoring the per-user agent when one exists; a rollback with
+`uninstall-daemons.sh` restores the agent plist, and leaves the daemon in
+place if there is none to restore. The scripts and `run-service.sh` share
 `ops/hub/launchdaemons/lib.sh` (autocut guard, agent restore, Postgres wait).
 
 **What runs.** `ops/hub/launchdaemons/dev.snowline.backup.plist` fires
@@ -360,17 +364,18 @@ in place if there is none to restore. Both scripts share
 
 - waits up to 120 s for `pg_isready` (Postgres is the owner's per-user
   LaunchAgent, so at boot it can start after this daemon fires), then dumps
-  `snowline_platform`, `snowline_pm`, `snowline_governance`,
-  `snowline_memory`, `snowline_musher` and `snowline_marketing` with
-  `pg_dump -Fc`, verifies each archive with `pg_restore -l`, then renames
-  `.partial` to the final name — one store failing does not skip the others,
-  and the run exits 1 if any did;
-- cross-checks that list against the server's own catalog (every
-  non-template database except `*_test*`, `*_dryrun*`, `*_e2e*` and the
-  legacy `snowline_dev`); with the default list, a live store that is
-  missing is logged as a WARNING and the run exits 3 (dumps still landed),
-  so a new service cannot go unbacked-up silently. Setting
-  `SNOWLINE_BACKUP_DBS` explicitly is a deliberate exclusion and only notes it;
+  every store (today `snowline_platform`, `snowline_pm`,
+  `snowline_governance`, `snowline_memory`, `snowline_musher`,
+  `snowline_marketing`) with `pg_dump -Fc`, verifies each archive with
+  `pg_restore -l`, then renames `.partial` to the final name — one store
+  failing does not skip the others, and the run exits 1 if any did;
+- the store list comes from the server's own catalog: every non-template
+  database except `*_test*`, `*_dryrun*`, `*_e2e*`, `*_restore*` and the
+  legacy `snowline_dev`, so a new service's store is backed up from its
+  first hour without a code change. If the catalog cannot be read the run
+  falls back to the six known stores and says so. Setting
+  `SNOWLINE_BACKUP_DBS` explicitly replaces the list; live stores it leaves
+  out are noted in the log;
 - refuses to run if the iCloud Drive root is missing (`mkdir -p` would
   otherwise recreate the folder locally and every run would "succeed" while
   nothing left the machine). This is a presence check only: if iCloud Drive
@@ -399,6 +404,16 @@ in the meantime (EX_CONFIG, penalty box). Then, when convenient,
 `sudo ops/hub/install-daemons.sh` moves the unit to the system domain (it
 waits for the first dump and puts the agent back if that fails).
 
+One thing only that first install can tell: macOS treats `~/Library/Mobile
+Documents` as a protected location (Files and Folders → iCloud Drive). The
+per-user agent writes there today; a process in the system domain has no
+session to receive a consent prompt, so its first dump may die with
+"Operation not permitted". The install catches that (exit 1 → agent
+restored). If it happens, grant Full Disk Access to `/bin/bash` in System
+Settings → Privacy & Security, or point `SNOWLINE_BACKUP_DIR` at a
+non-protected folder that iCloud or another sync covers, then re-run the
+install.
+
 **Is it alive?** Do this whenever you touch the hub — the job has silently
 died twice (2026-07-09 to 09-04 after the repo move; 2026-09-13 to 10-23
 while the script existed only on an unmerged branch):
@@ -408,18 +423,21 @@ sudo launchctl print system/dev.snowline.backup | grep -E 'last exit code|runs =
 ls -t ~/Library/Mobile\ Documents/com~apple~CloudDocs/Snowline/db-backups | head -6
 ```
 
-`last exit code = 0` and a dump under an hour old is healthy. Exit 3 means
-the dumps landed but a live store is missing from the script's default list
-(add it). Exit 1 with log lines says which store failed. `78: EX_CONFIG`
-means launchd could not spawn the program (script path missing — check the
-checkout).
+`last exit code = 0` and a dump under an hour old is healthy. Exit 1 with
+log lines says which store failed. `78: EX_CONFIG` means launchd could not
+spawn the program (script path missing — check the checkout).
 
 **Restore.** To inspect first (recommended):
 
 ```sh
 createdb snowline_restore
 pg_restore --no-owner -d snowline_restore <dump>
+# ... inspect ...
+dropdb snowline_restore
 ```
+
+(`*_restore` databases are excluded from the hourly dump, so a lingering
+inspect database costs nothing but disk; drop it when done anyway.)
 
 To overwrite the live store (destructive; stop that service first):
 
