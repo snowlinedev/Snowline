@@ -17,7 +17,6 @@
 autocut_guard "$@"
 
 STAMP="$(date +%Y%m%d)"
-START_EPOCH="$(date +%s)"   # the backup check below wants a dump newer than this install
 fail=0
 
 # --- the services: per-user agent -> system daemon, kickstarted ---
@@ -94,8 +93,8 @@ for entry in $urls; do
 done
 
 # --- the backup agent: tracked plist -> ~/Library/LaunchAgents, loaded ---
-# After the services are up, so its RunAtLoad dump does not land in a boot
-# migration's window (the dump itself also bounds that with pg_dump
+# After the services are up, so the proving run below does not land in a
+# boot migration's window (the dump itself also bounds that with pg_dump
 # --lock-wait-timeout). A per-user agent on purpose (docs "DB backups"):
 # the dumps need the owner's session anyway (Postgres is the owner's agent,
 # iCloud syncs per session), so a daemon would add no coverage, only a TCC

@@ -61,9 +61,11 @@ SNOWLINE_OWNER_HOME="$HOME"
 # store(s) failed to dump; 3 = another run held the lock (stepped aside).
 # install-daemons.sh reads them; nothing is rolled back on any of them.
 die() { log "$*" >&2; exit 2; }
-# Temp files used by the catalog read and the dump listing: created lazily,
-# removed on every exit path.
-CATALOG_ERR=""; Z_DUMPS_ERR=""
+# Temp files for the catalog read's and the dump listing's stderr: created
+# here, in the parent shell (z_dumps runs in subshells, where an assignment
+# would never reach the trap), removed on every exit path.
+CATALOG_ERR="$(mktemp -t snowline-backup-psql)"
+Z_DUMPS_ERR="$(mktemp -t snowline-backup-find)"
 trap 'rm -f "$CATALOG_ERR" "$Z_DUMPS_ERR"' EXIT
 # Operator overrides live in ~/.config/snowline/backup.env (optional; sourced
 # here), NOT in the launchd plist: install-daemons.sh replaces the plist with
@@ -102,7 +104,6 @@ name_stamp() {
 # to Z_DUMPS_ERR for the caller to inspect.
 TAB=$'\t'
 z_dumps() {
-    Z_DUMPS_ERR="${Z_DUMPS_ERR:-$(mktemp -t snowline-backup-find)}"
     find "$DEST" -maxdepth 1 \( -name "$1-[0-9]*Z.dump" -o -name ".$1-[0-9]*Z.dump.icloud" \) -type f 2>"$Z_DUMPS_ERR" \
     | while IFS= read -r zf; do
         name_stamp "$zf" || continue
@@ -260,7 +261,6 @@ wait_for_postgres || true
 # unreachable" (fallback + WARNING) is distinguishable from "every database
 # is scratch" (nothing to dump, which is then reported per store).
 CATALOG_OK=yes
-CATALOG_ERR="$(mktemp -t snowline-backup-psql)"   # removed by the EXIT trap
 # Only databases this role can actually connect to: a parked store
 # (datallowconn = false) or one without CONNECT would otherwise fail every
 # hourly run with exit 1 until someone hand-writes SNOWLINE_BACKUP_DBS.
