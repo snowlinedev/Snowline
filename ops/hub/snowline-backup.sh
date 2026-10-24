@@ -402,7 +402,6 @@ for DB in "$@"; do
     fi
 done
 
-trap - TERM INT
 
 # Stale .partial leftovers from any store.
 find "$DEST" -maxdepth 1 -name '*.partial' -type f -mtime +1 -delete || true
