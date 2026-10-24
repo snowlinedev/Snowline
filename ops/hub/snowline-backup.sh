@@ -138,7 +138,7 @@ name_stamp() {
 # for the caller to inspect.
 TAB=$'\t'
 z_dumps() {
-    if [ "${2:-}" = all ]; then zd_tail='[0-9]'; else zd_tail='Z'; fi
+    if [ "${2:-}" = all ]; then zd_tail=''; else zd_tail='Z'; fi   # all: Z names and pre-#319 names alike
     find "$DEST" -maxdepth 1 \( -name "$1-[0-9]*${zd_tail}.dump" -o -name ".$1-[0-9]*${zd_tail}.dump.icloud" \) -type f 2>"$Z_DUMPS_ERR" \
     | while IFS= read -r zf; do
         name_stamp "$zf" || continue
