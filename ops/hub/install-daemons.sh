@@ -58,9 +58,12 @@ autocut_guard() {
 }
 autocut_guard "$@"
 
-for svc in $SERVICES; do
-  label="dev.snowline.$svc"
-  echo "== $label"
+# install_unit <name> <kick:yes|no> — the same steps for a service and a timer;
+# only the trailing kickstart differs (a timer must never be kickstarted: that
+# fires an immediate run). Returns non-zero if the bootstrap failed.
+install_unit() {
+  label="dev.snowline.$1"
+  echo "== $label$([ "$2" = yes ] || echo ' (timer; not kickstarted)')"
   # 1. stop the agent (ignore: it may not be loaded) ...
   launchctl bootout "gui/$OWNER_UID/$label" 2>/dev/null || true
   # 2. ... and move its plist aside so it cannot reload at login and double-bind
@@ -73,23 +76,41 @@ for svc in $SERVICES; do
   cp "$SRC/$label.plist" "$DEST/$label.plist"
   chown root:wheel "$DEST/$label.plist"
   chmod 644 "$DEST/$label.plist"
-  launchctl bootstrap system "$DEST/$label.plist"
-  launchctl kickstart -k "system/$label"
+  if ! launchctl bootstrap system "$DEST/$label.plist"; then
+    echo "   bootstrap FAILED for $label" >&2
+    return 1
+  fi
+  [ "$2" = yes ] && launchctl kickstart -k "system/$label"
+  return 0
+}
+
+# restore_agent <name> — undo install_unit for a unit that had a per-user
+# agent: boot the daemon out, put the newest .disabled-* plist back and load
+# it. Used when the install of that unit cannot be trusted.
+restore_agent() {
+  label="dev.snowline.$1"
+  launchctl bootout "system/$label" 2>/dev/null || true
+  rm -f "${DEST:?}/${label:?}.plist"
+  disabled="$(ls -1 "$AGENTS/$label.plist.disabled-"* 2>/dev/null | sort | tail -n 1)"
+  if [ -n "$disabled" ]; then
+    mv "$disabled" "$AGENTS/$label.plist"
+    chown "$OWNER_UID" "$AGENTS/$label.plist"
+    launchctl bootstrap "gui/$OWNER_UID" "$AGENTS/$label.plist" || true
+    echo "   restored and loaded the per-user agent $AGENTS/$label.plist" >&2
+  else
+    echo "   no per-user agent plist to restore for $label — NO backup unit is loaded" >&2
+  fi
+}
+
+for svc in $SERVICES; do
+  install_unit "$svc" yes || true   # /health poll below reports it
 done
 
+backup_loaded=yes
 for timer in $TIMERS; do
-  label="dev.snowline.$timer"
-  echo "== $label (timer; not kickstarted)"
-  launchctl bootout "gui/$OWNER_UID/$label" 2>/dev/null || true
-  if [ -f "$AGENTS/$label.plist" ]; then
-    mv "$AGENTS/$label.plist" "$AGENTS/$label.plist.disabled-$STAMP"
-    echo "   agent plist -> $label.plist.disabled-$STAMP"
+  if ! install_unit "$timer" no; then
+    [ "$timer" = backup ] && backup_loaded=no
   fi
-  launchctl bootout "system/$label" 2>/dev/null || true
-  cp "$SRC/$label.plist" "$DEST/$label.plist"
-  chown root:wheel "$DEST/$label.plist"
-  chmod 644 "$DEST/$label.plist"
-  launchctl bootstrap system "$DEST/$label.plist"
 done
 
 echo "== waiting up to 60s for /health"
@@ -114,19 +135,27 @@ done
 # if it exited non-zero — the old agent has already been retired above, so a
 # daemon that cannot dump must not pass silently.
 echo "== dev.snowline.backup (RunAtLoad dump)"
-i=0
 code=""
-while [ "$i" -lt 150 ]; do
-  code="$(launchctl print system/dev.snowline.backup 2>/dev/null | sed -n 's/.*last exit code = \([0-9]*\).*/\1/p' | head -n 1)"
-  [ -n "$code" ] && break
-  sleep 2
-  i=$((i + 2))
-done
-tail -n 8 "$OWNER_HOME/Library/Logs/snowline-backup.log" 2>/dev/null | sed 's/^/   /'
+i=0
+if [ "$backup_loaded" = yes ]; then
+  while [ "$i" -lt 150 ]; do
+    code="$(launchctl print system/dev.snowline.backup 2>/dev/null | sed -n 's/.*last exit code = \([0-9]*\).*/\1/p' | head -n 1)"
+    [ -n "$code" ] && break
+    sleep 2
+    i=$((i + 2))
+  done
+  tail -n 8 "$OWNER_HOME/Library/Logs/snowline-backup.log" 2>/dev/null | sed 's/^/   /'
+fi
 if [ "$code" = "0" ]; then
   echo "   backup: OK (exit 0)"
 else
-  echo "   backup: FAILED (exit ${code:-still running after ${i}s}) — see $OWNER_HOME/Library/Logs/snowline-backup.log" >&2
+  if [ "$backup_loaded" != yes ]; then
+    echo "   backup: FAILED (daemon did not bootstrap)" >&2
+  else
+    echo "   backup: FAILED (exit ${code:-still running after ${i}s}) — see $OWNER_HOME/Library/Logs/snowline-backup.log" >&2
+  fi
+  # Do not leave the hub without a loaded backup unit: put the agent back.
+  restore_agent backup
   fail=1
 fi
 exit "$fail"

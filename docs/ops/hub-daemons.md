@@ -371,7 +371,10 @@ and leaves the daemon in place if there is none to restore.
   `SNOWLINE_BACKUP_DBS` explicitly is a deliberate exclusion and only notes it;
 - refuses to run if the iCloud Drive root is missing (`mkdir -p` would
   otherwise recreate the folder locally and every run would "succeed" while
-  nothing left the machine);
+  nothing left the machine). This is a presence check only: if iCloud Drive
+  is turned off with "keep a copy", the folder stays and the guard cannot
+  tell, so confirm from another device now and then that a recent dump is
+  actually in iCloud;
 - writes owner-only (umask 077, destination 0700): the platform dump carries
   the live replication HMAC secrets, so a dump is as sensitive as the hub;
 - prunes each store's dumps older than `SNOWLINE_BACKUP_RETENTION_DAYS`
@@ -381,6 +384,16 @@ and leaves the daemon in place if there is none to restore.
 Dumps land in `~/Library/Mobile Documents/com~apple~CloudDocs/Snowline/db-backups/`
 as `<store>-<YYYYMMDD-HHMMSS>Z.dump` (UTC). Log: `~/Library/Logs/snowline-backup.log`.
 The `.env` secrets are deliberately not backed up.
+
+**Rolling out this change on the hub.** The hub checkout had an untracked
+hand-restored copy of `ops/hub/snowline-backup.sh` from 2026-10-23 (the
+#223 script, kept running while the PR was open). A tracked file at the same
+path arrives with this merge, so before pulling: remove that untracked copy
+(or the `.git/info/exclude` entry that hides it) and then `git pull
+--ff-only`; the per-user agent keeps dumping from the same path, now with
+the hardened script. Then, when convenient, `sudo ops/hub/install-daemons.sh`
+moves the unit to the system domain (it waits for the first dump and puts
+the agent back if that fails).
 
 **Is it alive?** Do this whenever you touch the hub — the job has silently
 died twice (2026-07-09 to 09-04 after the repo move; 2026-09-13 to 10-23

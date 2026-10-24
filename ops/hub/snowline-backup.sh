@@ -53,12 +53,16 @@ die() { echo "$(now) $*" >&2; exit 1; }
 
 # --- destination: refuse to write "backups" that never leave the machine ---
 # `mkdir -p` of the full default path would silently recreate the iCloud
-# folder as a plain local directory when iCloud Drive is signed out or not yet
-# mounted, and every run would then log success while nothing is replicated.
-# Only the leaf may be created; the iCloud root must already exist.
+# folder as a plain local directory when iCloud Drive is not yet mounted or
+# the account was removed, and every run would then log success while
+# nothing is replicated. Only the leaf may be created; the iCloud root must
+# already exist. This is a presence check, not a sync check: macOS can keep
+# the folder (and its contents) when iCloud Drive is turned off with "keep a
+# copy", and nothing here can tell that apart from a healthy mount. Confirm
+# off-machine arrival from another device now and then (docs/ops/hub-daemons.md).
 case "$DEST" in
     "$ICLOUD_ROOT"/*)
-        [ -d "$ICLOUD_ROOT" ] || die "iCloud Drive root missing ($ICLOUD_ROOT); refusing to write local-only backups — is iCloud Drive signed in?"
+        [ -d "$ICLOUD_ROOT" ] || die "iCloud Drive root missing ($ICLOUD_ROOT); refusing to write local-only backups — is iCloud Drive set up for this user?"
         ;;
 esac
 [ -d "$(dirname "$DEST")" ] || die "backup destination parent missing: $(dirname "$DEST")"
@@ -93,7 +97,8 @@ done
 configured_dbs() {
     {
         # env files: optional `export`, optional quotes around the value
-        sed -n -E "s/^(export[[:space:]]+)?([A-Z_]+_DATABASE_URL)=[\"']?([^\"']*)[\"']?[[:space:]]*$/\\2=\\3/p" \
+        # (value runs to the first whitespace, so a trailing `# comment` is dropped)
+        sed -n -E "s/^(export[[:space:]]+)?([A-Z_]+_DATABASE_URL)=[\"']?([^\"'[:space:]]*)[\"']?([[:space:]]+#.*)?[[:space:]]*$/\\2=\\3/p" \
             "$HOME"/.config/snowline/*.env 2>/dev/null
         # plists: <key>NAME_DATABASE_URL</key> followed by its <string> value
         for plist in "$HOME"/Library/LaunchAgents/dev.snowline.*.plist /Library/LaunchDaemons/dev.snowline.*.plist; do
