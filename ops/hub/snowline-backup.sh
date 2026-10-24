@@ -66,23 +66,32 @@ RETENTION_DAYS="${SNOWLINE_BACKUP_RETENTION_DAYS:-30}"
 # install-daemons.sh rolls the unit back to the per-user agent only on 2.
 die() { log "$*" >&2; exit 2; }
 
-# --- run lock: one backup at a time, and a signal to the ops scripts ---
-# A directory created atomically with mkdir, holding this pid; lib.sh's
-# backup_guard waits on it before booting this unit out. A second run while
-# one is in progress (RunAtLoad racing the hourly fire) just steps aside —
-# the running one's dumps land. A stale lock (crashed run, pid gone) is taken
-# over.
-mkdir -p "$(dirname "$BACKUP_LOCK")"
-if ! mkdir "$BACKUP_LOCK" 2>/dev/null; then
-    if backup_lock_held; then
-        log "another backup run (pid $pid) is in progress; skipping this one"
-        exit 0
-    fi
-    rm -rf "${BACKUP_LOCK:?}"
-    mkdir "$BACKUP_LOCK" || die "cannot take the run lock $BACKUP_LOCK"
+# --- run lock: a flock on $BACKUP_LOCK, held for the whole run ---
+# Taken by re-executing this script under a tiny python wrapper that opens
+# the lock file, takes a non-blocking flock and execs bash with that fd
+# inherited: the lock lives exactly as long as this process, the kernel
+# drops it on exit or crash, so there is no stale lock and no pid to trust.
+# lib.sh's unit_busy_wait probes the same file before the ops scripts boot
+# this unit out. A second run while one holds the lock (RunAtLoad racing the
+# hourly fire) steps aside with exit 3, which install-daemons.sh treats as
+# inconclusive — never as "dumps landed".
+if [ -z "${SNOWLINE_BACKUP_LOCK_FD:-}" ]; then
+    mkdir -p "$(dirname "$BACKUP_LOCK")"
+    exec /usr/bin/python3 -c '
+import datetime, fcntl, os, sys
+lock, script, args = sys.argv[1], sys.argv[2], sys.argv[3:]
+fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print("%s another backup run holds %s; stepping aside" % (stamp, lock), file=sys.stderr)
+    sys.exit(3)
+os.set_inheritable(fd, True)
+os.environ["SNOWLINE_BACKUP_LOCK_FD"] = str(fd)
+os.execv("/bin/bash", ["/bin/bash", script] + args)
+' "$BACKUP_LOCK" "$0" ${1+"$@"}
 fi
-echo $$ > "$BACKUP_LOCK/pid"
-trap 'rm -rf "${BACKUP_LOCK:?}"' EXIT
 
 # --- destination: refuse to write "backups" that never leave the machine ---
 # `mkdir -p` of the full default path would silently recreate the iCloud
@@ -112,11 +121,19 @@ mkdir -p "$DEST" || die "cannot create backup destination: $DEST"
 PROBE="$DEST/.probe.$$"
 ( : > "$PROBE" ) 2>/dev/null || die "backup destination not writable: $DEST (TCC consent? full or read-only volume?)"
 rm -f "$PROBE"
-# Owner-only posture for the folder AND for dumps written before this script
-# enforced it (they were 0644). Best effort on an iCloud folder, but say so.
+# Owner-only posture for the folder, and a one-time sweep of dumps written
+# before this script enforced it (they were 0644) — once, recorded by a
+# marker, not a stat of thousands of iCloud entries every hour. Best effort
+# on an iCloud folder, but say so.
 chmod 700 "$DEST" 2>/dev/null || log "WARNING: could not chmod 700 $DEST" >&2
-find "$DEST" -maxdepth 1 -name '*.dump' -type f -perm +044 -exec chmod 600 {} + 2>/dev/null \
-    || log "WARNING: could not tighten permissions on existing dumps in $DEST" >&2
+PERMS_MARK="$LOCKS_DIR/backup-perms-tightened"
+if [ ! -e "$PERMS_MARK" ]; then
+    if find "$DEST" -maxdepth 1 -name '*.dump' -type f -perm +044 -exec chmod 600 {} + 2>/dev/null; then
+        : > "$PERMS_MARK"
+    else
+        log "WARNING: could not tighten permissions on existing dumps in $DEST (will retry next run)" >&2
+    fi
+fi
 
 # --- wait for Postgres (bounded; see lib.sh) ---
 wait_for_postgres || true
@@ -130,6 +147,9 @@ CATALOG_OK=yes
 CATALOG_ERR="$(mktemp -t snowline-backup-psql)"
 CATALOG="$(psql -X -At -d postgres -c "select datname from pg_database where not datistemplate and datname <> 'postgres' order by 1" 2>"$CATALOG_ERR")" || CATALOG_OK=no
 LIVE="$(printf '%s\n' "$CATALOG" | grep -E "$STORE_RE" | grep -v -E "$SCRATCH_RE" | grep -v '^$' || true)"
+# A whitespace-only SNOWLINE_BACKUP_DBS is "unset", not "dump nothing".
+set -- $DBS_EXPLICIT
+DBS_EXPLICIT="$*"
 if [ -n "$DBS_EXPLICIT" ]; then
     DBS="$DBS_EXPLICIT"
     EXCLUDED=""

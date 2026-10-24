@@ -15,6 +15,10 @@ GUARD_ARG="${1:-}"
 autocut_guard "$GUARD_ARG"
 
 STAMP="$(date +%Y%m%d)"
+# A file older than anything this install produces: the backup judge below
+# requires a dump NEWER than it, not just an exit code.
+START_MARK="$(mktemp -t snowline-install)"
+trap 'rm -f "$START_MARK"' EXIT
 
 # install_unit <name> <kick:yes|no> — the same steps for a service and a timer;
 # only the trailing kickstart differs (a timer must never be kickstarted: that
@@ -22,13 +26,12 @@ STAMP="$(date +%Y%m%d)"
 install_unit() {
   label="dev.snowline.$1"
   echo "== $label$([ "$2" = yes ] || echo ' (timer; not kickstarted)')"
-  # 0. never boot a unit out mid-run: the backup mid-dump, autocut mid-cut
-  #    (re-checked here, right before the bootout, not only at script start)
-  case " $AGENT_TIMERS " in *" $1 "*) backup_guard || true ;; esac
-  if [ "$1" = autocut ] && autocut_lock_held; then
-    # A cut started since the pre-flight guard at the top: skip this unit
-    # rather than refuse mid-install (the services are already cycled).
-    echo "   an autocut is running now (lock held); leaving $label as it is — re-run the install after it finishes" >&2
+  # 0. never boot a unit out mid-run: wait on the unit's own run lock
+  #    (<name>.lock — autocut holds it for the cut, the backup for the dump;
+  #    a service has none). Still busy after the bound: skip this unit and
+  #    say so, rather than killing a run or refusing mid-install.
+  if ! unit_busy_wait "$1"; then
+    echo "   leaving $label as it is — re-run the install after it finishes" >&2
     return 1
   fi
   # 1./2. units that had a per-user agent (the services, the agent-backed
@@ -53,6 +56,13 @@ install_unit() {
   chown root:wheel "$DAEMONS_DIR/$label.plist"
   chmod 644 "$DAEMONS_DIR/$label.plist"
   if ! launchctl bootstrap system "$DAEMONS_DIR/$label.plist"; then
+    # A service whose old registration never finished tearing down is still
+    # loaded: restart it onto the new plist rather than leave the old code
+    # running behind an UP /health. Never for a timer (a kickstart fires a run).
+    if [ "$2" = yes ] && launchctl print "system/$label" >/dev/null 2>&1; then
+      echo "   bootstrap refused but $label is still loaded; restarting it" >&2
+      launchctl kickstart -k "system/$label" && return 0
+    fi
     echo "   bootstrap FAILED for $label" >&2
     return 1
   fi
@@ -92,7 +102,10 @@ done
 # Each AGENT_TIMERS unit proves itself on load: wait for its RunAtLoad run to
 # finish — the backup script may wait 120s for Postgres first, then dump
 # every store, so allow 5 minutes — and judge it:
-#   exit 0            dumps landed
+#   exit 0            dumps landed — and a fresh *.dump in the destination
+#                     proves it (an exit code alone is not evidence)
+#   exit 3            stepped aside because another backup run held the lock:
+#                     inconclusive, fail the install, do NOT roll back
 #   exit 2            the daemon cannot run at all in the system domain (no
 #                     destination / no iCloud root / cannot write — e.g. TCC,
 #                     see docs/ops/hub-daemons.md "DB backups"): put the
@@ -132,7 +145,16 @@ for timer in $AGENT_TIMERS; do
   done
   tail -n 8 "$OWNER_HOME/Library/Logs/snowline-$timer.log" 2>/dev/null | sed 's/^/   /'
   if [ "$code" = 0 ]; then
-    echo "   $timer: OK (exit 0)"
+    dest="$(plutil -extract EnvironmentVariables.SNOWLINE_BACKUP_DIR raw -o - "$DAEMONS_DIR/$label.plist" 2>/dev/null || echo "$BACKUP_DIR")"
+    if find "$dest" -maxdepth 1 -name '*.dump' -type f -newer "$START_MARK" 2>/dev/null | grep -q .; then
+      echo "   $timer: OK (exit 0, fresh dump in $dest)"
+    else
+      echo "   $timer: exit 0 but NO new dump in $dest — not trusting it; check $OWNER_HOME/Library/Logs/snowline-$timer.log" >&2
+      fail=1
+    fi
+  elif [ "$code" = 3 ]; then
+    echo "   $timer: inconclusive (exit 3: another backup run held the lock; nothing dumped by this unit yet); not rolling back — re-check in an hour" >&2
+    fail=1
   elif [ "$code" = 1 ]; then
     echo "   $timer: FAILED (exit 1: some store(s) failed; not rolling back — see $OWNER_HOME/Library/Logs/snowline-$timer.log)" >&2
     fail=1

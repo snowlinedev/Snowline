@@ -14,6 +14,7 @@ autocut_guard "$@"
 for timer in $SYSTEM_TIMERS; do
   label="dev.snowline.$timer"
   echo "== $label"
+  unit_busy_wait "$timer" || { echo "   leaving $label as it is — re-run after it finishes" >&2; continue; }
   launchctl bootout "system/$label" 2>/dev/null || true
   rm -f "${DAEMONS_DIR:?}/${label:?}.plist"
 done
@@ -35,7 +36,7 @@ done
 # without a backup unit.
 for timer in $AGENT_TIMERS; do
   echo "== dev.snowline.$timer"
-  backup_guard || true
+  unit_busy_wait "$timer" || { echo "   leaving dev.snowline.$timer as it is — re-run after it finishes" >&2; continue; }
   restore_agent "$timer" keep-daemon-if-none || true
 done
 echo "done; check the four /health URLs and 'launchctl print gui/$OWNER_UID/dev.snowline.backup' (docs/ops/hub-daemons.md)"

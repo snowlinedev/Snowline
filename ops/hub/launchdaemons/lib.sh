@@ -56,31 +56,42 @@ wait_for_postgres() {
   return 0
 }
 
-# backup_lock_held — is a backup run in progress? snowline-backup.sh holds
-# BACKUP_LOCK (a directory, created atomically with mkdir, holding its pid)
-# for its whole run and removes it on exit; a stale lock from a crashed run
-# (pid gone) does not count.
-BACKUP_LOCK="$OWNER_HOME/Library/Application Support/Snowline/backup.lock"
-backup_lock_held() {
-  [ -d "$BACKUP_LOCK" ] || return 1
-  pid="$(cat "$BACKUP_LOCK/pid" 2>/dev/null)"
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+# ---- unit run locks ----
+# A timer that must not be booted out mid-run holds a flock on
+# $LOCKS_DIR/<name>.lock for its whole run: autocut for the cut (taken by
+# `snowline release autocut`), the backup for the dump (snowline-backup.sh
+# re-executes itself under a flock-holding wrapper). lock_held <path> probes
+# a lock without taking it. The kernel drops a flock with its process, so a
+# file left by a crash or power loss is simply not held: no pid to trust,
+# nothing to take over, no false "in progress" after a reboot.
+LOCKS_DIR="$OWNER_HOME/Library/Application Support/Snowline"
+BACKUP_LOCK="$LOCKS_DIR/backup.lock"
+BACKUP_DIR="$OWNER_HOME/Library/Mobile Documents/com~apple~CloudDocs/Snowline/db-backups"
+lock_held() {
+  [ -e "$1" ] || return 1
+  /usr/bin/python3 -c 'import fcntl, os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(0)
+sys.exit(1)' "$1"
 }
-# backup_guard — wait (up to 10 min) for a running backup to finish before
-# anything boots its unit out: a SIGTERM mid-dump leaves a .partial in iCloud
-# and loses that hour's dump of the store it was on. Call it right before the
-# bootout, not minutes earlier. After the bound it returns 1 and the caller
-# proceeds (and says so).
-backup_guard() {
-  waited=0
-  while backup_lock_held; do
-    if [ "$waited" -ge 600 ]; then
-      echo "   a backup run is still going after ${waited}s; proceeding anyway (that hour's dump may be lost)" >&2
+# unit_busy_wait <name> — wait (up to 10 min) while <name>.lock is held; the
+# ops scripts call it right before booting that unit out. Returns 1 if still
+# held after the bound (the caller then skips the unit rather than killing a
+# run). A unit with no lock file is never busy.
+unit_busy_wait() {
+  lock="$LOCKS_DIR/$1.lock"
+  busy_waited=0
+  while lock_held "$lock"; do
+    if [ "$busy_waited" -ge 600 ]; then
+      echo "   $1 is still running after ${busy_waited}s ($lock held)" >&2
       return 1
     fi
-    echo "   backup run in progress (pid $pid); waiting (${waited}s)"
+    echo "   $1 run in progress; waiting (${busy_waited}s)"
     sleep 5
-    waited=$((waited + 5))
+    busy_waited=$((busy_waited + 5))
   done
   return 0
 }
@@ -104,18 +115,9 @@ wait_unloaded() {
 # min, hourly). The cut holds a flock on AUTOCUT_LOCK for its whole run, so
 # test it first. `--wait` polls up to 15 min instead. (A fire that starts
 # between this check and the bootout is not covered; the window is seconds.)
-AUTOCUT_LOCK="$OWNER_HOME/Library/Application Support/Snowline/autocut.lock"
+AUTOCUT_LOCK="$LOCKS_DIR/autocut.lock"
 AUTOCUT_LOG="$OWNER_HOME/Library/Logs/snowline-autocut.log"
-autocut_lock_held() {
-  [ -e "$AUTOCUT_LOCK" ] || return 1
-  /usr/bin/python3 -c 'import fcntl, os, sys
-fd = os.open(sys.argv[1], os.O_RDONLY)
-try:
-    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-except OSError:
-    sys.exit(0)
-sys.exit(1)' "$AUTOCUT_LOCK"
-}
+autocut_lock_held() { lock_held "$AUTOCUT_LOCK"; }
 autocut_guard() {
   waited=0
   while autocut_lock_held; do

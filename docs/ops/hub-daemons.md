@@ -30,10 +30,11 @@ each of platform / pm / governance / memory:
    RunAtLoad dump starts here and runs while the next step polls.
 5. Polls the four `/health` URLs for up to 60s and prints UP/DOWN.
 6. Waits (up to 5 min) for the backup timer's first dump and fails the
-   install if it did not exit 0. The per-user agent is restored only when
-   the daemon cannot run at all (exit 2, or it never ran); a store-level
-   failure (exit 1) or a dump still running at the deadline fails the
-   install without rolling back.
+   install unless it exited 0 AND a fresh `*.dump` landed in the
+   destination. The per-user agent is restored only when the daemon cannot
+   run at all (exit 2, or it never ran); a store-level failure (exit 1), a
+   lock step-aside (exit 3) or a dump still running at the deadline fails
+   the install without rolling back.
 
 The daemons run as `UserName=seanlynch`, `GroupName=staff`, so the mode-600
 env files in `~/.config/snowline/` stay readable. Logs are unchanged
@@ -85,9 +86,10 @@ timer `dev.snowline.backup` falls back to the tracked agent plist in
 `ops/hub/launchagents/` when no `.disabled-*` copy exists, and is left in
 the system domain only if no agent plist exists from any source, so a
 rollback never leaves the hub without a backup unit ("DB backups" below). Both scripts wait up to 10 minutes for a running
-backup (it holds `~/Library/Application Support/Snowline/backup.lock`) before
-booting its unit out, then proceed regardless, in which case that hour's
-dump may be lost.
+timer (autocut holds `autocut.lock`, the backup `backup.lock`, both under
+`~/Library/Application Support/Snowline/`, as flocks) before booting its unit
+out, and skip that unit if it is still running, so a run is never killed
+mid-way.
 
 ## Deploy routine change
 
@@ -446,9 +448,10 @@ ls -t ~/Library/Mobile\ Documents/com~apple~CloudDocs/Snowline/db-backups | head
 
 `last exit code = 0` and a dump under an hour old is healthy. Exit 1 with
 log lines says which store failed. Exit 2 means the run could not start at
-all (destination missing or unwritable, iCloud root absent). `78: EX_CONFIG`
-means launchd could not spawn the program (script path missing — check the
-checkout).
+all (destination missing or unwritable, iCloud root absent). Exit 3 means
+the run stepped aside because another backup run held the lock (RunAtLoad
+racing the hourly fire; harmless once). `78: EX_CONFIG` means launchd could
+not spawn the program (script path missing — check the checkout).
 
 **Restore.** To inspect first (recommended):
 
