@@ -38,9 +38,12 @@ each of platform / pm / governance / memory:
    own, without sudo, whenever the backup needs (re)proving — re-running
    `install-daemons.sh` restarts all four services and is NOT the way to
    do that. It (re)loads `ops/hub/launchagents/dev.snowline.backup.plist`
-   into `gui/501` when the tracked plist differs, the unit is not loaded,
-   its last run exited with anything other than 0 or 3, or no dump landed
-   in the last two hours — waiting first for a dump in progress. The plist
+   into `gui/501` when the tracked plist differs from the one last
+   confirmed loaded, the unit is not loaded, its last run exited with
+   anything other than 0 or 3, or there is no evidence the unit itself
+   dumped in the last two hours (a fresh dump plus the unit's own `run
+   exit` log line — a manual dump alone does not count) — waiting first
+   for a dump in progress. The plist
    carries the canonical checkout path for the script on purpose (a path
    taken from whichever checkout runs an install could be a scratch
    worktree); the installer refuses to run from any other checkout and

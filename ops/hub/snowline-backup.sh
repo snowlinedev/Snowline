@@ -64,21 +64,21 @@ die() { log "$*" >&2; exit 2; }
 # Temp files for the catalog read's and the dump listing's stderr: created
 # here, in the parent shell (z_dumps runs in subshells, where an assignment
 # would never reach the trap), removed on every exit path.
-CATALOG_ERR="$(mktemp -t snowline-backup-psql)" || die "cannot create a temp file (TMPDIR unwritable?)"
-Z_DUMPS_ERR="$(mktemp -t snowline-backup-find)" || die "cannot create a temp file (TMPDIR unwritable?)"
-PROBE=""   # the destination write probe, set below; removed on every exit too
 # Every run ends with ONE machine-readable line, "run exit <code>", written
 # by the EXIT trap whatever the path (success, a refusal, a step-aside, an
-# interrupt): install-backup-agent.sh reads the LAST such line to judge a
-# run when it cannot see the destination itself. Queries (--print-dest,
-# --check) do not log one.
+# interrupt — armed before anything below can fail): install-backup-agent.sh
+# reads the LAST such line to judge a run when it cannot see the
+# destination itself. Queries (--print-dest, --check) do not log one.
 QUIET_EXIT=no
+CATALOG_ERR=""; Z_DUMPS_ERR=""; PROBE=""   # temp files, set below; removed on every exit
 on_exit() {
     oe_rc=$?
-    rm -f "$CATALOG_ERR" "$Z_DUMPS_ERR" ${PROBE:+"$PROBE"}
+    rm -f ${CATALOG_ERR:+"$CATALOG_ERR"} ${Z_DUMPS_ERR:+"$Z_DUMPS_ERR"} ${PROBE:+"$PROBE"}
     [ "$QUIET_EXIT" = yes ] || log "run exit $oe_rc"
 }
 trap on_exit EXIT
+CATALOG_ERR="$(mktemp -t snowline-backup-psql)" || die "cannot create a temp file (TMPDIR unwritable?)"
+Z_DUMPS_ERR="$(mktemp -t snowline-backup-find)" || die "cannot create a temp file (TMPDIR unwritable?)"
 # A SIGTERM/SIGINT at ANY point (a bootout during the Postgres wait, a
 # logout, a shutdown) logs itself; once a dump is in flight (OUT/DUMP_PID
 # set below) it is killed and its partial removed. Armed here, not just
@@ -146,6 +146,20 @@ z_dumps() {
     done
 }
 
+# dest_state — the ONE destination rule, for --check and the run alike:
+# prints ok (exists), no-leaf (absent, but under a present iCloud root: may
+# be created), or missing (iCloud root absent, or a non-iCloud destination
+# that is not there — never created here: a destination that is itself a
+# mount point would otherwise be silently recreated as a plain local
+# directory while the disk is unplugged).
+dest_state() {
+    if [ -d "$DEST" ]; then echo ok; return; fi
+    case "$DEST" in
+        "$ICLOUD_ROOT"/*) [ -d "$ICLOUD_ROOT" ] && { echo no-leaf; return; } ;;
+    esac
+    echo missing
+}
+
 # Queries install-backup-agent.sh makes by running this script AS THE OWNER
 # (so backup.env, TCC consent and the destination are exactly this
 # script's), checked before anything below touches the positional params:
@@ -170,15 +184,14 @@ case "${1:-}" in
         # 2, so a caller can tell "no dump" from "could not even run".
         mins="${2:-}"
         case "$mins" in ''|*[!0-9]*) echo "--check needs a number of minutes" >&2; exit 2 ;; esac
-        # Same destination rule as a run: under a present iCloud root the leaf
-        # may simply not exist yet (no dump yet -> NONE); a missing iCloud
-        # root or a missing non-iCloud destination is "cannot run here".
-        if [ ! -d "$DEST" ]; then
-            case "$DEST" in
-                "$ICLOUD_ROOT"/*) [ -d "$ICLOUD_ROOT" ] && { echo NONE; exit 1; } ;;
-            esac
-            echo UNREADABLE; exit 2
-        fi
+        # Same destination rule as a run (dest_state): a leaf that does not
+        # exist yet under a present iCloud root is "no dump yet" (NONE); a
+        # missing root or non-iCloud destination is "cannot run here".
+        case "$(dest_state)" in
+            ok) ;;
+            no-leaf) echo NONE; exit 1 ;;
+            *) echo UNREADABLE; exit 2 ;;
+        esac
         cutoff="$(date -u -v-"${mins}"M +%Y%m%d-%H%M%S 2>/dev/null)" || { echo UNREADABLE; exit 2; }
         [ -n "$cutoff" ] || { echo UNREADABLE; exit 2; }
         found=no
@@ -242,19 +255,13 @@ esac
 # the folder (and its contents) when iCloud Drive is turned off with "keep a
 # copy", and nothing here can tell that apart from a healthy mount. Confirm
 # off-machine arrival from another device now and then (docs/ops/hub-daemons.md).
-# Under a verified iCloud root the leaf folders may be created freely; any
-# other destination (external volume, rsync target) must already EXIST and
-# is never created here — a destination that is itself a mount point
-# (/Volumes/Backups) would otherwise be silently recreated as a plain local
-# directory while the disk is unplugged.
-case "$DEST" in
-    "$ICLOUD_ROOT"/*)
-        [ -d "$ICLOUD_ROOT" ] || die "iCloud Drive root missing ($ICLOUD_ROOT); refusing to write local-only backups — is iCloud Drive set up for this user?"
-        mkdir -p "$DEST" || die "cannot create backup destination: $DEST"
-        ;;
-    *)
-        [ -d "$DEST" ] || die "backup destination missing: $DEST (not mounted? it is never created by this script)"
-        ;;
+# The one rule (dest_state): under a verified iCloud root the leaf folders
+# may be created freely; any other destination (external volume, rsync
+# target) must already exist and is never created here.
+case "$(dest_state)" in
+    ok) ;;
+    no-leaf) mkdir -p "$DEST" || die "cannot create backup destination: $DEST" ;;
+    *) die "backup destination missing: $DEST (iCloud Drive root absent, or a volume not mounted — it is never created by this script)" ;;
 esac
 # A real create, not `[ -w ]`: access(2) does not see a TCC denial (a
 # system-domain process without iCloud Drive consent) or a full/read-only
@@ -288,11 +295,15 @@ CATALOG_OK=yes
 # never silently dropped from the backup set: the query returns
 # "<name>|<connectable>" and the unconnectable ones are reported below.
 CATALOG_ROWS="$(psql -X -At -d postgres -c "select datname, (datallowconn and has_database_privilege(datname, 'CONNECT')) from pg_database where not datistemplate and datname <> 'postgres' and datname ~ '^[A-Za-z0-9_]+\$' order by 1" 2>"$CATALOG_ERR")" || CATALOG_OK=no
-CATALOG="$(printf '%s\n' "$CATALOG_ROWS" | awk -F'|' '$2 == "t" { print $1 }')"
-UNCONNECTABLE="$(printf '%s\n' "$CATALOG_ROWS" | awk -F'|' '$2 != "t" { print $1 }' | grep -E "$STORE_RE" | grep -v -E "$SCRATCH_RE" | tr '\n' ' ')"
-[ -z "${UNCONNECTABLE% }" ] || log "WARNING: snowline store(s) this role cannot connect to, NOT backed up:${UNCONNECTABLE:+ ${UNCONNECTABLE% }} (parked? CONNECT revoked?)" >&2
-LIVE="$(printf '%s\n' "$CATALOG" | grep -E "$STORE_RE" | grep -v -E "$SCRATCH_RE" | grep -v '^$' || true)"
-LIVE="$(printf '%s\n' "$LIVE" | tr '\n' ' ')"; LIVE="${LIVE% }"
+# One pass: the store filter (STORE_RE minus SCRATCH_RE) applied once,
+# connectable names to LIVE, the others to UNCONNECTABLE.
+CATALOG_SPLIT="$(printf '%s\n' "$CATALOG_ROWS" | awk -F'|' -v store="$STORE_RE" -v scratch="$SCRATCH_RE" '
+    $1 ~ store && $1 !~ scratch { if ($2 == "t") live = live " " $1; else dead = dead " " $1 }
+    END { print live; print dead }')"
+LIVE="$(printf '%s\n' "$CATALOG_SPLIT" | sed -n 1p)"; LIVE="${LIVE# }"
+UNCONNECTABLE="$(printf '%s\n' "$CATALOG_SPLIT" | sed -n 2p)"; UNCONNECTABLE="${UNCONNECTABLE# }"
+[ -z "$UNCONNECTABLE" ] || log "WARNING: snowline store(s) this role cannot connect to, NOT backed up: $UNCONNECTABLE (parked? CONNECT revoked?)" >&2
+# (LIVE was built above, in the same pass)
 if [ -n "$DBS_EXPLICIT" ]; then
     DBS="$DBS_EXPLICIT"
     EXCLUDED=""
@@ -380,7 +391,7 @@ for DB in "$@"; do
         && mv "$OUT.partial" "$OUT"; then
         # Size is best-effort (an iCloud file can be evicted to a placeholder
         # the instant it lands, making du error).
-        SIZE="$(du -h "$OUT" 2>/dev/null | cut -f1 || true)"
+        SIZE="$(du -h "$OUT" 2>/dev/null | awk '{ print $1 }' || true)"
         log "backed up ${DB} -> ${OUT} (${SIZE:-size unknown})"
         OUT=""   # landed: the interrupt trap must not name it any more
     else

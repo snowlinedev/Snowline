@@ -49,7 +49,11 @@ echo "== $label (per-user agent; unit runs $BACKUP_SCRIPT)"
 [ -e "$log_file" ] || touch "$log_file"
 
 # --- evidence helpers: ask the script (same backup.env, same destination) ---
-dest="$(/bin/bash "$BACKUP_SCRIPT" --print-dest 2>/dev/null)" || dest="(unknown: --print-dest failed)"
+# With this shell's SNOWLINE_BACKUP_* unset: the agent under launchd sees
+# only backup.env, and the probes must see the same, or a leftover export
+# from a scratch test would make them judge a different folder.
+query() { env -u SNOWLINE_BACKUP_DIR -u SNOWLINE_BACKUP_RETENTION_DAYS -u SNOWLINE_BACKUP_DBS /bin/bash "$BACKUP_SCRIPT" "$@"; }
+dest="$(query --print-dest 2>/dev/null)" || dest="(unknown: --print-dest failed)"
 # dump_evidence <minutes> <since-stamp> — sets EVIDENCE to OK (a dump newer
 # than <minutes> in the destination), NONE (readable, none there), LOG_OK /
 # LOG_FAIL (the destination cannot be read from this context — Terminal or
@@ -57,7 +61,7 @@ dest="$(/bin/bash "$BACKUP_SCRIPT" --print-dest 2>/dev/null)" || dest="(unknown:
 # <since-stamp> decide, by their LAST run), or UNKNOWN; EVIDENCE_MSG carries
 # the --check reason.
 dump_evidence() {
-  EVIDENCE_MSG="$(/bin/bash "$BACKUP_SCRIPT" --check "$1" 2>&1)"; de_rc=$?
+  EVIDENCE_MSG="$(query --check "$1" 2>&1)"; de_rc=$?
   EVIDENCE_MSG="$(printf '%s\n' "$EVIDENCE_MSG" | tail -n 1)"
   case $de_rc in
     0) EVIDENCE=OK; return ;;
@@ -90,13 +94,22 @@ log_verdict() {
 
 # --- decide: leave alone, or (re)load ---
 # (Re)load — plist copied in at that point, never before — when the tracked
-# plist differs from the installed one, the unit is not loaded, its last run
-# exited with anything but 0 or 3 (3 = "stepped aside" is harmless), or no
-# dump landed in the last two hours (an exit code alone is not evidence: a
-# unit launchd stopped firing still shows its old exit 0).
+# plist differs from the one launchd last LOADED (recorded by checksum in a
+# marker when a load succeeded: the file on disk alone cannot tell, since a
+# load can fail with the old registration still running), the unit is not
+# loaded, its last run exited with anything but 0 or 3 (3 = "stepped aside"
+# is harmless), or no evidence that THE UNIT dumped in the last two hours:
+# a fresh dump in the destination AND a "run exit" line in the agent's log
+# (a manual run writes to the terminal, not the log, so a dump alone could
+# be the operator's, masking a unit launchd stopped firing; an exit code
+# alone is no evidence either — a stopped unit still shows its old 0).
+LOADED_MARK="$LOCKS_DIR/backup-agent.loaded"
+plist_sum="$(cksum < "$plist_src" | cut -d' ' -f1)"
 why=""
 if ! cmp -s "$plist_src" "$plist_dst" 2>/dev/null; then
   why="plist changed"
+elif [ "$(cat "$LOADED_MARK" 2>/dev/null)" != "$plist_sum" ]; then
+  why="this plist was never confirmed loaded (a previous load did not complete?)"
 elif ! unit_snapshot "$domain/$label"; then
   why="not loaded"
 else
@@ -105,13 +118,15 @@ else
     *) why="last run exited $UNIT_EXIT" ;;
   esac
   if [ -z "$why" ]; then
-    dump_evidence 120 "$(date -u -v-120M +%FT%TZ)"
-    case "$EVIDENCE" in
-      OK)       echo "   unchanged and loaded, dumped within 2 h; left as it is" ;;
-      LOG_OK)   echo "   unchanged and loaded; the log shows a dump within 2 h (destination not checkable from here: $EVIDENCE_MSG); left as it is" ;;
-      NONE)     why="no dump in the last 2 h in $dest" ;;
-      LOG_FAIL) why="the log's last run within 2 h failed" ;;
-      *)        why="no dump evidence in the last 2 h (destination not checkable from here: $EVIDENCE_MSG; no run in the log)" ;;
+    since="$(date -u -v-120M +%FT%TZ)"
+    dump_evidence 120 "$since"
+    log_verdict "$since"   # the unit's own account; a manual run leaves no line here
+    case "$EVIDENCE:$LOGSAYS" in
+      OK:OK|LOG_OK:OK) echo "   unchanged and loaded, the unit dumped within 2 h; left as it is" ;;
+      OK:NONE)         why="a dump landed within 2 h but the unit's log shows no run (a manual dump? the unit not firing?)" ;;
+      NONE:*)          why="no dump in the last 2 h in $dest" ;;
+      *:FAIL|LOG_FAIL:*) why="the unit's last run within 2 h failed" ;;
+      *)               why="no evidence the unit ran in the last 2 h (destination: $EVIDENCE_MSG)" ;;
     esac
   fi
 fi
@@ -126,7 +141,9 @@ if [ -n "$why" ]; then
     fail=1
   elif place_unit "$plist_src" "$plist_dst" "$(id -u)" && load_unit "$label" "$domain" "$plist_dst"; then
     loaded=yes
+    mkdir -p "$LOCKS_DIR" && printf '%s\n' "$plist_sum" > "$LOADED_MARK"
   else
+    rm -f "$LOADED_MARK"   # whatever launchd runs now, it is not confirmed to be this plist
     fail=1
   fi
 fi
