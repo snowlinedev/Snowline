@@ -89,7 +89,7 @@ if [ -f "$BACKUP_ENV" ]; then
     # (and say so when the file's value lost: the hub's pre-#319 agent plist
     # exported SNOWLINE_BACKUP_DIR itself until install-backup-agent.sh
     # replaced it, which made a backup.env value look ignored)
-    shadow() { [ -z "$2" ] || [ "$2" = "$3" ] || log "note: $1 from the environment ($2) overrides $BACKUP_ENV ($3)"; }
+    shadow() { [ -z "$2" ] || [ "$2" = "$3" ] || log "note: $1 from the environment ($2) overrides $BACKUP_ENV ($3)" >&2; }
     shadow SNOWLINE_BACKUP_DIR "$env_dir" "${SNOWLINE_BACKUP_DIR:-}"
     shadow SNOWLINE_BACKUP_RETENTION_DAYS "$env_days" "${SNOWLINE_BACKUP_RETENTION_DAYS:-}"
     shadow SNOWLINE_BACKUP_DBS "$env_dbs" "${SNOWLINE_BACKUP_DBS:-}"
@@ -194,10 +194,10 @@ for vn in "$@"; do
     esac
 done
 # --- run lock: a flock on $BACKUP_LOCK, held for the whole run ---
-# fd 9 is opened on the lock file for the life of this process; a one-line
-# python takes the flock on that inherited fd (the lock lives on the open
-# file description, so it stays held after python exits, for as long as
-# this script keeps fd 9). The kernel drops it on exit or crash: no stale
+# fd 9 is opened on the lock file for the life of this process; flock_fd
+# (lib.sh, perl) takes the flock on that inherited fd (the lock lives on the
+# open file description, so it stays held after the helper exits, for as
+# long as this script keeps fd 9). The kernel drops it on exit or crash: no stale
 # lock, no pid to trust. lib.sh's unit_busy_wait probes the same file before
 # the ops scripts boot this unit out (a probe holds a shared lock for an
 # instant, so the acquire retries over a few seconds). A second run while
@@ -317,11 +317,16 @@ set +f
 # comparison against one cutoff stamp; no fork per file).
 PRUNE_CUTOFF="$(date -u -v-"${RETENTION_DAYS}"d +%Y%m%d-%H%M%S 2>/dev/null)" || PRUNE_CUTOFF=""
 [ -n "$PRUNE_CUTOFF" ] || log "WARNING: cannot compute the retention cutoff for $RETENTION_DAYS days; NOT pruning this run (the folder grows until this is fixed)" >&2
+# Whatever the age, the newest KEEP_MIN dumps of a store are never pruned:
+# a store whose dump keeps failing must not lose its last good copy once it
+# ages out (the prune runs before each dump, so a full destination can free
+# itself; this is the other side of that).
+KEEP_MIN=3
 prune_by_name() {
     [ -n "$PRUNE_CUTOFF" ] || return 0   # no cutoff, no pruning (never over-delete; warned above)
-    z_dumps "$1" | while IFS="$TAB" read -r pb_stamp pb_f; do
-        [ "$pb_stamp" \< "$PRUNE_CUTOFF" ] && rm -f "$pb_f"
-    done
+    z_dumps "$1" | sort -r | awk -F"$TAB" -v cutoff="$PRUNE_CUTOFF" -v keep="$KEEP_MIN" \
+        'NR > keep && $1 < cutoff { print $2 }' \
+    | while IFS= read -r pb_f; do rm -f "$pb_f"; done
     return 0
 }
 # bash runs a trap only once the foreground command returns, so pg_dump is
@@ -374,7 +379,10 @@ trap - TERM INT
 # Stale .partial leftovers from any store.
 find "$DEST" -maxdepth 1 -name '*.partial' -type f -mtime +1 -delete || true
 
+# One summary line per run — what install-backup-agent.sh reads back when
+# it cannot see the destination itself.
 if [ -n "$FAILED" ]; then
     log "run incomplete; failed:${FAILED}" >&2
     exit 1
 fi
+log "run complete: $# store(s)"

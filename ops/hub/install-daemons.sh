@@ -21,10 +21,15 @@ autocut_guard "$@"
 STAMP="$(date +%Y%m%d)"
 fail=0
 
-# --- the services: per-user agent -> system daemon, kickstarted ---
+# --- the services: per-user agent -> system daemon ---
+# The daemon plist goes on disk first (nothing is torn down before its
+# replacement exists), then the agent is stopped, waited for and moved
+# aside, then the daemon is loaded (RunAtLoad + KeepAlive: the bootstrap
+# starts it; a kickstart would only kill it mid-startup).
 for svc in $SERVICES; do
   label="dev.snowline.$svc"
   echo "== $label"
+  place_unit "$LAUNCHDAEMONS_SRC/$label.plist" "$DAEMONS_DIR/$label.plist" root:wheel || { fail=1; continue; }
   # stop the agent (ignore: it may not be loaded) and wait for it to be
   # gone — a service runs its whole startup before binding, so the daemon
   # must never start while the agent is still shutting down ...
@@ -39,7 +44,7 @@ for svc in $SERVICES; do
     mv "$AGENTS/$label.plist" "$AGENTS/$label.plist.disabled-$STAMP"
     echo "   agent plist -> $label.plist.disabled-$STAMP"
   fi
-  load_unit "$label" system "$LAUNCHDAEMONS_SRC/$label.plist" "$DAEMONS_DIR/$label.plist" root:wheel yes || fail=1
+  load_unit "$label" system "$DAEMONS_DIR/$label.plist" || fail=1
 done
 
 # --- system-only timers (autocut): bootstrapped, never kickstarted ---
@@ -71,7 +76,8 @@ for timer in $TIMERS; do
   # autocut was refused up front by autocut_guard; a cut that started since
   # is a plain check here — still running means skip, never kill it
   if timer_skip "$timer" "the install"; then fail=1; continue; fi
-  load_unit "$label" system "$LAUNCHDAEMONS_SRC/$label.plist" "$DAEMONS_DIR/$label.plist" root:wheel no || fail=1
+  place_unit "$LAUNCHDAEMONS_SRC/$label.plist" "$DAEMONS_DIR/$label.plist" root:wheel || { fail=1; continue; }
+  load_unit "$label" system "$DAEMONS_DIR/$label.plist" || fail=1
 done
 
 echo "== waiting up to 60s for /health"

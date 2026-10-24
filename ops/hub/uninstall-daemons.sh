@@ -23,15 +23,11 @@ for timer in $TIMERS; do
 done
 
 # Services: restore_agent (lib.sh) removes the daemon, puts the newest
-# .disabled-* agent plist back (or keeps a live one) and loads it; then
-# kickstart.
+# .disabled-* agent plist back (or keeps a live one) and loads it (the
+# agents are RunAtLoad + KeepAlive: loading starts them).
 for svc in $SERVICES; do
   echo "== dev.snowline.$svc"
-  if restore_agent "$svc"; then
-    launchctl kickstart -k "gui/$OWNER_UID/dev.snowline.$svc" || true
-  else
-    fail=1
-  fi
+  restore_agent "$svc" || fail=1
 done
 echo "done; check the four /health URLs (docs/ops/hub-daemons.md). The backup agent dev.snowline.backup was left as it is."
 exit "$fail"

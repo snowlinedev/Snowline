@@ -17,6 +17,7 @@ fi
 
 # shellcheck disable=SC1091
 . "$(cd "$(dirname "$0")" && pwd)/launchdaemons/lib.sh"
+BACKUP_SCRIPT="$(backup_script)" || BACKUP_SCRIPT=""
 
 label="dev.snowline.backup"
 domain="gui/$(id -u)"
@@ -70,15 +71,17 @@ dump_evidence() {
   esac
 }
 # log_verdict <since-stamp> — sets LOGSAYS to OK / FAIL / NONE from the
-# agent's own stamped log lines since <since-stamp> (pg_dump stderr shares
-# the file, unstamped, and is ignored); the LAST line is the verdict, so
-# an old failure cannot outrank a later clean run
+# agent's own log since <since-stamp>. The script ends every run with ONE
+# summary line: "run complete: N store(s)" or "run incomplete; failed: …",
+# and every refusal is a stamped line too; WARNING/note lines are
+# informational and ignored, pg_dump's unstamped stderr likewise. The LAST
+# remaining stamped line is the verdict, so an old failure cannot outrank
+# a later clean run, and a run cut short (no summary) is NONE, not OK.
 log_verdict() {
-  lv_last="$(awk -v s="$1" '$1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ && $1 >= s' "$log_file" 2>/dev/null | tail -n 1)"
+  lv_last="$(awk -v s="$1" '$1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ && $1 >= s && $2 != "WARNING:" && $2 != "note:"' "$log_file" 2>/dev/null | tail -n 1)"
   case "$lv_last" in
-    *"backed up"*) LOGSAYS=OK ;;
-    "") LOGSAYS=NONE ;;
-    *FAILED*|*"run incomplete"*|*interrupted*|*cannot*|*missing*|*"not writable"*|*refusing*|*"must be"*|*"is not a"*) LOGSAYS=FAIL ;;
+    *"run complete:"*) LOGSAYS=OK ;;
+    *"run incomplete"*|*interrupted*|*cannot*|*missing*|*"not writable"*|*refusing*|*"must be"*|*"is not a"*|*"stepping aside"*) LOGSAYS=FAIL ;;
     *) LOGSAYS=NONE ;;
   esac
 }
@@ -119,7 +122,7 @@ if [ -n "$why" ]; then
   if ! unit_busy_wait backup 600; then
     echo "   a dump is still running (or its lock cannot be probed); leaving $label as it is — re-run later" >&2
     fail=1
-  elif load_unit "$label" "$domain" "$plist_src" "$plist_dst" "$(id -u)" no; then
+  elif place_unit "$plist_src" "$plist_dst" "$(id -u)" && load_unit "$label" "$domain" "$plist_dst"; then
     loaded=yes
   else
     fail=1
@@ -165,11 +168,12 @@ if [ "$loaded" = yes ]; then
       fi
     fi
     tail -n 8 "$log_file" 2>/dev/null | sed 's/^/   /'
+    if [ "$deferred" = yes ]; then how="the concurrent run completed"; else how="exit $code"; fi
     if [ "$code" = 0 ]; then
       dump_evidence $(( ($(date +%s) - run_epoch) / 60 + 1 )) "$run_stamp"
       case "$EVIDENCE" in
-        OK)       echo "   OK ($([ "$deferred" = yes ] && echo "the concurrent run completed" || echo "exit 0"); dump landed in $dest)" ;;
-        LOG_OK)   echo "   OK ($([ "$deferred" = yes ] && echo "the concurrent run completed" || echo "exit 0"); the log shows the dump — destination not checkable from this context: $EVIDENCE_MSG)" ;;
+        OK)       echo "   OK ($how; dump landed in $dest)" ;;
+        LOG_OK)   echo "   OK ($how; the log shows the dump — destination not checkable from this context: $EVIDENCE_MSG)" ;;
         NONE)     echo "   exit 0 but NO new dump in $dest — not trusting it; check $log_file" >&2; fail=1 ;;
         LOG_FAIL) echo "   exit 0 but the log's last run failed — check $log_file" >&2; fail=1 ;;
         *)        echo "   exit 0, UNCONFIRMED: could not check $dest ($EVIDENCE_MSG) and the log shows no dump — verify by hand: ls -t '$dest' | head" >&2; fail=1 ;;
@@ -178,7 +182,8 @@ if [ "$loaded" = yes ]; then
       echo "   no result after ${i}s (still running, never spawned, or killed by a signal) — check $log_file and 'launchctl print $domain/$label'" >&2
       fail=1
     else
-      echo "   FAILED ($([ "$deferred" = yes ] && echo "the concurrent run's last line reports a failure" || echo "exit $code")) — see $log_file (1: a store failed; 2: cannot run here)" >&2
+      [ "$deferred" = yes ] && how="the concurrent run's last line reports a failure"
+      echo "   FAILED ($how) — see $log_file (1: a store failed; 2: cannot run here)" >&2
       fail=1
     fi
   fi

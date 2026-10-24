@@ -20,8 +20,10 @@ each of platform / pm / governance / memory:
    `...plist.disabled-<YYYYMMDD>` so the agent cannot reload at login and
    double-bind the port.
 3. Copies `ops/hub/launchdaemons/dev.snowline.<svc>.plist` to
-   `/Library/LaunchDaemons` (root:wheel, 644), `launchctl bootstrap system`,
-   then `launchctl kickstart -k system/dev.snowline.<svc>`.
+   `/Library/LaunchDaemons` (root:wheel, 644) — before step 1, so the
+   replacement is on disk before anything is stopped — and
+   `launchctl bootstrap system` (RunAtLoad + KeepAlive: that starts it; no
+   kickstart, which would only kill it mid-startup).
 4. Installs the autocut launchd timer from `ops/hub/launchdaemons/` the
    same way, but only bootstraps it (never kickstarts) — and only when the
    in-process autocut host is NOT enabled (`~/.config/snowline/
@@ -42,8 +44,9 @@ each of platform / pm / governance / memory:
    carries the canonical checkout path for the script on purpose (a path
    taken from whichever checkout runs an install could be a scratch
    worktree); the installer refuses to run from any other checkout and
-   refuses to load a unit whose script is missing — update `BACKUP_SCRIPT`
-   in `lib.sh` and the tracked plist if the hub checkout ever moves.
+   refuses to load a unit whose script is missing — update the path in
+   the tracked plist if the hub checkout ever moves (nothing else holds
+   it).
    Operator overrides live in `~/.config/snowline/backup.env`, never in the
    plist. It stays a per-user agent on purpose ("DB backups" below).
 7. If step 6 (re)loaded the backup agent, the installer proves it by firing one run
@@ -433,7 +436,9 @@ RunAtLoad; the first timed run is an hour after loading). The script:
   in the folder is tightened to 0600 each run): the platform dump carries
   the live replication HMAC secrets, so a dump is as sensitive as the hub;
 - prunes each store's dumps older than `SNOWLINE_BACKUP_RETENTION_DAYS`
-  (30) by the UTC stamp in the name (the same rule `--check` uses; an
+  (30), always keeping a store's newest three whatever their age (a store
+  whose dumps keep failing never loses its last good copy), by the UTC
+  stamp in the name (the same rule `--check` uses; an
   iCloud placeholder's mtime is eviction time), including evicted
   `.NAME.icloud` placeholders; the legacy `snowline_dev-*` dumps are never
   touched. Any argument other than `--print-dest` / `--check` is refused

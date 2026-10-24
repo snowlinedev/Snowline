@@ -29,12 +29,19 @@ LAUNCHAGENTS_SRC="$OPS_HUB/launchagents"
 ICLOUD_ROOT="$OWNER_HOME/Library/Mobile Documents/com~apple~CloudDocs"
 BACKUP_DIR="$ICLOUD_ROOT/Snowline/db-backups"   # the backup script's default destination
 BACKUP_LOG="$OWNER_HOME/Library/Logs/snowline-backup.log"   # the agent plist's StandardOut/ErrorPath
-# The canonical hub checkout's backup script: whatever the tracked agent
-# plist runs (its last ProgramArguments entry) — the plist is the single
-# source, deliberately static (a path taken from whichever checkout runs an
-# install could be a scratch worktree, dying with EX_CONFIG when deleted).
-# install-backup-agent.sh refuses to run from any other checkout.
-BACKUP_SCRIPT="$(plutil -extract ProgramArguments.1 raw -o - "$LAUNCHAGENTS_SRC/dev.snowline.backup.plist" 2>/dev/null)"
+# backup_script — the canonical hub checkout's backup script: whatever the
+# tracked agent plist runs (its LAST ProgramArguments entry). The plist is
+# the single source, deliberately static (a path taken from whichever
+# checkout runs an install could be a scratch worktree, dying with
+# EX_CONFIG when deleted); install-backup-agent.sh refuses to run from any
+# other checkout. A function, not a constant: only the installer needs it,
+# and the hourly run should not fork plutil.
+backup_script() {
+  bs_plist="$LAUNCHAGENTS_SRC/dev.snowline.backup.plist"
+  bs_n="$(plutil -extract ProgramArguments raw -o - "$bs_plist" 2>/dev/null)" || return 1
+  [ "${bs_n:-0}" -gt 0 ] || return 1
+  plutil -extract "ProgramArguments.$((bs_n - 1))" raw -o - "$bs_plist" 2>/dev/null
+}
 
 # ---- logging ----
 # Helpers log through `log`. A caller that defines its own log() FUNCTION
@@ -162,7 +169,7 @@ unit_busy_wait() {
       unknown) echo "   cannot probe $lock (perl missing? unreadable?); not touching $1" >&2; return 1 ;;
     esac
     if [ "$busy_waited" -ge "$bound" ]; then
-      echo "   $1 is still running after ${busy_waited}s ($lock held)" >&2
+      [ "$bound" -eq 0 ] || echo "   $1 is still running after ${busy_waited}s ($lock held)" >&2
       return 1
     fi
     echo "   $1 run in progress; waiting (${busy_waited}s)"
@@ -187,40 +194,40 @@ timer_skip() {
 # between this check and the bootout is not covered by this guard; the
 # install re-checks the lock right before touching the autocut unit.)
 autocut_guard() {
-  # one probe/wait loop for every unit: bound 0 refuses at once, --wait
-  # polls (15 s steps) for up to 15 min
+  # one probe/wait loop for every unit: bound 0 refuses at once (quietly —
+  # the refusal below is the message), --wait polls (15 s steps) up to 15 min
   if [ "${1:-}" = "--wait" ]; then ag_bound=900; else ag_bound=0; fi
-  unit_busy_wait autocut "$ag_bound" 15 && return 0
+  unit_busy_wait autocut "$ag_bound" 15 2>/dev/null && return 0
   echo "refusing: an autocut is running (lock held: $AUTOCUT_LOCK), or its lock cannot be probed." >&2
   echo "  booting the timer out now would kill the cut mid-publish." >&2
   echo "  follow it in $AUTOCUT_LOG, then re-run (or pass --wait)." >&2
   exit 75
 }
 
-# ---- loading a unit ----
-# load_unit <label> <domain> <src-plist> <dst-plist> <owner> <kick:yes|no>
-# Boot the label out of <domain>, wait for it to be gone, copy <src> to
-# <dst> (creating the directory, owned by <owner>), bootstrap it, and
-# kickstart it when <kick> is yes (never for a timer: that fires a run).
-# Order: the plist is put in place FIRST (launchd holds its own copy of a
-# loaded definition, so overwriting the file is harmless), then the old
-# registration is booted out, waited for, and the new one bootstrapped —
-# nothing is torn down before its replacement is on disk.
-# Sets UNIT_RESULT: installed | copy-failed (the plist could not be put in
-# place; nothing was touched) | still-old (the old registration did not go
-# away within 30 s, or bootstrap was refused with it still loaded: it keeps
-# running the OLD definition, the new plist is on disk, re-run) |
-# not-loaded (bootstrap refused, nothing loaded — a gui-domain unit then
-# loads at the next login) | not-started (loaded, kickstart refused).
-# Returns 0 only for installed.
-load_unit() {
-  lu_label="$1"; lu_domain="$2"; lu_src="$3"; lu_dst="$4"; lu_owner="$5"; lu_kick="$6"
-  if ! { mkdir -p "$(dirname "$lu_dst")" && chown "$lu_owner" "$(dirname "$lu_dst")" \
-         && cp "$lu_src" "$lu_dst" && chown "$lu_owner" "$lu_dst" && chmod 644 "$lu_dst"; }; then
-    echo "   could not install $lu_src -> $lu_dst; $lu_label left as it was" >&2
-    UNIT_RESULT=copy-failed
+# ---- placing and loading a unit ----
+# place_unit <src-plist> <dst-plist> <owner> — put the plist in place
+# (creating the directory, owned by <owner>). launchd holds its own copy of
+# a loaded definition, so overwriting the file is harmless; do this BEFORE
+# anything is booted out, so nothing is torn down before its replacement is
+# on disk. Returns 1 (nothing touched) if the copy fails.
+place_unit() {
+  if ! { mkdir -p "$(dirname "$2")" && chown "$3" "$(dirname "$2")" \
+         && cp "$1" "$2" && chown "$3" "$2" && chmod 644 "$2"; }; then
+    echo "   could not install $1 -> $2; nothing changed" >&2
     return 1
   fi
+}
+# load_unit <label> <domain> <dst-plist> — boot the label out of <domain>,
+# wait for it to be gone, bootstrap the plist (a RunAtLoad / KeepAlive unit
+# starts right there; nothing is kickstarted: a kick after the bootstrap
+# would only kill the instance launchd just spawned, mid-startup).
+# Sets UNIT_RESULT: installed | still-old (the old registration did not go
+# away within 30 s, or bootstrap was refused with it still loaded: it keeps
+# running the OLD definition — re-run) | not-loaded (bootstrap refused,
+# nothing loaded — a gui-domain unit then loads at the next login).
+# Returns 0 only for installed.
+load_unit() {
+  lu_label="$1"; lu_domain="$2"; lu_dst="$3"
   launchctl bootout "$lu_domain/$lu_label" 2>/dev/null || true
   if ! wait_unloaded "$lu_domain/$lu_label"; then
     echo "   old registration of $lu_label still loaded after 30s (it keeps running the old definition; the new plist is on disk) — re-run" >&2
@@ -235,11 +242,6 @@ load_unit() {
       echo "   bootstrap of $lu_label refused (no session for $lu_domain?); the plist is installed at $lu_dst and loads when that domain next comes up — nothing runs for $lu_label until then" >&2
       UNIT_RESULT=not-loaded
     fi
-    return 1
-  fi
-  if [ "$lu_kick" = yes ] && ! launchctl kickstart -k "$lu_domain/$lu_label"; then
-    echo "   kickstart of $lu_label failed (spawn throttled?); it is loaded but not started" >&2
-    UNIT_RESULT=not-started
     return 1
   fi
   UNIT_RESULT=installed
