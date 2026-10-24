@@ -71,8 +71,9 @@ for timer in $TIMERS; do
     continue
   fi
   if cmp -s "$LAUNCHDAEMONS_SRC/$label.plist" "$DAEMONS_DIR/$label.plist" \
+     && unit_current "$label" "$DAEMONS_DIR/$label.plist" \
      && launchctl print "system/$label" >/dev/null 2>&1; then
-    echo "   unchanged and loaded; left as it is"
+    echo "   unchanged, confirmed loaded; left as it is"
     continue
   fi
   # autocut was refused up front by autocut_guard; a cut that started since
@@ -108,7 +109,11 @@ done
 # key on, and the backup proof can be inconclusive from an ssh session for
 # reasons that have nothing to do with the services.
 echo "== dev.snowline.backup (ops/hub/install-backup-agent.sh, as the owner)"
-if sudo -u "#$OWNER_UID" -H /bin/sh "$OPS_HUB/install-backup-agent.sh"; then
+if [ "$fail" != 0 ]; then
+  # the ordering exists so the proving dump never lands in a boot
+  # migration's window; with a service DOWN that is where it would land
+  echo "== backup agent: SKIPPED (a service is DOWN or failed to install; its proving dump must not land in a migration) — run ops/hub/install-backup-agent.sh as the owner once /health is clean" >&2
+elif sudo -u "#$OWNER_UID" -H /bin/sh "$OPS_HUB/install-backup-agent.sh"; then
   echo "== backup agent: OK"
 else
   echo "== backup agent: NOT OK (see above) — fix and re-run ops/hub/install-backup-agent.sh as the owner; the services' result is exit $fail" >&2

@@ -10,13 +10,12 @@
 # Exit: 0 = agent loaded and (if it was (re)loaded) proven by one run with
 # evidence; 1 = something needs the operator (message says what).
 
-if [ "$(id -u)" = 0 ]; then
-  echo "run this as the hub owner, not root: the unit is a per-user agent" >&2
-  exit 64
-fi
-
 # shellcheck disable=SC1091
 . "$(cd "$(dirname "$0")" && pwd)/launchdaemons/lib.sh"
+if [ "$(id -u)" != "$OWNER_UID" ]; then
+  echo "run this as the hub owner (uid $OWNER_UID), not root or another account: the unit is the owner's per-user agent and every path here is the owner's" >&2
+  exit 64
+fi
 BACKUP_SCRIPT="$(backup_script)" || BACKUP_SCRIPT=""
 
 label="dev.snowline.backup"
@@ -92,81 +91,82 @@ log_verdict() {
   done
 }
 
-# --- decide: leave alone, or (re)load ---
-# (Re)load — plist copied in at that point, never before — when the tracked
-# plist differs from the one launchd last LOADED (recorded by checksum in a
-# marker when a load succeeded: the file on disk alone cannot tell, since a
-# load can fail with the old registration still running), the unit is not
-# loaded, its last run exited with anything but 0 or 3 (3 = "stepped aside"
-# is harmless), or no evidence that THE UNIT dumped in the last two hours:
-# a fresh dump in the destination AND a "run exit" line in the agent's log
-# (a manual run writes to the terminal, not the log, so a dump alone could
-# be the operator's, masking a unit launchd stopped firing; an exit code
-# alone is no evidence either — a stopped unit still shows its old 0).
-LOADED_MARK="$LOCKS_DIR/backup-agent.loaded"
-plist_sum="$(cksum < "$plist_src" | cut -d' ' -f1)"
-why=""
+# --- decide: leave alone, reload, or re-prove ---
+# RELOAD (plist copied in at that point, never before) only for what a
+# reload can change: the tracked plist differs from the one launchd last
+# confirmed loaded (unit_current — bytes on disk alone cannot tell, since a
+# load can fail with the old registration still running), or the unit is
+# not loaded. RE-PROVE (fire one run, judge it) when the unit is loaded and
+# current but there is no evidence it is healthy: its last run exited with
+# anything but 0 or 3, or nothing shows THE UNIT dumped in the last two
+# hours — a fresh dump in the destination AND a "run exit" line in the
+# agent's log (a manual run writes to the terminal, not the log, so a dump
+# alone could be the operator's, masking a unit launchd stopped firing; an
+# exit code alone is no evidence either — a stopped unit still shows its
+# old 0). Otherwise LEAVE ALONE.
+action=leave; why=""
 if ! cmp -s "$plist_src" "$plist_dst" 2>/dev/null; then
-  why="plist changed"
-elif [ "$(cat "$LOADED_MARK" 2>/dev/null)" != "$plist_sum" ]; then
-  why="this plist was never confirmed loaded (a previous load did not complete?)"
+  action=reload; why="plist changed"
+elif ! unit_current "$label" "$plist_dst"; then
+  action=reload; why="this plist was never confirmed loaded (a previous load did not complete?)"
 elif ! unit_snapshot "$domain/$label"; then
-  why="not loaded"
+  action=reload; why="not loaded"
 else
   case "$UNIT_EXIT" in
     ""|0|3) ;;
-    2)
-      # "cannot run here" (destination or volume missing, TCC, bad
-      # configuration): a reload changes nothing, so none — but the unit is
-      # proven again right away, which is how a fixed cause is confirmed
-      echo "   loaded, but its last run exited 2 (cannot run here; see $log_file) — no reload, proving it again instead"
-      reprove=yes ;;
-    *) why="last run exited $UNIT_EXIT" ;;
+    *) action=reprove; why="last run exited $UNIT_EXIT" ;;
   esac
-  if [ -z "$why" ] && [ "${reprove:-no}" = no ]; then
+  if [ "$action" = leave ]; then
     since="$(date -u -v-120M +%FT%TZ)"
     log_verdict "$since"   # the unit's own account; a manual run leaves no line here
     dump_evidence 120
     case "$EVIDENCE:$LOGSAYS" in
-      OK:OK|LOG_OK:OK) echo "   unchanged and loaded, the unit dumped within 2 h; left as it is" ;;
-      OK:NONE)         why="a dump landed within 2 h but the unit's log shows no run (a manual dump? the unit not firing?)" ;;
-      NONE:*)          why="no dump in the last 2 h in $dest" ;;
-      *:FAIL|LOG_FAIL:*) why="the unit's last run within 2 h failed" ;;
-      *)               why="no evidence the unit ran in the last 2 h (destination: $EVIDENCE_MSG)" ;;
+      OK:OK|LOG_OK:OK) echo "   unchanged, confirmed loaded, the unit dumped within 2 h; left as it is" ;;
+      OK:NONE)         action=reprove; why="a dump landed within 2 h but the unit's log shows no run (a manual dump? the unit not firing?)" ;;
+      NONE:*)          action=reprove; why="no dump in the last 2 h in $dest" ;;
+      *:FAIL|LOG_FAIL:*) action=reprove; why="the unit's last run within 2 h failed" ;;
+      *)               action=reprove; why="no evidence the unit ran in the last 2 h (destination: $EVIDENCE_MSG)" ;;
     esac
   fi
 fi
 loaded=no
-if [ -n "$why" ]; then
-  echo "   reloading ($why)"
-  # never boot the unit out mid-dump (it holds backup.lock); the hourly fire
-  # landing in the instant between the last probe and the bootout would
-  # lose that hour's dump, which the proving run then replaces
-  if ! unit_busy_wait backup 600; then
-    echo "   a dump is still running (or its lock cannot be probed); leaving $label as it is — re-run later" >&2
-    fail=1
-  elif place_unit "$plist_src" "$plist_dst" "$(id -u)" && load_unit "$label" "$domain" "$plist_dst"; then
-    loaded=yes
-    mkdir -p "$LOCKS_DIR" && printf '%s\n' "$plist_sum" > "$LOADED_MARK"
-  else
-    rm -f "$LOADED_MARK"   # whatever launchd runs now, it is not confirmed to be this plist
-    fail=1
-  fi
-fi
+case "$action" in
+  reload)
+    echo "   reloading ($why)"
+    # never boot the unit out mid-dump (it holds backup.lock); a manual run
+    # in the instant between the last probe and the bootout would lose
+    # that dump, which the proving run then replaces
+    if ! unit_busy_wait backup 600; then
+      echo "   a dump is still running (or its lock cannot be probed); leaving $label as it is — re-run later" >&2
+      fail=1
+    elif place_unit "$plist_src" "$plist_dst" "$(id -u)" && load_unit "$label" "$domain" "$plist_dst"; then
+      loaded=yes
+    else
+      fail=1
+    fi ;;
+  reprove)
+    echo "   loaded and current, but unproven ($why); proving it, no reload" ;;
+esac
 
 # --- prove the unit with one run through launchd ---
 # `kickstart`, so the run happens in the agent's OWN launchd session (its
-# TCC posture, its environment), not this shell's. Completion is seen in
-# launchd's run counter and the exit code is the agent's; evidence is a
-# dump newer than the run (or the agent's own log lines when the
-# destination cannot be read from here). Exit 3 (an hourly or manual run
-# held the lock) proves nothing about the unit: wait for that run, then
-# fire once more; a second step-aside ends as "nothing proven".
+# TCC posture, its environment), not this shell's. launchd runs one
+# instance per label, so the unit never races itself: a run already in
+# flight IS the run to judge (waited for, not restarted), and the only
+# thing that can hold the lock against it is a manual `bash
+# snowline-backup.sh` — then (exit 3) the run proves nothing and is fired
+# once more after the lock frees; a second step-aside ends as "nothing
+# proven". Completion is seen in launchd's run counter and the exit code is
+# the agent's; evidence is a dump newer than the run (or the agent's own
+# log lines when the destination cannot be read from here).
 prove_run() {
   pr_try="$1"
   unit_snapshot "$domain/$label"; runs_before="$UNIT_RUNS"
   run_stamp="$(date -u +%FT%TZ)"; run_epoch="$(date +%s)"
-  if ! launchctl kickstart "$domain/$label"; then
+  if [ "$UNIT_RUNNING" = yes ]; then
+    echo "   a run is already in flight; judging that one"
+    runs_before=$((UNIT_RUNS - 1)); run_epoch=$((run_epoch - 900)); run_stamp="$(date -u -v-15M +%FT%TZ)"
+  elif ! launchctl kickstart "$domain/$label"; then
     echo "   kickstart refused; the unit is loaded but unproven — run 'bash $BACKUP_SCRIPT' by hand" >&2
     fail=1; return
   fi
@@ -185,9 +185,9 @@ prove_run() {
   done
   if [ "$code" = 3 ]; then
     if [ "$pr_try" = 1 ]; then
-      echo "   stepped aside (another run held the lock); waiting for it, then firing once more"
+      echo "   stepped aside (a manual run held the lock); waiting for it, then firing once more"
       if unit_busy_wait backup 600; then prove_run 2; return; fi
-      echo "   the concurrent run is still going after 10 min; nothing proven — re-run later" >&2
+      echo "   that run is still going after 10 min; nothing proven — re-run later" >&2
     else
       echo "   stepped aside twice; nothing proven — re-run later" >&2
     fi
@@ -215,8 +215,8 @@ prove_run() {
 if [ "$loaded" = yes ]; then
   echo "== $label (proving run, via launchd)"
   prove_run 1
-elif [ "${reprove:-no}" = yes ]; then
-  echo "== $label (re-proving the last exit 2 without a reload, via launchd)"
+elif [ "$action" = reprove ]; then
+  echo "== $label (proving run, via launchd)"
   prove_run 1
 fi
 exit "$fail"

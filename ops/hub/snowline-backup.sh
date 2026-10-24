@@ -117,22 +117,20 @@ DEST="${SNOWLINE_BACKUP_DIR:-$BACKUP_DIR}"
 RETENTION_DAYS="${SNOWLINE_BACKUP_RETENTION_DAYS:-30}"
 case "$RETENTION_DAYS" in ''|*[!0-9]*) die "SNOWLINE_BACKUP_RETENTION_DAYS must be a whole number of days, at least 1: '$RETENTION_DAYS'" ;; esac
 [ "$RETENTION_DAYS" -ge 1 ] || die "SNOWLINE_BACKUP_RETENTION_DAYS must be at least 1: '$RETENTION_DAYS'"
-# name_stamp <path> — sets NAME_STAMP to the YYYYMMDD-HHMMSS stamp in a
-# dump's or placeholder's name (…-YYYYMMDD-HHMMSSZ.dump[.icloud]; the
-# pre-#319 names lack the Z and are local time — a few hours off, which the
-# 30-day retention does not care about); fails for any other name.
-# Parameter expansion only, result in a variable: no fork per file.
-name_stamp() {
-    NAME_STAMP="${1##*/}"; NAME_STAMP="${NAME_STAMP%.icloud}"; NAME_STAMP="${NAME_STAMP%.dump}"; NAME_STAMP="${NAME_STAMP%Z}"
-    NAME_STAMP="${NAME_STAMP#"${NAME_STAMP%???????????????}"}"   # last 15 chars
-    case "$NAME_STAMP" in
-        [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]) return 0 ;;
-        *) return 1 ;;
-    esac
+# parse_dump_name <path> — the ONE grammar of this script's file names,
+# <store>-YYYYMMDD-HHMMSS[Z].dump, optionally iCloud-evicted to
+# .<name>.icloud: sets NAME_STORE and NAME_STAMP, or fails for any other
+# name. (The pre-#319 names lack the Z and are local time — a few hours
+# off, which the 30-day retention does not care about.) A bash regex: no
+# fork per file.
+DUMP_NAME_RE='^(.*/)?\.?([A-Za-z0-9_]+)-([0-9]{8}-[0-9]{6})Z?\.dump(\.icloud)?$'
+parse_dump_name() {
+    [[ $1 =~ $DUMP_NAME_RE ]] || return 1
+    NAME_STORE="${BASH_REMATCH[2]}"; NAME_STAMP="${BASH_REMATCH[3]}"
 }
-# z_dumps <name-prefix> [all] — one "<stamp>\t<path>" line per dump or
-# placeholder of that prefix in DEST (`*` for every store): Z-named (UTC)
-# ones by default, pre-#319 local-time names too with `all`. The ONE
+# z_dumps <name-prefix> [all] — one "<store>\t<stamp>\t<path>" line per dump
+# or placeholder of that prefix in DEST (`*` for every store): Z-named
+# (UTC) ones by default, pre-#319 local-time names too with `all`. The ONE
 # listing --check (evidence: Z names only, written by this script) and the
 # prune (retention: every name) share. find's stderr goes to Z_DUMPS_ERR
 # for the caller to inspect.
@@ -141,8 +139,8 @@ z_dumps() {
     if [ "${2:-}" = all ]; then zd_tail=''; else zd_tail='Z'; fi   # all: Z names and pre-#319 names alike
     find "$DEST" -maxdepth 1 \( -name "$1-[0-9]*${zd_tail}.dump" -o -name ".$1-[0-9]*${zd_tail}.dump.icloud" \) -type f 2>"$Z_DUMPS_ERR" \
     | while IFS= read -r zf; do
-        name_stamp "$zf" || continue
-        printf '%s\t%s\n' "$NAME_STAMP" "$zf"
+        parse_dump_name "$zf" || continue
+        printf '%s\t%s\t%s\n' "$NAME_STORE" "$NAME_STAMP" "$zf"
     done
 }
 
@@ -205,9 +203,8 @@ case "${1:-}" in
         # SNOWLINE_BACKUP_DBS is set, else the catalog rule (store_wanted) —
         # a scratch or foreign dump put in the folder by hand is not evidence
         found=no
-        while IFS="$TAB" read -r s f; do
+        while IFS="$TAB" read -r store s f; do
             [ -n "$f" ] || continue
-            store="${f##*/}"; store="${store#.}"; store="${store%-"$s"Z.dump*}"
             if [ -n "${SNOWLINE_BACKUP_DBS:-}" ]; then
                 case " ${SNOWLINE_BACKUP_DBS} " in *" $store "*) ;; *) continue ;; esac
             else
@@ -323,7 +320,14 @@ done <<EOF_ROWS
 $CATALOG_ROWS
 EOF_ROWS
 LIVE="${LIVE# }"; UNCONNECTABLE="${UNCONNECTABLE# }"
-[ -z "$UNCONNECTABLE" ] || log "WARNING: snowline store(s) this role cannot connect to, NOT backed up: $UNCONNECTABLE (parked? CONNECT revoked?)" >&2
+# A store this role cannot connect to is a FAILED store, not a footnote:
+# the run ends incomplete (exit 1) so launchd, the installer and the "run
+# exit" line all say the backup is not whole.
+FAILED=""
+for uc in $UNCONNECTABLE; do
+    log "FAILED to back up ${uc}: this role cannot connect to it (parked? CONNECT revoked?)" >&2
+    FAILED="$FAILED $uc"
+done
 # (LIVE was built above, in the same pass)
 if [ -n "$DBS_EXPLICIT" ]; then
     DBS="$DBS_EXPLICIT"
@@ -351,7 +355,7 @@ fi
 
 # UTC stamp so file names sort monotonically (no DST fold) and match the log.
 STAMP="$(date -u +%Y%m%d-%H%M%SZ)"
-FAILED=""
+FAILED="${FAILED:-}"
 
 # Word-split DBS once, with globbing off (names are validated above or
 # catalog-sourced). A SIGTERM mid-dump (the unit booted out, a logout, a
@@ -373,8 +377,8 @@ PRUNE_CUTOFF="$(date -u -v-"${RETENTION_DAYS}"d +%Y%m%d-%H%M%S 2>/dev/null)" || 
 KEEP_MIN=3
 prune_by_name() {
     [ -n "$PRUNE_CUTOFF" ] || return 0   # no cutoff, no pruning (never over-delete; warned above)
-    z_dumps "$1" all | sort -r | awk -F"$TAB" -v cutoff="$PRUNE_CUTOFF" -v keep="$KEEP_MIN" \
-        'NR > keep && $1 < cutoff { print $2 }' \
+    z_dumps "$1" all | sort -t "$TAB" -k2,2r | awk -F"$TAB" -v cutoff="$PRUNE_CUTOFF" -v keep="$KEEP_MIN" \
+        'NR > keep && $2 < cutoff { print $3 }' \
     | while IFS= read -r pb_f; do rm -f "$pb_f"; done
     return 0
 }

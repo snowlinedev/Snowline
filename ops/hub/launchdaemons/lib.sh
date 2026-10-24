@@ -223,10 +223,19 @@ place_unit() {
     return 1
   fi
 }
+# unit_current <label> <plist> — is <plist> the definition launchd last
+# confirmed loaded for <label>? Bytes on disk alone cannot tell (a load can
+# fail with the old registration still running), so load_unit records the
+# checksum of what it successfully bootstrapped in $LOCKS_DIR/<label>.loaded
+# and this compares against it.
+unit_current() {
+  [ "$(cat "$LOCKS_DIR/$1.loaded" 2>/dev/null)" = "$(cksum < "$2" | cut -d' ' -f1)" ]
+}
 # load_unit <label> <domain> <dst-plist> — boot the label out of <domain>,
 # wait for it to be gone, bootstrap the plist (a RunAtLoad / KeepAlive unit
 # starts right there; nothing is kickstarted: a kick after the bootstrap
-# would only kill the instance launchd just spawned, mid-startup).
+# would only kill the instance launchd just spawned, mid-startup) and
+# record its checksum as the confirmed-loaded definition.
 # Sets UNIT_RESULT: installed | still-old (the old registration did not go
 # away within 30 s, or bootstrap was refused with it still loaded: it keeps
 # running the OLD definition — re-run) | not-loaded (bootstrap refused,
@@ -234,6 +243,7 @@ place_unit() {
 # Returns 0 only for installed.
 load_unit() {
   lu_label="$1"; lu_domain="$2"; lu_dst="$3"
+  rm -f "$LOCKS_DIR/$lu_label.loaded"   # whatever runs from here on is unconfirmed until bootstrap succeeds
   launchctl bootout "$lu_domain/$lu_label" 2>/dev/null || true
   if ! wait_unloaded "$lu_domain/$lu_label"; then
     echo "   old registration of $lu_label still loaded after 30s (it keeps running the old definition; the new plist is on disk) — re-run" >&2
@@ -250,6 +260,7 @@ load_unit() {
     fi
     return 1
   fi
+  mkdir -p "$LOCKS_DIR" && cksum < "$lu_dst" | cut -d' ' -f1 > "$LOCKS_DIR/$lu_label.loaded"
   UNIT_RESULT=installed
   return 0
 }

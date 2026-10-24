@@ -39,12 +39,13 @@ each of platform / pm / governance / memory:
    `install-daemons.sh` restarts all four services and is NOT the way to
    do that. Its outcome is printed, not folded into `install-daemons.sh`'s
    exit status, which is the services' result. It (re)loads `ops/hub/launchagents/dev.snowline.backup.plist`
-   into `gui/501` when the tracked plist differs from the one last
-   confirmed loaded, the unit is not loaded, its last run exited with
-   anything other than 0 or 3, or there is no evidence the unit itself
-   dumped in the last two hours (a fresh dump plus the unit's own `run
-   exit` log line — a manual dump alone does not count) — waiting first
-   for a dump in progress. The plist
+   into `gui/501` only when the tracked plist differs from the one last
+   confirmed loaded or the unit is not loaded (waiting first for a dump in
+   progress); a unit that is loaded and current but whose last run exited
+   with anything other than 0 or 3, or for which there is no evidence it
+   itself dumped in the last two hours (a fresh dump plus the unit's own
+   `run exit` log line — a manual dump alone does not count), is not
+   reloaded but proven again. The plist
    carries the canonical checkout path for the script on purpose (a path
    taken from whichever checkout runs an install could be a scratch
    worktree); the installer refuses to run from any other checkout and
@@ -414,9 +415,9 @@ RunAtLoad; the first timed run is an hour after loading). The script:
   `pg_restore -l`, then renames `.partial` to the final name — one store
   failing does not skip the others, and the run exits 1 if any did;
 - the store list comes from the server's own catalog: every `snowline_*`
-  database this role can connect to (one it cannot — parked, or CONNECT
-  revoked — is named in the log as NOT backed up, never silently dropped),
-  except scratch ones — a name with a `_test`, `_dryrun`, `_e2e`
+  database, except scratch ones; one this role cannot connect to (parked,
+  or CONNECT revoked) is a failed store — logged by name, and the run
+  ends incomplete (exit 1), never silently whole — — a name with a `_test`, `_dryrun`, `_e2e`
   or `_restore` component (as a whole component: `snowline_pm_test_sp` and
   `snowline_restore` are scratch, `snowline_testimonials` would be a store)
   and the legacy `snowline_dev`; only plain-identifier names — so a new
