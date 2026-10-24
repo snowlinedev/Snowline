@@ -98,6 +98,7 @@ for timer in $TIMERS; do
   launchctl bootstrap system "$DAEMONS_DIR/$label.plist" || { echo "   bootstrap FAILED for $label" >&2; fail=1; }
 done
 
+health_ok=yes
 echo "== waiting up to 60s for /health"
 urls="platform|http://100.81.176.75:8850/health pm|http://127.0.0.1:8802/health governance|http://127.0.0.1:8801/health memory|http://127.0.0.1:8803/health"
 for entry in $urls; do
@@ -111,7 +112,7 @@ for entry in $urls; do
     i=$((i + 1))
   done
   echo "   $name $url: $([ "$ok" = yes ] && echo UP || echo DOWN)"
-  [ "$ok" = yes ] || fail=1
+  [ "$ok" = yes ] || { fail=1; health_ok=no; }
 done
 
 # --- the backup agent: tracked plist -> ~/Library/LaunchAgents, loaded ---
@@ -162,7 +163,12 @@ else
   fi
 fi
 backup_loaded=no
-if [ -n "$why" ]; then
+if [ -n "$why" ] && [ "$health_ok" != yes ]; then
+  # a RunAtLoad dump would take ACCESS SHARE on every table of a service
+  # that may be mid-migration; never while a service is DOWN
+  echo "   would reload ($why) but a service is DOWN; leaving $label as it is — re-run the install once /health is clean" >&2
+  fail=1
+elif [ -n "$why" ]; then
   echo "   reloading ($why)"
   if ! unit_busy_wait backup 600; then
     echo "   a dump is still running; leaving $label as it is (plist NOT replaced) — re-run the install after it finishes" >&2
@@ -175,6 +181,7 @@ if [ -n "$why" ]; then
       echo "   old registration of $label still loaded after 30s; plist NOT replaced — re-run the install" >&2
       fail=1
     else
+      mkdir -p "$AGENTS" && chown "$OWNER_UID" "$AGENTS"
       cp "$LAUNCHAGENTS_SRC/$label.plist" "$AGENTS/$label.plist"
       chown "$OWNER_UID" "$AGENTS/$label.plist"
       chmod 644 "$AGENTS/$label.plist"
@@ -201,12 +208,12 @@ if [ "$backup_loaded" = yes ]; then
   echo "== $label (RunAtLoad dump)"
   code=""; running=no; i=0
   while [ "$i" -lt 300 ]; do
-    info="$(launchctl print "gui/$OWNER_UID/$label" 2>/dev/null)" || break   # unit gone
-    if printf '%s\n' "$info" | grep -q -E '^[[:space:]]*(state = running|pid = [0-9])'; then
+    launchctl print "gui/$OWNER_UID/$label" >/dev/null 2>&1 || break   # unit gone
+    if unit_running "gui/$OWNER_UID/$label"; then
       running=yes
     else
       running=no
-      code="$(printf '%s\n' "$info" | sed -n 's/.*last exit code = \([0-9][0-9]*\).*/\1/p' | head -n 1)"
+      code="$(unit_last_exit "gui/$OWNER_UID/$label")"
       [ -n "$code" ] && break
     fi
     sleep 2

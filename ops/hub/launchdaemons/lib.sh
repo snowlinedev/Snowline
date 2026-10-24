@@ -98,27 +98,22 @@ LOCKS_DIR="$OWNER_HOME/Library/Application Support/Snowline"
 BACKUP_LOCK="$LOCKS_DIR/backup.lock"
 AUTOCUT_LOCK="$LOCKS_DIR/autocut.lock"
 AUTOCUT_LOG="$OWNER_HOME/Library/Logs/snowline-autocut.log"
-# Exit 0 = held, 1 = free; anything else means the probe itself could not
-# run (python3 shim without Command Line Tools, unreadable file) and is
-# treated as HELD — a guard that cannot tell must refuse, not wave through.
-lock_held() {
-  [ -e "$1" ] || return 1
-  /usr/bin/python3 -c 'import errno, fcntl, os, sys
-try:
-    fd = os.open(sys.argv[1], os.O_RDONLY)
-except OSError:
-    sys.exit(2)          # cannot even open it: the probe could not run
-try:
-    fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-except OSError as e:
-    sys.exit(0 if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN) else 2)
-sys.exit(1)' "$1" 2>/dev/null
-  case $? in
-    0) return 0 ;;
-    1) return 1 ;;
-    *) echo "   cannot probe the lock $1 (python3 unavailable?); treating it as held" >&2; return 0 ;;
-  esac
+# lock_state <path> — prints held / free / unknown. A shared non-blocking
+# flock probe in /usr/bin/perl (base macOS; no Command Line Tools needed,
+# unlike the python3 stub): it fails only while an exclusive holder runs and
+# never leaves the probe owning the lock. "unknown" = the probe itself could
+# not run (unreadable file, perl missing): a guard that cannot tell must
+# refuse, not wave through, so callers treat it like held — but without
+# waiting on it.
+lock_state() {
+  [ -e "$1" ] || { echo free; return; }
+  /usr/bin/perl -e 'use Fcntl qw(:flock); open(my $fh, "<", $ARGV[0]) or exit 2;
+    exit 1 if flock($fh, LOCK_SH | LOCK_NB);
+    exit(($!{EWOULDBLOCK} || $!{EAGAIN}) ? 0 : 2);' "$1" 2>/dev/null
+  case $? in 0) echo held ;; 1) echo free ;; *) echo unknown ;; esac
 }
+# lock_held <path> — true unless the lock is known to be free.
+lock_held() { [ "$(lock_state "$1")" != free ]; }
 autocut_lock_held() { lock_held "$AUTOCUT_LOCK"; }
 
 # unit_busy_wait <name> [bound_s] — wait (default up to 10 min) while
@@ -129,7 +124,11 @@ unit_busy_wait() {
   lock="$LOCKS_DIR/$1.lock"
   bound="${2:-600}"
   busy_waited=0
-  while lock_held "$lock"; do
+  while :; do
+    case "$(lock_state "$lock")" in
+      free) return 0 ;;
+      unknown) echo "   cannot probe $lock (perl missing? unreadable?); not touching $1" >&2; return 1 ;;
+    esac
     if [ "$busy_waited" -ge "$bound" ]; then
       echo "   $1 is still running after ${busy_waited}s ($lock held)" >&2
       return 1
@@ -151,6 +150,10 @@ unit_busy_wait() {
 autocut_guard() {
   waited=0
   while autocut_lock_held; do
+    if [ "$(lock_state "$AUTOCUT_LOCK")" = unknown ]; then
+      echo "refusing: cannot probe the autocut lock $AUTOCUT_LOCK (perl missing? unreadable?)." >&2
+      exit 75
+    fi
     if [ "${1:-}" != "--wait" ] || [ "$waited" -ge 900 ]; then
       echo "refusing: an autocut is running (lock held: $AUTOCUT_LOCK)." >&2
       echo "  booting the timer out now would kill the cut mid-publish." >&2

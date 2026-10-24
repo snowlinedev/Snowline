@@ -88,7 +88,7 @@ case "${1:-}" in
     --check)
         mins="${2:-}"
         case "$mins" in ''|*[!0-9]*) echo "--check needs a number of minutes" >&2; exit 2 ;; esac
-        [ -d "$DEST" ] || exit 2
+        [ -d "$DEST" ] || exit 1   # no destination yet = no dump yet, not an error
         err="$(mktemp -t snowline-backup-check)"
         found="$(find "$DEST" -maxdepth 1 \( -name '*.dump' -o -name '.*.dump.icloud' \) -type f -mmin "-$mins" 2>"$err" | head -n 1)"
         if [ -n "$found" ]; then rm -f "$err"; exit 0; fi
@@ -130,23 +130,20 @@ die() { log "$*" >&2; exit 2; }
 # other flock error (an fs without flock, a bad fd) is exit 2.
 mkdir -p "$(dirname "$BACKUP_LOCK")"
 exec 9>>"$BACKUP_LOCK" || die "cannot open the run lock $BACKUP_LOCK (root-owned from a sudo run?); fix its ownership"
-/usr/bin/python3 -c '
-import errno, fcntl, sys, time
-for attempt in range(5):
-    try:
-        fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        sys.exit(0)
-    except OSError as e:
-        if e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
-            print("flock failed on the run lock: %s" % e, file=sys.stderr)
-            sys.exit(2)
-        time.sleep(1)   # a lock_held probe holds it for an instant; a real run for minutes
-sys.exit(3)
-'
+# /usr/bin/perl ships with base macOS (the python3 there is a Command Line
+# Tools stub); it flocks the inherited fd 9 in place, so the lock outlives it.
+/usr/bin/perl -e 'use Fcntl qw(:flock);
+    open(my $fh, ">>&=", 9) or exit 2;
+    for (1..5) {
+        exit 0 if flock($fh, LOCK_EX | LOCK_NB);
+        exit 2 unless $!{EWOULDBLOCK} || $!{EAGAIN};
+        sleep 1;   # a lock_state probe holds it for an instant; a real run for minutes
+    }
+    exit 3;'
 case $? in
     0) ;;
     3) log "another backup run holds $BACKUP_LOCK; stepping aside"; exit 3 ;;
-    *) die "cannot take the run lock $BACKUP_LOCK" ;;
+    *) die "cannot take the run lock $BACKUP_LOCK (flock failed)" ;;
 esac
 
 # --- destination: refuse to write "backups" that never leave the machine ---
@@ -212,7 +209,18 @@ if [ -n "$DBS_EXPLICIT" ]; then
     done
     [ -z "$EXCLUDED" ] || log "note: SNOWLINE_BACKUP_DBS excludes live store(s):${EXCLUDED}" >&2
 elif [ "$CATALOG_OK" = yes ] && [ -n "$LIVE" ]; then
-    DBS="$(printf '%s\n' "$LIVE" | tr '\n' ' ')"
+    # catalog names get the same identifier rule as an explicit list — a
+    # quoted name with a space would otherwise split into two bogus stores
+    DBS=""
+    while IFS= read -r db; do
+        case "$db" in
+            *[!A-Za-z0-9_]*) log "WARNING: skipping catalog database with a non-identifier name: '$db'" >&2 ;;
+            *) DBS="$DBS $db" ;;
+        esac
+    done <<EOF_LIVE
+$LIVE
+EOF_LIVE
+    DBS="${DBS# }"
 elif [ "$CATALOG_OK" = yes ]; then
     # Readable catalog with no snowline_* store: the wrong cluster (PGHOST /
     # PGPORT leaking in, a fresh cluster before migration). Never exit 0 with
@@ -237,15 +245,22 @@ set -f
 # shellcheck disable=SC2086
 set -- $DBS
 set +f
-OUT=""
-trap 'log "interrupted (SIGTERM/SIGINT); removing ${OUT:+$OUT.partial}" >&2; [ -z "$OUT" ] || rm -f "$OUT.partial"; exit 143' TERM INT
+OUT=""; DUMP_PID=""
+# bash runs a trap only once the foreground command returns, so pg_dump is
+# started in the background and waited for: `wait` is interruptible, the
+# handler runs at once, kills the dump and removes its partial.
+trap 'log "interrupted (SIGTERM/SIGINT); removing ${OUT:+$OUT.partial}" >&2; [ -z "$DUMP_PID" ] || kill "$DUMP_PID" 2>/dev/null; [ -z "$OUT" ] || rm -f "$OUT.partial"; exit 143' TERM INT
 for DB in "$@"; do
     OUT="$DEST/${DB}-${STAMP}.dump"
     # Dump to a .partial name, verify the archive is readable, then atomically
     # rename — an interrupted or truncated dump (machine sleep, OOM, iCloud
     # hiccup) never leaves a file that looks like a complete backup. One store
     # failing must not skip the others: record it and keep going.
-    if pg_dump -Fc "$DB" > "$OUT.partial" \
+    pg_dump -Fc "$DB" > "$OUT.partial" &
+    DUMP_PID=$!
+    wait "$DUMP_PID"; dump_rc=$?
+    DUMP_PID=""
+    if [ "$dump_rc" -eq 0 ] \
         && pg_restore -l "$OUT.partial" > /dev/null \
         && mv "$OUT.partial" "$OUT"; then
         # Size is best-effort (an iCloud file can be evicted to a placeholder

@@ -34,8 +34,10 @@ each of platform / pm / governance / memory:
    RunAtLoad dump cannot block a boot migration): (re)loads
    `ops/hub/launchagents/dev.snowline.backup.plist` into `gui/501` (copying
    it to `~/Library/LaunchAgents/` at that moment) when the tracked plist
-   differs, the unit is not loaded, its last run exited 1 or 2, or no dump
-   landed in the last two hours — waiting first for a dump in progress.
+   differs, the unit is not loaded, its last run exited with anything other
+   than 0 or 3, or no dump landed in the last two hours — waiting first for
+   a dump in progress, and never while a service is DOWN (its RunAtLoad
+   dump would hold ACCESS SHARE across a boot migration).
    Operator overrides live in `~/.config/snowline/backup.env`, never in the
    plist. It stays a per-user agent on purpose ("DB backups" below).
 7. If step 6 (re)loaded the backup agent, waits (up to 5 min) for its
