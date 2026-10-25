@@ -266,10 +266,8 @@ load_unit() {
   if ! launchctl bootstrap "$lu_domain" "$lu_dst"; then
     if launchctl print "$lu_domain/$lu_label" >/dev/null 2>&1; then
       echo "   bootstrap of $lu_label refused and an old registration is still loaded (old definition keeps running) — re-run, or reboot" >&2
-      UNIT_RESULT=still-old
     else
       echo "   bootstrap of $lu_label refused (no session for $lu_domain?); the plist is installed at $lu_dst and loads when that domain next comes up — nothing runs for $lu_label until then" >&2
-      UNIT_RESULT=not-loaded
     fi
     return 1
   fi
