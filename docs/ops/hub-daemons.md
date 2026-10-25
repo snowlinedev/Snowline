@@ -112,10 +112,15 @@ All four must answer. If one does not, read
 
 ## Rollback
 
-`sudo ops/hub/uninstall-daemons.sh` boots out the system daemons, removes the
-plists from `/Library/LaunchDaemons`, restores the newest `.disabled-*` agent
-plists and bootstraps them back into `gui/501`. The backup agent is not part
-of the move and is left as it is. Neither script boots the autocut timer out
+`sudo ops/hub/uninstall-daemons.sh` restores each service to its per-user
+agent: it checks first that there is an agent plist to go back to (a live
+`~/Library/LaunchAgents/dev.snowline.<svc>.plist`, else the newest
+`.disabled-*` copy), then boots the system daemon out, removes its plist
+from `/Library/LaunchDaemons`, puts the agent plist back and bootstraps it
+into `gui/501` (kickstarting it when it has no `RunAtLoad`). A service with
+NO agent plist to restore is left running as a daemon, with a message and a
+non-zero exit: recreate the agent plist by hand, then re-run. The backup
+agent is not part of the move and is left as it is. Neither script boots the autocut timer out
 mid-cut: a running cut is refused up front (exit 75, or waited for with
 `--wait`) and, if one starts during the install, the autocut unit is skipped
 with a message and a non-zero exit. The backup agent is only reloaded after

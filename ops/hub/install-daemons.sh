@@ -25,8 +25,11 @@ svc_fail=0   # the services only: what gates the backup step below
 # checkout the agent's plist names: say so NOW, not after the services have
 # been cycled.
 backup_here=yes
-if [ ! "$OPS_HUB/snowline-backup.sh" -ef "$(backup_script)" ]; then
-  echo "note: this is not the checkout the backup agent runs from ($(backup_script)); the backup step at the end is skipped — run ops/hub/install-backup-agent.sh from that checkout" >&2
+if ! agent_script="$(backup_script)"; then
+  echo "note: cannot read the backup agent's script path from $LAUNCHAGENTS_SRC/dev.snowline.backup.plist (plutil? malformed plist?); the backup step at the end is skipped" >&2
+  backup_here=no
+elif [ ! "$OPS_HUB/snowline-backup.sh" -ef "$agent_script" ]; then
+  echo "note: this is not the checkout the backup agent runs from ($agent_script); the backup step at the end is skipped — run ops/hub/install-backup-agent.sh from that checkout" >&2
   backup_here=no
 fi
 
@@ -129,7 +132,7 @@ if [ "$svc_fail" != 0 ]; then
   # migration's window; with a service DOWN that is where it would land
   echo "== backup agent: SKIPPED (a service is DOWN or failed to install; its proving dump must not land in a migration) — run ops/hub/install-backup-agent.sh as the owner once /health is clean" >&2
 elif [ "$backup_here" = no ]; then
-  echo "== backup agent: SKIPPED (this is not the checkout the agent runs from; see the note above)" >&2
+  echo "== backup agent: SKIPPED (see the note at the top)" >&2
 elif sudo -u "#$OWNER_UID" -H /bin/sh "$OPS_HUB/install-backup-agent.sh" --deploy; then
   echo "== backup agent: OK"
 else

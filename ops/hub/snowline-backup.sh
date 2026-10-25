@@ -71,7 +71,8 @@ SNOWLINE_OWNER_HOME="$HOME"
 # store(s) failed to dump; 3 = another run held the lock (stepped aside).
 # install-backup-agent.sh reads them; nothing is rolled back on any of them.
 die() { log "$*" >&2; exit 2; }
-# Temp files for the catalog read's and the dump listing's stderr: created
+# Temp files for the catalog read's output and stderr, the dump listing's
+# stderr and the write probe: created
 # here, in the parent shell (z_dumps runs in subshells, where an assignment
 # would never reach the trap), removed on every exit path.
 # Every run ends with ONE machine-readable line, "run exit <code>", written
@@ -80,7 +81,7 @@ die() { log "$*" >&2; exit 2; }
 # reads the LAST such line to judge a run when it cannot see the
 # destination itself. Queries (--print-dest, --check) do not log one
 # (QUIET_EXIT, decided with the command line above).
-CATALOG_ERR=""; Z_DUMPS_ERR=""; PROBE=""   # temp files, set below; removed on every exit
+CATALOG_ERR=""; CATALOG_OUT=""; Z_DUMPS_ERR=""; PROBE=""   # temp files, set below; removed on every exit
 on_exit() {
     oe_rc=$?
     rm -f ${CATALOG_ERR:+"$CATALOG_ERR"} ${CATALOG_OUT:+"$CATALOG_OUT"} ${Z_DUMPS_ERR:+"$Z_DUMPS_ERR"} ${PROBE:+"$PROBE"}
@@ -110,11 +111,14 @@ BACKUP_ENV="$HOME/.config/snowline/backup.env"
 BACKUP_ENV_VARS="SNOWLINE_BACKUP_DIR SNOWLINE_BACKUP_RETENTION_DAYS SNOWLINE_BACKUP_DBS"
 if [ -f "$BACKUP_ENV" ]; then
     for ev in $BACKUP_ENV_VARS; do printf -v "pre_$ev" '%s' "${!ev:-}"; done
-    # (plain `.`, not `set -a`: nothing in the file is for a child process,
-    # and an exported PGHOST or PATH there would silently retarget psql)
+    # A shell file, sourced: it CAN do anything (a PATH= line there does
+    # retarget pg_dump, PATH being exported above — the operator's call).
+    # Not under `set -a`, so an unexported PGHOST there stays local to this
+    # shell; and with stdout sent to stderr, so a stray echo cannot corrupt
+    # the --print-dest / --check protocol the installer parses.
     set +u   # the file may reference variables this shell does not have
     # shellcheck disable=SC1090
-    . "$BACKUP_ENV" || die "cannot source $BACKUP_ENV (syntax error?); refusing to run half-configured"
+    . "$BACKUP_ENV" >&2 || die "cannot source $BACKUP_ENV (syntax error?); refusing to run half-configured"
     set -u
     # the environment's value wins — and says so when the file's lost (the
     # hub's pre-#319 agent plist exported SNOWLINE_BACKUP_DIR itself until
@@ -133,6 +137,10 @@ fi
 # with SNOWLINE_BACKUP_DIR (in backup.env) to point at a tailnet rsync
 # target, an external volume, etc.
 DEST="${SNOWLINE_BACKUP_DIR:-$BACKUP_DIR}"
+# absolute, or launchd (cwd /) and an operator (cwd anywhere) would resolve
+# one setting to two folders; CDPATH unset so `cd` never prints or wanders
+case "$DEST" in /*) ;; *) die "SNOWLINE_BACKUP_DIR must be an absolute path: '$DEST'" ;; esac
+unset CDPATH
 RETENTION_DAYS="${SNOWLINE_BACKUP_RETENTION_DAYS:-30}"
 case "$RETENTION_DAYS" in ''|*[!0-9]*) die "SNOWLINE_BACKUP_RETENTION_DAYS must be a whole number of days, at least 1: '$RETENTION_DAYS'" ;; esac
 [ "$RETENTION_DAYS" -ge 1 ] || die "SNOWLINE_BACKUP_RETENTION_DAYS must be at least 1: '$RETENTION_DAYS'"
@@ -355,7 +363,10 @@ rm -f "$PROBE"; PROBE=""
 chmod 700 "$DEST" 2>/dev/null || log "WARNING: could not chmod 700 $DEST" >&2
 # (`-exec … {} +` runs nothing when nothing matches: one walk, no chmod
 # unless a loose file exists)
-find "$DEST" -maxdepth 1 -name 'snowline_*.dump' -type f -perm +044 -exec chmod 600 {} + 2>/dev/null \
+# (this job's stores: Snowline's and any the explicit list names)
+own_names=(-name 'snowline_*.dump')
+for db in $DBS_EXPLICIT; do own_names+=(-o -name "$db-*.dump"); done
+find "$DEST" -maxdepth 1 \( "${own_names[@]}" \) -type f -perm +044 -exec chmod 600 {} + 2>/dev/null \
     || log "WARNING: could not tighten permissions on existing dumps in $DEST" >&2
 
 # --- wait for Postgres (bounded; see lib.sh) ---
