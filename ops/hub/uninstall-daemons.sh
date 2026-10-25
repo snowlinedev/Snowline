@@ -5,12 +5,13 @@
 # The hourly DB backup agent is not part of the daemon move and is left as
 # it is. Unit lists and helpers: launchdaemons/lib.sh.
 
+# (the argument check comes before the sudo re-exec: a typo must not cost a password prompt)
+case "${1:-}" in --wait|"") ;; *) echo "unknown argument '$1' (only --wait is accepted)" >&2; exit 64 ;; esac
 [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
 
 unset CDPATH   # before the `cd` below: a caller's CDPATH would make it print and wander
 # shellcheck disable=SC1091
 . "$(cd "$(dirname "$0")" && pwd)/launchdaemons/lib.sh"
-case "${1:-}" in --wait|"") ;; *) echo "unknown argument '$1' (only --wait is accepted)" >&2; exit 64 ;; esac
 autocut_guard "$@"
 fail=0
 
