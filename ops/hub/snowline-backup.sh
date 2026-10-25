@@ -418,8 +418,8 @@ prune_all() {
     # only Snowline's own stores (STORE_RE): a destination shared with
     # another project's dumps is not this job's to prune
     z_dumps '*' all | sort -t "$TAB" -k1,1 -k2,2r \
-    | awk -F"$TAB" -v cutoff="$PRUNE_CUTOFF" -v keep="$KEEP_MIN" -v store="$STORE_RE" '
-        $1 !~ store || $1 == "snowline_dev" { next }
+    | awk -F"$TAB" -v cutoff="$PRUNE_CUTOFF" -v keep="$KEEP_MIN" -v re="$STORE_RE" '
+        $1 !~ re || $1 == "snowline_dev" { next }
         $1 != store { store = $1; n = 0 }
         { n++; if (n > keep && $2 < cutoff) print $3 }' \
     | while IFS= read -r pa_f; do rm -f "$pa_f"; done

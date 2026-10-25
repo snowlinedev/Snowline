@@ -58,12 +58,13 @@ done
 for timer in $TIMERS; do
   label="dev.snowline.$timer"
   echo "== $label (timer; not kickstarted)"
-  # (autocut.disabled, the kill switch, wins over autocut.enabled: with it
-  # present no cutter is active and a loaded timer is not a fault)
-  if [ "$timer" = autocut ] && [ -e "$OWNER_HOME/.config/snowline/autocut.enabled" ] \
-     && [ ! -e "$OWNER_HOME/.config/snowline/autocut.disabled" ]; then
+  # (autocut.disabled, the kill switch, pauses the host but does not make
+  # room for the timer: lifted, both would fire — so the timer is never
+  # installed while the host is enabled, paused or not)
+  if [ "$timer" = autocut ] && [ -e "$OWNER_HOME/.config/snowline/autocut.enabled" ]; then
+    if [ -e "$OWNER_HOME/.config/snowline/autocut.disabled" ]; then paused=" (paused by autocut.disabled for now)"; else paused=""; fi
     if launchctl print "system/$label" >/dev/null 2>&1; then
-      echo "   in-process autocut host is enabled AND this timer is loaded: two cutters — remove one (docs 'Auto-cut')" >&2
+      echo "   in-process autocut host is enabled$paused AND this timer is loaded: two cutters — remove one (docs 'Auto-cut')" >&2
       fail=1
     elif [ -f "$DAEMONS_DIR/$label.plist" ]; then
       # a stale plist would be loaded again at the next boot, next to the host

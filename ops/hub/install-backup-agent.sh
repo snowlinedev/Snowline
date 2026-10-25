@@ -135,15 +135,15 @@ log_verdict() {
 # exit code alone is no evidence either — a stopped unit still shows its
 # old 0). Otherwise LEAVE ALONE.
 action=leave; why=""
-if ! unit_unchanged "$label" "$domain" "$plist_src" "$plist_dst" || ! unit_snapshot "$domain/$label"; then
-  action=reload
-  if ! cmp -s "$plist_src" "$plist_dst" 2>/dev/null; then why="plist changed"
-  elif ! unit_current "$label" "$plist_dst"; then why="this plist was never confirmed loaded (a previous load did not complete?)"
-  else why="not loaded"; fi
+if ! unit_unchanged "$label" "$domain" "$plist_src" "$plist_dst"; then
+  action=reload; why="$UNIT_UNCHANGED_WHY"
+elif ! unit_snapshot "$domain/$label"; then
+  action=reload; why="not loaded"
 else
-  # an empty exit code with runs > 0 is a run that ended by a signal
-  # (launchd's "never exited"): not fine
-  [ "$UNIT_RUNS" -gt 0 ] && [ -z "$UNIT_EXIT" ] && UNIT_EXIT=signal
+  # an empty exit code with runs > 0 and nothing running is a run that
+  # ended by a signal (launchd's "never exited"): not fine. (A first run
+  # still in flight shows the same empty code; that is judged as in-flight.)
+  [ "$UNIT_RUNNING" != yes ] && [ "$UNIT_RUNS" -gt 0 ] && [ -z "$UNIT_EXIT" ] && UNIT_EXIT=signal
   case "$UNIT_EXIT" in
     ""|0|3) ;;
     signal) action=reprove; why="last run ended by a signal (killed mid-dump?)" ;;

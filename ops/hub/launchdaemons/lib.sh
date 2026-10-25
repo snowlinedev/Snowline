@@ -231,8 +231,14 @@ unit_current() {
 # leave-alone rule for a unit whose installer consults the marker: the
 # tracked plist is byte-identical to the installed one, that is the
 # definition launchd last confirmed loaded, and launchd still has it.
+# On failure UNIT_UNCHANGED_WHY says which test failed.
 unit_unchanged() {
-  cmp -s "$3" "$4" 2>/dev/null && unit_current "$1" "$4" && launchctl print "$2/$1" >/dev/null 2>&1
+  UNIT_UNCHANGED_WHY=""
+  if ! cmp -s "$3" "$4" 2>/dev/null; then UNIT_UNCHANGED_WHY="plist changed"
+  elif ! unit_current "$1" "$4"; then UNIT_UNCHANGED_WHY="this plist was never confirmed loaded (a previous load did not complete?)"
+  elif ! launchctl print "$2/$1" >/dev/null 2>&1; then UNIT_UNCHANGED_WHY="not loaded"
+  fi
+  [ -z "$UNIT_UNCHANGED_WHY" ]
 }
 # record_loaded <label> <plist> — write that marker. The directory is the
 # OWNER's (the backup and autocut locks live there too): when root writes
@@ -260,7 +266,7 @@ load_unit() {
   # re-register it, so give a slow teardown a second 30 s rather than leave
   # the unit with no replacement
   if ! wait_unloaded "$lu_domain/$lu_label" && ! wait_unloaded "$lu_domain/$lu_label"; then
-    echo "   old registration of $lu_label still tearing down after 60s; it will NOT come back by itself and the new one is not loaded — re-run once it is gone" >&2
+    echo "   old registration of $lu_label still tearing down after 60s; the new plist is on disk (it loads when $lu_domain next comes up) but nothing re-registers it now — re-run once the old one is gone" >&2
     return 1
   fi
   if ! launchctl bootstrap "$lu_domain" "$lu_dst"; then
