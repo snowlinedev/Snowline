@@ -127,8 +127,9 @@ log_verdict() {
   # exit-code rendering is not relied on for that
   # one pass: the last marker's kind, and the last exit code that is a
   # verdict (3, a step-aside, is not one)
-  set -- $(log_lines_since "$1" | awk '$2 == "run" && $3 == "start" { l = "start" } $2 == "run" && $3 == "exit" { l = "exit"; if ($4 != 3) v = $4 } END { print l, v }')
-  LOG_LAST_EXIT="${2:-}"   # the last verdict code in the window, OPEN or not
+  set -- $(log_lines_since "$1" | awk '$2 == "run" && $3 == "start" { l = "start"; st = $1 } $2 == "run" && $3 == "exit" { l = "exit"; if ($4 != 3) v = $4 } END { print l, (v == "" ? "-" : v), (st == "" ? "-" : st) }')
+  LOG_LAST_EXIT="${2:-}"; [ "$LOG_LAST_EXIT" != - ] || LOG_LAST_EXIT=""   # the last verdict code in the window, OPEN or not
+  LOG_LAST_START="${3:-}"; [ "$LOG_LAST_START" != - ] || LOG_LAST_START=""   # the last "run start" stamp in the window
   if [ "${1:-}" = start ]; then LOGSAYS=OPEN
   elif [ -z "${2:-}" ]; then LOGSAYS=NONE
   elif [ "$2" = 0 ]; then LOGSAYS=OK
@@ -184,8 +185,20 @@ else
     dump_evidence 120
     case "$EVIDENCE:$LOGSAYS" in
       CONFIG_FAIL:*)   echo "   the script refuses its configuration ($EVIDENCE_MSG) — every run will exit 2 until it is fixed; nothing to reload or prove" >&2; fail=1 ;;
-      *:OPEN) if [ "$UNIT_RUNNING" = yes ]; then echo "   unchanged, confirmed loaded, a run is in flight now; left as it is"
-              else action=reprove; why="the unit's last run began and never ended (killed mid-dump?)"; fi ;;
+      *:OPEN) if [ "$UNIT_RUNNING" != yes ]; then action=reprove; why="the unit's last run began and never ended (killed mid-dump?)"
+              else
+                # in flight — but not for ever: a run older than two hours is
+                # past anything the script's own bounds allow (a child stuck
+                # in an uninterruptible wait); it holds the lock and launchd
+                # skips every hourly fire, so say so and fail
+                st_epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$LOG_LAST_START" +%s 2>/dev/null)" || st_epoch=""
+                if [ -n "$st_epoch" ] && [ $(( $(date +%s) - st_epoch )) -gt 7200 ]; then
+                  echo "   a run has been in flight since $LOG_LAST_START — longer than the script's bounds allow: STUCK (a child in an uninterruptible wait?); it holds backup.lock and every hourly fire is skipped — recover with: launchctl bootout $domain/$label; then re-run this installer" >&2
+                  fail=1
+                else
+                  echo "   unchanged, confirmed loaded, a run is in flight now; left as it is"
+                fi
+              fi ;;
       OK:OK|LOG_OK:OK) echo "   unchanged, confirmed loaded, the unit dumped within 2 h; left as it is" ;;
       OK:NONE)         action=reprove; why="a dump landed within 2 h but the unit's log shows no run (a manual dump? the unit not firing?)" ;;
       NONE:*)          action=reprove; why="no dump in the last 2 h in $dest" ;;

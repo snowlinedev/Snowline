@@ -150,7 +150,10 @@ if [ -f "$BACKUP_ENV" ]; then
         iv="${il%%=*}"
         if [ -n "${!iv:-}" ]; then
             fv="$(eval "printf '%s' ${il#*=}")"
-            [ "${!iv}" = "$fv" ] || log "note: $iv from the environment (${!iv}) overrides $BACKUP_ENV ($fv)" >&2
+            case " $PG_ENV_VARS " in
+                *" $iv "*) [ "${!iv}" = "$fv" ] || log "note: $iv from the environment overrides $BACKUP_ENV (values not shown)" >&2 ;;
+                *) [ "${!iv}" = "$fv" ] || log "note: $iv from the environment (${!iv}) overrides $BACKUP_ENV ($fv)" >&2 ;;
+            esac
             continue
         fi
         eval "$il"; export "$iv"
@@ -167,6 +170,9 @@ DEST="${SNOWLINE_BACKUP_DIR:-$BACKUP_DIR}"
 # absolute, or launchd (cwd /) and an operator (cwd anywhere) would resolve
 # one setting to two folders (CDPATH is unset by lib.sh)
 case "$DEST" in /*) ;; *) die "SNOWLINE_BACKUP_DIR must be an absolute path: '$DEST'" ;; esac
+# (the listings below are tab-separated rows, one per line: a tab or a
+# newline in the path would split them and point the prune elsewhere)
+case "$DEST" in *"$(printf '\t')"*|*"$(printf '\n')"*) die "SNOWLINE_BACKUP_DIR must not contain a tab or a newline" ;; esac
 RETENTION_DAYS="${SNOWLINE_BACKUP_RETENTION_DAYS:-30}"
 case "$RETENTION_DAYS" in ''|*[!0-9]*) die "SNOWLINE_BACKUP_RETENTION_DAYS must be a whole number of days, at least 1: '$RETENTION_DAYS'" ;; esac
 [ "$RETENTION_DAYS" -ge 1 ] || die "SNOWLINE_BACKUP_RETENTION_DAYS must be at least 1: '$RETENTION_DAYS'"

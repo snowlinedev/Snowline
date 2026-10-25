@@ -76,7 +76,7 @@ wait_for_postgres() {
       return 1
     fi
     log "waiting for postgres (${waited}s)"
-    run_bounded 10 sleep 5   # (interruptible, and the sleep is the caller's trap's to kill, via RUN_BOUNDED_PID)
+    sleep 5 9>&- & RUN_BOUNDED_PID=$!; wait "$RUN_BOUNDED_PID" 2>/dev/null; RUN_BOUNDED_PID=""   # (interruptible, the caller's trap kills it, fd 9 not inherited; no bound needed around a sleep)
     waited=$((waited + 5))
   done
   return 0
@@ -213,10 +213,17 @@ unit_busy_wait() {
 run_bounded() {
   rb_bound="$1"; shift
   /usr/bin/perl -e '
+    use POSIX ();
     my $t = shift @ARGV;
     my $pid = fork; defined $pid or exit 127;
     if (!$pid) { exec { $ARGV[0] } @ARGV or exit 127 }   # (the block form: a one-word command is not handed to /bin/sh)
-    $SIG{ALRM} = sub { kill TERM => $pid; sleep 2; kill KILL => $pid; waitpid($pid, 0); exit 124 };
+    $SIG{ALRM} = sub {
+      kill TERM => $pid; sleep 2; kill KILL => $pid;
+      # reap if it can be reaped; a child stuck in an uninterruptible I/O
+      # wait cannot be, and must not keep this bound (and the run lock)
+      # blocked — it has fd 9 closed and holds nothing once the caller exits
+      for (1..10) { last if waitpid($pid, POSIX::WNOHANG()) == $pid; sleep 1 }
+      exit 124 };
     $SIG{TERM} = sub { kill TERM => $pid; waitpid($pid, 0); exit 143 };
     alarm $t; waitpid($pid, 0); my $s = $?;
     exit(($s & 127) ? 128 + ($s & 127) : $s >> 8);
