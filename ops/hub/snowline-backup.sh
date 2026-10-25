@@ -106,9 +106,9 @@ Z_DUMPS_ERR="$(mktemp -t snowline-backup-find)" || die "cannot create a temp fil
 # The file supplies DEFAULTS: a variable already set in the environment
 # (a scratch test's SNOWLINE_BACKUP_DIR=/tmp/x, say) wins over it.
 BACKUP_ENV="$HOME/.config/snowline/backup.env"
-# (BACKUP_ENV_VARS is the whole list of overrides; install-backup-agent.sh
-# clears the same three from its environment before querying this script)
-BACKUP_ENV_VARS="SNOWLINE_BACKUP_DIR SNOWLINE_BACKUP_RETENTION_DAYS SNOWLINE_BACKUP_DBS"
+# (BACKUP_ENV_VARS, from lib.sh, is the whole list of overrides;
+# install-backup-agent.sh clears the same list from its environment before
+# querying this script)
 if [ -f "$BACKUP_ENV" ]; then
     for ev in $BACKUP_ENV_VARS; do printf -v "pre_$ev" '%s' "${!ev:-}"; done
     # A shell file, sourced under `set -a` like the services' and autocut's
@@ -331,9 +331,9 @@ exec 9>>"$BACKUP_LOCK" || die "cannot open the run lock $BACKUP_LOCK (root-owned
 # holds the file for an instant while a real run holds it for minutes.
 flock_fd 9 ex 5
 case $? in
-    0) LOCKED=yes ;;
+    0) ;;
     1) log "another backup run holds $BACKUP_LOCK; stepping aside"; exit 3 ;;
-    127) LOCKED=no; log "WARNING: /usr/bin/perl is missing; running WITHOUT the run lock (the dump is the point, the lock a courtesy)" >&2 ;;
+    127) die "cannot take the run lock: /usr/bin/perl is missing (the installers cannot probe the lock without it either; two unlocked runs could collide)" ;;
     *) die "cannot take the run lock $BACKUP_LOCK (flock failed)" ;;
 esac
 
@@ -414,14 +414,18 @@ DUMP_PID=""
 # names it can pass around safely. (The row is read with `|` as the
 # separator; a name containing one would be mangled here, and is in any
 # case not an identifier.)
-LIVE=""; UNCONNECTABLE=""; NONIDENT=""
+LIVE=""; UNCONNECTABLE=""; NONIDENT=""; SCRATCHED=""
 while IFS='|' read -r cat_name cat_ok cat_ident; do
     [ -n "$cat_name" ] || continue
+    # (a snowline_* name the scratch rule drops is NAMED once a run below,
+    # so a real store with an unlucky name is not missed until restore time)
+    if [[ $cat_name =~ $STORE_RE ]] && [[ $cat_name =~ $SCRATCH_RE ]]; then SCRATCHED="$SCRATCHED $cat_name"; continue; fi
     store_wanted "$cat_name" || continue
     if [ "$cat_ident" != t ]; then NONIDENT="$NONIDENT $cat_name"
     elif [ "$cat_ok" = t ]; then LIVE="$LIVE $cat_name"; else UNCONNECTABLE="$UNCONNECTABLE $cat_name"; fi
 done < "$CATALOG_OUT"
 LIVE="${LIVE# }"; UNCONNECTABLE="${UNCONNECTABLE# }"
+[ -z "$SCRATCHED" ] || log "note: not dumping scratch store(s) (SCRATCH_RE):${SCRATCHED}"
 # A store this role cannot connect to is a FAILED store, not a footnote:
 # the run ends incomplete (exit 1) so launchd, the installer and the "run
 # exit" line all say the backup is not whole — unless an explicit
@@ -533,13 +537,8 @@ prune_all || true
 # counted nor pruned: say so once a run, or the bounded folder grows
 # unbounded unnoticed.
 # (holding the lock, this run is the only one: every such file is an
-# orphan now, whatever its age — the two-hour guard is for the lockless,
-# perl-less path only)
-# (`-mmin +0` is "older than a minute", near enough to every file; it is
-# spelled as an age test because bash 3.2's `set -u` rejects an empty
-# array expansion, which the "no age test" case would otherwise be)
-if [ "$LOCKED" = yes ]; then sweep_age="+0"; else sweep_age="+120"; fi
-UNREC="$(find "$DEST" -maxdepth 1 \( -type f \( "${own_stale[@]}" -o -name '.probe.*' -o -name '..probe.*.icloud' \) -mmin "$sweep_age" -delete \) \
+# orphan now, whatever its age)
+UNREC="$(find "$DEST" -maxdepth 1 \( -type f \( "${own_stale[@]}" -o -name '.probe.*' -o -name '..probe.*.icloud' \) -delete \) \
              -o \( -type f ! -name '*.partial' ! -name '.probe.*' ! -name '.*.partial.icloud' ! -name '..probe.*.icloud' ! -name '.DS_Store' -print \) 2>"$Z_DUMPS_ERR" \
     | while IFS= read -r uf; do parse_dump_name "$uf" || printf '%s\n' "${uf##*/}"; done)"
 [ -s "$Z_DUMPS_ERR" ] && log "WARNING: the stale-file sweep in $DEST hit an error ($(tail -n 1 "$Z_DUMPS_ERR"))" >&2

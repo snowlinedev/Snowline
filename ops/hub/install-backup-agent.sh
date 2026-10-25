@@ -20,6 +20,10 @@ if [ "$(id -u)" != "$OWNER_UID" ]; then
   echo "run this as the hub owner (uid $OWNER_UID), not root or another account: the unit is the owner's per-user agent and every path here is the owner's" >&2
   exit 64
 fi
+# the owner's HOME, whatever the caller's was (`sudo -u owner` without -H
+# keeps the caller's): the script resolves its destination, log and lock
+# from HOME, and the unit runs with the owner's
+HOME="$OWNER_HOME"; export HOME
 
 case "${1:-}" in
   --deploy) DEPLOY=yes ;;
@@ -54,11 +58,9 @@ echo "== $label (per-user agent; unit runs $BACKUP_SCRIPT)"
 # With this shell's SNOWLINE_BACKUP_* unset: the agent under launchd sees
 # only backup.env, and the probes must see the same, or a leftover export
 # from a scratch test would make them judge a different folder.
-# (the variables cleared are the script's own BACKUP_ENV_VARS list, read
-# from it so the two cannot drift; the three known names if that fails)
-query_unset="$(sed -n 's/^BACKUP_ENV_VARS="\([A-Z_ ]*\)"$/\1/p' "$BACKUP_SCRIPT" | head -n 1)"
-[ -n "$query_unset" ] || query_unset="SNOWLINE_BACKUP_DIR SNOWLINE_BACKUP_RETENTION_DAYS SNOWLINE_BACKUP_DBS"
-query_env=""; for qv in $query_unset; do query_env="$query_env -u $qv"; done
+# (the variables cleared are BACKUP_ENV_VARS from lib.sh — the script's
+# own list of overrides, so the two cannot drift)
+query_env=""; for qv in $BACKUP_ENV_VARS; do query_env="$query_env -u $qv"; done
 # shellcheck disable=SC2086
 query() { env $query_env /bin/bash "$BACKUP_SCRIPT" "$@"; }
 dest="$(query --print-dest 2>/dev/null)" || dest="(unknown: --print-dest failed)"
@@ -153,10 +155,16 @@ else
   # ended by a signal (launchd's "never exited"): not fine. (A first run
   # still in flight shows the same empty code; that is judged as in-flight.)
   [ "$UNIT_RUNNING" != yes ] && [ "$UNIT_RUNS" -gt 0 ] && [ -z "$UNIT_EXIT" ] && UNIT_EXIT=signal
-  # a registration that has never run (a reload whose proof was refused or
-  # timed out, then a re-run) has no record of its own: last hour's dump
-  # and "run exit 0" belong to its predecessor
-  [ "$UNIT_RUNS" -gt 0 ] || [ "$UNIT_RUNNING" = yes ] || UNIT_EXIT=never
+  # a registration that has never run has no record of its own — unless
+  # launchd's counter merely restarted at login: then the log shows a "run
+  # exit" newer than this plist's confirmed-loaded marker, and that run WAS
+  # this plist's. Only a load with no run since (a reload whose proof was
+  # refused or timed out, then a re-run) is "never".
+  if [ "$UNIT_RUNS" -eq 0 ] && [ "$UNIT_RUNNING" != yes ]; then
+    marker_epoch="$(stat -f %m "$LOCKS_DIR/$label.loaded" 2>/dev/null)" || marker_epoch=0
+    marker_stamp="$(date -u -r "$marker_epoch" +%FT%TZ)"
+    [ -n "$(log_lines_since "$marker_stamp" | awk '$2 == "run" && $3 == "exit"')" ] || UNIT_EXIT=never
+  fi
   case "$UNIT_EXIT" in
     ""|0|3) ;;
     never) action=reprove; why="this registration has never run (an earlier proof did not complete?)" ;;

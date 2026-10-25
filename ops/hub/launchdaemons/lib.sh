@@ -29,6 +29,10 @@ LAUNCHDAEMONS_SRC="$OPS_HUB/launchdaemons"
 LAUNCHAGENTS_SRC="$OPS_HUB/launchagents"
 ICLOUD_ROOT="$OWNER_HOME/Library/Mobile Documents/com~apple~CloudDocs"
 BACKUP_DIR="$ICLOUD_ROOT/Snowline/db-backups"   # the backup script's default destination
+# The backup script's operator overrides (~/.config/snowline/backup.env):
+# the script reads them, install-backup-agent.sh clears them from its own
+# environment before querying the script — one list for both.
+BACKUP_ENV_VARS="SNOWLINE_BACKUP_DIR SNOWLINE_BACKUP_RETENTION_DAYS SNOWLINE_BACKUP_DBS"
 BACKUP_LOG="$OWNER_HOME/Library/Logs/snowline-backup.log"   # what the tracked agent plist's StandardOutPath says today; backup_log() reads the plist
 # backup_script — the canonical hub checkout's backup script: whatever the
 # tracked agent plist runs (its LAST ProgramArguments entry). The plist is
@@ -100,23 +104,24 @@ unit_snapshot() {
 # launchd no longer knows the label, so an immediate bootstrap of the same
 # label cannot race the teardown ("Operation already in progress").
 wait_unloaded() {
+  wu_bound="${2:-30}"
   waited=0
   while launchctl print "$1" >/dev/null 2>&1; do
-    [ "$waited" -ge 30 ] && return 1
+    [ "$waited" -ge "$wu_bound" ] && return 1
     sleep 1
     waited=$((waited + 1))
   done
   return 0
 }
 # bootout_wait <domain/label> — the ONE teardown: issue the bootout (it may
-# not be loaded) and wait for the registration to go, up to 60 s: once the
-# bootout is issued nothing re-registers the unit, so a slow teardown (a
-# migration finishing) gets a second 30 s rather than leave the caller with
-# no replacement loaded. 1 = still registered; the caller says what that
+# not be loaded) and wait for the registration to go, up to 60 s (twice
+# wait_unloaded's default): once the bootout is issued nothing re-registers
+# the unit, so a slow teardown (a migration finishing) gets the time rather
+# than leave the caller with no replacement loaded. 1 = still registered; the caller says what that
 # leaves running.
 bootout_wait() {
   launchctl bootout "$1" 2>/dev/null || true
-  wait_unloaded "$1" || wait_unloaded "$1"
+  wait_unloaded "$1" 60
 }
 
 # ---- unit run locks ----
