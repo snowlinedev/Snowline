@@ -33,7 +33,6 @@ BACKUP_DIR="$ICLOUD_ROOT/Snowline/db-backups"   # the backup script's default de
 # the script reads them, install-backup-agent.sh clears them from its own
 # environment before querying the script — one list for both.
 BACKUP_ENV_VARS="SNOWLINE_BACKUP_DIR SNOWLINE_BACKUP_RETENTION_DAYS SNOWLINE_BACKUP_DBS"
-BACKUP_LOG="$OWNER_HOME/Library/Logs/snowline-backup.log"   # what the tracked agent plist's StandardOutPath says today; backup_log() reads the plist
 # backup_script — the canonical hub checkout's backup script: whatever the
 # tracked agent plist runs (its LAST ProgramArguments entry). The plist is
 # the single source, deliberately static (a path taken from whichever
@@ -49,10 +48,9 @@ backup_script() {
 }
 
 # backup_log — the agent's log file as the tracked plist names it
-# (StandardOutPath), so the plist stays the one source; BACKUP_LOG when the
-# plist cannot be read.
+# (StandardOutPath): the plist is the one source; 1 when it cannot be read.
 backup_log() {
-  bl="$(plutil -extract StandardOutPath raw -o - "$LAUNCHAGENTS_SRC/dev.snowline.backup.plist" 2>/dev/null)" && [ -n "$bl" ] && printf '%s\n' "$bl" || printf '%s\n' "$BACKUP_LOG"
+  bl="$(plutil -extract StandardOutPath raw -o - "$LAUNCHAGENTS_SRC/dev.snowline.backup.plist" 2>/dev/null)" && [ -n "$bl" ] && printf '%s\n' "$bl"
 }
 
 # ---- logging ----

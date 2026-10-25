@@ -119,10 +119,15 @@ if [ -f "$BACKUP_ENV" ]; then
     # protocol the installer parses. The shell options in force before are
     # restored afterwards: a `set -e` in the file would otherwise turn a
     # step-aside into exit 1 and a failed store into an aborted run.
+    # A file that EXITS (an `exit` line, or `set -e` plus a failing command)
+    # would end this shell mid-source with no reason logged: it is sourced
+    # in a throwaway subshell first, so that case is a refusal with a reason.
+    ( set +u; . "$BACKUP_ENV" ) >/dev/null 2>&1 \
+        || die "cannot source $BACKUP_ENV: it fails or exits when sourced (a syntax error? an exit line? set -e with a failing command?); refusing to run half-configured"
     saved_opts="$(set +o)"
     set -a; set +u   # +u: the file may reference variables this shell does not have
     # shellcheck disable=SC1090
-    . "$BACKUP_ENV" >&2 || die "cannot source $BACKUP_ENV (syntax error?); refusing to run half-configured"
+    . "$BACKUP_ENV" >&2
     eval "$saved_opts"
     # the environment's value wins — and says so when the file's lost (the
     # hub's pre-#319 agent plist exported SNOWLINE_BACKUP_DIR itself until
@@ -381,8 +386,8 @@ for db in $DBS_EXPLICIT; do
     own_names+=(-o -name "$db-*.dump")
     own_stale+=(-o -name "$db-[0-9]*.dump.partial" -o -name ".$db-[0-9]*.dump.partial.icloud")
 done
-find "$DEST" -maxdepth 1 \( "${own_names[@]}" \) -type f -perm +044 -exec chmod 600 {} + 2>/dev/null \
-    || log "WARNING: could not tighten permissions on existing dumps in $DEST" >&2
+find "$DEST" -maxdepth 1 \( "${own_names[@]}" \) -type f -perm +044 -exec chmod 600 {} + 2>"$Z_DUMPS_ERR" \
+    || log "WARNING: the permission sweep of $DEST hit an error ($(tail -n 1 "$Z_DUMPS_ERR")); a loose dump may remain" >&2
 
 # --- wait for Postgres (bounded; see lib.sh) ---
 wait_for_postgres || true

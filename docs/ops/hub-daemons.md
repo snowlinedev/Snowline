@@ -469,7 +469,11 @@ in the plist, which the install replaces with the tracked copy):
 `SNOWLINE_BACKUP_DIR` (a non-iCloud path skips the iCloud root check but
 must already exist — it is never created, so an unplugged volume cannot be
 replaced by a local folder), `SNOWLINE_BACKUP_RETENTION_DAYS`,
-`SNOWLINE_BACKUP_DBS` (plain identifiers, space-separated).
+`SNOWLINE_BACKUP_DBS` (plain identifiers, space-separated). The file
+supplies defaults: a `SNOWLINE_BACKUP_*` variable already exported in the
+environment wins over it (a `note:` log line says so), which is how a
+scratch test points the script elsewhere; the agent's environment carries
+none, so under launchd the file is authoritative.
 `bash ops/hub/snowline-backup.sh --print-dest` prints the destination the
 script resolves and `--check <minutes>` reports (OK / NONE / UNREADABLE / MISSING, exit 0/1/2)
 whether a dump newer than that many minutes exists there, judged by the

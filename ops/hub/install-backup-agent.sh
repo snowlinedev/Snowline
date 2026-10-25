@@ -40,7 +40,7 @@ label="dev.snowline.backup"
 domain="gui/$(id -u)"
 plist_src="$LAUNCHAGENTS_SRC/$label.plist"
 plist_dst="$AGENTS/$label.plist"
-log_file="$(backup_log)"   # from the tracked plist's StandardOutPath
+log_file="$(backup_log)" || { echo "cannot read StandardOutPath from $LAUNCHAGENTS_SRC/dev.snowline.backup.plist (plutil? malformed plist?)" >&2; exit 1; }
 fail=0
 
 # --- guards: the unit runs the canonical script; this install must BE it ---
@@ -160,7 +160,9 @@ else
   # exit" newer than this plist's confirmed-loaded marker, and that run WAS
   # this plist's. Only a load with no run since (a reload whose proof was
   # refused or timed out, then a re-run) is "never".
-  if [ "$UNIT_RUNS" -eq 0 ] && [ "$UNIT_RUNNING" != yes ]; then
+  # (only when launchd reports no exit code at all: a 78 with runs = 0 — a
+  # program that could not be spawned — must still reach the reload arm)
+  if [ "$UNIT_RUNS" -eq 0 ] && [ "$UNIT_RUNNING" != yes ] && [ -z "$UNIT_EXIT" ]; then
     marker_epoch="$(stat -f %m "$LOCKS_DIR/$label.loaded" 2>/dev/null)" || marker_epoch=0
     marker_stamp="$(date -u -r "$marker_epoch" +%FT%TZ)"
     [ -n "$(log_lines_since "$marker_stamp" | awk '$2 == "run" && $3 == "exit"')" ] || UNIT_EXIT=never

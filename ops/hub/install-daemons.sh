@@ -41,7 +41,7 @@ for svc in $SERVICES; do
   # the platform service hosts the in-process autocut: a cut that began
   # since autocut_guard (the earlier services' teardowns take up to a minute
   # each) must not be killed by this restart — re-check, skip, re-run later
-  if ! unit_busy_wait autocut 0; then
+  if [ "$svc" = platform ] && ! unit_busy_wait autocut 0; then
     echo "   an autocut started since the guard; NOT restarting $label mid-cut — re-run once it is done" >&2
     fail=1; svc_fail=1; continue
   fi
