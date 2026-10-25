@@ -105,24 +105,27 @@ trap 'log "interrupted (SIGTERM/SIGINT)${OUT:+; removing $OUT.partial}" >&2; [ -
 # The file supplies DEFAULTS: a variable already set in the environment
 # (a scratch test's SNOWLINE_BACKUP_DIR=/tmp/x, say) wins over it.
 BACKUP_ENV="$HOME/.config/snowline/backup.env"
+# (BACKUP_ENV_VARS is the whole list of overrides; install-backup-agent.sh
+# clears the same three from its environment before querying this script)
+BACKUP_ENV_VARS="SNOWLINE_BACKUP_DIR SNOWLINE_BACKUP_RETENTION_DAYS SNOWLINE_BACKUP_DBS"
 if [ -f "$BACKUP_ENV" ]; then
-    env_dir="${SNOWLINE_BACKUP_DIR:-}"; env_days="${SNOWLINE_BACKUP_RETENTION_DAYS:-}"; env_dbs="${SNOWLINE_BACKUP_DBS:-}"
+    for ev in $BACKUP_ENV_VARS; do printf -v "pre_$ev" '%s' "${!ev:-}"; done
     # (plain `.`, not `set -a`: nothing in the file is for a child process,
     # and an exported PGHOST or PATH there would silently retarget psql)
     set +u   # the file may reference variables this shell does not have
     # shellcheck disable=SC1090
     . "$BACKUP_ENV" || die "cannot source $BACKUP_ENV (syntax error?); refusing to run half-configured"
     set -u
-    # (and say so when the file's value lost: the hub's pre-#319 agent plist
-    # exported SNOWLINE_BACKUP_DIR itself until install-backup-agent.sh
-    # replaced it, which made a backup.env value look ignored)
-    shadow() { [ -z "$2" ] || [ "$2" = "$3" ] || log "note: $1 from the environment ($2) overrides $BACKUP_ENV ($3)" >&2; }
-    shadow SNOWLINE_BACKUP_DIR "$env_dir" "${SNOWLINE_BACKUP_DIR:-}"
-    shadow SNOWLINE_BACKUP_RETENTION_DAYS "$env_days" "${SNOWLINE_BACKUP_RETENTION_DAYS:-}"
-    shadow SNOWLINE_BACKUP_DBS "$env_dbs" "${SNOWLINE_BACKUP_DBS:-}"
-    [ -z "$env_dir" ]  || SNOWLINE_BACKUP_DIR="$env_dir"
-    [ -z "$env_days" ] || SNOWLINE_BACKUP_RETENTION_DAYS="$env_days"
-    [ -z "$env_dbs" ]  || SNOWLINE_BACKUP_DBS="$env_dbs"
+    # the environment's value wins — and says so when the file's lost (the
+    # hub's pre-#319 agent plist exported SNOWLINE_BACKUP_DIR itself until
+    # install-backup-agent.sh replaced it, which made a backup.env value look
+    # ignored)
+    for ev in $BACKUP_ENV_VARS; do
+        pre="pre_$ev"; pre="${!pre}"
+        [ -n "$pre" ] || continue
+        [ "$pre" = "${!ev:-}" ] || log "note: $ev from the environment ($pre) overrides $BACKUP_ENV (${!ev:-})" >&2
+        printf -v "$ev" '%s' "$pre"
+    done
 fi
 # Off-machine by default: iCloud Drive replicates the dumps off this host, so a
 # disk failure / theft doesn't take the backups with it. The default lives in
@@ -375,7 +378,6 @@ PGCONNECT_TIMEOUT=15 PGOPTIONS='-c statement_timeout=30000' \
 DUMP_PID=$!
 wait "$DUMP_PID" || CATALOG_OK=no
 DUMP_PID=""
-CATALOG_ROWS="$(cat "$CATALOG_OUT")"
 # One pass over the rows: the store rule (store_wanted) applied once per
 # name, connectable names to LIVE, the others to UNCONNECTABLE.
 LIVE=""; UNCONNECTABLE=""
@@ -383,9 +385,7 @@ while IFS='|' read -r cat_name cat_ok; do
     [ -n "$cat_name" ] || continue
     store_wanted "$cat_name" || continue
     if [ "$cat_ok" = t ]; then LIVE="$LIVE $cat_name"; else UNCONNECTABLE="$UNCONNECTABLE $cat_name"; fi
-done <<EOF_ROWS
-$CATALOG_ROWS
-EOF_ROWS
+done < "$CATALOG_OUT"
 LIVE="${LIVE# }"; UNCONNECTABLE="${UNCONNECTABLE# }"
 # A store this role cannot connect to is a FAILED store, not a footnote:
 # the run ends incomplete (exit 1) so launchd, the installer and the "run
@@ -465,8 +465,10 @@ prune_all() {
         $1 != store { store = $1; n = 0 }
         { n++; if (n > keep && $2 < cutoff) print $3 }' \
     | while IFS= read -r pa_f; do rm -f "$pa_f" 2>/dev/null || printf '%s\n' "${pa_f##*/}"; done)"
-    # (a dump this user cannot remove — root-owned from a sudo run — would
-    # otherwise sit there unpruned and unmentioned for ever)
+    # (a listing that failed part-way prunes too little; a dump this user
+    # cannot remove — root-owned from a sudo run — would otherwise sit there
+    # unpruned: both unmentioned for ever unless said here)
+    [ -s "$Z_DUMPS_ERR" ] && log "WARNING: the retention listing of $DEST hit an error ($(tail -n 1 "$Z_DUMPS_ERR")); less than due may have been pruned" >&2
     [ -z "$PRUNE_STUCK" ] || log "WARNING: could not remove $(printf '%s\n' "$PRUNE_STUCK" | wc -l | tr -d ' ') expired dump(s) in $DEST (owned by another user? a sudo run?) — remove by hand: $(printf '%s\n' "$PRUNE_STUCK" | head -n 3 | tr '\n' ' ')" >&2
     return 0
 }
@@ -483,11 +485,13 @@ prune_all || true
 # evicted placeholder of either) older than two hours belongs to a run that
 # died without its trap (SIGKILL, power loss): no live run owns it (a run
 # is bounded well inside an hour), so it is swept here, before the dumps,
-# and a full destination frees itself. And files outside the dump grammar
+# and a full destination frees itself — only THIS script's names
+# (<store>-<stamp>Z.dump.partial): another job's staging file in a shared
+# destination is left alone, and not nagged about. And files outside the dump grammar
 # (an iCloud conflict copy "NAME 2.dump", a hand-made .bak) are neither
 # counted nor pruned: say so once a run, or the bounded folder grows
 # unbounded unnoticed.
-UNREC="$(find "$DEST" -maxdepth 1 \( -type f \( -name '*.partial' -o -name '.probe.*' -o -name '.*.partial.icloud' -o -name '..probe.*.icloud' \) -mmin +120 -delete \) \
+UNREC="$(find "$DEST" -maxdepth 1 \( -type f \( -name '*Z.dump.partial' -o -name '.probe.*' -o -name '.*Z.dump.partial.icloud' -o -name '..probe.*.icloud' \) -mmin +120 -delete \) \
              -o \( -type f ! -name '*.partial' ! -name '.probe.*' ! -name '.*.partial.icloud' ! -name '..probe.*.icloud' ! -name '.DS_Store' -print \) 2>"$Z_DUMPS_ERR" \
     | while IFS= read -r uf; do parse_dump_name "$uf" || printf '%s\n' "${uf##*/}"; done)"
 [ -s "$Z_DUMPS_ERR" ] && log "WARNING: the stale-file sweep in $DEST hit an error ($(tail -n 1 "$Z_DUMPS_ERR"))" >&2
