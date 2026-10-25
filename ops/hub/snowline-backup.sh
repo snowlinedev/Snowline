@@ -201,7 +201,7 @@ dest_state() {
     # DENIED the stat of (TCC: ssh without Full Disk Access under the iCloud
     # root — the agent in its login session is not denied)
     case "$(ls -d "$DEST" 2>&1 >/dev/null)" in
-        *"Operation not permitted"*) echo unreadable ;;
+        *"Operation not permitted"*|*"Permission denied"*) echo unreadable ;;   # EPERM (TCC) or EACCES
         *) echo missing ;;
     esac
 }
