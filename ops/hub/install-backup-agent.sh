@@ -36,7 +36,7 @@ label="dev.snowline.backup"
 domain="gui/$(id -u)"
 plist_src="$LAUNCHAGENTS_SRC/$label.plist"
 plist_dst="$AGENTS/$label.plist"
-log_file="$BACKUP_LOG"
+log_file="$(backup_log)"   # from the tracked plist's StandardOutPath
 fail=0
 
 # --- guards: the unit runs the canonical script; this install must BE it ---

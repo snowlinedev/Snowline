@@ -111,18 +111,16 @@ BACKUP_ENV="$HOME/.config/snowline/backup.env"
 BACKUP_ENV_VARS="SNOWLINE_BACKUP_DIR SNOWLINE_BACKUP_RETENTION_DAYS SNOWLINE_BACKUP_DBS"
 if [ -f "$BACKUP_ENV" ]; then
     for ev in $BACKUP_ENV_VARS; do printf -v "pre_$ev" '%s' "${!ev:-}"; done
-    # A shell file, sourced: it CAN do anything (a PATH= line there does
-    # retarget pg_dump, PATH being exported above — the operator's call).
-    # Not under `set -a`: a connection setting for the pg_* tools (PGPORT,
-    # PGHOST) must be written `export PGPORT=5433` there, or it stays a
-    # shell variable they never see (docs say so). Stdout is sent to
+    # A shell file, sourced under `set -a` like the services' and autocut's
+    # env files, so a `PGPORT=5433` line there reaches pg_isready, psql and
+    # pg_dump as it does for them (it CAN do anything: a PATH= line there
+    # does retarget pg_dump — the operator's call). Stdout is sent to
     # stderr, so a stray echo cannot corrupt the --print-dest / --check
-    # protocol the installer parses.
-    # shell options are restored afterwards: a `set -e` in the file would
-    # otherwise turn a step-aside into exit 1 and a failed store into an
-    # aborted run
+    # protocol the installer parses. The shell options in force before are
+    # restored afterwards: a `set -e` in the file would otherwise turn a
+    # step-aside into exit 1 and a failed store into an aborted run.
     saved_opts="$(set +o)"
-    set +u   # the file may reference variables this shell does not have
+    set -a; set +u   # +u: the file may reference variables this shell does not have
     # shellcheck disable=SC1090
     . "$BACKUP_ENV" >&2 || die "cannot source $BACKUP_ENV (syntax error?); refusing to run half-configured"
     eval "$saved_opts"
@@ -400,7 +398,7 @@ CATALOG_OK=yes
 # hold the run — or the TERM trap — for ever) and backgrounded like the
 # dumps, so a bootout mid-read still gets its "run exit" line.
 PGCONNECT_TIMEOUT=15 PGOPTIONS='-c statement_timeout=30000' \
-    psql -X -At -d postgres -c "select datname, (datallowconn and has_database_privilege(datname, 'CONNECT')) from pg_database where not datistemplate and datname <> 'postgres' and datname ~ '^[A-Za-z0-9_]+\$' order by 1" > "$CATALOG_OUT" 2>"$CATALOG_ERR" &
+    psql -X -At -d postgres -c "select datname, (datallowconn and has_database_privilege(datname, 'CONNECT')) from pg_database where not datistemplate and datname <> 'postgres' and datname ~ '^[A-Za-z0-9_]+\$' order by 1" > "$CATALOG_OUT" 2>"$CATALOG_ERR" 9>&- &
 DUMP_PID=$!
 wait "$DUMP_PID" || CATALOG_OK=no
 DUMP_PID=""
@@ -533,7 +531,9 @@ for DB in $DBS; do
     # --lock-wait-timeout: a dump wants ACCESS SHARE on every table; a service
     # mid-migration (ACCESS EXCLUSIVE) must not be blocked by it for long —
     # better a store failure this hour than a stalled migration.
-    pg_dump -Fc --lock-wait-timeout=60000 "$DB" > "$OUT.partial" &
+    # (9>&-: the child must not inherit the run lock's fd, or a pg_dump
+    # orphaned by a SIGKILL of this shell would hold the lock until it ends)
+    pg_dump -Fc --lock-wait-timeout=60000 "$DB" > "$OUT.partial" 9>&- &
     DUMP_PID=$!
     wait "$DUMP_PID"; dump_rc=$?
     DUMP_PID=""

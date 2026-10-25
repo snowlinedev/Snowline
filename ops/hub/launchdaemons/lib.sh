@@ -29,7 +29,7 @@ LAUNCHDAEMONS_SRC="$OPS_HUB/launchdaemons"
 LAUNCHAGENTS_SRC="$OPS_HUB/launchagents"
 ICLOUD_ROOT="$OWNER_HOME/Library/Mobile Documents/com~apple~CloudDocs"
 BACKUP_DIR="$ICLOUD_ROOT/Snowline/db-backups"   # the backup script's default destination
-BACKUP_LOG="$OWNER_HOME/Library/Logs/snowline-backup.log"   # the agent plist's StandardOut/ErrorPath
+BACKUP_LOG="$OWNER_HOME/Library/Logs/snowline-backup.log"   # what the tracked agent plist's StandardOutPath says today; backup_log() reads the plist
 # backup_script — the canonical hub checkout's backup script: whatever the
 # tracked agent plist runs (its LAST ProgramArguments entry). The plist is
 # the single source, deliberately static (a path taken from whichever
@@ -42,6 +42,13 @@ backup_script() {
   bs_n="$(plutil -extract ProgramArguments raw -o - "$bs_plist" 2>/dev/null)" || return 1
   [ "${bs_n:-0}" -gt 0 ] || return 1
   plutil -extract "ProgramArguments.$((bs_n - 1))" raw -o - "$bs_plist" 2>/dev/null
+}
+
+# backup_log — the agent's log file as the tracked plist names it
+# (StandardOutPath), so the plist stays the one source; BACKUP_LOG when the
+# plist cannot be read.
+backup_log() {
+  bl="$(plutil -extract StandardOutPath raw -o - "$LAUNCHAGENTS_SRC/dev.snowline.backup.plist" 2>/dev/null)" && [ -n "$bl" ] && printf '%s\n' "$bl" || printf '%s\n' "$BACKUP_LOG"
 }
 
 # ---- logging ----

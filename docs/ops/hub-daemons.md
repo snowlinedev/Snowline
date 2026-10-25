@@ -473,9 +473,8 @@ script resolves and `--check <minutes>` reports (OK / NONE / UNREADABLE / MISSIN
 whether a dump newer than that many minutes exists there, judged by the
 UTC stamp in the file name (an iCloud placeholder's mtime is eviction
 time); the install runs both as the owner, so root never reads the owner's
-iCloud folder. A connection setting for the pg tools (`PGPORT`, `PGHOST`) must be written
-`export PGPORT=5433` there: the file is sourced without `set -a`, so a plain
-assignment stays a shell variable the tools never see.
+iCloud folder. The file is sourced under `set -a`, like the services' env files, so a
+plain `PGPORT=5433` line there reaches the pg tools.
 
 **Rolling out this change on the hub.** The hub checkout had an untracked
 hand-restored copy of `ops/hub/snowline-backup.sh` from 2026-10-23 (the
