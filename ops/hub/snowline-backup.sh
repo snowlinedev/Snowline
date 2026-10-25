@@ -30,10 +30,9 @@
 # Restore (to a scratch DB, to inspect first):
 #   createdb snowline_restore && pg_restore --no-owner -d snowline_restore <dump>
 set -uo pipefail
-# The command line, captured before anything below touches the positional
-# parameters (the store-list normalisation re-sets them). A query
-# (--print-dest, --check) is quiet: it never logs a "run exit" line, even
-# when it dies on a refused configuration before reaching the dispatch.
+# The command line. A query (--print-dest, --check) is quiet: it never logs
+# a "run start" / "run exit" line, even when it dies on a refused
+# configuration before reaching the dispatch.
 ARG1="${1:-}"; ARG2="${2:-}"
 case "$ARG1" in --print-dest|--check) QUIET_EXIT=yes ;; *) QUIET_EXIT=no ;; esac
 export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -88,6 +87,7 @@ on_exit() {
     [ "$QUIET_EXIT" = yes ] || log "run exit $oe_rc"
 }
 trap on_exit EXIT
+[ "$QUIET_EXIT" = yes ] || log "run start"   # the run's real start, for the installer
 CATALOG_ERR="$(mktemp -t snowline-backup-psql)" || die "cannot create a temp file (TMPDIR unwritable?)"
 Z_DUMPS_ERR="$(mktemp -t snowline-backup-find)" || die "cannot create a temp file (TMPDIR unwritable?)"
 # A SIGTERM/SIGINT at ANY point (a bootout during the Postgres wait, a
@@ -104,10 +104,12 @@ trap 'log "interrupted (SIGTERM/SIGINT)${OUT:+; removing $OUT.partial}" >&2; [ -
 BACKUP_ENV="$HOME/.config/snowline/backup.env"
 if [ -f "$BACKUP_ENV" ]; then
     env_dir="${SNOWLINE_BACKUP_DIR:-}"; env_days="${SNOWLINE_BACKUP_RETENTION_DAYS:-}"; env_dbs="${SNOWLINE_BACKUP_DBS:-}"
-    set -a; set +u   # the file may reference variables this shell does not have
+    # (plain `.`, not `set -a`: nothing in the file is for a child process,
+    # and an exported PGHOST or PATH there would silently retarget psql)
+    set +u   # the file may reference variables this shell does not have
     # shellcheck disable=SC1090
     . "$BACKUP_ENV" || die "cannot source $BACKUP_ENV (syntax error?); refusing to run half-configured"
-    set -u; set +a
+    set -u
     # (and say so when the file's value lost: the hub's pre-#319 agent plist
     # exported SNOWLINE_BACKUP_DIR itself until install-backup-agent.sh
     # replaced it, which made a backup.env value look ignored)
@@ -161,16 +163,18 @@ has_word() { hw="$1"; shift; case " $* " in *" $hw "*) return 0 ;; esac; return 
 # SNOWLINE_BACKUP_DBS, normalised ONCE (split on any whitespace with
 # globbing off, re-joined with single spaces) so --check and the run agree
 # on membership; validated further down, before anything side-effecting.
+# (word-split with globbing off, re-joined with single spaces; the
+# positional parameters are never touched)
+DBS_EXPLICIT=""
 set -f
-# shellcheck disable=SC2086
-set -- ${SNOWLINE_BACKUP_DBS:-}
+for vn in ${SNOWLINE_BACKUP_DBS:-}; do DBS_EXPLICIT="$DBS_EXPLICIT $vn"; done
 set +f
-DBS_EXPLICIT="$*"
+DBS_EXPLICIT="${DBS_EXPLICIT# }"
 # ... and validated here, cheap and side-effect free, so a query and a run
 # refuse the same bad value: each name must be a plain identifier (the
 # catalog query applies the same rule in SQL); a whitespace-only value is
 # "unset", not "dump nothing".
-for vn in "$@"; do
+for vn in $DBS_EXPLICIT; do
     case "$vn" in
         *[!A-Za-z0-9_]*) die "SNOWLINE_BACKUP_DBS entry is not a database name: '$vn'" ;;
     esac
@@ -199,13 +203,12 @@ dest_state() {
 
 # Queries install-backup-agent.sh makes by running this script AS THE OWNER
 # (so backup.env, TCC consent and the destination are exactly this
-# script's). The positional parameters are ALREADY the store list here (the
-# normalisation above re-set them); only ARG1/ARG2, captured at the top,
-# describe the command line:
+# script's):
 #   --print-dest        print the resolved destination
 #   --check <minutes>   exit 0 if a dump (or its iCloud-evicted placeholder)
 #                       newer than <minutes> exists in the destination,
-#                       1 if none, 2 if the destination cannot be read
+#                       1 if none, 2 if it cannot be read from here
+#                       (UNREADABLE) or does not exist at all (MISSING)
 case "$ARG1" in
     --print-dest)
         printf '%s\n' "$DEST"
@@ -227,7 +230,7 @@ case "$ARG1" in
         case "$(dest_state)" in
             ok) ;;
             no-leaf) echo NONE; exit 1 ;;
-            *) echo UNREADABLE; exit 2 ;;
+            *) echo MISSING; exit 2 ;;   # a run would exit 2 too: nothing to read, not "unreadable from here"
         esac
         cutoff="$(date -u -v-"${mins}"M +%Y%m%d-%H%M%S 2>/dev/null)" || { echo UNREADABLE; exit 2; }
         [ -n "$cutoff" ] || { echo UNREADABLE; exit 2; }
@@ -254,7 +257,7 @@ EOF_Z
     *) die "unknown argument '$ARG1' (this script takes no arguments except --print-dest and --check <minutes>); refusing to run" ;;
 esac
 # (the explicit store list was normalised and validated at the top, before
-# the query dispatch; the positional parameters hold it)
+# the query dispatch)
 # --- run lock: a flock on $BACKUP_LOCK, held for the whole run ---
 # fd 9 is opened on the lock file for the life of this process; flock_fd
 # (lib.sh, perl) takes the flock on that inherited fd (the lock lives on the
@@ -275,6 +278,7 @@ flock_fd 9 ex 5
 case $? in
     0) ;;
     1) log "another backup run holds $BACKUP_LOCK; stepping aside"; exit 3 ;;
+    127) log "WARNING: /usr/bin/perl is missing; running WITHOUT the run lock (the dump is the point, the lock a courtesy)" >&2 ;;
     *) die "cannot take the run lock $BACKUP_LOCK (flock failed)" ;;
 esac
 
@@ -388,14 +392,11 @@ fi
 # UTC stamp so file names sort monotonically (no DST fold) and match the log.
 STAMP="$(date -u +%Y%m%d-%H%M%SZ)"
 
-# Word-split DBS once, with globbing off (names are validated above or
+# DBS is iterated with globbing off (names are validated above or
 # catalog-sourced). A SIGTERM mid-dump (the unit booted out, a logout, a
 # shutdown) logs itself and removes the partial it was writing, so the log
 # shows a kill rather than a hang.
-set -f
-# shellcheck disable=SC2086
-set -- $DBS
-set +f
+STORES=0
 # The retention cutoff: one stamp, compared against each dump's name stamp
 # as a string (fixed-width UTC; no fork per file).
 PRUNE_CUTOFF="$(date -u -v-"${RETENTION_DAYS}"d +%Y%m%d-%H%M%S 2>/dev/null)" || PRUNE_CUTOFF=""
@@ -427,7 +428,10 @@ prune_all() {
 # stamp in the NAME, a placeholder's mtime being eviction time). Non-fatal:
 # a find hiccup must not fail the run.
 prune_all || true
-for DB in "$@"; do
+set -f
+for DB in $DBS; do
+    set +f
+    STORES=$((STORES + 1))
     OUT="$DEST/${DB}-${STAMP}.dump"
     # Dump to a .partial name, verify the archive is readable, then atomically
     # rename — an interrupted or truncated dump (machine sleep, OOM, iCloud
@@ -454,7 +458,9 @@ for DB in "$@"; do
         log "FAILED to back up ${DB} (pg_dump, archive check, or rename failed)" >&2
         FAILED="$FAILED $DB"
     fi
+    set -f
 done
+set +f
 
 
 # Stale .partial leftovers from any store.
@@ -466,4 +472,4 @@ if [ -n "$FAILED" ]; then
     log "run incomplete; failed:${FAILED}" >&2
     exit 1
 fi
-log "run complete: $# store(s)"
+log "run complete: $STORES store(s)"

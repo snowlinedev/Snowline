@@ -461,7 +461,7 @@ must already exist — it is never created, so an unplugged volume cannot be
 replaced by a local folder), `SNOWLINE_BACKUP_RETENTION_DAYS`,
 `SNOWLINE_BACKUP_DBS` (plain identifiers, space-separated).
 `bash ops/hub/snowline-backup.sh --print-dest` prints the destination the
-script resolves and `--check <minutes>` reports (OK / NONE / UNREADABLE, exit 0/1/2)
+script resolves and `--check <minutes>` reports (OK / NONE / UNREADABLE / MISSING, exit 0/1/2)
 whether a dump newer than that many minutes exists there, judged by the
 UTC stamp in the file name (an iCloud placeholder's mtime is eviction
 time); the install runs both as the owner, so root never reads the owner's
@@ -501,8 +501,9 @@ ls -t ~/Library/Mobile\ Documents/com~apple~CloudDocs/Snowline/db-backups | head
 ```
 
 `last exit code = 0` and a dump under an hour old is healthy. Exit 1 with
-log lines says which store failed; every run ends with a `run exit <code>`
-line, which the installer reads when it cannot see the destination. Exit 2
+log lines says which store failed; every run begins with a `run start`
+line and ends with a `run exit <code>` line, which the installer reads
+when it cannot see the destination. Exit 2
 means the run could not start at
 all (destination missing or unwritable, iCloud root absent, lib.sh missing,
 lock file unopenable) or refused its configuration (a `backup.env` that

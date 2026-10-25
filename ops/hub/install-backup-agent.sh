@@ -71,6 +71,10 @@ dump_evidence() {
   # UNREADABLE on stdout) or the script REFUSING its configuration (a die
   # on stderr, nothing on stdout) — the latter is a failure of the unit
   # itself, never a reason to fall back to old log evidence
+  if [ "$de_out" = MISSING ]; then
+    EVIDENCE=CONFIG_FAIL; EVIDENCE_MSG="destination missing: $dest (volume unplugged? iCloud root gone?) — every run exits 2"
+    return
+  fi
   if [ "$de_out" != UNREADABLE ]; then
     EVIDENCE=CONFIG_FAIL
     return
@@ -130,6 +134,7 @@ elif ! unit_snapshot "$domain/$label"; then
 else
   case "$UNIT_EXIT" in
     ""|0|3) ;;
+    78) action=reload; why="launchd could not spawn the program (EX_CONFIG) — a reload clears the penalty box" ;;
     *) action=reprove; why="last run exited $UNIT_EXIT" ;;
   esac
   if [ "$action" = leave ]; then
@@ -185,14 +190,24 @@ prove_run() {
     # "run exit" line (or, failing that, 15 min ago)
     echo "   a run is already in flight; judging that one"
     runs_before=$((UNIT_RUNS - 1))
-    # (only a line that FOLLOWS a "run exit" line can be this run's start; a
-    # log with no such line yet gives nothing, and the 15-minute fallback)
-    started="$(log_lines_since 0 | awk '$2 == "run" && $3 == "exit" { seen = 1; s = ""; next } seen && s == "" { s = $1 } END { print s }')"
+    # its start is the script's own last "run start" line (or, failing
+    # that, 15 min ago)
+    started="$(log_lines_since 0 | awk '$2 == "run" && $3 == "start" { s = $1 } END { print s }')"
     started_epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$started" +%s 2>/dev/null)" || started_epoch=""
     if [ -n "$started" ] && [ -n "$started_epoch" ]; then run_stamp="$started"; run_epoch="$started_epoch"; else run_epoch=$((run_epoch - 900)); run_stamp="$(date -u -v-15M +%FT%TZ)"; fi
-  elif ! launchctl kickstart "$domain/$label"; then
-    echo "   kickstart refused; the unit is loaded but unproven — run 'bash $BACKUP_SCRIPT' by hand" >&2
-    fail=1; return
+  else
+    # bounded: a kickstart of a unit launchd has penalty-boxed can hang
+    launchctl kickstart "$domain/$label" & kp=$!
+    ki=0; while kill -0 "$kp" 2>/dev/null && [ "$ki" -lt 30 ]; do sleep 1; ki=$((ki + 1)); done
+    if kill -0 "$kp" 2>/dev/null; then
+      kill "$kp" 2>/dev/null
+      echo "   kickstart hung for 30 s (penalty box after spawn failures?); reload the unit: launchctl bootout $domain/$label; re-run this installer" >&2
+      fail=1; return
+    fi
+    if ! wait "$kp"; then
+      echo "   kickstart refused; the unit is loaded but unproven — run 'bash $BACKUP_SCRIPT' by hand" >&2
+      fail=1; return
+    fi
   fi
   code=""; i=0; spawned=no
   while [ "$i" -lt 900 ]; do   # 120 s Postgres wait + up to 60 s lock wait per store + the dumps

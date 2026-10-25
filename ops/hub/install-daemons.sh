@@ -47,7 +47,7 @@ for svc in $SERVICES; do
     fail=1; svc_fail=1
     continue
   fi
-  load_unit "$label" system "$DAEMONS_DIR/$label.plist" || { fail=1; svc_fail=1; }
+  load_unit "$label" system "$DAEMONS_DIR/$label.plist" norecord || { fail=1; svc_fail=1; }
 done
 
 # --- system-only timers (autocut): bootstrapped, never kickstarted ---

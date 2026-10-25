@@ -132,20 +132,17 @@ flock_fd() {
 }
 
 # lock_state <path> — prints held / free / unknown: a shared non-blocking
-# probe (same semantics as flock_fd's sh mode), released at once. It fails
-# only while an exclusive holder runs and never leaves the probe owning the
-# lock.
+# probe through flock_fd, released at once. It fails only while an
+# exclusive holder runs and never leaves the probe owning the lock.
 # "unknown" = the probe itself could not run (unreadable file, perl
 # missing): a guard that cannot tell must refuse, not wave through, so
 # callers treat it like held — but without waiting on it.
 lock_state() {
   [ -e "$1" ] || { echo free; return; }
-  # perl opens the path itself: under /bin/sh a failed `exec 8<` redirection
-  # on the special builtin exits the whole script, so no shell-side open here
-  /usr/bin/perl -e 'use Fcntl qw(:flock);
-    open(my $fh, "<", $ARGV[0]) or exit 2;
-    exit 0 if flock($fh, LOCK_SH | LOCK_NB);
-    exit(($!{EWOULDBLOCK} || $!{EAGAIN}) ? 1 : 2);' "$1" 2>/dev/null
+  # one flock implementation: flock_fd on a read fd opened in a SUBSHELL —
+  # under /bin/sh a failed `exec 8<` on the special builtin exits the shell,
+  # which here is only the subshell
+  ( exec 8<"$1" 2>/dev/null || exit 2; flock_fd 8 sh 1 )
   case $? in 0) echo free ;; 1) echo held ;; *) echo unknown ;; esac
 }
 # lock_held <path> — true unless the lock is known to be free.
@@ -235,7 +232,7 @@ record_loaded() {
   { mkdir -p "$LOCKS_DIR" && cksum < "$2" | cut -d' ' -f1 > "$LOCKS_DIR/$1.loaded"; } || return 1
   if [ "$(id -u)" = 0 ]; then chown "$OWNER_UID" "$LOCKS_DIR" "$LOCKS_DIR/$1.loaded" || return 1; fi
 }
-# load_unit <label> <domain> <dst-plist> — boot the label out of <domain>,
+# load_unit <label> <domain> <dst-plist> [norecord] — boot the label out of <domain>,
 # wait for it to be gone, bootstrap the plist (a RunAtLoad / KeepAlive unit
 # starts right there; nothing is kickstarted: a kick after the bootstrap
 # would only kill the instance launchd just spawned, mid-startup) and
@@ -247,7 +244,7 @@ record_loaded() {
 # — a gui-domain unit then loads at the next login).
 # Returns 0 only for installed.
 load_unit() {
-  lu_label="$1"; lu_domain="$2"; lu_dst="$3"
+  lu_label="$1"; lu_domain="$2"; lu_dst="$3"; lu_record="${4:-record}"
   rm -f "$LOCKS_DIR/$lu_label.loaded"   # whatever runs from here on is unconfirmed until bootstrap succeeds
   launchctl bootout "$lu_domain/$lu_label" 2>/dev/null || true
   # the bootout is issued: the old instance is going down and nothing will
@@ -268,7 +265,10 @@ load_unit() {
     fi
     return 1
   fi
-  if ! record_loaded "$lu_label" "$lu_dst"; then
+  # (the marker is for units whose installer consults unit_current — the
+  # timers and the backup agent; the services are always cycled on a
+  # deploy and pass `norecord`)
+  if [ "$lu_record" != norecord ] && ! record_loaded "$lu_label" "$lu_dst"; then
     echo "   $lu_label is loaded, but its confirmed-loaded marker could not be written under $LOCKS_DIR — the next install will reload it; check that directory" >&2
   fi
   UNIT_RESULT=installed
