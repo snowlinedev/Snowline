@@ -9,6 +9,9 @@
 #
 # Exit: 0 = agent loaded and (if it was (re)loaded) proven by one run with
 # evidence; 1 = something needs the operator (message says what).
+# --deploy (what install-daemons.sh passes): called from a service rollout,
+# so never wait long on the backup — a dump in progress is skipped (re-run
+# later) and the proof is bounded to 5 minutes instead of 15.
 
 # shellcheck disable=SC1091
 . "$(cd "$(dirname "$0")" && pwd)/launchdaemons/lib.sh"
@@ -17,6 +20,13 @@ if [ "$(id -u)" != "$OWNER_UID" ]; then
   exit 64
 fi
 BACKUP_SCRIPT="$(backup_script)" || BACKUP_SCRIPT=""
+
+case "${1:-}" in
+  --deploy) DEPLOY=yes ;;
+  "") DEPLOY=no ;;
+  *) echo "unknown argument '$1' (only --deploy is accepted)" >&2; exit 64 ;;
+esac
+if [ "$DEPLOY" = yes ]; then BUSY_BOUND=0; PROVE_BOUND=300; else BUSY_BOUND=600; PROVE_BOUND=900; fi
 
 label="dev.snowline.backup"
 domain="gui/$(id -u)"
@@ -132,8 +142,14 @@ elif ! unit_current "$label" "$plist_dst"; then
 elif ! unit_snapshot "$domain/$label"; then
   action=reload; why="not loaded"
 else
+  # (unit_unchanged in lib.sh is these three tests; they are spelled out
+  # here because the snapshot's exit code and run count are needed next)
+  # an empty exit code with runs > 0 is a run that ended by a signal
+  # (launchd's "never exited"): not fine
+  [ "$UNIT_RUNS" -gt 0 ] && [ -z "$UNIT_EXIT" ] && UNIT_EXIT=signal
   case "$UNIT_EXIT" in
     ""|0|3) ;;
+    signal) action=reprove; why="last run ended by a signal (killed mid-dump?)" ;;
     78) action=reload; why="launchd could not spawn the program (EX_CONFIG) — a reload clears the penalty box" ;;
     *) action=reprove; why="last run exited $UNIT_EXIT" ;;
   esac
@@ -158,7 +174,7 @@ case "$action" in
     # never boot the unit out mid-dump (it holds backup.lock); a manual run
     # in the instant between the last probe and the bootout would lose
     # that dump, which the proving run then replaces
-    if ! unit_busy_wait backup 600; then
+    if ! unit_busy_wait backup "$BUSY_BOUND"; then
       echo "   a dump is still running (or its lock cannot be probed); leaving $label as it is — re-run later" >&2
       fail=1
     elif place_unit "$plist_src" "$plist_dst" "$(id -u)" && load_unit "$label" "$domain" "$plist_dst"; then
@@ -186,15 +202,15 @@ prove_run() {
   unit_snapshot "$domain/$label"; runs_before="$UNIT_RUNS"
   run_stamp="$(date -u +%FT%TZ)"; run_epoch="$(date +%s)"
   if [ "$UNIT_RUNNING" = yes ]; then
-    # its start is the first stamped log line after the previous run's
-    # "run exit" line (or, failing that, 15 min ago)
+    # its start is the script's own last "run start" line; failing that
+    # (log rotated), the previous run's "run exit" stamp — never a guess
+    # that could credit an older run's dumps to this one
     echo "   a run is already in flight; judging that one"
     runs_before=$((UNIT_RUNS - 1))
-    # its start is the script's own last "run start" line (or, failing
-    # that, 15 min ago)
     started="$(log_lines_since 0 | awk '$2 == "run" && $3 == "start" { s = $1 } END { print s }')"
+    [ -n "$started" ] || started="$(log_lines_since 0 | awk '$2 == "run" && $3 == "exit" { s = $1 } END { print s }')"
     started_epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$started" +%s 2>/dev/null)" || started_epoch=""
-    if [ -n "$started" ] && [ -n "$started_epoch" ]; then run_stamp="$started"; run_epoch="$started_epoch"; else run_epoch=$((run_epoch - 900)); run_stamp="$(date -u -v-15M +%FT%TZ)"; fi
+    if [ -n "$started" ] && [ -n "$started_epoch" ]; then run_stamp="$started"; run_epoch="$started_epoch"; else run_stamp="$(date -u +%FT%TZ)"; fi
   else
     # bounded: a kickstart of a unit launchd has penalty-boxed can hang
     launchctl kickstart "$domain/$label" & kp=$!
@@ -210,7 +226,7 @@ prove_run() {
     fi
   fi
   code=""; i=0; spawned=no
-  while [ "$i" -lt 900 ]; do   # 120 s Postgres wait + up to 60 s lock wait per store + the dumps
+  while [ "$i" -lt "$PROVE_BOUND" ]; do   # 120 s Postgres wait + up to 60 s lock wait per store + the dumps
     unit_snapshot "$domain/$label" || break   # unit gone
     [ "$UNIT_RUNNING" = yes ] && spawned=yes
     if [ "$UNIT_RUNNING" = no ] && [ "$UNIT_RUNS" -gt "$runs_before" ]; then
@@ -225,7 +241,7 @@ prove_run() {
   if [ "$code" = 3 ]; then
     if [ "$pr_try" = 1 ]; then
       echo "   stepped aside (a manual run held the lock); waiting for it, then firing once more"
-      if unit_busy_wait backup 600; then prove_run 2; return; fi
+      if unit_busy_wait backup "$BUSY_BOUND"; then prove_run 2; return; fi
       echo "   that run is still going after 10 min; nothing proven — re-run later" >&2
     else
       echo "   stepped aside twice; nothing proven — re-run later" >&2

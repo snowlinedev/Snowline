@@ -38,7 +38,9 @@ each of platform / pm / governance / memory:
    own, without sudo, whenever the backup needs (re)proving — re-running
    `install-daemons.sh` restarts all four services and is NOT the way to
    do that. Its outcome is printed, not folded into `install-daemons.sh`'s
-   exit status, which is the services' result. It (re)loads `ops/hub/launchagents/dev.snowline.backup.plist`
+   exit status, which is the deploy's own result (services and timer); it
+   is called with `--deploy`, so a dump in progress is skipped rather than
+   waited on and the proof is bounded to five minutes. It (re)loads `ops/hub/launchagents/dev.snowline.backup.plist`
    into `gui/501` only when the tracked plist differs from the one last
    confirmed loaded or the unit is not loaded (waiting first for a dump in
    progress); a unit that is loaded and current but whose last run exited

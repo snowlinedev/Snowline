@@ -227,6 +227,13 @@ unit_current() {
   [ -f "$2" ] && [ -s "$LOCKS_DIR/$1.loaded" ] \
     && [ "$(cat "$LOCKS_DIR/$1.loaded" 2>/dev/null)" = "$(cksum < "$2" | cut -d' ' -f1)" ]
 }
+# unit_unchanged <label> <domain> <src-plist> <dst-plist> — the ONE
+# leave-alone rule for a unit whose installer consults the marker: the
+# tracked plist is byte-identical to the installed one, that is the
+# definition launchd last confirmed loaded, and launchd still has it.
+unit_unchanged() {
+  cmp -s "$3" "$4" 2>/dev/null && unit_current "$1" "$4" && launchctl print "$2/$1" >/dev/null 2>&1
+}
 # record_loaded <label> <plist> — write that marker. The directory is the
 # OWNER's (the backup and autocut locks live there too): when root writes
 # it, directory and marker are handed to the owner, or the owner's own

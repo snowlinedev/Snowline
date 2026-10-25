@@ -161,10 +161,9 @@ z_dumps() {
 has_word() { hw="$1"; shift; case " $* " in *" $hw "*) return 0 ;; esac; return 1; }
 
 # SNOWLINE_BACKUP_DBS, normalised ONCE (split on any whitespace with
-# globbing off, re-joined with single spaces) so --check and the run agree
-# on membership; validated further down, before anything side-effecting.
-# (word-split with globbing off, re-joined with single spaces; the
-# positional parameters are never touched)
+# globbing off, re-joined with single spaces; the positional parameters are
+# never touched) so --check and the run agree on membership; validated just
+# below, before anything side-effecting.
 DBS_EXPLICIT=""
 set -f
 for vn in ${SNOWLINE_BACKUP_DBS:-}; do DBS_EXPLICIT="$DBS_EXPLICIT $vn"; done
@@ -232,8 +231,10 @@ case "$ARG1" in
             no-leaf) echo NONE; exit 1 ;;
             *) echo MISSING; exit 2 ;;   # a run would exit 2 too: nothing to read, not "unreadable from here"
         esac
-        cutoff="$(date -u -v-"${mins}"M +%Y%m%d-%H%M%S 2>/dev/null)" || { echo UNREADABLE; exit 2; }
-        [ -n "$cutoff" ] || { echo UNREADABLE; exit 2; }
+        # (a cutoff that cannot be computed is a refused argument — a die,
+        # nothing on stdout — not "the destination is unreadable")
+        cutoff="$(date -u -v-"${mins}"M +%Y%m%d-%H%M%S 2>/dev/null)" && [ -n "$cutoff" ] \
+            || die "--check: cannot compute a cutoff $mins minutes back"
         # only the stores this job dumps count: the configured list when
         # SNOWLINE_BACKUP_DBS is set, else the catalog rule (store_wanted) —
         # a scratch or foreign dump put in the folder by hand is not evidence
@@ -256,8 +257,6 @@ EOF_Z
     "") ;;   # no arguments: a real run
     *) die "unknown argument '$ARG1' (this script takes no arguments except --print-dest and --check <minutes>); refusing to run" ;;
 esac
-# (the explicit store list was normalised and validated at the top, before
-# the query dispatch)
 # --- run lock: a flock on $BACKUP_LOCK, held for the whole run ---
 # fd 9 is opened on the lock file for the life of this process; flock_fd
 # (lib.sh, perl) takes the flock on that inherited fd (the lock lives on the
@@ -357,7 +356,6 @@ if [ "$CATALOG_OK" != yes ]; then
     if [ -n "$DBS_EXPLICIT" ]; then catalog_clause="the connectability check and the exclusion note are skipped this run"; else catalog_clause="dumping the fallback list only: $FALLBACK_DBS"; fi
     log "WARNING: could not list databases from the server ($(tr '\n' ' ' < "$CATALOG_ERR")); $catalog_clause" >&2
 fi
-# (LIVE was built above, in the same pass)
 if [ -n "$DBS_EXPLICIT" ]; then
     # (an unconnectable name on the list was already recorded as FAILED
     # above; it is not dumped a second time to fail twice)

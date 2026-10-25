@@ -74,9 +74,7 @@ for timer in $TIMERS; do
     fi
     continue
   fi
-  if cmp -s "$LAUNCHDAEMONS_SRC/$label.plist" "$DAEMONS_DIR/$label.plist" \
-     && unit_current "$label" "$DAEMONS_DIR/$label.plist" \
-     && launchctl print "system/$label" >/dev/null 2>&1; then
+  if unit_unchanged "$label" system "$LAUNCHDAEMONS_SRC/$label.plist" "$DAEMONS_DIR/$label.plist"; then
     echo "   unchanged, confirmed loaded; left as it is"
     continue
   fi
@@ -109,17 +107,20 @@ done
 # installer is idempotent and is also the thing to run by itself, without
 # sudo, whenever the backup needs (re)proving.
 # Its outcome is reported, not folded into this script's exit status: that
-# status is the SERVICES' deploy result, which an automation wrapper may
-# key on, and the backup proof can be inconclusive from an ssh session for
-# reasons that have nothing to do with the services.
+# status is this deploy's own result (the services and the autocut timer),
+# which an automation wrapper may key on, and the backup proof can be
+# inconclusive from an ssh session for reasons that have nothing to do with
+# the services. Run with --deploy: a backup in progress is skipped rather
+# than waited on, and the proof is bounded more tightly, so a service
+# rollout is never held for long by the backup step.
 echo "== dev.snowline.backup (ops/hub/install-backup-agent.sh, as the owner)"
 if [ "$svc_fail" != 0 ]; then
   # the ordering exists so the proving dump never lands in a boot
   # migration's window; with a service DOWN that is where it would land
   echo "== backup agent: SKIPPED (a service is DOWN or failed to install; its proving dump must not land in a migration) — run ops/hub/install-backup-agent.sh as the owner once /health is clean" >&2
-elif sudo -u "#$OWNER_UID" -H /bin/sh "$OPS_HUB/install-backup-agent.sh"; then
+elif sudo -u "#$OWNER_UID" -H /bin/sh "$OPS_HUB/install-backup-agent.sh" --deploy; then
   echo "== backup agent: OK"
 else
-  echo "== backup agent: NOT OK (see above) — fix and re-run ops/hub/install-backup-agent.sh as the owner; the services' result is exit $fail" >&2
+  echo "== backup agent: NOT OK (see above) — fix and re-run ops/hub/install-backup-agent.sh as the owner; this deploy's own result (services and timers) is exit $fail" >&2
 fi
 exit "$fail"
