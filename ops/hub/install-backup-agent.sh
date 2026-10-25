@@ -154,7 +154,8 @@ else
   # an empty exit code with runs > 0 and nothing running is a run that
   # ended by a signal (launchd's "never exited"): not fine. (A first run
   # still in flight shows the same empty code; that is judged as in-flight.)
-  [ "$UNIT_RUNNING" != yes ] && [ "$UNIT_RUNS" -gt 0 ] && [ -z "$UNIT_EXIT" ] && UNIT_EXIT=signal
+  verdict="$UNIT_EXIT"   # launchd's code, or a word for what the code cannot say
+  [ "$UNIT_RUNNING" != yes ] && [ "$UNIT_RUNS" -gt 0 ] && [ -z "$UNIT_EXIT" ] && verdict=signal
   # a registration that has never run has no record of its own — unless
   # launchd's counter merely restarted at login: then the log shows a "run
   # exit" newer than this plist's confirmed-loaded marker, and that run WAS
@@ -165,9 +166,9 @@ else
   if [ "$UNIT_RUNS" -eq 0 ] && [ "$UNIT_RUNNING" != yes ] && [ -z "$UNIT_EXIT" ]; then
     marker_epoch="$(stat -f %m "$LOCKS_DIR/$label.loaded" 2>/dev/null)" || marker_epoch=0
     marker_stamp="$(date -u -r "$marker_epoch" +%FT%TZ)"
-    [ -n "$(log_lines_since "$marker_stamp" | awk '$2 == "run" && $3 == "exit"')" ] || UNIT_EXIT=never
+    [ -n "$(log_lines_since "$marker_stamp" | awk '$2 == "run" && $3 == "exit"')" ] || verdict=never
   fi
-  case "$UNIT_EXIT" in
+  case "$verdict" in
     ""|0|3) ;;
     never) action=reprove; why="this registration has never run (an earlier proof did not complete?)" ;;
     signal) action=reprove; why="last run ended by a signal (killed mid-dump?)" ;;

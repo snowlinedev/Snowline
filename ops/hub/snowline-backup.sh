@@ -94,8 +94,9 @@ trap on_exit EXIT
 # command returns, so both run in the background and are waited for) is
 # killed, and a dump's partial removed. Armed here, before the first log
 # line and the first fork, so a run never vanishes without a log line.
-OUT=""; DUMP_PID=""
-trap 'log "interrupted (SIGTERM/SIGINT/SIGHUP)${OUT:+; removing $OUT.partial}" >&2; [ -z "$DUMP_PID" ] || kill "$DUMP_PID" 2>/dev/null; [ -z "$OUT" ] || rm -f "$OUT.partial"; exit 143' TERM INT HUP
+OUT=""; DUMP_PID=""; WATCHDOG_PID=""
+DUMP_BOUND_S=1800   # per store; the largest store dumps in well under a minute today
+trap 'log "interrupted (SIGTERM/SIGINT/SIGHUP)${OUT:+; removing $OUT.partial}" >&2; [ -z "$DUMP_PID" ] || kill "$DUMP_PID" 2>/dev/null; [ -z "$WATCHDOG_PID" ] || kill "$WATCHDOG_PID" 2>/dev/null; [ -z "$OUT" ] || rm -f "$OUT.partial"; exit 143' TERM INT HUP
 [ "$QUIET_EXIT" = yes ] || log "run start"   # the run's real start, for the installer
 CATALOG_ERR="$(mktemp -t snowline-backup-psql)" || die "cannot create a temp file (TMPDIR unwritable?)"
 CATALOG_OUT="$(mktemp -t snowline-backup-catalog)" || die "cannot create a temp file (TMPDIR unwritable?)"
@@ -125,8 +126,11 @@ if [ -f "$BACKUP_ENV" ]; then
     # last command's status is NOT the test (`[ -d /Volumes/X ] && ...` with
     # the volume away returns 1 and is fine). The file therefore runs twice
     # a run; it is meant to hold assignments, not side effects.
+    # (and a syntax error first: bash would apply the lines before it and
+    # drop the rest — the half-configured run this refuses)
+    bash -n "$BACKUP_ENV" 2>/dev/null || die "cannot source $BACKUP_ENV: syntax error (bash -n); refusing to run half-configured"
     [ "$( ( set +u; . "$BACKUP_ENV" >/dev/null 2>&1; echo SOURCED ) 2>/dev/null )" = SOURCED ] \
-        || die "cannot source $BACKUP_ENV: it exits when sourced (a syntax error? an exit line? set -e with a failing command?); refusing to run half-configured"
+        || die "cannot source $BACKUP_ENV: it exits when sourced (an exit line? set -e with a failing command?); refusing to run half-configured"
     saved_opts="$(set +o)"
     set -a; set +u   # +u: the file may reference variables this shell does not have
     # shellcheck disable=SC1090
@@ -427,7 +431,10 @@ while IFS='|' read -r cat_name cat_ok cat_ident; do
     [ -n "$cat_name" ] || continue
     # (a snowline_* name the scratch rule drops is NAMED once a run below,
     # so a real store with an unlucky name is not missed until restore time)
-    if [[ $cat_name =~ $STORE_RE ]] && [[ $cat_name =~ $SCRATCH_RE ]]; then SCRATCHED="$SCRATCHED $cat_name"; continue; fi
+    if [[ $cat_name =~ $STORE_RE ]] && [[ $cat_name =~ $SCRATCH_RE ]]; then
+        has_word "$cat_name" $DBS_EXPLICIT || SCRATCHED="$SCRATCHED $cat_name"   # (the explicit list may dump it; then it is not "not dumped")
+        continue
+    fi
     store_wanted "$cat_name" || continue
     if [ "$cat_ident" != t ]; then NONIDENT="$NONIDENT $cat_name"
     elif [ "$cat_ok" = t ]; then LIVE="$LIVE $cat_name"; else UNCONNECTABLE="$UNCONNECTABLE $cat_name"; fi
@@ -563,10 +570,21 @@ for DB in $DBS; do
     # better a store failure this hour than a stalled migration.
     # (9>&-: the child must not inherit the run lock's fd, or a pg_dump
     # orphaned by a SIGKILL of this shell would hold the lock until it ends)
+    # A watchdog bounds the dump (DUMP_BOUND_S): a backend that hangs after
+    # taking its locks, or a write into iCloud that stalls, would otherwise
+    # hold the run lock for ever and every later hourly run would step
+    # aside — exit 3, "not a verdict" — in silence. (The watchdog closes fd
+    # 9 too, and is killed as soon as the dump returns.)
     pg_dump -Fc --lock-wait-timeout=60000 "$DB" > "$OUT.partial" 9>&- &
     DUMP_PID=$!
+    # (the watchdog's own sleep is a separate process: killing the watchdog
+    # must take the sleep with it, or an orphan sleep outlives every run)
+    ( trap 'kill "$wd_sleep" 2>/dev/null; exit 0' TERM; sleep "$DUMP_BOUND_S" & wd_sleep=$!; wait "$wd_sleep"; kill "$DUMP_PID" 2>/dev/null ) >/dev/null 2>&1 9>&- &
+    WATCHDOG_PID=$!
     wait "$DUMP_PID"; dump_rc=$?
     DUMP_PID=""
+    kill "$WATCHDOG_PID" 2>/dev/null; wait "$WATCHDOG_PID" 2>/dev/null; WATCHDOG_PID=""
+    [ "$dump_rc" -ne 143 ] || log "FAILED to back up ${DB}: the dump ran past ${DUMP_BOUND_S}s and was killed (a hung backend? a stalled destination?)" >&2
     if [ "$dump_rc" -eq 0 ] && pg_restore -l "$OUT.partial" > /dev/null; then
         # The archive is good: from here the trap must not remove it, so OUT
         # is cleared BEFORE the rename — a signal between the two leaves a
@@ -585,7 +603,7 @@ for DB in $DBS; do
         fi
     else
         rm -f "$OUT.partial"; OUT=""
-        log "FAILED to back up ${DB} (pg_dump or the archive check failed)" >&2
+        [ "$dump_rc" -eq 143 ] || log "FAILED to back up ${DB} (pg_dump or the archive check failed)" >&2
         FAILED="$FAILED $DB"
     fi
 done
