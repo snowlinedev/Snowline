@@ -100,6 +100,16 @@ wait_unloaded() {
   done
   return 0
 }
+# bootout_wait <domain/label> — the ONE teardown: issue the bootout (it may
+# not be loaded) and wait for the registration to go, up to 60 s: once the
+# bootout is issued nothing re-registers the unit, so a slow teardown (a
+# migration finishing) gets a second 30 s rather than leave the caller with
+# no replacement loaded. 1 = still registered; the caller says what that
+# leaves running.
+bootout_wait() {
+  launchctl bootout "$1" 2>/dev/null || true
+  wait_unloaded "$1" || wait_unloaded "$1"
+}
 
 # ---- unit run locks ----
 # A timer that must not be booted out mid-run holds a flock on
@@ -264,11 +274,7 @@ record_loaded() {
 load_unit() {
   lu_label="$1"; lu_domain="$2"; lu_dst="$3"; lu_record="${4:-record}"
   rm -f "$LOCKS_DIR/$lu_label.loaded"   # whatever runs from here on is unconfirmed until bootstrap succeeds
-  launchctl bootout "$lu_domain/$lu_label" 2>/dev/null || true
-  # the bootout is issued: the old instance is going down and nothing will
-  # re-register it, so give a slow teardown a second 30 s rather than leave
-  # the unit with no replacement
-  if ! wait_unloaded "$lu_domain/$lu_label" && ! wait_unloaded "$lu_domain/$lu_label"; then
+  if ! bootout_wait "$lu_domain/$lu_label"; then
     echo "   old registration of $lu_label still tearing down after 60s; the new plist is on disk (it loads when $lu_domain next comes up) but nothing re-registers it now — re-run once the old one is gone" >&2
     return 1
   fi
@@ -307,9 +313,8 @@ restore_agent() {
     echo "   no agent plist to restore for $ra_label (neither $AGENTS/$ra_label.plist nor a .disabled-* copy); leaving the daemon in place" >&2
     return 1
   fi
-  launchctl bootout "system/$ra_label" 2>/dev/null || true
-  if ! wait_unloaded "system/$ra_label"; then
-    echo "   daemon $ra_label still registered after 30s; NOT starting the agent on top of it — re-run" >&2
+  if ! bootout_wait "system/$ra_label"; then
+    echo "   daemon $ra_label still tearing down after 60s; NOT starting the agent on top of it — once it is gone NOTHING serves $1 until this rollback is re-run" >&2
     return 1
   fi
   rm -f "${DAEMONS_DIR:?}/${ra_label:?}.plist"
@@ -325,6 +330,12 @@ restore_agent() {
     return 0
   fi
   if launchctl bootstrap "gui/$OWNER_UID" "$AGENTS/$ra_label.plist"; then
+    # the restored plist is not tracked here: a RunAtLoad one is started by
+    # the bootstrap (a kickstart would only kill it mid-startup); any other
+    # needs the kick the old rollback always gave
+    if [ "$(plutil -extract RunAtLoad raw -o - "$AGENTS/$ra_label.plist" 2>/dev/null)" != true ]; then
+      launchctl kickstart "gui/$OWNER_UID/$ra_label" || echo "   agent $ra_label loaded but not started (no RunAtLoad and the kickstart failed) — start it by hand: launchctl kickstart gui/$OWNER_UID/$ra_label" >&2
+    fi
     return 0
   fi
   echo "   agent plist for $ra_label is on disk but could NOT be loaded into gui/$OWNER_UID (no login session?); it loads at the next login — nothing runs for $ra_label until then" >&2

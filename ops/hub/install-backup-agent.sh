@@ -26,8 +26,10 @@ case "${1:-}" in
   "") DEPLOY=no ;;
   *) echo "unknown argument '$1' (only --deploy is accepted)" >&2; exit 64 ;;
 esac
-# (the proof bound covers the script's own worst case: 120 s Postgres wait
-# + 60 s lock wait per store + the dumps)
+# (a run is 120 s of Postgres wait at most, up to 60 s of lock wait per
+# store, then the dumps: 15 min covers that; the 10 min of --deploy does
+# not quite when EVERY store is lock-contended, and then its verdict is
+# "still running", not a failure of the unit)
 if [ "$DEPLOY" = yes ]; then BUSY_BOUND=0; PROVE_BOUND=600; DEPLOY_NOTE=" (a --deploy call does not wait longer)"; else BUSY_BOUND=600; PROVE_BOUND=900; DEPLOY_NOTE=""; fi
 
 label="dev.snowline.backup"

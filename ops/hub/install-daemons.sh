@@ -34,18 +34,16 @@ for svc in $SERVICES; do
   # stop the agent (ignore: it may not be loaded) and wait for it to be
   # gone — a service runs its whole startup before binding, so the daemon
   # must never start while the agent is still shutting down ...
-  launchctl bootout "gui/$OWNER_UID/$label" 2>/dev/null || true
-  # ... move its plist aside at once, so that whatever happens next only
+  # ... its plist moved aside at once, so that whatever happens next only
   # the daemon can come up at the next boot/login (never both) ...
   if [ -f "$AGENTS/$label.plist" ]; then
     mv "$AGENTS/$label.plist" "$AGENTS/$label.plist.disabled-$STAMP"
     echo "   agent plist -> $label.plist.disabled-$STAMP"
   fi
-  # ... and only start the daemon once the agent is really gone (a slow
-  # teardown — a migration finishing — gets a second 30 s, as in load_unit:
-  # the bootout is issued and nothing re-registers the agent, so giving up
-  # here leaves the service with NOTHING loaded until a re-run or a boot)
-  if ! wait_unloaded "gui/$OWNER_UID/$label" && ! wait_unloaded "gui/$OWNER_UID/$label"; then
+  # ... and the daemon started only once the agent is really gone
+  # (bootout_wait: 60 s; giving up leaves the service with NOTHING loaded
+  # until a re-run or a boot)
+  if ! bootout_wait "gui/$OWNER_UID/$label"; then
     echo "   agent $label still tearing down after 60s; NOT starting the daemon on top of it — once it is gone NOTHING serves $svc until this install is re-run (or the next boot loads the daemon plist, which is in place)" >&2
     fail=1; svc_fail=1
     continue

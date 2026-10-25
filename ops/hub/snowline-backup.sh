@@ -186,6 +186,13 @@ store_wanted() {
     [[ $1 =~ $STORE_RE ]] && ! [[ $1 =~ $SCRATCH_RE ]]
 }
 
+# canon_dest — once the destination exists, use its real path: `find
+# "$DEST" -maxdepth 1` on a SYMLINK (an override pointing at a volume) sees
+# nothing at all, and a trailing slash in an override would put `//` in
+# every dump path.
+canon_dest() {
+    DEST="$(cd "$DEST" 2>/dev/null && pwd -P)" && [ -n "$DEST" ] || die "cannot resolve the backup destination's real path"
+}
 # dest_state — the ONE destination rule, for --check and the run alike:
 # prints ok (exists), no-leaf (absent, but under a present iCloud root: may
 # be created), or missing (iCloud root absent, or a non-iCloud destination
@@ -239,7 +246,7 @@ case "$ARG1" in
         # its login session is not denied); a path that is not there — iCloud
         # Drive signed out, a volume unplugged — is MISSING.
         case "$(dest_state)" in
-            ok) ;;
+            ok) canon_dest ;;
             no-leaf) echo NONE; exit 1 ;;
             unreadable) echo "stat of $DEST denied in this context (Full Disk Access?)" >&2; echo UNREADABLE; exit 2 ;;
             *) echo MISSING; exit 2 ;;
@@ -310,8 +317,8 @@ esac
 # may be created freely; any other destination (external volume, rsync
 # target) must already exist and is never created here.
 case "$(dest_state)" in
-    ok) ;;
-    no-leaf) mkdir -p "$DEST" || die "cannot create backup destination: $DEST" ;;
+    ok) canon_dest ;;
+    no-leaf) mkdir -p "$DEST" || die "cannot create backup destination: $DEST"; canon_dest ;;
     unreadable) die "backup destination cannot be reached from this context: $DEST (stat denied — Full Disk Access / iCloud Drive consent for this session?)" ;;
     *) die "backup destination missing: $DEST (iCloud Drive root absent, or a volume not mounted — it is never created by this script)" ;;
 esac
@@ -429,12 +436,13 @@ PRUNE_CUTOFF="$(date -u -v-"${RETENTION_DAYS}"d +%Y%m%d-%H%M%S 2>/dev/null)" || 
 KEEP_MIN=3
 prune_all() {
     [ -n "$PRUNE_CUTOFF" ] || return 0   # no cutoff, no pruning (never over-delete; warned above)
-    # the stores this job may dump — Snowline's own (STORE_RE) and any the
-    # explicit list names — and no other: a destination shared with another
-    # project's dumps is not this job's to prune
+    # the stores this job may dump — store_wanted's rule (STORE_RE and not
+    # SCRATCH_RE, which spares the legacy snowline_dev history) or a name on
+    # the explicit list — and no other: a scratch store's dumps or another
+    # project's in a shared destination are not this job's to prune
     z_dumps '*' all | sort -t "$TAB" -k1,1 -k2,2r \
-    | awk -F"$TAB" -v cutoff="$PRUNE_CUTOFF" -v keep="$KEEP_MIN" -v re="$STORE_RE" -v explicit=" $DBS_EXPLICIT " '
-        ($1 !~ re && index(explicit, " " $1 " ") == 0) || $1 == "snowline_dev" { next }
+    | awk -F"$TAB" -v cutoff="$PRUNE_CUTOFF" -v keep="$KEEP_MIN" -v re="$STORE_RE" -v scratch="$SCRATCH_RE" -v explicit=" $DBS_EXPLICIT " '
+        index(explicit, " " $1 " ") == 0 && ($1 !~ re || $1 ~ scratch) { next }
         $1 != store { store = $1; n = 0 }
         { n++; if (n > keep && $2 < cutoff) print $3 }' \
     | while IFS= read -r pa_f; do rm -f "$pa_f"; done
