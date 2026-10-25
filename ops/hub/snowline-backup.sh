@@ -429,13 +429,15 @@ DUMP_PID=""
 LIVE=""; UNCONNECTABLE=""; NONIDENT=""; SCRATCHED=""
 while IFS='|' read -r cat_name cat_ok cat_ident; do
     [ -n "$cat_name" ] || continue
-    # (a snowline_* name the scratch rule drops is NAMED once a run below,
-    # so a real store with an unlucky name is not missed until restore time)
-    if [[ $cat_name =~ $STORE_RE ]] && [[ $cat_name =~ $SCRATCH_RE ]]; then
-        has_word "$cat_name" $DBS_EXPLICIT || SCRATCHED="$SCRATCHED $cat_name"   # (the explicit list may dump it; then it is not "not dumped")
-        continue
+    # a name on the explicit list is classified whatever its pattern (it
+    # will be dumped: a parked one must be named as unconnectable, not fail
+    # blind); otherwise a snowline_* name the scratch rule drops is NAMED
+    # once a run below, so a real store with an unlucky name is not missed
+    # until restore time
+    if has_word "$cat_name" $DBS_EXPLICIT; then :
+    elif [[ $cat_name =~ $STORE_RE ]] && [[ $cat_name =~ $SCRATCH_RE ]]; then SCRATCHED="$SCRATCHED $cat_name"; continue
+    else store_wanted "$cat_name" || continue
     fi
-    store_wanted "$cat_name" || continue
     if [ "$cat_ident" != t ]; then NONIDENT="$NONIDENT $cat_name"
     elif [ "$cat_ok" = t ]; then LIVE="$LIVE $cat_name"; else UNCONNECTABLE="$UNCONNECTABLE $cat_name"; fi
 done < "$CATALOG_OUT"
@@ -539,6 +541,23 @@ prune_all() {
 # kept, iCloud `.NAME.icloud` placeholders by the same rule — age is the
 # stamp in the NAME, a placeholder's mtime being eviction time). Non-fatal:
 # a find hiccup must not fail the run.
+# run_bounded <seconds> <command...> — the command in the background with
+# the run lock's fd closed (9>&-: a child orphaned by a SIGKILL of this
+# shell must not hold the lock), killed after <seconds> by a watchdog whose
+# own sleep dies with it (an orphan sleep would outlive every run); the
+# command's status, 143 when the watchdog struck. DUMP_PID/WATCHDOG_PID are
+# what the TERM trap kills.
+run_bounded() {
+    rb_bound="$1"; shift
+    "$@" 9>&- &
+    DUMP_PID=$!
+    ( trap 'kill "$wd_sleep" 2>/dev/null; exit 0' TERM; sleep "$rb_bound" & wd_sleep=$!; wait "$wd_sleep"; kill "$DUMP_PID" 2>/dev/null ) >/dev/null 2>&1 9>&- &
+    WATCHDOG_PID=$!
+    wait "$DUMP_PID"; rb_rc=$?
+    DUMP_PID=""
+    kill "$WATCHDOG_PID" 2>/dev/null; wait "$WATCHDOG_PID" 2>/dev/null; WATCHDOG_PID=""
+    return "$rb_rc"
+}
 prune_all || true
 # One more walk for two things. A .partial (or a write probe, or iCloud's
 # evicted placeholder of either) belongs to a run that died without its
@@ -570,22 +589,20 @@ for DB in $DBS; do
     # better a store failure this hour than a stalled migration.
     # (9>&-: the child must not inherit the run lock's fd, or a pg_dump
     # orphaned by a SIGKILL of this shell would hold the lock until it ends)
-    # A watchdog bounds the dump (DUMP_BOUND_S): a backend that hangs after
-    # taking its locks, or a write into iCloud that stalls, would otherwise
-    # hold the run lock for ever and every later hourly run would step
-    # aside — exit 3, "not a verdict" — in silence. (The watchdog closes fd
-    # 9 too, and is killed as soon as the dump returns.)
-    pg_dump -Fc --lock-wait-timeout=60000 "$DB" > "$OUT.partial" 9>&- &
-    DUMP_PID=$!
-    # (the watchdog's own sleep is a separate process: killing the watchdog
-    # must take the sleep with it, or an orphan sleep outlives every run)
-    ( trap 'kill "$wd_sleep" 2>/dev/null; exit 0' TERM; sleep "$DUMP_BOUND_S" & wd_sleep=$!; wait "$wd_sleep"; kill "$DUMP_PID" 2>/dev/null ) >/dev/null 2>&1 9>&- &
-    WATCHDOG_PID=$!
-    wait "$DUMP_PID"; dump_rc=$?
-    DUMP_PID=""
-    kill "$WATCHDOG_PID" 2>/dev/null; wait "$WATCHDOG_PID" 2>/dev/null; WATCHDOG_PID=""
+    # The dump and its verification each run under run_bounded (above): a
+    # backend that hangs after taking its locks, or a read or write that
+    # stalls on the destination, would otherwise hold the run lock for ever
+    # and every later hourly run would step aside — exit 3, "not a verdict"
+    # — in silence.
+    run_bounded "$DUMP_BOUND_S" pg_dump -Fc --lock-wait-timeout=60000 "$DB" > "$OUT.partial"; dump_rc=$?
     [ "$dump_rc" -ne 143 ] || log "FAILED to back up ${DB}: the dump ran past ${DUMP_BOUND_S}s and was killed (a hung backend? a stalled destination?)" >&2
-    if [ "$dump_rc" -eq 0 ] && pg_restore -l "$OUT.partial" > /dev/null; then
+    if [ "$dump_rc" -eq 0 ]; then
+        run_bounded "$DUMP_BOUND_S" pg_restore -l "$OUT.partial" > /dev/null; verify_rc=$?
+        [ "$verify_rc" -ne 143 ] || log "FAILED to back up ${DB}: verifying the archive ran past ${DUMP_BOUND_S}s and was killed (a stalled destination?)" >&2
+    else
+        verify_rc=1
+    fi
+    if [ "$verify_rc" -eq 0 ]; then
         # The archive is good: from here the trap must not remove it, so OUT
         # is cleared BEFORE the rename — a signal between the two leaves a
         # complete .partial for the sweep, never a landed dump reported as
@@ -603,7 +620,7 @@ for DB in $DBS; do
         fi
     else
         rm -f "$OUT.partial"; OUT=""
-        [ "$dump_rc" -eq 143 ] || log "FAILED to back up ${DB} (pg_dump or the archive check failed)" >&2
+        [ "$dump_rc" -eq 143 ] || [ "$verify_rc" -eq 143 ] || log "FAILED to back up ${DB} (pg_dump or the archive check failed)" >&2
         FAILED="$FAILED $DB"
     fi
 done

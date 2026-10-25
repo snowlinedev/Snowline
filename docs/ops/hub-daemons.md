@@ -40,7 +40,11 @@ each of platform / pm / governance / memory:
    do that. Its outcome is printed, not folded into `install-daemons.sh`'s
    exit status, which is the deploy's own result (services and timer); it
    is called with `--deploy`, so a dump in progress is skipped rather than
-   waited on and the proof is bounded to ten minutes. It (re)loads `ops/hub/launchagents/dev.snowline.backup.plist`
+   waited on and the proof is bounded to ten minutes. (It is run as the
+   owner from a root process via `sudo -u`; should launchd refuse
+   `gui/501` management from there — "bootstrap ... refused (no session
+   for gui/501?)" — run `ops/hub/install-backup-agent.sh` from the owner's
+   own session instead, which is the primary path anyway.) It (re)loads `ops/hub/launchagents/dev.snowline.backup.plist`
    into `gui/501` only when the tracked plist differs from the one last
    confirmed loaded or the unit is not loaded (waiting first for a dump in
    progress); a unit that is loaded and current but whose last run exited

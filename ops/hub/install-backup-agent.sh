@@ -173,6 +173,15 @@ else
     never) action=reprove; why="this registration has never run (an earlier proof did not complete?)" ;;
     signal) action=reprove; why="last run ended by a signal (killed mid-dump?)" ;;
     78) action=reload; why="launchd could not spawn the program (EX_CONFIG) — a reload clears the penalty box" ;;
+    2) # "cannot run here": when the script refuses its configuration, a
+       # kickstart would only fail the same way — report the reason instead
+       dump_evidence 120
+       if [ "$EVIDENCE" = CONFIG_FAIL ]; then
+         echo "   the script refuses its configuration ($EVIDENCE_MSG) — every run exits 2 until it is fixed; nothing to reload or prove" >&2
+         fail=1; action=none
+       else
+         action=reprove; why="last run exited 2 (cannot run here: destination, lock or Postgres — see the log)"
+       fi ;;
     *) action=reprove; why="last run exited $UNIT_EXIT" ;;
   esac
   if [ "$action" = leave ]; then
