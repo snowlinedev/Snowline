@@ -96,15 +96,15 @@ on_exit() {
 trap on_exit EXIT
 # A SIGTERM/SIGINT/SIGHUP at ANY point (a bootout during the Postgres wait,
 # a logout, a shutdown, an ssh session dropping under a manual run) logs
-# itself; the child in flight (DUMP_PID: the catalog read, a dump or its
-# verification — bash runs a trap only once the foreground command
-# returns, so they run in the background and are waited for) is killed,
-# and a dump's partial removed. Armed here, before the first log
+# itself; the child in flight (RUN_BOUNDED_PID: the catalog read, a dump,
+# its verification or a folder walk — bash runs a trap only once the
+# foreground command returns, so they run in the background, under
+# run_bounded, and are waited for) is killed, and a dump's partial removed. Armed here, before the first log
 # line and the first fork, so a run never vanishes without a log line.
-OUT=""; DUMP_PID=""
+OUT=""; RUN_BOUNDED_PID=""
 DUMP_BOUND_S=1800   # per store; the largest store dumps in well under a minute today
 WALK_BOUND_S=600    # per folder walk (a stalled iCloud readdir must not hold the lock for ever)
-trap 'log "interrupted (SIGTERM/SIGINT/SIGHUP)${OUT:+; removing $OUT.partial}" >&6; [ -z "$DUMP_PID" ] || kill "$DUMP_PID" 2>/dev/null; [ -z "$OUT" ] || rm -f "$OUT.partial"; exit 143' TERM INT HUP
+trap 'log "interrupted (SIGTERM/SIGINT/SIGHUP)${OUT:+; removing $OUT.partial}" >&6; [ -z "$RUN_BOUNDED_PID" ] || kill "$RUN_BOUNDED_PID" 2>/dev/null; [ -z "$OUT" ] || rm -f "$OUT.partial"; exit 143' TERM INT HUP
 [ "$QUIET_EXIT" = yes ] || log "run start"   # the run's real start, for the installer
 CATALOG_ERR="$(mktemp -t snowline-backup-psql)" || die "cannot create a temp file (TMPDIR unwritable?)"
 CATALOG_OUT="$(mktemp -t snowline-backup-catalog)" || die "cannot create a temp file (TMPDIR unwritable?)"
@@ -141,11 +141,11 @@ if [ -f "$BACKUP_ENV" ]; then
     bash -n "$BACKUP_ENV" 2>/dev/null || die "cannot source $BACKUP_ENV: syntax error (bash -n); refusing to run half-configured"
     [ "$( ( set +u; . "$BACKUP_ENV" >/dev/null 2>&1; echo SOURCED ) 2>/dev/null )" = SOURCED ] \
         || die "cannot source $BACKUP_ENV: it exits when sourced (an exit line? set -e with a failing command?); refusing to run half-configured"
-    saved_opts="$(set +o)"
+    saved_opts="$(set +o)"; saved_ifs="$IFS"
     set -a; set +u   # +u: the file may reference variables this shell does not have
     # shellcheck disable=SC1090
     . "$BACKUP_ENV" >&2
-    eval "$saved_opts"
+    eval "$saved_opts"; IFS="$saved_ifs"   # (an IFS= line in the file must not reshape every word split below)
     # the environment's value wins — and says so when the file's lost (the
     # hub's pre-#319 agent plist exported SNOWLINE_BACKUP_DIR itself until
     # install-backup-agent.sh replaced it, which made a backup.env value look
@@ -435,10 +435,8 @@ CATALOG_OK=yes
 # hold the run — or the TERM trap — for ever) and backgrounded like the
 # dumps, so a bootout mid-read still gets its "run exit" line.
 PGCONNECT_TIMEOUT=15 PGOPTIONS='-c statement_timeout=30000' \
-    psql -X -At -d postgres -c "select datname, (datallowconn and has_database_privilege(datname, 'CONNECT')), (datname ~ '^[A-Za-z0-9_]+\$') from pg_database where not datistemplate and datname <> 'postgres' order by 1" > "$CATALOG_OUT" 2>"$CATALOG_ERR" 9>&- &
-DUMP_PID=$!
-wait "$DUMP_PID" || CATALOG_OK=no
-DUMP_PID=""
+    run_bounded 120 psql -X -At -d postgres -c "select datname, (datallowconn and has_database_privilege(datname, 'CONNECT')), (datname ~ '^[A-Za-z0-9_]+\$') from pg_database where not datistemplate and datname <> 'postgres' order by 1" > "$CATALOG_OUT" 2>"$CATALOG_ERR" \
+    || CATALOG_OK=no
 # One pass over the rows: the store rule (store_wanted) applied once per
 # name, connectable names to LIVE, the others to UNCONNECTABLE; a wanted
 # name that is not a plain identifier (a quoted name with a dash, say) is
@@ -570,15 +568,17 @@ prune_all || true
 # and a full destination frees itself — only THIS job's stores' staging
 # names (own_stale: Snowline's and the explicit list's, the pre-#319
 # local-time stamp included so the old script's last staging file goes
-# too): another job's staging file in a shared destination is left alone,
-# and not nagged about. And files outside the dump grammar
+# too): another job's staging file in a shared destination is left alone
+# when it follows the same grammar; anything else — an iCloud conflict
+# copy "NAME 2.partial", a foreign NAME.partial — is reported with the
+# other unrecognised names. And files outside the dump grammar
 # (an iCloud conflict copy "NAME 2.dump", a hand-made .bak) are neither
 # counted nor pruned: say so once a run, or the bounded folder grows
 # unbounded unnoticed.
 # (holding the lock, this run is the only one: every such file is an
 # orphan now, whatever its age)
 walk_bounded \( -type f \( "${own_stale[@]}" -o -name '.probe.*' -o -name '..probe.*.icloud' \) -delete \) \
-             -o \( -type f ! -name '*.partial' ! -name '.probe.*' ! -name '.*.partial.icloud' ! -name '..probe.*.icloud' ! -name '.DS_Store' -print \) || true
+             -o \( -type f ! -name '*-[0-9]*.dump.partial' ! -name '.probe.*' ! -name '.*-[0-9]*.dump.partial.icloud' ! -name '..probe.*.icloud' ! -name '.DS_Store' -print \) || true
 UNREC="$(while IFS= read -r uf; do parse_dump_name "$uf" || printf '%s\n' "${uf##*/}"; done < "$Z_LIST")"
 [ -s "$Z_DUMPS_ERR" ] && log "WARNING: the stale-file sweep in $DEST hit an error ($(tail -n 1 "$Z_DUMPS_ERR"))" >&2
 [ -z "$UNREC" ] || log "WARNING: $(printf '%s\n' "$UNREC" | wc -l | tr -d ' ') file(s) in $DEST outside the dump name grammar — neither counted nor pruned, tidy by hand: $(printf '%s\n' "$UNREC" | head -n 3 | tr '\n' ' ')" >&2
@@ -615,9 +615,10 @@ for DB in $DBS; do
         LANDED="$OUT"; OUT=""
         if mv "$LANDED.partial" "$LANDED"; then
             # Size is best-effort (an iCloud file can be evicted to a
-            # placeholder the instant it lands, making du error).
-            SIZE="$(run_bounded 60 du -h "$LANDED" 2>/dev/null | awk '{ print $1 }' || true)"
-            log "backed up ${DB} -> ${LANDED} (${SIZE:-size unknown})"
+            # placeholder the instant it lands, making the stat error); a
+            # stat, not a child: nothing here may stall unbounded.
+            SIZE="$(stat -f %z "$LANDED" 2>/dev/null || true)"
+            log "backed up ${DB} -> ${LANDED} (${SIZE:+$SIZE bytes}${SIZE:-size unknown})"
         else
             rm -f "$LANDED.partial"
             log "FAILED to back up ${DB} (the rename of its verified archive failed)" >&2

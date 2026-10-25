@@ -202,26 +202,28 @@ unit_busy_wait() {
 # of the caller must not hold it), bounded by ONE perl process that forks
 # it, waits with an alarm, and on the alarm kills it (TERM, then KILL) and
 # exits 124 — whatever the child does with SIGALRM itself. A TERM to the
-# perl is passed to the child (the caller's trap kills DUMP_PID). Returns
+# perl is passed to the child. Returns
 # the child's status (128+signal when it died by one), 124 on timeout, 127
-# when it could not be started. (A two-process shell watchdog raced its
-# parent on bash 3.2; the caller's own `wait` is still not interruptible
-# by a TERM landing between fork and wait — launchd's exit timeout and
-# process-group kill cover that short window.)
+# when it could not be started. While it runs RUN_BOUNDED_PID is the
+# perl's pid — the helper's one piece of state, for a caller's TERM trap
+# to kill. (A two-process shell watchdog raced its parent on bash 3.2; the
+# caller's own `wait` is still not interruptible by a TERM landing between
+# fork and wait — launchd's exit timeout and process-group kill cover that
+# short window.)
 run_bounded() {
   rb_bound="$1"; shift
   /usr/bin/perl -e '
     my $t = shift @ARGV;
     my $pid = fork; defined $pid or exit 127;
-    if (!$pid) { exec @ARGV or exit 127 }
+    if (!$pid) { exec { $ARGV[0] } @ARGV or exit 127 }   # (the block form: a one-word command is not handed to /bin/sh)
     $SIG{ALRM} = sub { kill TERM => $pid; sleep 2; kill KILL => $pid; waitpid($pid, 0); exit 124 };
     $SIG{TERM} = sub { kill TERM => $pid; waitpid($pid, 0); exit 143 };
     alarm $t; waitpid($pid, 0); my $s = $?;
     exit(($s & 127) ? 128 + ($s & 127) : $s >> 8);
   ' "$rb_bound" "$@" 9>&- &
-  DUMP_PID=$!
-  wait "$DUMP_PID" 2>/dev/null; rb_rc=$?
-  DUMP_PID=""
+  RUN_BOUNDED_PID=$!
+  wait "$RUN_BOUNDED_PID" 2>/dev/null; rb_rc=$?
+  RUN_BOUNDED_PID=""
   return "$rb_rc"
 }
 # timer_skip <name> <what> — when <name>'s lock is held (or cannot be
