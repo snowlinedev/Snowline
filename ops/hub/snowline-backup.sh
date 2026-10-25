@@ -256,7 +256,7 @@ case "$ARG1" in
         done <<EOF_Z
 $(z_dumps '*')
 EOF_Z
-        if [ -s "$Z_DUMPS_ERR" ]; then echo UNREADABLE; exit 2; fi
+        if [ -s "$Z_DUMPS_ERR" ]; then tail -n 1 "$Z_DUMPS_ERR" >&2; echo UNREADABLE; exit 2; fi   # the reason, for the installer
         [ "$found" = yes ] && { echo OK; exit 0; }
         echo NONE; exit 1
         ;;
@@ -274,7 +274,7 @@ esac
 # one holds the lock (a manual or proving run racing the hourly fire) steps aside with
 # exit 3, which install-backup-agent.sh never mistakes for "dumps landed"; any
 # other flock error (an fs without flock, a bad fd) is exit 2.
-mkdir -p "$(dirname "$BACKUP_LOCK")"
+mkdir -p "$(dirname "$BACKUP_LOCK")" || die "cannot create $(dirname "$BACKUP_LOCK") for the run lock"
 exec 9>>"$BACKUP_LOCK" || die "cannot open the run lock $BACKUP_LOCK (root-owned from a sudo run?); fix its ownership"
 # flock_fd (lib.sh) flocks the inherited fd 9 in place, so the lock
 # outlives the helper; five tries a second apart, because a lock_state probe
@@ -434,6 +434,11 @@ prune_all() {
 # stamp in the NAME, a placeholder's mtime being eviction time). Non-fatal:
 # a find hiccup must not fail the run.
 prune_all || true
+# A .partial older than two hours belongs to a run that died without its
+# trap (SIGKILL, power loss): no live run owns it (a run is bounded well
+# inside an hour), so it is swept here, before the dumps, and a full
+# destination frees itself.
+find "$DEST" -maxdepth 1 -name '*.partial' -type f -mmin +120 -delete 2>/dev/null || true
 set -f
 for DB in $DBS; do
     set +f
@@ -468,9 +473,6 @@ for DB in $DBS; do
 done
 set +f
 
-
-# Stale .partial leftovers from any store.
-find "$DEST" -maxdepth 1 -name '*.partial' -type f -mtime +1 -delete || true
 
 # One summary line per run — what install-backup-agent.sh reads back when
 # it cannot see the destination itself.

@@ -72,10 +72,13 @@ dest="$(query --print-dest 2>/dev/null)" || dest="(unknown: --print-dest failed)
 dump_evidence() {
   de_err="$(mktemp -t snowline-install-check)"
   de_out="$(query --check "$1" 2>"$de_err")"; de_rc=$?
-  EVIDENCE_MSG="$(tail -n 1 "$de_err")"; rm -f "$de_err"
+  # (the last stderr line, without the script's own stamp)
+  EVIDENCE_MSG="$(tail -n 1 "$de_err" | sed 's/^[0-9][0-9-]*T[0-9:]*Z //')"; rm -f "$de_err"
   case $de_rc in
     0) EVIDENCE=OK; return ;;
     1) EVIDENCE=NONE; return ;;
+    2) ;;
+    *) EVIDENCE=UNKNOWN; EVIDENCE_MSG="--check could not run (exit $de_rc${EVIDENCE_MSG:+: $EVIDENCE_MSG})"; return ;;
   esac
   # exit 2 is either "destination unreadable from here" (the script says
   # UNREADABLE on stdout) or the script REFUSING its configuration (a die
@@ -204,10 +207,13 @@ prove_run() {
     # that could credit an older run's dumps to this one
     echo "   a run is already in flight; judging that one"
     runs_before=$((UNIT_RUNS - 1))
-    # (one pass over the log for both stamps; a log with neither — just
-    # created or rotated — gives a window of 15 min, longer than any run,
-    # since the run's dumps are necessarily older than "now")
-    started="$(log_lines_since 0 | awk '$2 == "run" && $3 == "start" { s = $1 } $2 == "run" && $3 == "exit" { e = $1 } END { print (s != "" ? s : e) }')"
+    # (one pass over the log's tail for both stamps: this run's start is a
+    # "run start" NEWER than the last "run exit"; an older one is the
+    # previous run's — this run spawned an instant ago and has not written
+    # its own yet — and a log with no usable stamp gives a window of 15 min,
+    # longer than any run, since the run's dumps are necessarily older than
+    # "now")
+    started="$(tail -n 500 "$log_file" 2>/dev/null | awk '$2 == "run" && $3 == "start" { s = $1 } $2 == "run" && $3 == "exit" { e = $1 } END { print (s > e ? s : "") }')"
     started_epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$started" +%s 2>/dev/null)" || started_epoch=""
     if [ -n "$started" ] && [ -n "$started_epoch" ]; then run_stamp="$started"; run_epoch="$started_epoch"; else run_epoch=$((run_epoch - 900)); run_stamp="$(date -u -v-15M +%FT%TZ)"; fi
   else
