@@ -116,10 +116,14 @@ if [ -f "$BACKUP_ENV" ]; then
     # Not under `set -a`, so an unexported PGHOST there stays local to this
     # shell; and with stdout sent to stderr, so a stray echo cannot corrupt
     # the --print-dest / --check protocol the installer parses.
+    # shell options are restored afterwards: a `set -e` in the file would
+    # otherwise turn a step-aside into exit 1 and a failed store into an
+    # aborted run
+    saved_opts="$(set +o)"
     set +u   # the file may reference variables this shell does not have
     # shellcheck disable=SC1090
     . "$BACKUP_ENV" >&2 || die "cannot source $BACKUP_ENV (syntax error?); refusing to run half-configured"
-    set -u
+    eval "$saved_opts"
     # the environment's value wins — and says so when the file's lost (the
     # hub's pre-#319 agent plist exported SNOWLINE_BACKUP_DIR itself until
     # install-backup-agent.sh replaced it, which made a backup.env value look
@@ -150,10 +154,14 @@ case "$RETENTION_DAYS" in ''|*[!0-9]*) die "SNOWLINE_BACKUP_RETENTION_DAYS must 
 # name. (The pre-#319 names lack the Z and are local time — a few hours
 # off, which the 30-day retention does not care about.) A bash regex: no
 # fork per file.
-DUMP_NAME_RE='^(.*/)?\.?([A-Za-z0-9_]+)-([0-9]{8}-[0-9]{6})Z?\.dump(\.icloud)?$'
+DUMP_NAME_RE='^(.*/)?(\.)?([A-Za-z0-9_]+)-([0-9]{8}-[0-9]{6})Z?\.dump(\.icloud)?$'
 parse_dump_name() {
     [[ $1 =~ $DUMP_NAME_RE ]] || return 1
-    NAME_STORE="${BASH_REMATCH[2]}"; NAME_STAMP="${BASH_REMATCH[3]}"
+    # a dump is NAME.dump; its evicted placeholder is .NAME.dump.icloud —
+    # a hidden .dump or a visible .icloud is neither (a hand-made copy, an
+    # editor backup) and must not count as evidence or toward the kept three
+    { [ -n "${BASH_REMATCH[2]}" ] && [ -n "${BASH_REMATCH[5]}" ]; } || { [ -z "${BASH_REMATCH[2]}" ] && [ -z "${BASH_REMATCH[5]}" ]; } || return 1
+    NAME_STORE="${BASH_REMATCH[3]}"; NAME_STAMP="${BASH_REMATCH[4]}"
 }
 # z_dumps [all] — one "<store>\t<stamp>\t<path>" line per dump or
 # placeholder in DEST, every store: Z-named
@@ -225,7 +233,9 @@ dest_state() {
     # login session is not denied) is unreadable whether or not the root
     # above it happens to be visible; only a path that is NOT THERE is then
     # a leaf to create (under a present iCloud root) or missing
-    case "$(LC_ALL=C ls -d "$DEST" 2>&1 >/dev/null)" in
+    # (the trailing slash makes ls follow a symlinked destination to its
+    # target, whose errno is the one that matters)
+    case "$(LC_ALL=C ls -d "$DEST/" 2>&1 >/dev/null)" in
         *"Operation not permitted"*|*"Permission denied"*) echo unreadable; return ;;   # EPERM (TCC) or EACCES
     esac
     # something that is not a directory in the way (a file, a dangling

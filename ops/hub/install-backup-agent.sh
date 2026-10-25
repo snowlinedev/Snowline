@@ -79,8 +79,8 @@ dump_evidence() {
   # (the last stderr line, without the script's own stamp)
   EVIDENCE_MSG="$(tail -n 1 "$de_err" | strip_stamp)"; rm -f "$de_err"
   case $de_rc in
-    0) EVIDENCE=OK; return ;;
-    1) EVIDENCE=NONE; return ;;
+    0) EVIDENCE=OK; EVIDENCE_MSG=""; return ;;    # (no reason to carry: stderr here is backup.env's chatter at most)
+    1) EVIDENCE=NONE; EVIDENCE_MSG=""; return ;;
     2) ;;
     *) EVIDENCE=UNKNOWN; EVIDENCE_MSG="--check could not run (exit $de_rc${EVIDENCE_MSG:+: $EVIDENCE_MSG})"; return ;;
   esac
@@ -250,7 +250,12 @@ prove_run() {
     unit_snapshot "$domain/$label" || { gone=yes; break; }   # unit gone
     [ "$UNIT_RUNNING" = yes ] && spawned=yes
     if [ "$UNIT_RUNNING" = no ] && [ "$UNIT_RUNS" -gt "$runs_before" ]; then
-      code="$UNIT_EXIT"; break
+      # (debounced: launchd can bump runs an instant before the state line
+      # says running, which would hand back the PREVIOUS run's exit code)
+      sleep 1
+      unit_snapshot "$domain/$label" || { gone=yes; break; }
+      [ "$UNIT_RUNNING" = no ] && { code="$UNIT_EXIT"; break; }
+      spawned=yes
     fi
     # a kickstart that launchd accepted but could not spawn (EX_CONFIG:
     # the program vanished) never increments runs: give up after a minute
