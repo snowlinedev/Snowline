@@ -83,17 +83,20 @@ die() { log "$*" >&2; exit 2; }
 CATALOG_ERR=""; Z_DUMPS_ERR=""; PROBE=""   # temp files, set below; removed on every exit
 on_exit() {
     oe_rc=$?
-    rm -f ${CATALOG_ERR:+"$CATALOG_ERR"} ${Z_DUMPS_ERR:+"$Z_DUMPS_ERR"} ${PROBE:+"$PROBE"}
+    rm -f ${CATALOG_ERR:+"$CATALOG_ERR"} ${CATALOG_OUT:+"$CATALOG_OUT"} ${Z_DUMPS_ERR:+"$Z_DUMPS_ERR"} ${PROBE:+"$PROBE"}
     [ "$QUIET_EXIT" = yes ] || log "run exit $oe_rc"
 }
 trap on_exit EXIT
 [ "$QUIET_EXIT" = yes ] || log "run start"   # the run's real start, for the installer
 CATALOG_ERR="$(mktemp -t snowline-backup-psql)" || die "cannot create a temp file (TMPDIR unwritable?)"
+CATALOG_OUT="$(mktemp -t snowline-backup-catalog)" || die "cannot create a temp file (TMPDIR unwritable?)"
 Z_DUMPS_ERR="$(mktemp -t snowline-backup-find)" || die "cannot create a temp file (TMPDIR unwritable?)"
 # A SIGTERM/SIGINT at ANY point (a bootout during the Postgres wait, a
-# logout, a shutdown) logs itself; once a dump is in flight (OUT/DUMP_PID
-# set below) it is killed and its partial removed. Armed here, not just
-# around the dump loop, so a run never vanishes without a log line.
+# logout, a shutdown) logs itself; the child in flight (DUMP_PID: the
+# catalog read or a dump — bash runs a trap only once the foreground
+# command returns, so both run in the background and are waited for) is
+# killed, and a dump's partial removed. Armed here, not just around the
+# dump loop, so a run never vanishes without a log line.
 OUT=""; DUMP_PID=""
 trap 'log "interrupted (SIGTERM/SIGINT)${OUT:+; removing $OUT.partial}" >&2; [ -z "$DUMP_PID" ] || kill "$DUMP_PID" 2>/dev/null; [ -z "$OUT" ] || rm -f "$OUT.partial"; exit 143' TERM INT
 # Operator overrides live in ~/.config/snowline/backup.env (optional; sourced
@@ -191,11 +194,13 @@ store_wanted() {
 # nothing at all, and a trailing slash in an override would put `//` in
 # every dump path.
 canon_dest() {
-    DEST="$(cd "$DEST" 2>/dev/null && pwd -P)" && [ -n "$DEST" ] || die "cannot resolve the backup destination's real path"
+    cd_real="$(cd "$DEST" 2>/dev/null && pwd -P)" && [ -n "$cd_real" ] || die "cannot enter the backup destination $DEST (no execute permission on it?)"
+    DEST="$cd_real"
 }
 # dest_state — the ONE destination rule, for --check and the run alike:
 # prints ok (exists), no-leaf (absent, but under a present iCloud root: may
-# be created), or missing (iCloud root absent, or a non-iCloud destination
+# be created), unreadable (this context is denied the stat), not-dir (a
+# file or dangling symlink in the way), or missing (iCloud root absent, or a non-iCloud destination
 # that is not there — never created here: a destination that is itself a
 # mount point would otherwise be silently recreated as a plain local
 # directory while the disk is unplugged).
@@ -209,6 +214,9 @@ dest_state() {
     case "$(ls -d "$DEST" 2>&1 >/dev/null)" in
         *"Operation not permitted"*|*"Permission denied"*) echo unreadable; return ;;   # EPERM (TCC) or EACCES
     esac
+    # something that is not a directory in the way (a file, a dangling
+    # symlink after a volume rename) is neither absent nor creatable
+    if [ -e "$DEST" ] || [ -L "$DEST" ]; then echo not-dir; return; fi
     case "$DEST" in
         "$ICLOUD_ROOT"/*) [ -d "$ICLOUD_ROOT" ] && { echo no-leaf; return; } ;;
     esac
@@ -249,7 +257,8 @@ case "$ARG1" in
             ok) canon_dest ;;
             no-leaf) echo NONE; exit 1 ;;
             unreadable) echo "stat of $DEST denied in this context (Full Disk Access?)" >&2; echo UNREADABLE; exit 2 ;;
-            *) echo MISSING; exit 2 ;;
+            not-dir) echo "$DEST exists but is not a directory (a file or a dangling symlink in the way)" >&2; echo MISSING; exit 2 ;;
+            *) echo "$DEST is missing (volume unplugged? iCloud Drive signed out?)" >&2; echo MISSING; exit 2 ;;
         esac
         # (a cutoff that cannot be computed is a refused argument — a die,
         # nothing on stdout — not "the destination is unreadable")
@@ -320,6 +329,7 @@ case "$(dest_state)" in
     ok) canon_dest ;;
     no-leaf) mkdir -p "$DEST" || die "cannot create backup destination: $DEST"; canon_dest ;;
     unreadable) die "backup destination cannot be reached from this context: $DEST (stat denied — Full Disk Access / iCloud Drive consent for this session?)" ;;
+    not-dir) die "backup destination exists but is not a directory: $DEST (a file or a dangling symlink in the way)" ;;
     *) die "backup destination missing: $DEST (iCloud Drive root absent, or a volume not mounted — it is never created by this script)" ;;
 esac
 # A real create, not `[ -w ]`: access(2) does not see a TCC denial (a
@@ -328,7 +338,8 @@ esac
 PROBE="$DEST/.probe.$$"
 ( : > "$PROBE" ) 2>/dev/null || die "backup destination not writable: $DEST (TCC consent? full or read-only volume?)"
 rm -f "$PROBE"; PROBE=""
-# Owner-only posture for the folder and for every dump in it: new dumps are
+# Owner-only posture for the folder and for Snowline's dumps in it (another
+# project's files in a shared destination are not this job's): new dumps are
 # written under umask 077; older ones (0644 before this script enforced it)
 # and dumps that iCloud re-materialises are tightened each run. (This walk,
 # the prune's and the sweep's each stat every entry: at steady state
@@ -338,7 +349,7 @@ rm -f "$PROBE"; PROBE=""
 chmod 700 "$DEST" 2>/dev/null || log "WARNING: could not chmod 700 $DEST" >&2
 # (`-exec … {} +` runs nothing when nothing matches: one walk, no chmod
 # unless a loose file exists)
-find "$DEST" -maxdepth 1 -name '*.dump' -type f -perm +044 -exec chmod 600 {} + 2>/dev/null \
+find "$DEST" -maxdepth 1 -name 'snowline_*.dump' -type f -perm +044 -exec chmod 600 {} + 2>/dev/null \
     || log "WARNING: could not tighten permissions on existing dumps in $DEST" >&2
 
 # --- wait for Postgres (bounded; see lib.sh) ---
@@ -356,7 +367,15 @@ CATALOG_OK=yes
 # that is parked (datallowconn = false) or lost CONNECT is NAMED in the log,
 # never silently dropped from the backup set: the query returns
 # "<name>|<connectable>" and the unconnectable ones are reported below.
-CATALOG_ROWS="$(psql -X -At -d postgres -c "select datname, (datallowconn and has_database_privilege(datname, 'CONNECT')) from pg_database where not datistemplate and datname <> 'postgres' and datname ~ '^[A-Za-z0-9_]+\$' order by 1" 2>"$CATALOG_ERR")" || CATALOG_OK=no
+# Bounded (a server that accepts connections but stalls the query must not
+# hold the run — or the TERM trap — for ever) and backgrounded like the
+# dumps, so a bootout mid-read still gets its "run exit" line.
+PGCONNECT_TIMEOUT=15 PGOPTIONS='-c statement_timeout=30000' \
+    psql -X -At -d postgres -c "select datname, (datallowconn and has_database_privilege(datname, 'CONNECT')) from pg_database where not datistemplate and datname <> 'postgres' and datname ~ '^[A-Za-z0-9_]+\$' order by 1" > "$CATALOG_OUT" 2>"$CATALOG_ERR" &
+DUMP_PID=$!
+wait "$DUMP_PID" || CATALOG_OK=no
+DUMP_PID=""
+CATALOG_ROWS="$(cat "$CATALOG_OUT")"
 # One pass over the rows: the store rule (store_wanted) applied once per
 # name, connectable names to LIVE, the others to UNCONNECTABLE.
 LIVE=""; UNCONNECTABLE=""
@@ -440,12 +459,15 @@ prune_all() {
     # SCRATCH_RE, which spares the legacy snowline_dev history) or a name on
     # the explicit list — and no other: a scratch store's dumps or another
     # project's in a shared destination are not this job's to prune
-    z_dumps '*' all | sort -t "$TAB" -k1,1 -k2,2r \
+    PRUNE_STUCK="$(z_dumps '*' all | sort -t "$TAB" -k1,1 -k2,2r \
     | awk -F"$TAB" -v cutoff="$PRUNE_CUTOFF" -v keep="$KEEP_MIN" -v re="$STORE_RE" -v scratch="$SCRATCH_RE" -v explicit=" $DBS_EXPLICIT " '
         index(explicit, " " $1 " ") == 0 && ($1 !~ re || $1 ~ scratch) { next }
         $1 != store { store = $1; n = 0 }
         { n++; if (n > keep && $2 < cutoff) print $3 }' \
-    | while IFS= read -r pa_f; do rm -f "$pa_f"; done
+    | while IFS= read -r pa_f; do rm -f "$pa_f" 2>/dev/null || printf '%s\n' "${pa_f##*/}"; done)"
+    # (a dump this user cannot remove — root-owned from a sudo run — would
+    # otherwise sit there unpruned and unmentioned for ever)
+    [ -z "$PRUNE_STUCK" ] || log "WARNING: could not remove $(printf '%s\n' "$PRUNE_STUCK" | wc -l | tr -d ' ') expired dump(s) in $DEST (owned by another user? a sudo run?) — remove by hand: $(printf '%s\n' "$PRUNE_STUCK" | head -n 3 | tr '\n' ' ')" >&2
     return 0
 }
 # bash runs a trap only once the foreground command returns, so pg_dump is
@@ -457,16 +479,18 @@ prune_all() {
 # stamp in the NAME, a placeholder's mtime being eviction time). Non-fatal:
 # a find hiccup must not fail the run.
 prune_all || true
-# One more walk for two things. A .partial (or a write probe) older than
-# two hours belongs to a run that died without its trap (SIGKILL, power
-# loss): no live run owns it (a run is bounded well inside an hour), so it
-# is swept here, before the dumps, and a full destination frees itself. And files outside the
-# dump grammar (an iCloud conflict copy "NAME 2.dump", a hand-made .bak)
-# are neither counted nor pruned: say so once a run, or the bounded folder
-# grows unbounded unnoticed.
-UNREC="$(find "$DEST" -maxdepth 1 \( -type f \( -name '*.partial' -o -name '.probe.*' \) -mmin +120 -delete \) \
-             -o \( -type f ! -name '*.partial' ! -name '.probe.*' ! -name '.DS_Store' -print \) 2>/dev/null \
+# One more walk for two things. A .partial (or a write probe, or iCloud's
+# evicted placeholder of either) older than two hours belongs to a run that
+# died without its trap (SIGKILL, power loss): no live run owns it (a run
+# is bounded well inside an hour), so it is swept here, before the dumps,
+# and a full destination frees itself. And files outside the dump grammar
+# (an iCloud conflict copy "NAME 2.dump", a hand-made .bak) are neither
+# counted nor pruned: say so once a run, or the bounded folder grows
+# unbounded unnoticed.
+UNREC="$(find "$DEST" -maxdepth 1 \( -type f \( -name '*.partial' -o -name '.probe.*' -o -name '.*.partial.icloud' -o -name '..probe.*.icloud' \) -mmin +120 -delete \) \
+             -o \( -type f ! -name '*.partial' ! -name '.probe.*' ! -name '.*.partial.icloud' ! -name '..probe.*.icloud' ! -name '.DS_Store' -print \) 2>"$Z_DUMPS_ERR" \
     | while IFS= read -r uf; do parse_dump_name "$uf" || printf '%s\n' "${uf##*/}"; done)"
+[ -s "$Z_DUMPS_ERR" ] && log "WARNING: the stale-file sweep in $DEST hit an error ($(tail -n 1 "$Z_DUMPS_ERR"))" >&2
 [ -z "$UNREC" ] || log "WARNING: $(printf '%s\n' "$UNREC" | wc -l | tr -d ' ') file(s) in $DEST outside the dump name grammar — neither counted nor pruned, tidy by hand: $(printf '%s\n' "$UNREC" | head -n 3 | tr '\n' ' ')" >&2
 set -f
 for DB in $DBS; do

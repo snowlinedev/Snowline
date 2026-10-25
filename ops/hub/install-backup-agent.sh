@@ -89,7 +89,7 @@ dump_evidence() {
   # on stderr, nothing on stdout) — the latter is a failure of the unit
   # itself, never a reason to fall back to old log evidence
   if [ "$de_out" = MISSING ]; then
-    EVIDENCE=CONFIG_FAIL; EVIDENCE_MSG="destination missing: $dest (volume unplugged? iCloud root gone?) — every run exits 2"
+    EVIDENCE=CONFIG_FAIL; EVIDENCE_MSG="destination not usable: ${EVIDENCE_MSG:-$dest is missing} — every run exits 2"
     return
   fi
   if [ "$de_out" != UNREADABLE ]; then
@@ -104,13 +104,14 @@ dump_evidence() {
     *)    EVIDENCE=UNKNOWN ;;
   esac
 }
-# log_verdict <since-stamp> — sets LOGSAYS to OK / FAIL / NONE from the
+# log_verdict <since-stamp> — sets LOGSAYS to OK / FAIL / NONE / OPEN from the
 # agent's own log since <since-stamp>: the script's EXIT trap writes one
 # machine-readable "run exit <code>" line per run, whatever the path. The
 # LAST such line is the verdict (0 = OK; 3, a step-aside, is not a verdict
 # at all and the line before it is consulted; anything else = FAIL), so an
 # old failure cannot outrank a later clean run and a run cut short by
-# SIGKILL (no line) is NONE, not OK.
+# SIGKILL (no line) is NONE, not OK — or OPEN when its "run start" is the
+# last marker (never ended: in flight, or killed).
 # log_lines_since <stamp> — the agent's own stamped log lines at or after
 # <stamp> (pg_dump's unstamped stderr shares the file and is dropped): the
 # ONE reader of the log format, for log_verdict and the in-flight start.
@@ -121,6 +122,12 @@ log_lines_since() {
 strip_stamp() { sed -E "s/${LOG_STAMP_RE%\$} //"; }
 log_verdict() {
   LOGSAYS=NONE
+  # a "run start" with no "run exit" after it is a run that never ended:
+  # in flight now, or killed (SIGKILL, launchd's exit timeout) — launchctl's
+  # exit-code rendering is not relied on for that
+  if [ "$(log_lines_since "$1" | awk '$2 == "run" && ($3 == "start" || $3 == "exit") { l = $3 } END { print l }')" = start ]; then
+    LOGSAYS=OPEN; return
+  fi
   for lv_code in $(log_lines_since "$1" | awk '$2 == "run" && $3 == "exit" { print $4 }' | tail -r); do
     case "$lv_code" in
       3) continue ;;
@@ -165,6 +172,8 @@ else
     dump_evidence 120
     case "$EVIDENCE:$LOGSAYS" in
       CONFIG_FAIL:*)   echo "   the script refuses its configuration ($EVIDENCE_MSG) — every run will exit 2 until it is fixed; nothing to reload or prove" >&2; fail=1 ;;
+      *:OPEN) if [ "$UNIT_RUNNING" = yes ]; then echo "   unchanged, confirmed loaded, a run is in flight now; left as it is"
+              else action=reprove; why="the unit's last run began and never ended (killed mid-dump?)"; fi ;;
       OK:OK|LOG_OK:OK) echo "   unchanged, confirmed loaded, the unit dumped within 2 h; left as it is" ;;
       OK:NONE)         action=reprove; why="a dump landed within 2 h but the unit's log shows no run (a manual dump? the unit not firing?)" ;;
       NONE:*)          action=reprove; why="no dump in the last 2 h in $dest" ;;
@@ -213,13 +222,13 @@ prove_run() {
     # that could credit an older run's dumps to this one
     echo "   a run is already in flight; judging that one"
     runs_before=$((UNIT_RUNS - 1))
-    # (one pass over the log's tail for both stamps: this run's start is a
+    # (one pass over the log's stamped lines for both stamps: this run's start is a
     # "run start" NEWER than the last "run exit"; an older one is the
     # previous run's — this run spawned an instant ago and has not written
     # its own yet — and a log with no usable stamp gives a window of 15 min,
     # longer than any run, since the run's dumps are necessarily older than
     # "now")
-    started="$(tail -n 500 "$log_file" 2>/dev/null | awk '$2 == "run" && $3 == "start" { s = $1 } $2 == "run" && $3 == "exit" { e = $1 } END { print (s > e ? s : "") }')"
+    started="$(log_lines_since 0 | awk '$2 == "run" && $3 == "start" { s = $1 } $2 == "run" && $3 == "exit" { e = $1 } END { print (s > e ? s : "") }')"
     started_epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$started" +%s 2>/dev/null)" || started_epoch=""
     if [ -n "$started" ] && [ -n "$started_epoch" ]; then run_stamp="$started"; run_epoch="$started_epoch"; else run_epoch=$((run_epoch - 900)); run_stamp="$(date -u -v-15M +%FT%TZ)"; fi
   else
