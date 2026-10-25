@@ -197,7 +197,13 @@ dest_state() {
     case "$DEST" in
         "$ICLOUD_ROOT"/*) [ -d "$ICLOUD_ROOT" ] && { echo no-leaf; return; } ;;
     esac
-    echo missing
+    # the errno tells a path that is not there from one this context is
+    # DENIED the stat of (TCC: ssh without Full Disk Access under the iCloud
+    # root — the agent in its login session is not denied)
+    case "$(ls -d "$DEST" 2>&1 >/dev/null)" in
+        *"Operation not permitted"*) echo unreadable ;;
+        *) echo missing ;;
+    esac
 }
 
 # Queries install-backup-agent.sh makes by running this script AS THE OWNER
@@ -227,19 +233,14 @@ case "$ARG1" in
         case "$mins" in ''|*[!0-9]*) echo "--check needs a number of minutes" >&2; exit 2 ;; esac
         # Same destination rule as a run (dest_state): a leaf that does not
         # exist yet under a present iCloud root is "no dump yet" (NONE); a
-        # missing root or non-iCloud destination is "cannot run here".
-        # (under the iCloud root the errno decides: this caller's context
-        # may be DENIED the stat — ssh without Full Disk Access, which the
-        # agent in its login session is not — and that is UNREADABLE, to be
-        # judged from the log; a path that is not there at all — iCloud
-        # Drive signed out — is MISSING, like any other absent destination)
+        # denied stat is UNREADABLE (to be judged from the log: the agent in
+        # its login session is not denied); a path that is not there — iCloud
+        # Drive signed out, a volume unplugged — is MISSING.
         case "$(dest_state)" in
             ok) ;;
             no-leaf) echo NONE; exit 1 ;;
-            *) case "$(ls -d "$DEST" 2>&1 >/dev/null)" in
-                   *"Operation not permitted"*) echo UNREADABLE ;;
-                   *) echo MISSING ;;
-               esac; exit 2 ;;
+            unreadable) echo "stat of $DEST denied in this context (Full Disk Access?)" >&2; echo UNREADABLE; exit 2 ;;
+            *) echo MISSING; exit 2 ;;
         esac
         # (a cutoff that cannot be computed is a refused argument — a die,
         # nothing on stdout — not "the destination is unreadable")
@@ -260,8 +261,11 @@ case "$ARG1" in
         done <<EOF_Z
 $(z_dumps '*')
 EOF_Z
-        if [ -s "$Z_DUMPS_ERR" ]; then tail -n 1 "$Z_DUMPS_ERR" >&2; echo UNREADABLE; exit 2; fi   # the reason, for the installer
+        # (a dump found is evidence whatever else find tripped over — an
+        # entry iCloud evicted between readdir and stat; only an EMPTY
+        # listing with errors is "cannot read from here")
         [ "$found" = yes ] && { echo OK; exit 0; }
+        if [ -s "$Z_DUMPS_ERR" ]; then tail -n 1 "$Z_DUMPS_ERR" >&2; echo UNREADABLE; exit 2; fi   # the reason, for the installer
         echo NONE; exit 1
         ;;
     "") [ "$ARGC" -eq 0 ] || die "an empty argument is not a run (this script takes no arguments except --print-dest and --check <minutes>); refusing to run" ;;
@@ -306,6 +310,7 @@ esac
 case "$(dest_state)" in
     ok) ;;
     no-leaf) mkdir -p "$DEST" || die "cannot create backup destination: $DEST" ;;
+    unreadable) die "backup destination cannot be reached from this context: $DEST (stat denied — Full Disk Access / iCloud Drive consent for this session?)" ;;
     *) die "backup destination missing: $DEST (iCloud Drive root absent, or a volume not mounted — it is never created by this script)" ;;
 esac
 # A real create, not `[ -w ]`: access(2) does not see a TCC denial (a
@@ -317,10 +322,10 @@ rm -f "$PROBE"; PROBE=""
 # Owner-only posture for the folder and for every dump in it: new dumps are
 # written under umask 077; older ones (0644 before this script enforced it)
 # and dumps that iCloud re-materialises are tightened each run. (This walk,
-# the prune's and the .partial sweep's each stat every entry: at steady
-# state ~4,300 files, so some 13,000 stats an hour — fine for a local
-# folder, worth knowing before adding a fourth.) Best effort on an iCloud
-# folder, but say so.
+# the prune's and the sweep's each stat every entry: at steady state
+# ~4,300 files, so some 13,000 stats an hour — fine for a local folder,
+# worth knowing before adding a fourth.) Best effort on an iCloud folder,
+# but say so.
 chmod 700 "$DEST" 2>/dev/null || log "WARNING: could not chmod 700 $DEST" >&2
 # (`-exec … {} +` runs nothing when nothing matches: one walk, no chmod
 # unless a loose file exists)
@@ -422,11 +427,12 @@ PRUNE_CUTOFF="$(date -u -v-"${RETENTION_DAYS}"d +%Y%m%d-%H%M%S 2>/dev/null)" || 
 KEEP_MIN=3
 prune_all() {
     [ -n "$PRUNE_CUTOFF" ] || return 0   # no cutoff, no pruning (never over-delete; warned above)
-    # only Snowline's own stores (STORE_RE): a destination shared with
-    # another project's dumps is not this job's to prune
+    # the stores this job may dump — Snowline's own (STORE_RE) and any the
+    # explicit list names — and no other: a destination shared with another
+    # project's dumps is not this job's to prune
     z_dumps '*' all | sort -t "$TAB" -k1,1 -k2,2r \
-    | awk -F"$TAB" -v cutoff="$PRUNE_CUTOFF" -v keep="$KEEP_MIN" -v re="$STORE_RE" '
-        $1 !~ re || $1 == "snowline_dev" { next }
+    | awk -F"$TAB" -v cutoff="$PRUNE_CUTOFF" -v keep="$KEEP_MIN" -v re="$STORE_RE" -v explicit=" $DBS_EXPLICIT " '
+        ($1 !~ re && index(explicit, " " $1 " ") == 0) || $1 == "snowline_dev" { next }
         $1 != store { store = $1; n = 0 }
         { n++; if (n > keep && $2 < cutoff) print $3 }' \
     | while IFS= read -r pa_f; do rm -f "$pa_f"; done
@@ -441,15 +447,15 @@ prune_all() {
 # stamp in the NAME, a placeholder's mtime being eviction time). Non-fatal:
 # a find hiccup must not fail the run.
 prune_all || true
-# A .partial older than two hours belongs to a run that died without its
-# trap (SIGKILL, power loss): no live run owns it (a run is bounded well
-# inside an hour), so it is swept here, before the dumps, and a full
-# destination frees itself.
-find "$DEST" -maxdepth 1 -name '*.partial' -type f -mmin +120 -delete 2>/dev/null || true
-# Files outside the dump grammar (an iCloud conflict copy "NAME 2.dump", a
-# hand-made .bak) are neither counted nor pruned: say so once a run, or the
-# bounded folder grows unbounded unnoticed.
-UNREC="$(find "$DEST" -maxdepth 1 -type f ! -name '*.partial' ! -name '.DS_Store' 2>/dev/null \
+# One more walk for two things. A .partial older than two hours belongs to
+# a run that died without its trap (SIGKILL, power loss): no live run owns
+# it (a run is bounded well inside an hour), so it is swept here, before
+# the dumps, and a full destination frees itself. And files outside the
+# dump grammar (an iCloud conflict copy "NAME 2.dump", a hand-made .bak)
+# are neither counted nor pruned: say so once a run, or the bounded folder
+# grows unbounded unnoticed.
+UNREC="$(find "$DEST" -maxdepth 1 \( -type f -name '*.partial' -mmin +120 -delete \) \
+             -o \( -type f ! -name '*.partial' ! -name '.DS_Store' -print \) 2>/dev/null \
     | while IFS= read -r uf; do parse_dump_name "$uf" || printf '%s\n' "${uf##*/}"; done)"
 [ -z "$UNREC" ] || log "WARNING: $(printf '%s\n' "$UNREC" | wc -l | tr -d ' ') file(s) in $DEST outside the dump name grammar — neither counted nor pruned, tidy by hand: $(printf '%s\n' "$UNREC" | head -n 3 | tr '\n' ' ')" >&2
 set -f

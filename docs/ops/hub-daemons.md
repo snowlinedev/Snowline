@@ -58,8 +58,9 @@ each of platform / pm / governance / memory:
    plist. It stays a per-user agent on purpose ("DB backups" below).
 7. If step 6 (re)loaded the backup agent, the installer proves it by firing one run
    through launchd (`kickstart`, so it runs in the agent's own session) and
-   fails the install unless that run exited 0 AND a dump newer than it was
-   confirmed — in the destination, or, when the install's own context
+   fails `install-backup-agent.sh` (reported by `install-daemons.sh`, whose
+   own exit status it does not change) unless that run exited 0 AND a dump
+   newer than it was confirmed — in the destination, or, when the install's own context
    cannot read it (ssh without Full Disk Access), in the agent's log lines
    for the run. An
    exit 3 (a manual run held the lock; launchd runs one instance per label,

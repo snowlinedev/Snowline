@@ -160,22 +160,22 @@ lock_held() { [ "$(lock_state "$1")" != free ]; }
 # caller then skips the unit rather than killing a run) or if the lock
 # cannot be probed. A bound of 0 is a plain check.
 unit_busy_wait() {
-  lock="$LOCKS_DIR/$1.lock"
-  bound="${2:-600}"
-  step="${3:-5}"
-  busy_waited=0
+  ubw_lock="$LOCKS_DIR/$1.lock"
+  ubw_bound="${2:-600}"
+  ubw_step="${3:-5}"
+  ubw_waited=0
   while :; do
-    case "$(lock_state "$lock")" in
+    case "$(lock_state "$ubw_lock")" in
       free) return 0 ;;
-      unknown) echo "   cannot probe $lock (perl missing? unreadable?); not touching $1" >&2; return 1 ;;
+      unknown) echo "   cannot probe $ubw_lock (perl missing? unreadable?); not touching $1" >&2; return 1 ;;
     esac
-    if [ "$busy_waited" -ge "$bound" ]; then
-      [ "$bound" -eq 0 ] || echo "   $1 is still running after ${busy_waited}s ($lock held)" >&2
+    if [ "$ubw_waited" -ge "$ubw_bound" ]; then
+      [ "$ubw_bound" -eq 0 ] || echo "   $1 is still running after ${ubw_waited}s ($ubw_lock held)" >&2
       return 1
     fi
-    echo "   $1 run in progress; waiting (${busy_waited}s)"
-    sleep "$step"
-    busy_waited=$((busy_waited + step))
+    echo "   $1 run in progress; waiting (${ubw_waited}s)"
+    sleep "$ubw_step"
+    ubw_waited=$((ubw_waited + ubw_step))
   done
 }
 # timer_skip <name> <what> — when <name>'s lock is held (or cannot be
@@ -298,35 +298,35 @@ load_unit() {
 # registration) before binding its port, so two instances must never start
 # together.
 restore_agent() {
-  label="dev.snowline.$1"
+  ra_label="dev.snowline.$1"
   # something to restore FIRST: with neither a live agent plist nor a
   # .disabled-* one, the daemon stays — tearing it down would leave the
   # service with nothing loaded anywhere
-  disabled="$(ls -1 "$AGENTS/$label.plist.disabled-"* 2>/dev/null | sort | tail -n 1)"
-  if [ ! -f "$AGENTS/$label.plist" ] && [ -z "$disabled" ]; then
-    echo "   no agent plist to restore for $label (neither $AGENTS/$label.plist nor a .disabled-* copy); leaving the daemon in place" >&2
+  ra_disabled="$(ls -1 "$AGENTS/$ra_label.plist.disabled-"* 2>/dev/null | sort | tail -n 1)"
+  if [ ! -f "$AGENTS/$ra_label.plist" ] && [ -z "$ra_disabled" ]; then
+    echo "   no agent plist to restore for $ra_label (neither $AGENTS/$ra_label.plist nor a .disabled-* copy); leaving the daemon in place" >&2
     return 1
   fi
-  launchctl bootout "system/$label" 2>/dev/null || true
-  if ! wait_unloaded "system/$label"; then
-    echo "   daemon $label still registered after 30s; NOT starting the agent on top of it — re-run" >&2
+  launchctl bootout "system/$ra_label" 2>/dev/null || true
+  if ! wait_unloaded "system/$ra_label"; then
+    echo "   daemon $ra_label still registered after 30s; NOT starting the agent on top of it — re-run" >&2
     return 1
   fi
-  rm -f "${DAEMONS_DIR:?}/${label:?}.plist"
-  if [ -f "$AGENTS/$label.plist" ]; then
-    [ -z "$disabled" ] || echo "   keeping the live $AGENTS/$label.plist (leaving $disabled aside)"
+  rm -f "${DAEMONS_DIR:?}/${ra_label:?}.plist"
+  if [ -f "$AGENTS/$ra_label.plist" ]; then
+    [ -z "$ra_disabled" ] || echo "   keeping the live $AGENTS/$ra_label.plist (leaving $ra_disabled aside)"
   else
-    mv "$disabled" "$AGENTS/$label.plist"
-    chown "$OWNER_UID" "$AGENTS/$label.plist"
-    echo "   restored $AGENTS/$label.plist"
+    mv "$ra_disabled" "$AGENTS/$ra_label.plist"
+    chown "$OWNER_UID" "$AGENTS/$ra_label.plist"
+    echo "   restored $AGENTS/$ra_label.plist"
   fi
-  if launchctl print "gui/$OWNER_UID/$label" >/dev/null 2>&1; then
-    echo "   agent $label already loaded in gui/$OWNER_UID"
+  if launchctl print "gui/$OWNER_UID/$ra_label" >/dev/null 2>&1; then
+    echo "   agent $ra_label already loaded in gui/$OWNER_UID"
     return 0
   fi
-  if launchctl bootstrap "gui/$OWNER_UID" "$AGENTS/$label.plist"; then
+  if launchctl bootstrap "gui/$OWNER_UID" "$AGENTS/$ra_label.plist"; then
     return 0
   fi
-  echo "   agent plist for $label is on disk but could NOT be loaded into gui/$OWNER_UID (no login session?); it loads at the next login — nothing runs for $label until then" >&2
+  echo "   agent plist for $ra_label is on disk but could NOT be loaded into gui/$OWNER_UID (no login session?); it loads at the next login — nothing runs for $ra_label until then" >&2
   return 1
 }

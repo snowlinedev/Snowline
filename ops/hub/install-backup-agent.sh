@@ -234,9 +234,9 @@ prove_run() {
       fail=1; return
     fi
   fi
-  code=""; i=0; spawned=no
+  code=""; i=0; spawned=no; gone=no
   while [ "$i" -lt "$PROVE_BOUND" ]; do   # 120 s Postgres wait + up to 60 s lock wait per store + the dumps
-    unit_snapshot "$domain/$label" || break   # unit gone
+    unit_snapshot "$domain/$label" || { gone=yes; break; }   # unit gone
     [ "$UNIT_RUNNING" = yes ] && spawned=yes
     if [ "$UNIT_RUNNING" = no ] && [ "$UNIT_RUNS" -gt "$runs_before" ]; then
       code="$UNIT_EXIT"; break
@@ -273,6 +273,9 @@ prove_run() {
       CONFIG_FAIL) echo "   exit 0, but the script now refuses its configuration ($EVIDENCE_MSG) — the next run will exit 2" >&2; fail=1 ;;
       *)        echo "   exit 0, UNCONFIRMED: could not check $dest ($EVIDENCE_MSG) and the log shows no run — verify by hand: ls -t '$dest' | head" >&2; fail=1 ;;
     esac
+  elif [ "$gone" = yes ]; then
+    echo "   $domain/$label disappeared during the proof (booted out by another process?); nothing proven — re-run this installer" >&2
+    fail=1
   elif [ -z "$code" ]; then
     if unit_snapshot "$domain/$label" && [ "$UNIT_RUNNING" = yes ]; then
       echo "   still running after ${i}s; not proven${DEPLOY_NOTE:-} — check $log_file later, or run this installer by itself" >&2
