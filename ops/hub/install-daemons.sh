@@ -41,9 +41,12 @@ for svc in $SERVICES; do
     mv "$AGENTS/$label.plist" "$AGENTS/$label.plist.disabled-$STAMP"
     echo "   agent plist -> $label.plist.disabled-$STAMP"
   fi
-  # ... and only start the daemon once the agent is really gone
-  if ! wait_unloaded "gui/$OWNER_UID/$label"; then
-    echo "   agent $label still registered after 30s; NOT starting the daemon on top of it — re-run the install (the daemon plist is in place and loads at the next boot)" >&2
+  # ... and only start the daemon once the agent is really gone (a slow
+  # teardown — a migration finishing — gets a second 30 s, as in load_unit:
+  # the bootout is issued and nothing re-registers the agent, so giving up
+  # here leaves the service with NOTHING loaded until a re-run or a boot)
+  if ! wait_unloaded "gui/$OWNER_UID/$label" && ! wait_unloaded "gui/$OWNER_UID/$label"; then
+    echo "   agent $label still tearing down after 60s; NOT starting the daemon on top of it — once it is gone NOTHING serves $svc until this install is re-run (or the next boot loads the daemon plist, which is in place)" >&2
     fail=1; svc_fail=1
     continue
   fi

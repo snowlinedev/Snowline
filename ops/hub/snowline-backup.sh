@@ -194,16 +194,18 @@ store_wanted() {
 # directory while the disk is unplugged).
 dest_state() {
     if [ -d "$DEST" ]; then echo ok; return; fi
+    # the errno FIRST: a path this context is DENIED the stat of (TCC: ssh
+    # without Full Disk Access under the iCloud root — the agent in its
+    # login session is not denied) is unreadable whether or not the root
+    # above it happens to be visible; only a path that is NOT THERE is then
+    # a leaf to create (under a present iCloud root) or missing
+    case "$(ls -d "$DEST" 2>&1 >/dev/null)" in
+        *"Operation not permitted"*|*"Permission denied"*) echo unreadable; return ;;   # EPERM (TCC) or EACCES
+    esac
     case "$DEST" in
         "$ICLOUD_ROOT"/*) [ -d "$ICLOUD_ROOT" ] && { echo no-leaf; return; } ;;
     esac
-    # the errno tells a path that is not there from one this context is
-    # DENIED the stat of (TCC: ssh without Full Disk Access under the iCloud
-    # root — the agent in its login session is not denied)
-    case "$(ls -d "$DEST" 2>&1 >/dev/null)" in
-        *"Operation not permitted"*|*"Permission denied"*) echo unreadable ;;   # EPERM (TCC) or EACCES
-        *) echo missing ;;
-    esac
+    echo missing
 }
 
 # Queries install-backup-agent.sh makes by running this script AS THE OWNER
@@ -447,15 +449,15 @@ prune_all() {
 # stamp in the NAME, a placeholder's mtime being eviction time). Non-fatal:
 # a find hiccup must not fail the run.
 prune_all || true
-# One more walk for two things. A .partial older than two hours belongs to
-# a run that died without its trap (SIGKILL, power loss): no live run owns
-# it (a run is bounded well inside an hour), so it is swept here, before
-# the dumps, and a full destination frees itself. And files outside the
+# One more walk for two things. A .partial (or a write probe) older than
+# two hours belongs to a run that died without its trap (SIGKILL, power
+# loss): no live run owns it (a run is bounded well inside an hour), so it
+# is swept here, before the dumps, and a full destination frees itself. And files outside the
 # dump grammar (an iCloud conflict copy "NAME 2.dump", a hand-made .bak)
 # are neither counted nor pruned: say so once a run, or the bounded folder
 # grows unbounded unnoticed.
-UNREC="$(find "$DEST" -maxdepth 1 \( -type f -name '*.partial' -mmin +120 -delete \) \
-             -o \( -type f ! -name '*.partial' ! -name '.DS_Store' -print \) 2>/dev/null \
+UNREC="$(find "$DEST" -maxdepth 1 \( -type f \( -name '*.partial' -o -name '.probe.*' \) -mmin +120 -delete \) \
+             -o \( -type f ! -name '*.partial' ! -name '.probe.*' ! -name '.DS_Store' -print \) 2>/dev/null \
     | while IFS= read -r uf; do parse_dump_name "$uf" || printf '%s\n' "${uf##*/}"; done)"
 [ -z "$UNREC" ] || log "WARNING: $(printf '%s\n' "$UNREC" | wc -l | tr -d ' ') file(s) in $DEST outside the dump name grammar — neither counted nor pruned, tidy by hand: $(printf '%s\n' "$UNREC" | head -n 3 | tr '\n' ' ')" >&2
 set -f
