@@ -58,6 +58,7 @@ SCRATCH_RE='(_(test|dryrun|e2e|restore)(_|$)|^snowline_dev$)'
 # Shared helpers and constants (log, wait_for_postgres, ICLOUD_ROOT,
 # BACKUP_DIR, BACKUP_LOCK, LOCKS_DIR); lib.sh only defines things. A checkout
 # without it cannot run at all: exit 2, not a store failure.
+[ -n "${HOME:-}" ] || { echo "$(date -u +%FT%TZ) HOME is not set; this script resolves its destination, log and lock from it — cannot run" >&2; exit 2; }
 SNOWLINE_OWNER_HOME="$HOME"
 # shellcheck disable=SC1091
 . "$(dirname "$0")/launchdaemons/lib.sh" || {
@@ -81,10 +82,10 @@ die() { log "$*" >&2; exit 2; }
 # reads the LAST such line to judge a run when it cannot see the
 # destination itself. Queries (--print-dest, --check) do not log one
 # (QUIET_EXIT, decided with the command line above).
-CATALOG_ERR=""; CATALOG_OUT=""; Z_DUMPS_ERR=""; PROBE=""   # temp files, set below; removed on every exit
+CATALOG_ERR=""; CATALOG_OUT=""; Z_DUMPS_ERR=""; Z_LIST=""; Z_ROWS=""; PROBE=""   # temp files, set below; removed on every exit
 on_exit() {
     oe_rc=$?
-    rm -f ${CATALOG_ERR:+"$CATALOG_ERR"} ${CATALOG_OUT:+"$CATALOG_OUT"} ${Z_DUMPS_ERR:+"$Z_DUMPS_ERR"} ${PROBE:+"$PROBE"}
+    rm -f ${CATALOG_ERR:+"$CATALOG_ERR"} ${CATALOG_OUT:+"$CATALOG_OUT"} ${Z_DUMPS_ERR:+"$Z_DUMPS_ERR"} ${Z_LIST:+"$Z_LIST"} ${Z_ROWS:+"$Z_ROWS"} ${PROBE:+"$PROBE"}
     [ "$QUIET_EXIT" = yes ] || log "run exit $oe_rc"
 }
 trap on_exit EXIT
@@ -103,6 +104,8 @@ trap 'log "interrupted (SIGTERM/SIGINT/SIGHUP)${OUT:+; removing $OUT.partial}" >
 CATALOG_ERR="$(mktemp -t snowline-backup-psql)" || die "cannot create a temp file (TMPDIR unwritable?)"
 CATALOG_OUT="$(mktemp -t snowline-backup-catalog)" || die "cannot create a temp file (TMPDIR unwritable?)"
 Z_DUMPS_ERR="$(mktemp -t snowline-backup-find)" || die "cannot create a temp file (TMPDIR unwritable?)"
+Z_LIST="$(mktemp -t snowline-backup-list)" || die "cannot create a temp file (TMPDIR unwritable?)"
+Z_ROWS="$(mktemp -t snowline-backup-rows)" || die "cannot create a temp file (TMPDIR unwritable?)"
 # Operator overrides live in ~/.config/snowline/backup.env (optional; sourced
 # here), NOT in the launchd plist: install-backup-agent.sh replaces the plist with
 # the tracked copy whenever it differs, so anything put there would be lost.
@@ -176,20 +179,30 @@ parse_dump_name() {
     { [ -n "${BASH_REMATCH[2]}" ] && [ -n "${BASH_REMATCH[5]}" ]; } || { [ -z "${BASH_REMATCH[2]}" ] && [ -z "${BASH_REMATCH[5]}" ]; } || return 1
     NAME_STORE="${BASH_REMATCH[3]}"; NAME_STAMP="${BASH_REMATCH[4]}"
 }
-# z_dumps [all] — one "<store>\t<stamp>\t<path>" line per dump or
-# placeholder in DEST, every store: Z-named
+# z_dumps [all] — one "<store>\t<stamp>\t<path>" row per dump or
+# placeholder in DEST, every store, written to Z_ROWS: Z-named
 # (UTC) ones by default, pre-#319 local-time names too with `all`. The ONE
 # listing --check (evidence: Z names only, written by this script) and the
 # prune (retention: every name) share. find's stderr goes to Z_DUMPS_ERR
 # for the caller to inspect.
 TAB=$'\t'
+# walk_bounded <args...> — `find "$DEST" -maxdepth 1 <args>` under the walk
+# bound, output in Z_LIST, errors in Z_DUMPS_ERR; a timeout is written
+# there too, so every consumer sees it. Called DIRECTLY (no pipeline, no
+# command substitution): the child is then visible to the TERM trap and
+# the wait is interruptible.
+walk_bounded() {
+    run_bounded "$WALK_BOUND_S" find "$DEST" -maxdepth 1 "$@" > "$Z_LIST" 2>"$Z_DUMPS_ERR"; wb_rc=$?
+    [ "$wb_rc" -ne 124 ] || echo "the walk of $DEST timed out after ${WALK_BOUND_S}s (a stalled iCloud readdir?)" >> "$Z_DUMPS_ERR"
+    return "$wb_rc"
+}
 z_dumps() {
     if [ "${1:-}" = all ]; then zd_tail=''; else zd_tail='Z'; fi   # all: Z names and pre-#319 names alike
-    run_bounded "$WALK_BOUND_S" find "$DEST" -maxdepth 1 \( -name "*-[0-9]*${zd_tail}.dump" -o -name ".*-[0-9]*${zd_tail}.dump.icloud" \) -type f 2>"$Z_DUMPS_ERR" \
-    | while IFS= read -r zf; do
+    walk_bounded \( -name "*-[0-9]*${zd_tail}.dump" -o -name ".*-[0-9]*${zd_tail}.dump.icloud" \) -type f || true
+    while IFS= read -r zf; do
         parse_dump_name "$zf" || continue
         printf '%s\t%s\t%s\n' "$NAME_STORE" "$NAME_STAMP" "$zf"
-    done
+    done < "$Z_LIST" > "$Z_ROWS"
 }
 
 # has_word <word> <list...> — is <word> one of the space-separated words?
@@ -305,6 +318,7 @@ case "$ARG1" in
         # only the stores this job dumps count: the configured list when
         # SNOWLINE_BACKUP_DBS is set, else the catalog rule (store_wanted) —
         # a scratch or foreign dump put in the folder by hand is not evidence
+        z_dumps
         found=no
         while IFS="$TAB" read -r store s f; do
             [ -n "$f" ] || continue
@@ -314,9 +328,7 @@ case "$ARG1" in
                 store_wanted "$store" || continue
             fi
             [ "$s" \< "$cutoff" ] || found=yes
-        done <<EOF_Z
-$(z_dumps)
-EOF_Z
+        done < "$Z_ROWS"
         # (a dump found is evidence whatever else find tripped over — an
         # entry iCloud evicted between readdir and stat; only an EMPTY
         # listing with errors is "cannot read from here")
@@ -523,7 +535,8 @@ prune_all() {
     # SCRATCH_RE, which spares the legacy snowline_dev history) or a name on
     # the explicit list — and no other: a scratch store's dumps or another
     # project's in a shared destination are not this job's to prune
-    PRUNE_STUCK="$(z_dumps all | sort -t "$TAB" -k1,1 -k2,2r \
+    z_dumps all
+    PRUNE_STUCK="$(sort -t "$TAB" -k1,1 -k2,2r < "$Z_ROWS" \
     | awk -F"$TAB" -v cutoff="$PRUNE_CUTOFF" -v keep="$KEEP_MIN" -v re="$STORE_RE" -v scratch="$SCRATCH_RE" -v explicit=" $DBS_EXPLICIT " '
         index(explicit, " " $1 " ") == 0 && ($1 !~ re || $1 ~ scratch) { next }
         $1 != store { store = $1; n = 0 }
@@ -559,9 +572,9 @@ prune_all || true
 # unbounded unnoticed.
 # (holding the lock, this run is the only one: every such file is an
 # orphan now, whatever its age)
-UNREC="$(run_bounded "$WALK_BOUND_S" find "$DEST" -maxdepth 1 \( -type f \( "${own_stale[@]}" -o -name '.probe.*' -o -name '..probe.*.icloud' \) -delete \) \
-             -o \( -type f ! -name '*.partial' ! -name '.probe.*' ! -name '.*.partial.icloud' ! -name '..probe.*.icloud' ! -name '.DS_Store' -print \) 2>"$Z_DUMPS_ERR" \
-    | while IFS= read -r uf; do parse_dump_name "$uf" || printf '%s\n' "${uf##*/}"; done)"
+walk_bounded \( -type f \( "${own_stale[@]}" -o -name '.probe.*' -o -name '..probe.*.icloud' \) -delete \) \
+             -o \( -type f ! -name '*.partial' ! -name '.probe.*' ! -name '.*.partial.icloud' ! -name '..probe.*.icloud' ! -name '.DS_Store' -print \) || true
+UNREC="$(while IFS= read -r uf; do parse_dump_name "$uf" || printf '%s\n' "${uf##*/}"; done < "$Z_LIST")"
 [ -s "$Z_DUMPS_ERR" ] && log "WARNING: the stale-file sweep in $DEST hit an error ($(tail -n 1 "$Z_DUMPS_ERR"))" >&2
 [ -z "$UNREC" ] || log "WARNING: $(printf '%s\n' "$UNREC" | wc -l | tr -d ' ') file(s) in $DEST outside the dump name grammar — neither counted nor pruned, tidy by hand: $(printf '%s\n' "$UNREC" | head -n 3 | tr '\n' ' ')" >&2
 for DB in $DBS; do

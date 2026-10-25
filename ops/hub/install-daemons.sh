@@ -138,6 +138,9 @@ echo "== dev.snowline.backup (ops/hub/install-backup-agent.sh, as the owner)"
 if [ "$svc_fail" != 0 ]; then
   # the ordering exists so the proving dump never lands in a boot
   # migration's window; with a service DOWN that is where it would land
+  # (and a wrong checkout is still said, or the suggested command would
+  # just refuse)
+  [ "$backup_here" = yes ] || { echo "== backup agent: also, $BACKUP_GUARD_WHY" >&2; backup_fail=1; }
   echo "== backup agent: SKIPPED (a service is DOWN or failed to install; its proving dump must not land in a migration) — run ops/hub/install-backup-agent.sh as the owner once /health is clean" >&2
 elif [ "$backup_here" = no ]; then
   # (not green: a moved checkout means the unit fails with EX_CONFIG every hour)

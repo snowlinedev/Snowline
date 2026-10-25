@@ -21,6 +21,11 @@ fail=0
 for timer in $TIMERS; do
   label="dev.snowline.$timer"
   echo "== $label"
+  if ! launchctl print "system/$label" >/dev/null 2>&1 && [ ! -f "$DAEMONS_DIR/$label.plist" ]; then
+    echo "   not installed (the in-process host does this job); nothing to remove"
+    rm -f "$LOCKS_DIR/$label.loaded"
+    continue
+  fi
   if timer_skip "$timer" "the uninstall"; then fail=1; continue; fi
   launchctl bootout "system/$label" 2>/dev/null || true
   rm -f "${DAEMONS_DIR:?}/${label:?}.plist"
