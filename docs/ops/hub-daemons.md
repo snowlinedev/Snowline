@@ -37,9 +37,9 @@ each of platform / pm / governance / memory:
    That script is the backup agent's own installer and can be run on its
    own, without sudo, whenever the backup needs (re)proving — re-running
    `install-daemons.sh` restarts all four services and is NOT the way to
-   do that. Its outcome is printed, not folded into `install-daemons.sh`'s
-   exit status, which is the deploy's own result (services and timer); it
-   is called with `--deploy`, so a dump in progress is skipped rather than
+   do that. Its outcome never alters a non-zero services/timers result;
+   when those are fine and the backup step is not, `install-daemons.sh`
+   exits 3 — distinct, never silently green. It is called with `--deploy`, so a dump in progress is skipped rather than
    waited on and the proof is bounded to ten minutes. (It is run as the
    owner from a root process via `sudo -u`; should launchd refuse
    `gui/501` management from there — "bootstrap ... refused (no session
@@ -64,8 +64,8 @@ each of platform / pm / governance / memory:
    plist. It stays a per-user agent on purpose ("DB backups" below).
 7. If step 6 (re)loaded the backup agent, the installer proves it by firing one run
    through launchd (`kickstart`, so it runs in the agent's own session) and
-   fails `install-backup-agent.sh` (reported by `install-daemons.sh`, whose
-   own exit status it does not change) unless that run exited 0 AND a dump
+   fails `install-backup-agent.sh` (reported by `install-daemons.sh` as
+   exit 3 when everything else succeeded) unless that run exited 0 AND a dump
    newer than it was confirmed — in the destination, or, when the install's own context
    cannot read it (ssh without Full Disk Access), in the agent's log lines
    for the run. An
