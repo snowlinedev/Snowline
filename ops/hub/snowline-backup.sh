@@ -579,10 +579,10 @@ for DB in $DBS; do
     # and every later hourly run would step aside — exit 3, "not a verdict"
     # — in silence.
     run_bounded "$DUMP_BOUND_S" pg_dump -Fc --lock-wait-timeout=60000 "$DB" > "$OUT.partial"; dump_rc=$?
-    [ "$dump_rc" -ne 143 ] || log "FAILED to back up ${DB}: the dump ran past ${DUMP_BOUND_S}s and was killed (a hung backend? a stalled destination?)" >&2
+    [ "$dump_rc" -ne 124 ] || log "FAILED to back up ${DB}: the dump ran past ${DUMP_BOUND_S}s and was killed (a hung backend? a stalled destination?)" >&2
     if [ "$dump_rc" -eq 0 ]; then
         run_bounded "$DUMP_BOUND_S" pg_restore -l "$OUT.partial" > /dev/null; verify_rc=$?
-        [ "$verify_rc" -ne 143 ] || log "FAILED to back up ${DB}: verifying the archive ran past ${DUMP_BOUND_S}s and was killed (a stalled destination?)" >&2
+        [ "$verify_rc" -ne 124 ] || log "FAILED to back up ${DB}: verifying the archive ran past ${DUMP_BOUND_S}s and was killed (a stalled destination?)" >&2
     else
         verify_rc=1
     fi
@@ -604,7 +604,7 @@ for DB in $DBS; do
         fi
     else
         rm -f "$OUT.partial"; OUT=""
-        [ "$dump_rc" -eq 143 ] || [ "$verify_rc" -eq 143 ] || log "FAILED to back up ${DB} (pg_dump or the archive check failed)" >&2
+        [ "$dump_rc" -eq 124 ] || [ "$verify_rc" -eq 124 ] || log "FAILED to back up ${DB} (pg_dump or the archive check failed${dump_rc:+; pg_dump exit $dump_rc})" >&2
         FAILED="$FAILED $DB"
     fi
 done

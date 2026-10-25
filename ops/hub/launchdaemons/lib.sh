@@ -169,7 +169,7 @@ lock_state() {
   # builtin `exec` exits the (sub)shell with status 1 — which would read as
   # "held" — unless `command` strips the special-builtin status, so that
   # `|| exit 2` runs and any open failure (EACCES, ELOOP, EMFILE) is "unknown"
-  ( command exec 8<"$1" 2>/dev/null || exit 2; flock_fd 8 sh 1 )
+  ( command exec 2>/dev/null 8<"$1" || exit 2; flock_fd 8 sh 1 )   # (stderr first: redirections apply left to right)
   case $? in 0) echo free ;; 1) echo held ;; *) echo unknown ;; esac
 }
 
@@ -201,24 +201,27 @@ unit_busy_wait() {
 # fd 9 closed (the backup script's run lock: a child orphaned by a SIGKILL
 # of the caller must not hold it), killed after <seconds> by a watchdog
 # whose own sleep dies with it (an orphan sleep would outlive every run);
-# returns the command's status, 143 when the watchdog struck. Sets
-# DUMP_PID / WATCHDOG_PID while running, for a caller's TERM trap to kill.
+# returns the command's status, or 124 when the watchdog struck (the
+# watchdog says so with its own exit status 99 — a TERM from elsewhere to
+# the child is the child's 143, not a timeout). Sets DUMP_PID /
+# WATCHDOG_PID while running, for a caller's TERM trap to kill.
 run_bounded() {
   rb_bound="$1"; shift
   "$@" 9>&- &
   DUMP_PID=$!
-  ( trap 'kill "$wd_sleep" 2>/dev/null; exit 0' TERM; sleep "$rb_bound" & wd_sleep=$!; wait "$wd_sleep"; kill "$DUMP_PID" 2>/dev/null ) >/dev/null 2>&1 9>&- &
+  ( trap 'kill "$wd_sleep" 2>/dev/null; exit 0' TERM; sleep "$rb_bound" & wd_sleep=$!; wait "$wd_sleep"; kill "$DUMP_PID" 2>/dev/null; exit 99 ) >/dev/null 2>&1 9>&- &
   WATCHDOG_PID=$!
   wait "$DUMP_PID"; rb_rc=$?
   DUMP_PID=""
-  kill "$WATCHDOG_PID" 2>/dev/null; wait "$WATCHDOG_PID" 2>/dev/null; WATCHDOG_PID=""
+  kill "$WATCHDOG_PID" 2>/dev/null; wait "$WATCHDOG_PID" 2>/dev/null; rb_wd=$?; WATCHDOG_PID=""
+  [ "$rb_wd" -ne 99 ] || return 124
   return "$rb_rc"
 }
 # timer_skip <name> <what> — when <name>'s lock is held (or cannot be
 # probed) print why the unit is being left alone and return 0; the caller
 # then skips it. <what> names the action to repeat later.
 timer_skip() {
-  unit_busy_wait "$1" 0 >/dev/null 2>&1 && return 1   # (free: nothing to skip)
+  unit_busy_wait "$1" 0 >/dev/null && return 1   # (free: nothing to skip; its "cannot probe" line, if any, passes through)
   echo "   $1 is running now (or its lock cannot be probed); leaving dev.snowline.$1 as it is — re-run $2 after it finishes" >&2
   return 0
 }

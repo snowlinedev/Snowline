@@ -255,7 +255,7 @@ prove_run() {
     # bounded (run_bounded, lib.sh): a kickstart of a unit launchd has
     # penalty-boxed can hang
     run_bounded 30 launchctl kickstart "$domain/$label"; ks_rc=$?
-    if [ "$ks_rc" -eq 143 ]; then
+    if [ "$ks_rc" -eq 124 ]; then
       echo "   kickstart hung for 30 s (penalty box after spawn failures?); reload the unit: launchctl bootout $domain/$label; re-run this installer" >&2
       fail=1; return
     elif [ "$ks_rc" -ne 0 ]; then

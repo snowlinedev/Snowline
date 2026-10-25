@@ -59,13 +59,18 @@ for svc in $SERVICES; do
     mv "$AGENTS/$label.plist" "$AGENTS/$label.plist.disabled-$STAMP"
     echo "   agent plist -> $label.plist.disabled-$STAMP"
   fi
-  # ... and the daemon started only once the agent is really gone
-  # (bootout_wait: 60 s; giving up leaves the service with NOTHING loaded
-  # until a re-run or a boot)
+  # ... and the daemon started only once the agent is really gone. launchd
+  # SIGKILLs the agent after its exit timeout, so the registration goes
+  # within seconds of that; a teardown still registered after bootout_wait's
+  # 60 s gets a further two minutes, with a line, because giving up here
+  # leaves the service with NOTHING loaded until a re-run or a boot.
   if ! bootout_wait "gui/$OWNER_UID/$label"; then
-    echo "   agent $label still tearing down after 60s; NOT starting the daemon on top of it — once it is gone NOTHING serves $svc until this install is re-run (or the next boot loads the daemon plist, which is in place)" >&2
-    fail=1; svc_fail=1
-    continue
+    echo "   agent $label still tearing down after 60s; waiting up to 2 more minutes rather than leave $svc unserved"
+    if ! wait_unloaded "gui/$OWNER_UID/$label" 120; then
+      echo "   agent $label still registered after 3 min; NOT starting the daemon on top of it — once it is gone NOTHING serves $svc until this install is re-run (or the next boot loads the daemon plist, which is in place)" >&2
+      fail=1; svc_fail=1
+      continue
+    fi
   fi
   load_unit "$label" system "$DAEMONS_DIR/$label.plist" norecord || { fail=1; svc_fail=1; }
 done
@@ -138,7 +143,9 @@ if [ "$svc_fail" != 0 ]; then
   # migration's window; with a service DOWN that is where it would land
   echo "== backup agent: SKIPPED (a service is DOWN or failed to install; its proving dump must not land in a migration) — run ops/hub/install-backup-agent.sh as the owner once /health is clean" >&2
 elif [ "$backup_here" = no ]; then
-  echo "== backup agent: SKIPPED (see the note at the top)" >&2
+  # (not green: a moved checkout means the unit fails with EX_CONFIG every hour)
+  echo "== backup agent: NOT CHECKED (see the note at the top) — the unit may be failing every hour; run ops/hub/install-backup-agent.sh from the canonical checkout" >&2
+  backup_fail=1
 elif sudo -u "#$OWNER_UID" -H /bin/sh "$OPS_HUB/install-backup-agent.sh" --deploy; then
   echo "== backup agent: OK"
 else
