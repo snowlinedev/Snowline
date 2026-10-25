@@ -19,7 +19,6 @@ if [ "$(id -u)" != "$OWNER_UID" ]; then
   echo "run this as the hub owner (uid $OWNER_UID), not root or another account: the unit is the owner's per-user agent and every path here is the owner's" >&2
   exit 64
 fi
-BACKUP_SCRIPT="$(backup_script)" || BACKUP_SCRIPT=""
 
 case "${1:-}" in
   --deploy) DEPLOY=yes ;;
@@ -46,18 +45,7 @@ fail=0
 # must exist, and this install must run from that very checkout (same
 # file, not merely equal bytes — it sources the canonical lib.sh and
 # backup.env too).
-if [ -z "$BACKUP_SCRIPT" ]; then
-  echo "cannot read the script path from $plist_src (plutil? malformed plist?)" >&2
-  exit 1
-fi
-if [ ! -f "$BACKUP_SCRIPT" ]; then
-  echo "$BACKUP_SCRIPT is not on this hub (checkout moved? then update the path in the tracked plist); NOT installing a unit that would fail with EX_CONFIG" >&2
-  exit 1
-fi
-if [ ! "$OPS_HUB/snowline-backup.sh" -ef "$BACKUP_SCRIPT" ]; then
-  echo "this install runs from $OPS_HUB, but the unit runs $BACKUP_SCRIPT; run it from the canonical checkout (after pulling)" >&2
-  exit 1
-fi
+backup_canonical_here || { echo "$BACKUP_GUARD_WHY — NOT installing" >&2; exit 1; }
 echo "== $label (per-user agent; unit runs $BACKUP_SCRIPT)"
 [ -e "$log_file" ] || touch "$log_file"
 
@@ -125,16 +113,13 @@ log_verdict() {
   # a "run start" with no "run exit" after it is a run that never ended:
   # in flight now, or killed (SIGKILL, launchd's exit timeout) — launchctl's
   # exit-code rendering is not relied on for that
-  if [ "$(log_lines_since "$1" | awk '$2 == "run" && ($3 == "start" || $3 == "exit") { l = $3 } END { print l }')" = start ]; then
-    LOGSAYS=OPEN; return
-  fi
-  for lv_code in $(log_lines_since "$1" | awk '$2 == "run" && $3 == "exit" { print $4 }' | tail -r); do
-    case "$lv_code" in
-      3) continue ;;
-      0) LOGSAYS=OK; return ;;
-      *) LOGSAYS=FAIL; return ;;
-    esac
-  done
+  # one pass: the last marker's kind, and the last exit code that is a
+  # verdict (3, a step-aside, is not one)
+  set -- $(log_lines_since "$1" | awk '$2 == "run" && $3 == "start" { l = "start" } $2 == "run" && $3 == "exit" { l = "exit"; if ($4 != 3) v = $4 } END { print l, v }')
+  if [ "${1:-}" = start ]; then LOGSAYS=OPEN
+  elif [ -z "${2:-}" ]; then LOGSAYS=NONE
+  elif [ "$2" = 0 ]; then LOGSAYS=OK
+  else LOGSAYS=FAIL; fi
 }
 
 # --- decide: leave alone, reload, or re-prove ---

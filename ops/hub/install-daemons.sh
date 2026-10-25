@@ -25,13 +25,7 @@ svc_fail=0   # the services only: what gates the backup step below
 # checkout the agent's plist names: say so NOW, not after the services have
 # been cycled.
 backup_here=yes
-if ! agent_script="$(backup_script)"; then
-  echo "note: cannot read the backup agent's script path from $LAUNCHAGENTS_SRC/dev.snowline.backup.plist (plutil? malformed plist?); the backup step at the end is skipped" >&2
-  backup_here=no
-elif [ ! "$OPS_HUB/snowline-backup.sh" -ef "$agent_script" ]; then
-  echo "note: this is not the checkout the backup agent runs from ($agent_script); the backup step at the end is skipped — run ops/hub/install-backup-agent.sh from that checkout" >&2
-  backup_here=no
-fi
+backup_canonical_here || { echo "note: $BACKUP_GUARD_WHY; the backup step at the end is skipped" >&2; backup_here=no; }
 
 # --- the services: per-user agent -> system daemon ---
 # The daemon plist goes on disk first (nothing is torn down before its

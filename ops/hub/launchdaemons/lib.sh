@@ -23,6 +23,7 @@ OWNER_UID=501
 OWNER_HOME="${SNOWLINE_OWNER_HOME:-/Users/seanlynch}"
 DAEMONS_DIR=/Library/LaunchDaemons           # not DEST: the backup script's dump dir
 AGENTS="$OWNER_HOME/Library/LaunchAgents"
+unset CDPATH                                 # a caller's CDPATH would make `cd` print, here and in every caller
 OPS_HUB="$(cd "$(dirname "$0")" && pwd)"      # the calling script's directory
 LAUNCHDAEMONS_SRC="$OPS_HUB/launchdaemons"
 LAUNCHAGENTS_SRC="$OPS_HUB/launchagents"
@@ -252,6 +253,23 @@ unit_unchanged() {
   elif ! launchctl print "$2/$1" >/dev/null 2>&1; then UNIT_UNCHANGED_WHY="not loaded"
   fi
   [ -z "$UNIT_UNCHANGED_WHY" ]
+}
+# backup_canonical_here — the ONE checkout guard for the backup agent: the
+# tracked plist names the script by absolute path (launchd runs that file,
+# and dies with EX_CONFIG when it is gone), so the file must exist and the
+# caller must be running from that very checkout (same file, not merely
+# equal bytes — it sources that checkout's lib.sh too). Sets BACKUP_SCRIPT;
+# on failure BACKUP_GUARD_WHY says why.
+backup_canonical_here() {
+  BACKUP_GUARD_WHY=""
+  if ! BACKUP_SCRIPT="$(backup_script)"; then
+    BACKUP_GUARD_WHY="cannot read the script path from $LAUNCHAGENTS_SRC/dev.snowline.backup.plist (plutil? malformed plist?)"
+  elif [ ! -f "$BACKUP_SCRIPT" ]; then
+    BACKUP_GUARD_WHY="$BACKUP_SCRIPT is not on this hub (checkout moved? then update the path in the tracked plist); a unit pointing there would fail with EX_CONFIG"
+  elif [ ! "$OPS_HUB/snowline-backup.sh" -ef "$BACKUP_SCRIPT" ]; then
+    BACKUP_GUARD_WHY="this runs from $OPS_HUB, but the backup unit runs $BACKUP_SCRIPT; run it from the canonical checkout (after pulling)"
+  fi
+  [ -z "$BACKUP_GUARD_WHY" ]
 }
 # record_loaded <label> <plist> — write that marker. The directory is the
 # OWNER's (the backup and autocut locks live there too): when root writes

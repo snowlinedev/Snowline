@@ -88,18 +88,18 @@ on_exit() {
     [ "$QUIET_EXIT" = yes ] || log "run exit $oe_rc"
 }
 trap on_exit EXIT
-[ "$QUIET_EXIT" = yes ] || log "run start"   # the run's real start, for the installer
-CATALOG_ERR="$(mktemp -t snowline-backup-psql)" || die "cannot create a temp file (TMPDIR unwritable?)"
-CATALOG_OUT="$(mktemp -t snowline-backup-catalog)" || die "cannot create a temp file (TMPDIR unwritable?)"
-Z_DUMPS_ERR="$(mktemp -t snowline-backup-find)" || die "cannot create a temp file (TMPDIR unwritable?)"
 # A SIGTERM/SIGINT at ANY point (a bootout during the Postgres wait, a
 # logout, a shutdown) logs itself; the child in flight (DUMP_PID: the
 # catalog read or a dump — bash runs a trap only once the foreground
 # command returns, so both run in the background and are waited for) is
-# killed, and a dump's partial removed. Armed here, not just around the
-# dump loop, so a run never vanishes without a log line.
+# killed, and a dump's partial removed. Armed here, before the first log
+# line and the first fork, so a run never vanishes without a log line.
 OUT=""; DUMP_PID=""
 trap 'log "interrupted (SIGTERM/SIGINT)${OUT:+; removing $OUT.partial}" >&2; [ -z "$DUMP_PID" ] || kill "$DUMP_PID" 2>/dev/null; [ -z "$OUT" ] || rm -f "$OUT.partial"; exit 143' TERM INT
+[ "$QUIET_EXIT" = yes ] || log "run start"   # the run's real start, for the installer
+CATALOG_ERR="$(mktemp -t snowline-backup-psql)" || die "cannot create a temp file (TMPDIR unwritable?)"
+CATALOG_OUT="$(mktemp -t snowline-backup-catalog)" || die "cannot create a temp file (TMPDIR unwritable?)"
+Z_DUMPS_ERR="$(mktemp -t snowline-backup-find)" || die "cannot create a temp file (TMPDIR unwritable?)"
 # Operator overrides live in ~/.config/snowline/backup.env (optional; sourced
 # here), NOT in the launchd plist: install-backup-agent.sh replaces the plist with
 # the tracked copy whenever it differs, so anything put there would be lost.
@@ -113,9 +113,11 @@ if [ -f "$BACKUP_ENV" ]; then
     for ev in $BACKUP_ENV_VARS; do printf -v "pre_$ev" '%s' "${!ev:-}"; done
     # A shell file, sourced: it CAN do anything (a PATH= line there does
     # retarget pg_dump, PATH being exported above — the operator's call).
-    # Not under `set -a`, so an unexported PGHOST there stays local to this
-    # shell; and with stdout sent to stderr, so a stray echo cannot corrupt
-    # the --print-dest / --check protocol the installer parses.
+    # Not under `set -a`: a connection setting for the pg_* tools (PGPORT,
+    # PGHOST) must be written `export PGPORT=5433` there, or it stays a
+    # shell variable they never see (docs say so). Stdout is sent to
+    # stderr, so a stray echo cannot corrupt the --print-dest / --check
+    # protocol the installer parses.
     # shell options are restored afterwards: a `set -e` in the file would
     # otherwise turn a step-aside into exit 1 and a failed store into an
     # aborted run
@@ -142,9 +144,8 @@ fi
 # target, an external volume, etc.
 DEST="${SNOWLINE_BACKUP_DIR:-$BACKUP_DIR}"
 # absolute, or launchd (cwd /) and an operator (cwd anywhere) would resolve
-# one setting to two folders; CDPATH unset so `cd` never prints or wanders
+# one setting to two folders (CDPATH is unset by lib.sh)
 case "$DEST" in /*) ;; *) die "SNOWLINE_BACKUP_DIR must be an absolute path: '$DEST'" ;; esac
-unset CDPATH
 RETENTION_DAYS="${SNOWLINE_BACKUP_RETENTION_DAYS:-30}"
 case "$RETENTION_DAYS" in ''|*[!0-9]*) die "SNOWLINE_BACKUP_RETENTION_DAYS must be a whole number of days, at least 1: '$RETENTION_DAYS'" ;; esac
 [ "$RETENTION_DAYS" -ge 1 ] || die "SNOWLINE_BACKUP_RETENTION_DAYS must be at least 1: '$RETENTION_DAYS'"
@@ -258,6 +259,7 @@ dest_state() {
 case "$ARG1" in
     --print-dest)
         [ "$ARGC" -eq 1 ] || die "--print-dest takes no further argument"
+        [ "$(dest_state)" != ok ] || canon_dest   # the folder a run would use, not the override's spelling
         printf '%s\n' "$DEST"
         exit 0
         ;;
