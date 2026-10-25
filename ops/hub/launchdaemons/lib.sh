@@ -76,7 +76,7 @@ wait_for_postgres() {
       return 1
     fi
     log "waiting for postgres (${waited}s)"
-    sleep 5 & wait $!   # (interruptible: a TERM trap runs now, not after the sleep)
+    sleep 5 9>&- & wait $! 2>/dev/null   # (interruptible: a TERM trap runs now, not after the sleep; fd 9 — the backup script's lock — not inherited)
     waited=$((waited + 5))
   done
   return 0
@@ -209,9 +209,12 @@ run_bounded() {
   rb_bound="$1"; shift
   "$@" 9>&- &
   DUMP_PID=$!
-  ( trap 'kill "$wd_sleep" 2>/dev/null; exit 0' TERM; sleep "$rb_bound" & wd_sleep=$!; wait "$wd_sleep"; kill "$DUMP_PID" 2>/dev/null; exit 99 ) >/dev/null 2>&1 9>&- &
+  # (once the watchdog has struck it ignores TERM, so the parent's kill
+  # racing its `exit 99` cannot turn a timeout verdict into the child's 143;
+  # the parent's wait is quiet, or bash would print a "Terminated" job line)
+  ( trap 'kill "$wd_sleep" 2>/dev/null; exit 0' TERM; sleep "$rb_bound" & wd_sleep=$!; wait "$wd_sleep"; trap '' TERM; kill "$DUMP_PID" 2>/dev/null; exit 99 ) >/dev/null 2>&1 9>&- &
   WATCHDOG_PID=$!
-  wait "$DUMP_PID"; rb_rc=$?
+  wait "$DUMP_PID" 2>/dev/null; rb_rc=$?
   DUMP_PID=""
   kill "$WATCHDOG_PID" 2>/dev/null; wait "$WATCHDOG_PID" 2>/dev/null; rb_wd=$?; WATCHDOG_PID=""
   [ "$rb_wd" -ne 99 ] || return 124

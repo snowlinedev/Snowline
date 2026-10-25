@@ -604,7 +604,10 @@ for DB in $DBS; do
         fi
     else
         rm -f "$OUT.partial"; OUT=""
-        [ "$dump_rc" -eq 124 ] || [ "$verify_rc" -eq 124 ] || log "FAILED to back up ${DB} (pg_dump or the archive check failed${dump_rc:+; pg_dump exit $dump_rc})" >&2
+        if [ "$dump_rc" -ne 124 ] && [ "$verify_rc" -ne 124 ]; then
+            if [ "$dump_rc" -ne 0 ]; then log "FAILED to back up ${DB}: pg_dump exit $dump_rc" >&2
+            else log "FAILED to back up ${DB}: the archive check (pg_restore -l) failed on the dump (truncated write? full volume?)" >&2; fi
+        fi
         FAILED="$FAILED $DB"
     fi
 done

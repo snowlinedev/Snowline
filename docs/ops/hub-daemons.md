@@ -46,8 +46,8 @@ each of platform / pm / governance / memory:
    for gui/501?)" — run `ops/hub/install-backup-agent.sh` from the owner's
    own session instead, which is the primary path anyway.) It (re)loads `ops/hub/launchagents/dev.snowline.backup.plist`
    into `gui/501` only when the tracked plist differs from the one last
-   confirmed loaded or the unit is not loaded (waiting first for a dump in
-   progress); a unit that is loaded and current but whose last run exited
+   confirmed loaded or the unit is not loaded (run by itself it waits first
+   for a dump in progress; from the deploy path it skips instead, exit 3); a unit that is loaded and current but whose last run exited
    with anything other than 0 or 3, or for which there is no evidence it
    itself dumped in the last two hours (a fresh dump plus the unit's own
    `run exit` log line — a manual dump alone does not count), is not

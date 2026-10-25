@@ -32,6 +32,15 @@ done
 # agents are RunAtLoad + KeepAlive: loading starts them).
 for svc in $SERVICES; do
   echo "== dev.snowline.$svc"
+  # (the platform service hosts the in-process autocut: as in the install,
+  # a cut that began since the guard is not killed by this teardown)
+  if [ "$svc" = platform ]; then
+    case "$(lock_state "$AUTOCUT_LOCK")" in
+      free) ;;
+      held) echo "   an autocut started since the guard; NOT touching dev.snowline.$svc mid-cut — re-run once it is done" >&2; fail=1; continue ;;
+      *) echo "   cannot probe $AUTOCUT_LOCK (perl missing? unreadable?); NOT touching dev.snowline.$svc blind — fix that and re-run" >&2; fail=1; continue ;;
+    esac
+  fi
   restore_agent "$svc" || fail=1
 done
 echo "done; check the four /health URLs (docs/ops/hub-daemons.md). The backup agent dev.snowline.backup was left as it is."
