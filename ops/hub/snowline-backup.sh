@@ -617,8 +617,8 @@ for DB in $DBS; do
             # Size is best-effort (an iCloud file can be evicted to a
             # placeholder the instant it lands, making the stat error); a
             # stat, not a child: nothing here may stall unbounded.
-            SIZE="$(stat -f %z "$LANDED" 2>/dev/null || true)"
-            log "backed up ${DB} -> ${LANDED} (${SIZE:+$SIZE bytes}${SIZE:-size unknown})"
+            SIZE="$(stat -f %z "$LANDED" 2>/dev/null)" && SIZE="$SIZE bytes" || SIZE="size unknown"
+            log "backed up ${DB} -> ${LANDED} ($SIZE)"
         else
             rm -f "$LANDED.partial"
             log "FAILED to back up ${DB} (the rename of its verified archive failed)" >&2
