@@ -350,8 +350,16 @@ restore_agent() {
     chown "$OWNER_UID" "$AGENTS/$ra_label.plist"
     echo "   restored $AGENTS/$ra_label.plist"
   fi
-  if launchctl print "gui/$OWNER_UID/$ra_label" >/dev/null 2>&1; then
-    echo "   agent $ra_label already loaded in gui/$OWNER_UID"
+  if unit_snapshot "gui/$OWNER_UID/$ra_label"; then
+    if [ "$UNIT_RUNNING" = yes ]; then
+      echo "   agent $ra_label already loaded and running in gui/$OWNER_UID"
+    else
+      # loaded but not running (it lost the port to the daemon and sits in
+      # launchd's respawn throttle, or has no KeepAlive): start it now, as
+      # the old rollback always did
+      launchctl kickstart "gui/$OWNER_UID/$ra_label" && echo "   agent $ra_label was loaded but not running; kickstarted" \
+        || echo "   agent $ra_label is loaded but not running and the kickstart failed — start it by hand: launchctl kickstart gui/$OWNER_UID/$ra_label" >&2
+    fi
     return 0
   fi
   if launchctl bootstrap "gui/$OWNER_UID" "$AGENTS/$ra_label.plist"; then

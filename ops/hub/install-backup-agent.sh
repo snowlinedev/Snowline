@@ -117,6 +117,7 @@ log_verdict() {
   # one pass: the last marker's kind, and the last exit code that is a
   # verdict (3, a step-aside, is not one)
   set -- $(log_lines_since "$1" | awk '$2 == "run" && $3 == "start" { l = "start" } $2 == "run" && $3 == "exit" { l = "exit"; if ($4 != 3) v = $4 } END { print l, v }')
+  LOG_LAST_EXIT="${2:-}"   # the last verdict code in the window, OPEN or not
   if [ "${1:-}" = start ]; then LOGSAYS=OPEN
   elif [ -z "${2:-}" ]; then LOGSAYS=NONE
   elif [ "$2" = 0 ]; then LOGSAYS=OK
@@ -266,6 +267,12 @@ prove_run() {
   tail -n 8 "$log_file" 2>/dev/null | sed 's/^/   /'
   if [ "$code" = 0 ]; then
     log_verdict "$run_stamp"
+    # (the proving run is known to have ended; an hourly fire that began in
+    # the seconds since makes the log OPEN — judge the proving run by the
+    # last exit code in the window, not by that new start)
+    if [ "$LOGSAYS" = OPEN ] && [ -n "$LOG_LAST_EXIT" ]; then
+      if [ "$LOG_LAST_EXIT" = 0 ]; then LOGSAYS=OK; else LOGSAYS=FAIL; fi
+    fi
     dump_evidence $(( ($(date +%s) - run_epoch) / 60 + 1 ))
     case "$EVIDENCE" in
       OK)       echo "   OK (exit 0; dump landed in $dest)" ;;

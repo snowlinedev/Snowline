@@ -47,7 +47,9 @@ each of platform / pm / governance / memory:
    with anything other than 0 or 3, or for which there is no evidence it
    itself dumped in the last two hours (a fresh dump plus the unit's own
    `run exit` log line — a manual dump alone does not count), is not
-   reloaded but proven again. The plist
+   reloaded but proven again — except exit 78 (launchd could not spawn the
+   program), which IS reloaded, since a reload is what clears launchd's
+   penalty box. The plist
    carries the canonical checkout path for the script on purpose (a path
    taken from whichever checkout runs an install could be a scratch
    worktree); the installer refuses to run from any other checkout and

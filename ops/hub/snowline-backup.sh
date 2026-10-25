@@ -88,14 +88,14 @@ on_exit() {
     [ "$QUIET_EXIT" = yes ] || log "run exit $oe_rc"
 }
 trap on_exit EXIT
-# A SIGTERM/SIGINT at ANY point (a bootout during the Postgres wait, a
-# logout, a shutdown) logs itself; the child in flight (DUMP_PID: the
+# A SIGTERM/SIGINT/SIGHUP at ANY point (a bootout during the Postgres wait,
+# a logout, a shutdown, an ssh session dropping under a manual run) logs itself; the child in flight (DUMP_PID: the
 # catalog read or a dump — bash runs a trap only once the foreground
 # command returns, so both run in the background and are waited for) is
 # killed, and a dump's partial removed. Armed here, before the first log
 # line and the first fork, so a run never vanishes without a log line.
 OUT=""; DUMP_PID=""
-trap 'log "interrupted (SIGTERM/SIGINT)${OUT:+; removing $OUT.partial}" >&2; [ -z "$DUMP_PID" ] || kill "$DUMP_PID" 2>/dev/null; [ -z "$OUT" ] || rm -f "$OUT.partial"; exit 143' TERM INT
+trap 'log "interrupted (SIGTERM/SIGINT/SIGHUP)${OUT:+; removing $OUT.partial}" >&2; [ -z "$DUMP_PID" ] || kill "$DUMP_PID" 2>/dev/null; [ -z "$OUT" ] || rm -f "$OUT.partial"; exit 143' TERM INT HUP
 [ "$QUIET_EXIT" = yes ] || log "run start"   # the run's real start, for the installer
 CATALOG_ERR="$(mktemp -t snowline-backup-psql)" || die "cannot create a temp file (TMPDIR unwritable?)"
 CATALOG_OUT="$(mktemp -t snowline-backup-catalog)" || die "cannot create a temp file (TMPDIR unwritable?)"
@@ -331,9 +331,9 @@ exec 9>>"$BACKUP_LOCK" || die "cannot open the run lock $BACKUP_LOCK (root-owned
 # holds the file for an instant while a real run holds it for minutes.
 flock_fd 9 ex 5
 case $? in
-    0) ;;
+    0) LOCKED=yes ;;
     1) log "another backup run holds $BACKUP_LOCK; stepping aside"; exit 3 ;;
-    127) log "WARNING: /usr/bin/perl is missing; running WITHOUT the run lock (the dump is the point, the lock a courtesy)" >&2 ;;
+    127) LOCKED=no; log "WARNING: /usr/bin/perl is missing; running WITHOUT the run lock (the dump is the point, the lock a courtesy)" >&2 ;;
     *) die "cannot take the run lock $BACKUP_LOCK (flock failed)" ;;
 esac
 
@@ -398,17 +398,23 @@ CATALOG_OK=yes
 # hold the run — or the TERM trap — for ever) and backgrounded like the
 # dumps, so a bootout mid-read still gets its "run exit" line.
 PGCONNECT_TIMEOUT=15 PGOPTIONS='-c statement_timeout=30000' \
-    psql -X -At -d postgres -c "select datname, (datallowconn and has_database_privilege(datname, 'CONNECT')) from pg_database where not datistemplate and datname <> 'postgres' and datname ~ '^[A-Za-z0-9_]+\$' order by 1" > "$CATALOG_OUT" 2>"$CATALOG_ERR" 9>&- &
+    psql -X -At -d postgres -c "select datname, (datallowconn and has_database_privilege(datname, 'CONNECT')), (datname ~ '^[A-Za-z0-9_]+\$') from pg_database where not datistemplate and datname <> 'postgres' order by 1" > "$CATALOG_OUT" 2>"$CATALOG_ERR" 9>&- &
 DUMP_PID=$!
 wait "$DUMP_PID" || CATALOG_OK=no
 DUMP_PID=""
 # One pass over the rows: the store rule (store_wanted) applied once per
-# name, connectable names to LIVE, the others to UNCONNECTABLE.
-LIVE=""; UNCONNECTABLE=""
-while IFS='|' read -r cat_name cat_ok; do
+# name, connectable names to LIVE, the others to UNCONNECTABLE; a wanted
+# name that is not a plain identifier (a quoted name with a dash, say) is
+# NAMED as failed below, never silently dropped — this script only dumps
+# names it can pass around safely. (The row is read with `|` as the
+# separator; a name containing one would be mangled here, and is in any
+# case not an identifier.)
+LIVE=""; UNCONNECTABLE=""; NONIDENT=""
+while IFS='|' read -r cat_name cat_ok cat_ident; do
     [ -n "$cat_name" ] || continue
     store_wanted "$cat_name" || continue
-    if [ "$cat_ok" = t ]; then LIVE="$LIVE $cat_name"; else UNCONNECTABLE="$UNCONNECTABLE $cat_name"; fi
+    if [ "$cat_ident" != t ]; then NONIDENT="$NONIDENT $cat_name"
+    elif [ "$cat_ok" = t ]; then LIVE="$LIVE $cat_name"; else UNCONNECTABLE="$UNCONNECTABLE $cat_name"; fi
 done < "$CATALOG_OUT"
 LIVE="${LIVE# }"; UNCONNECTABLE="${UNCONNECTABLE# }"
 # A store this role cannot connect to is a FAILED store, not a footnote:
@@ -421,6 +427,11 @@ for uc in $UNCONNECTABLE; do
     if [ -n "$DBS_EXPLICIT" ] && ! has_word "$uc" $DBS_EXPLICIT; then continue; fi
     log "FAILED to back up ${uc}: this role cannot connect to it (parked? CONNECT revoked?)" >&2
     FAILED="$FAILED $uc"
+done
+for ni in $NONIDENT; do
+    [ -z "$DBS_EXPLICIT" ] || continue   # an explicit list names what it wants; it cannot name this
+    log "FAILED to back up '${ni}': its name is not a plain identifier (letters, digits, _), which this script does not handle — rename it, or back it up by hand" >&2
+    FAILED="$FAILED $ni"
 done
 if [ "$CATALOG_OK" != yes ]; then
     if [ -n "$DBS_EXPLICIT" ]; then catalog_clause="the connectability check and the exclusion note are skipped this run"; else catalog_clause="dumping the fallback list only: $FALLBACK_DBS"; fi
@@ -506,9 +517,8 @@ prune_all() {
 # a find hiccup must not fail the run.
 prune_all || true
 # One more walk for two things. A .partial (or a write probe, or iCloud's
-# evicted placeholder of either) older than two hours belongs to a run that
-# died without its trap (SIGKILL, power loss): no live run owns it (a run
-# is bounded well inside an hour), so it is swept here, before the dumps,
+# evicted placeholder of either) belongs to a run that died without its
+# trap (SIGKILL, power loss): no live run owns it, so it is swept here, before the dumps,
 # and a full destination frees itself — only THIS script's names
 # (<store>-<stamp>.dump.partial, the pre-#319 local-time stamp included:
 # the old script's last staging file is swept too): another job's staging
@@ -516,7 +526,11 @@ prune_all || true
 # (an iCloud conflict copy "NAME 2.dump", a hand-made .bak) are neither
 # counted nor pruned: say so once a run, or the bounded folder grows
 # unbounded unnoticed.
-UNREC="$(find "$DEST" -maxdepth 1 \( -type f \( -name '*-[0-9]*.dump.partial' -o -name '.probe.*' -o -name '.*-[0-9]*.dump.partial.icloud' -o -name '..probe.*.icloud' \) -mmin +120 -delete \) \
+# (holding the lock, this run is the only one: every such file is an
+# orphan now, whatever its age — the two-hour guard is for the lockless,
+# perl-less path only)
+if [ "$LOCKED" = yes ]; then sweep_age=(); else sweep_age=(-mmin +120); fi
+UNREC="$(find "$DEST" -maxdepth 1 \( -type f \( -name '*-[0-9]*.dump.partial' -o -name '.probe.*' -o -name '.*-[0-9]*.dump.partial.icloud' -o -name '..probe.*.icloud' \) "${sweep_age[@]}" -delete \) \
              -o \( -type f ! -name '*.partial' ! -name '.probe.*' ! -name '.*.partial.icloud' ! -name '..probe.*.icloud' ! -name '.DS_Store' -print \) 2>"$Z_DUMPS_ERR" \
     | while IFS= read -r uf; do parse_dump_name "$uf" || printf '%s\n' "${uf##*/}"; done)"
 [ -s "$Z_DUMPS_ERR" ] && log "WARNING: the stale-file sweep in $DEST hit an error ($(tail -n 1 "$Z_DUMPS_ERR"))" >&2
