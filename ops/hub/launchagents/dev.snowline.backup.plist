@@ -45,6 +45,11 @@
         <string>/Users/seanlynch/Projects/snowline-platform/ops/hub/snowline-backup.sh</string>
     </array>
 
+    <!-- launchd's default is 5 s from SIGTERM to SIGKILL; the script's TERM
+         handler can be deferred by a foreground command (a Postgres wait,
+         a folder walk) for a few seconds, and it must get to log itself -->
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
     <key>StartInterval</key>
     <integer>3600</integer>
 

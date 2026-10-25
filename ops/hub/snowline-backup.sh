@@ -541,23 +541,7 @@ prune_all() {
 # kept, iCloud `.NAME.icloud` placeholders by the same rule — age is the
 # stamp in the NAME, a placeholder's mtime being eviction time). Non-fatal:
 # a find hiccup must not fail the run.
-# run_bounded <seconds> <command...> — the command in the background with
-# the run lock's fd closed (9>&-: a child orphaned by a SIGKILL of this
-# shell must not hold the lock), killed after <seconds> by a watchdog whose
-# own sleep dies with it (an orphan sleep would outlive every run); the
-# command's status, 143 when the watchdog struck. DUMP_PID/WATCHDOG_PID are
-# what the TERM trap kills.
-run_bounded() {
-    rb_bound="$1"; shift
-    "$@" 9>&- &
-    DUMP_PID=$!
-    ( trap 'kill "$wd_sleep" 2>/dev/null; exit 0' TERM; sleep "$rb_bound" & wd_sleep=$!; wait "$wd_sleep"; kill "$DUMP_PID" 2>/dev/null ) >/dev/null 2>&1 9>&- &
-    WATCHDOG_PID=$!
-    wait "$DUMP_PID"; rb_rc=$?
-    DUMP_PID=""
-    kill "$WATCHDOG_PID" 2>/dev/null; wait "$WATCHDOG_PID" 2>/dev/null; WATCHDOG_PID=""
-    return "$rb_rc"
-}
+# (run_bounded, lib.sh: the dump and its verification run under it below)
 prune_all || true
 # One more walk for two things. A .partial (or a write probe, or iCloud's
 # evicted placeholder of either) belongs to a run that died without its

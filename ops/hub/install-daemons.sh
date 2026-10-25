@@ -127,11 +127,9 @@ done
 # migration's window. A per-user agent on purpose (docs "DB backups"); the
 # installer is idempotent and is also the thing to run by itself, without
 # sudo, whenever the backup needs (re)proving.
-# Its outcome is reported, not folded into this script's exit status: that
-# status is this deploy's own result (the services and the autocut timer),
-# which an automation wrapper may key on, and the backup proof can be
-# inconclusive from an ssh session for reasons that have nothing to do with
-# the services. Run with --deploy: a backup in progress is skipped rather
+# Its outcome does not alter a non-zero services/timers result (an
+# automation wrapper keys on that); when they are fine and the backup step
+# is not, the exit is 3 — distinct, never silently green. Run with --deploy: a backup in progress is skipped rather
 # than waited on, and the proof is bounded more tightly, so a service
 # rollout is never held for long by the backup step.
 echo "== dev.snowline.backup (ops/hub/install-backup-agent.sh, as the owner)"
@@ -144,6 +142,12 @@ elif [ "$backup_here" = no ]; then
 elif sudo -u "#$OWNER_UID" -H /bin/sh "$OPS_HUB/install-backup-agent.sh" --deploy; then
   echo "== backup agent: OK"
 else
-  echo "== backup agent: NOT OK (see above) — fix and re-run ops/hub/install-backup-agent.sh as the owner; this deploy's own result (services and timers) is exit $fail" >&2
+  echo "== backup agent: NOT OK (see above) — fix and re-run ops/hub/install-backup-agent.sh as the owner; the services and timers are fine (exit 3 says exactly that)" >&2
+  backup_fail=1
 fi
-exit "$fail"
+# exit: the services' and timers' own result when it is non-zero; else 3
+# when the backup step failed (a deploy that leaves the hourly backup
+# broken must not read as green); else 0
+[ "$fail" -eq 0 ] || exit "$fail"
+[ "${backup_fail:-0}" -eq 0 ] || exit 3
+exit 0

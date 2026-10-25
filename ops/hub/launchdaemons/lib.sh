@@ -76,7 +76,7 @@ wait_for_postgres() {
       return 1
     fi
     log "waiting for postgres (${waited}s)"
-    sleep 5
+    sleep 5 & wait $!   # (interruptible: a TERM trap runs now, not after the sleep)
     waited=$((waited + 5))
   done
   return 0
@@ -196,6 +196,23 @@ unit_busy_wait() {
     sleep "$ubw_step"
     ubw_waited=$((ubw_waited + ubw_step))
   done
+}
+# run_bounded <seconds> <command...> — the command in the background with
+# fd 9 closed (the backup script's run lock: a child orphaned by a SIGKILL
+# of the caller must not hold it), killed after <seconds> by a watchdog
+# whose own sleep dies with it (an orphan sleep would outlive every run);
+# returns the command's status, 143 when the watchdog struck. Sets
+# DUMP_PID / WATCHDOG_PID while running, for a caller's TERM trap to kill.
+run_bounded() {
+  rb_bound="$1"; shift
+  "$@" 9>&- &
+  DUMP_PID=$!
+  ( trap 'kill "$wd_sleep" 2>/dev/null; exit 0' TERM; sleep "$rb_bound" & wd_sleep=$!; wait "$wd_sleep"; kill "$DUMP_PID" 2>/dev/null ) >/dev/null 2>&1 9>&- &
+  WATCHDOG_PID=$!
+  wait "$DUMP_PID"; rb_rc=$?
+  DUMP_PID=""
+  kill "$WATCHDOG_PID" 2>/dev/null; wait "$WATCHDOG_PID" 2>/dev/null; WATCHDOG_PID=""
+  return "$rb_rc"
 }
 # timer_skip <name> <what> — when <name>'s lock is held (or cannot be
 # probed) print why the unit is being left alone and return 0; the caller

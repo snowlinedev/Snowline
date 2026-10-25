@@ -252,15 +252,13 @@ prove_run() {
     started_epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$started" +%s 2>/dev/null)" || started_epoch=""
     if [ -n "$started" ] && [ -n "$started_epoch" ]; then run_stamp="$started"; run_epoch="$started_epoch"; fi
   else
-    # bounded: a kickstart of a unit launchd has penalty-boxed can hang
-    launchctl kickstart "$domain/$label" & kp=$!
-    ki=0; while kill -0 "$kp" 2>/dev/null && [ "$ki" -lt 30 ]; do sleep 1; ki=$((ki + 1)); done
-    if kill -0 "$kp" 2>/dev/null; then
-      kill "$kp" 2>/dev/null
+    # bounded (run_bounded, lib.sh): a kickstart of a unit launchd has
+    # penalty-boxed can hang
+    run_bounded 30 launchctl kickstart "$domain/$label"; ks_rc=$?
+    if [ "$ks_rc" -eq 143 ]; then
       echo "   kickstart hung for 30 s (penalty box after spawn failures?); reload the unit: launchctl bootout $domain/$label; re-run this installer" >&2
       fail=1; return
-    fi
-    if ! wait "$kp"; then
+    elif [ "$ks_rc" -ne 0 ]; then
       echo "   kickstart refused; the unit is loaded but unproven — run 'bash $BACKUP_SCRIPT' by hand" >&2
       fail=1; return
     fi
