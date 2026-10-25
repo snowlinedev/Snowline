@@ -235,13 +235,17 @@ prove_run() {
     echo "   a run is already in flight; judging that one"
     runs_before=$((UNIT_RUNS - 1))
     # (one pass over the log's stamped lines for both stamps: this run's
-    # start is a "run start" NEWER than the last "run exit"; an older one is
-    # the previous run's — this run spawned an instant ago and has not
-    # written its own yet, and "now" is then its start to within a second;
-    # never an earlier guess, which could credit a manual run's dumps)
-    started="$(log_lines_since 0 | awk '$2 == "run" && $3 == "start" { s = $1 } $2 == "run" && $3 == "exit" { e = $1 } END { print (s > e ? s : "") }')"
+    # start is a "run start" NEWER than the last "run exit" AND within the
+    # last two hours — an older unmatched start is a run that died without
+    # its exit line, not this one; with no usable start — this run spawned
+    # an instant ago and has not written its own yet, or the log was
+    # rotated — the start is taken as five minutes ago: a run that far in
+    # already took its STAMP and is about to land dumps, and no manual run
+    # of the last hour is credited)
+    started="$(log_lines_since "$(date -u -v-120M +%FT%TZ)" | awk '$2 == "run" && $3 == "start" { s = $1 } $2 == "run" && $3 == "exit" { e = $1 } END { print (s > e ? s : "") }')"
     started_epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$started" +%s 2>/dev/null)" || started_epoch=""
-    if [ -n "$started" ] && [ -n "$started_epoch" ]; then run_stamp="$started"; run_epoch="$started_epoch"; fi
+    if [ -n "$started" ] && [ -n "$started_epoch" ]; then run_stamp="$started"; run_epoch="$started_epoch"
+    else run_epoch=$((run_epoch - 300)); run_stamp="$(date -u -v-5M +%FT%TZ)"; fi
   else
     # bounded (run_bounded, lib.sh): a kickstart of a unit launchd has
     # penalty-boxed can hang

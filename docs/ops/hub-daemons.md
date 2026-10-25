@@ -48,7 +48,8 @@ each of platform / pm / governance / memory:
    into `gui/501` only when the tracked plist differs from the one last
    confirmed loaded or the unit is not loaded (run by itself it waits first
    for a dump in progress; from the deploy path it skips instead, exit 3); a unit that is loaded and current but whose last run exited
-   with anything other than 0 or 3, or for which there is no evidence it
+   with anything other than 0, 2 or 3 (2, "cannot run here", is judged by
+   the evidence like 0: a refused configuration is reported, not re-kicked), or for which there is no evidence it
    itself dumped in the last two hours (a fresh dump plus the unit's own
    `run exit` log line — a manual dump alone does not count), is not
    reloaded but proven again — except exit 78 (launchd could not spawn the

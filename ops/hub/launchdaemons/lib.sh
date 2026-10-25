@@ -76,7 +76,7 @@ wait_for_postgres() {
       return 1
     fi
     log "waiting for postgres (${waited}s)"
-    sleep 5 9>&- & wait $! 2>/dev/null   # (interruptible: a TERM trap runs now, not after the sleep; fd 9 — the backup script's lock — not inherited)
+    run_bounded 10 sleep 5   # (interruptible, and the sleep is the caller's trap's to kill, via RUN_BOUNDED_PID)
     waited=$((waited + 5))
   done
   return 0
