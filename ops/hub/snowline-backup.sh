@@ -89,14 +89,15 @@ on_exit() {
 }
 trap on_exit EXIT
 # A SIGTERM/SIGINT/SIGHUP at ANY point (a bootout during the Postgres wait,
-# a logout, a shutdown, an ssh session dropping under a manual run) logs itself; the child in flight (DUMP_PID: the
-# catalog read or a dump — bash runs a trap only once the foreground
-# command returns, so both run in the background and are waited for) is
-# killed, and a dump's partial removed. Armed here, before the first log
+# a logout, a shutdown, an ssh session dropping under a manual run) logs
+# itself; the child in flight (DUMP_PID: the catalog read, a dump or its
+# verification — bash runs a trap only once the foreground command
+# returns, so they run in the background and are waited for) is killed,
+# and a dump's partial removed. Armed here, before the first log
 # line and the first fork, so a run never vanishes without a log line.
-OUT=""; DUMP_PID=""; WATCHDOG_PID=""
+OUT=""; DUMP_PID=""
 DUMP_BOUND_S=1800   # per store; the largest store dumps in well under a minute today
-trap 'log "interrupted (SIGTERM/SIGINT/SIGHUP)${OUT:+; removing $OUT.partial}" >&2; [ -z "$DUMP_PID" ] || kill "$DUMP_PID" 2>/dev/null; [ -z "$WATCHDOG_PID" ] || kill "$WATCHDOG_PID" 2>/dev/null; [ -z "$OUT" ] || rm -f "$OUT.partial"; exit 143' TERM INT HUP
+trap 'log "interrupted (SIGTERM/SIGINT/SIGHUP)${OUT:+; removing $OUT.partial}" >&2; [ -z "$DUMP_PID" ] || kill "$DUMP_PID" 2>/dev/null; [ -z "$OUT" ] || rm -f "$OUT.partial"; exit 143' TERM INT HUP
 [ "$QUIET_EXIT" = yes ] || log "run start"   # the run's real start, for the installer
 CATALOG_ERR="$(mktemp -t snowline-backup-psql)" || die "cannot create a temp file (TMPDIR unwritable?)"
 CATALOG_OUT="$(mktemp -t snowline-backup-catalog)" || die "cannot create a temp file (TMPDIR unwritable?)"
@@ -573,7 +574,7 @@ for DB in $DBS; do
     # better a store failure this hour than a stalled migration.
     # (9>&-: the child must not inherit the run lock's fd, or a pg_dump
     # orphaned by a SIGKILL of this shell would hold the lock until it ends)
-    # The dump and its verification each run under run_bounded (above): a
+    # The dump and its verification each run under run_bounded (lib.sh): a
     # backend that hangs after taking its locks, or a read or write that
     # stalls on the destination, would otherwise hold the run lock for ever
     # and every later hourly run would step aside — exit 3, "not a verdict"

@@ -199,25 +199,23 @@ unit_busy_wait() {
 }
 # run_bounded <seconds> <command...> — the command in the background with
 # fd 9 closed (the backup script's run lock: a child orphaned by a SIGKILL
-# of the caller must not hold it), killed after <seconds> by a watchdog
-# whose own sleep dies with it (an orphan sleep would outlive every run);
-# returns the command's status, or 124 when the watchdog struck (the
-# watchdog says so with its own exit status 99 — a TERM from elsewhere to
-# the child is the child's 143, not a timeout). Sets DUMP_PID /
-# WATCHDOG_PID while running, for a caller's TERM trap to kill.
+# of the caller must not hold it), bounded by a perl alarm set in the SAME
+# process before the exec (SIGALRM survives exec; the default disposition
+# ends the program, status 142, reported here as 124). One process, no
+# watchdog: a two-process shell watchdog races its own parent on bash 3.2
+# (orphaned sleeps, a pending TERM missed before `wait`). Returns the
+# command's status, 124 on timeout, 127 when it could not be started.
+# Sets DUMP_PID while running, for a caller's TERM trap to kill. (The
+# caller's `wait` itself is not interruptible by a TERM that lands between
+# the fork and the wait on bash 3.2 — a short window; launchd's exit
+# timeout and process-group kill cover it.)
 run_bounded() {
   rb_bound="$1"; shift
-  "$@" 9>&- &
+  /usr/bin/perl -e 'alarm shift @ARGV; exec @ARGV or exit 127' "$rb_bound" "$@" 9>&- &
   DUMP_PID=$!
-  # (once the watchdog has struck it ignores TERM, so the parent's kill
-  # racing its `exit 99` cannot turn a timeout verdict into the child's 143;
-  # the parent's wait is quiet, or bash would print a "Terminated" job line)
-  ( trap 'kill "$wd_sleep" 2>/dev/null; exit 0' TERM; sleep "$rb_bound" & wd_sleep=$!; wait "$wd_sleep"; trap '' TERM; kill "$DUMP_PID" 2>/dev/null; exit 99 ) >/dev/null 2>&1 9>&- &
-  WATCHDOG_PID=$!
   wait "$DUMP_PID" 2>/dev/null; rb_rc=$?
   DUMP_PID=""
-  kill "$WATCHDOG_PID" 2>/dev/null; wait "$WATCHDOG_PID" 2>/dev/null; rb_wd=$?; WATCHDOG_PID=""
-  [ "$rb_wd" -ne 99 ] || return 124
+  [ "$rb_rc" -ne 142 ] || return 124
   return "$rb_rc"
 }
 # timer_skip <name> <what> — when <name>'s lock is held (or cannot be

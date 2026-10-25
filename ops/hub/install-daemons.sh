@@ -45,8 +45,8 @@ for svc in $SERVICES; do
   if [ "$svc" = platform ]; then
     case "$(lock_state "$AUTOCUT_LOCK")" in
       free) ;;
-      held) echo "   an autocut started since the guard; NOT restarting $label mid-cut — re-run once it is done" >&2; fail=1; svc_fail=1; continue ;;
-      *) echo "   cannot probe $AUTOCUT_LOCK (perl missing? unreadable?); NOT restarting $label blind — fix that and re-run" >&2; fail=1; svc_fail=1; continue ;;
+      held) echo "   an autocut started since the guard; NOT restarting $label mid-cut, nor the other services on top of the old platform — re-run once it is done" >&2; fail=1; svc_fail=1; break ;;
+      *) echo "   cannot probe $AUTOCUT_LOCK (perl missing? unreadable?); NOT restarting $label blind, nor the other services — fix that and re-run" >&2; fail=1; svc_fail=1; break ;;
     esac
   fi
   place_unit "$LAUNCHDAEMONS_SRC/$label.plist" "$DAEMONS_DIR/$label.plist" root:wheel || { fail=1; svc_fail=1; continue; }
