@@ -14,6 +14,7 @@
 # later) and the proof is bounded to 10 minutes instead of 15.
 
 unset CDPATH   # before the `cd` below: a caller's CDPATH would make it print and wander
+unset SNOWLINE_OWNER_HOME   # lib.sh honours it for the backup script's sake; an installer is the OWNER's
 # shellcheck disable=SC1091
 . "$(cd "$(dirname "$0")" && pwd)/launchdaemons/lib.sh"
 if [ "$(id -u)" != "$OWNER_UID" ]; then
@@ -30,10 +31,12 @@ case "${1:-}" in
   "") DEPLOY=no ;;
   *) echo "unknown argument '$1' (only --deploy is accepted)" >&2; exit 64 ;;
 esac
-# (a run is 120 s of Postgres wait at most, up to 60 s of lock wait per
-# store, then the dumps: 15 min covers that; the 10 min of --deploy does
-# not quite when EVERY store is lock-contended, and then its verdict is
-# "still running", not a failure of the unit)
+# (a normal run is 120 s of Postgres wait at most, up to 60 s of lock wait
+# per store, then dumps of seconds each: 15 min covers that, the 10 min of
+# --deploy nearly; a run with a STALLED store may last up to the script's
+# own watchdog bounds — 30 min for the dump and 30 more for its
+# verification — and then the verdict here is "still running", not a
+# failure of the unit)
 if [ "$DEPLOY" = yes ]; then BUSY_BOUND=0; PROVE_BOUND=600; DEPLOY_NOTE=" (a --deploy call does not wait longer)"; else BUSY_BOUND=600; PROVE_BOUND=900; DEPLOY_NOTE=""; fi
 
 label="dev.snowline.backup"
@@ -233,22 +236,21 @@ esac
 prove_run() {
   pr_try="$1"
   unit_snapshot "$domain/$label"; runs_before="$UNIT_RUNS"
-  run_stamp="$(date -u +%FT%TZ)"; run_epoch="$(date +%s)"
+  run_stamp="$(utc_stamp)"; run_epoch="$(date +%s)"
   if [ "$UNIT_RUNNING" = yes ]; then
     # its start is the script's own last "run start" line; failing that
     # (log rotated), the previous run's "run exit" stamp — never a guess
     # that could credit an older run's dumps to this one
     echo "   a run is already in flight; judging that one"
     runs_before=$((UNIT_RUNS - 1))
-    # (one pass over the log's stamped lines for both stamps: this run's start is a
-    # "run start" NEWER than the last "run exit"; an older one is the
-    # previous run's — this run spawned an instant ago and has not written
-    # its own yet — and a log with no usable stamp gives a window of 15 min,
-    # longer than any run, since the run's dumps are necessarily older than
-    # "now")
+    # (one pass over the log's stamped lines for both stamps: this run's
+    # start is a "run start" NEWER than the last "run exit"; an older one is
+    # the previous run's — this run spawned an instant ago and has not
+    # written its own yet, and "now" is then its start to within a second;
+    # never an earlier guess, which could credit a manual run's dumps)
     started="$(log_lines_since 0 | awk '$2 == "run" && $3 == "start" { s = $1 } $2 == "run" && $3 == "exit" { e = $1 } END { print (s > e ? s : "") }')"
     started_epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$started" +%s 2>/dev/null)" || started_epoch=""
-    if [ -n "$started" ] && [ -n "$started_epoch" ]; then run_stamp="$started"; run_epoch="$started_epoch"; else run_epoch=$((run_epoch - 900)); run_stamp="$(date -u -v-15M +%FT%TZ)"; fi
+    if [ -n "$started" ] && [ -n "$started_epoch" ]; then run_stamp="$started"; run_epoch="$started_epoch"; fi
   else
     # bounded: a kickstart of a unit launchd has penalty-boxed can hang
     launchctl kickstart "$domain/$label" & kp=$!

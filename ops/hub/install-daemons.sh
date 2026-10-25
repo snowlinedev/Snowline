@@ -17,6 +17,7 @@ case "${1:-}" in --wait|"") ;; *) echo "unknown argument '$1' (only --wait is ac
 [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
 
 unset CDPATH   # before the `cd` below: a caller's CDPATH would make it print and wander
+unset SNOWLINE_OWNER_HOME   # lib.sh honours it for the backup script's sake; an installer is the OWNER's
 # shellcheck disable=SC1091
 . "$(cd "$(dirname "$0")" && pwd)/launchdaemons/lib.sh"
 autocut_guard "$@"

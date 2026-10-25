@@ -56,7 +56,8 @@ backup_log() {
 # ---- logging ----
 # Helpers and callers log through `log`: one UTC-stamped line. (A shell
 # function, so it shadows macOS's /usr/bin/log for everything sourcing this.)
-log() { echo "$(date -u +%FT%TZ) $*"; }
+utc_stamp() { date -u +%FT%TZ; }   # the ONE spelling of the stamp
+log() { echo "$(utc_stamp) $*"; }
 # The stamp's grammar, for whoever reads those lines back (awk ERE, no
 # interval expressions: macOS awk).
 LOG_STAMP_RE='^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z$'
@@ -126,7 +127,7 @@ bootout_wait() {
 # A timer that must not be booted out mid-run holds a flock on
 # $LOCKS_DIR/<name>.lock for its whole run: autocut for the cut (taken by
 # `snowline release autocut`), the backup for the dump (snowline-backup.sh
-# opens the file on fd 9 for its lifetime and flocks it). lock_held <path> probes
+# opens the file on fd 9 for its lifetime and flocks it). lock_state <path> probes
 # a lock without keeping it (a shared non-blocking lock, released at once;
 # the backup's acquire retries over a few seconds so a probe cannot make it
 # step aside). The kernel drops a flock with its process, so a file left by
@@ -202,7 +203,7 @@ unit_busy_wait() {
 # probed) print why the unit is being left alone and return 0; the caller
 # then skips it. <what> names the action to repeat later.
 timer_skip() {
-  lock_held "$LOCKS_DIR/$1.lock" || return 1
+  unit_busy_wait "$1" 0 >/dev/null 2>&1 && return 1   # (free: nothing to skip)
   echo "   $1 is running now (or its lock cannot be probed); leaving dev.snowline.$1 as it is — re-run $2 after it finishes" >&2
   return 0
 }
