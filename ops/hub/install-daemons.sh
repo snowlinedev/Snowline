@@ -14,6 +14,7 @@
 
 [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
 
+unset CDPATH   # before the `cd` below: a caller's CDPATH would make it print and wander
 # shellcheck disable=SC1091
 . "$(cd "$(dirname "$0")" && pwd)/launchdaemons/lib.sh"
 autocut_guard "$@"

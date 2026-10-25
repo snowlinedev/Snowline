@@ -13,6 +13,7 @@
 # so never wait long on the backup — a dump in progress is skipped (re-run
 # later) and the proof is bounded to 10 minutes instead of 15.
 
+unset CDPATH   # before the `cd` below: a caller's CDPATH would make it print and wander
 # shellcheck disable=SC1091
 . "$(cd "$(dirname "$0")" && pwd)/launchdaemons/lib.sh"
 if [ "$(id -u)" != "$OWNER_UID" ]; then
