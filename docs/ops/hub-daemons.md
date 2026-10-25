@@ -522,7 +522,7 @@ does not source, a bad `SNOWLINE_BACKUP_RETENTION_DAYS` or
 `SNOWLINE_BACKUP_DBS`, an unknown argument) — the log line names which. Exit 3 means the run stepped aside because another
 backup run held the lock (a manual or proving run racing the hourly fire;
 harmless once).
-A log line "interrupted (SIGTERM/SIGINT)" (exit 143, or `(never exited)`
+A log line "interrupted (SIGTERM/SIGINT/SIGHUP)" (exit 143, or `(never exited)`
 in launchctl) means the run was killed mid-dump — a bootout, logout or
 shutdown; its partial was removed and the next tick dumps again.
 `78: EX_CONFIG` means launchd could not spawn the program (script path

@@ -54,7 +54,13 @@ echo "== $label (per-user agent; unit runs $BACKUP_SCRIPT)"
 # With this shell's SNOWLINE_BACKUP_* unset: the agent under launchd sees
 # only backup.env, and the probes must see the same, or a leftover export
 # from a scratch test would make them judge a different folder.
-query() { env -u SNOWLINE_BACKUP_DIR -u SNOWLINE_BACKUP_RETENTION_DAYS -u SNOWLINE_BACKUP_DBS /bin/bash "$BACKUP_SCRIPT" "$@"; }
+# (the variables cleared are the script's own BACKUP_ENV_VARS list, read
+# from it so the two cannot drift; the three known names if that fails)
+query_unset="$(sed -n 's/^BACKUP_ENV_VARS="\([A-Z_ ]*\)"$/\1/p' "$BACKUP_SCRIPT" | head -n 1)"
+[ -n "$query_unset" ] || query_unset="SNOWLINE_BACKUP_DIR SNOWLINE_BACKUP_RETENTION_DAYS SNOWLINE_BACKUP_DBS"
+query_env=""; for qv in $query_unset; do query_env="$query_env -u $qv"; done
+# shellcheck disable=SC2086
+query() { env $query_env /bin/bash "$BACKUP_SCRIPT" "$@"; }
 dest="$(query --print-dest 2>/dev/null)" || dest="(unknown: --print-dest failed)"
 # dump_evidence <minutes> — sets EVIDENCE to OK (a dump newer than <minutes>
 # in the destination), NONE (readable, none there), CONFIG_FAIL (the script
@@ -147,8 +153,13 @@ else
   # ended by a signal (launchd's "never exited"): not fine. (A first run
   # still in flight shows the same empty code; that is judged as in-flight.)
   [ "$UNIT_RUNNING" != yes ] && [ "$UNIT_RUNS" -gt 0 ] && [ -z "$UNIT_EXIT" ] && UNIT_EXIT=signal
+  # a registration that has never run (a reload whose proof was refused or
+  # timed out, then a re-run) has no record of its own: last hour's dump
+  # and "run exit 0" belong to its predecessor
+  [ "$UNIT_RUNS" -gt 0 ] || [ "$UNIT_RUNNING" = yes ] || UNIT_EXIT=never
   case "$UNIT_EXIT" in
     ""|0|3) ;;
+    never) action=reprove; why="this registration has never run (an earlier proof did not complete?)" ;;
     signal) action=reprove; why="last run ended by a signal (killed mid-dump?)" ;;
     78) action=reload; why="launchd could not spawn the program (EX_CONFIG) — a reload clears the penalty box" ;;
     *) action=reprove; why="last run exited $UNIT_EXIT" ;;

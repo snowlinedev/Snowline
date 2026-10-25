@@ -375,7 +375,12 @@ chmod 700 "$DEST" 2>/dev/null || log "WARNING: could not chmod 700 $DEST" >&2
 # unless a loose file exists)
 # (this job's stores: Snowline's and any the explicit list names)
 own_names=(-name 'snowline_*.dump')
-for db in $DBS_EXPLICIT; do own_names+=(-o -name "$db-*.dump"); done
+# (and the same stores' staging files and evicted placeholders, for the sweep)
+own_stale=(-name 'snowline_*-[0-9]*.dump.partial' -o -name '.snowline_*-[0-9]*.dump.partial.icloud')
+for db in $DBS_EXPLICIT; do
+    own_names+=(-o -name "$db-*.dump")
+    own_stale+=(-o -name "$db-[0-9]*.dump.partial" -o -name ".$db-[0-9]*.dump.partial.icloud")
+done
 find "$DEST" -maxdepth 1 \( "${own_names[@]}" \) -type f -perm +044 -exec chmod 600 {} + 2>/dev/null \
     || log "WARNING: could not tighten permissions on existing dumps in $DEST" >&2
 
@@ -519,10 +524,11 @@ prune_all || true
 # One more walk for two things. A .partial (or a write probe, or iCloud's
 # evicted placeholder of either) belongs to a run that died without its
 # trap (SIGKILL, power loss): no live run owns it, so it is swept here, before the dumps,
-# and a full destination frees itself — only THIS script's names
-# (<store>-<stamp>.dump.partial, the pre-#319 local-time stamp included:
-# the old script's last staging file is swept too): another job's staging
-# file in a shared destination is left alone, and not nagged about. And files outside the dump grammar
+# and a full destination frees itself — only THIS job's stores' staging
+# names (own_stale: Snowline's and the explicit list's, the pre-#319
+# local-time stamp included so the old script's last staging file goes
+# too): another job's staging file in a shared destination is left alone,
+# and not nagged about. And files outside the dump grammar
 # (an iCloud conflict copy "NAME 2.dump", a hand-made .bak) are neither
 # counted nor pruned: say so once a run, or the bounded folder grows
 # unbounded unnoticed.
@@ -533,7 +539,7 @@ prune_all || true
 # spelled as an age test because bash 3.2's `set -u` rejects an empty
 # array expansion, which the "no age test" case would otherwise be)
 if [ "$LOCKED" = yes ]; then sweep_age="+0"; else sweep_age="+120"; fi
-UNREC="$(find "$DEST" -maxdepth 1 \( -type f \( -name '*-[0-9]*.dump.partial' -o -name '.probe.*' -o -name '.*-[0-9]*.dump.partial.icloud' -o -name '..probe.*.icloud' \) -mmin "$sweep_age" -delete \) \
+UNREC="$(find "$DEST" -maxdepth 1 \( -type f \( "${own_stale[@]}" -o -name '.probe.*' -o -name '..probe.*.icloud' \) -mmin "$sweep_age" -delete \) \
              -o \( -type f ! -name '*.partial' ! -name '.probe.*' ! -name '.*.partial.icloud' ! -name '..probe.*.icloud' ! -name '.DS_Store' -print \) 2>"$Z_DUMPS_ERR" \
     | while IFS= read -r uf; do parse_dump_name "$uf" || printf '%s\n' "${uf##*/}"; done)"
 [ -s "$Z_DUMPS_ERR" ] && log "WARNING: the stale-file sweep in $DEST hit an error ($(tail -n 1 "$Z_DUMPS_ERR"))" >&2
