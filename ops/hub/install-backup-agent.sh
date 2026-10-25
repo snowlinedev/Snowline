@@ -135,15 +135,12 @@ log_verdict() {
 # exit code alone is no evidence either — a stopped unit still shows its
 # old 0). Otherwise LEAVE ALONE.
 action=leave; why=""
-if ! cmp -s "$plist_src" "$plist_dst" 2>/dev/null; then
-  action=reload; why="plist changed"
-elif ! unit_current "$label" "$plist_dst"; then
-  action=reload; why="this plist was never confirmed loaded (a previous load did not complete?)"
-elif ! unit_snapshot "$domain/$label"; then
-  action=reload; why="not loaded"
+if ! unit_unchanged "$label" "$domain" "$plist_src" "$plist_dst" || ! unit_snapshot "$domain/$label"; then
+  action=reload
+  if ! cmp -s "$plist_src" "$plist_dst" 2>/dev/null; then why="plist changed"
+  elif ! unit_current "$label" "$plist_dst"; then why="this plist was never confirmed loaded (a previous load did not complete?)"
+  else why="not loaded"; fi
 else
-  # (unit_unchanged in lib.sh is these three tests; they are spelled out
-  # here because the snapshot's exit code and run count are needed next)
   # an empty exit code with runs > 0 is a run that ended by a signal
   # (launchd's "never exited"): not fine
   [ "$UNIT_RUNS" -gt 0 ] && [ -z "$UNIT_EXIT" ] && UNIT_EXIT=signal
@@ -207,10 +204,12 @@ prove_run() {
     # that could credit an older run's dumps to this one
     echo "   a run is already in flight; judging that one"
     runs_before=$((UNIT_RUNS - 1))
-    started="$(log_lines_since 0 | awk '$2 == "run" && $3 == "start" { s = $1 } END { print s }')"
-    [ -n "$started" ] || started="$(log_lines_since 0 | awk '$2 == "run" && $3 == "exit" { s = $1 } END { print s }')"
+    # (one pass over the log for both stamps; a log with neither — just
+    # created or rotated — gives a window of 15 min, longer than any run,
+    # since the run's dumps are necessarily older than "now")
+    started="$(log_lines_since 0 | awk '$2 == "run" && $3 == "start" { s = $1 } $2 == "run" && $3 == "exit" { e = $1 } END { print (s != "" ? s : e) }')"
     started_epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$started" +%s 2>/dev/null)" || started_epoch=""
-    if [ -n "$started" ] && [ -n "$started_epoch" ]; then run_stamp="$started"; run_epoch="$started_epoch"; else run_stamp="$(date -u +%FT%TZ)"; fi
+    if [ -n "$started" ] && [ -n "$started_epoch" ]; then run_stamp="$started"; run_epoch="$started_epoch"; else run_epoch=$((run_epoch - 900)); run_stamp="$(date -u -v-15M +%FT%TZ)"; fi
   else
     # bounded: a kickstart of a unit launchd has penalty-boxed can hang
     launchctl kickstart "$domain/$label" & kp=$!
@@ -242,7 +241,11 @@ prove_run() {
     if [ "$pr_try" = 1 ]; then
       echo "   stepped aside (a manual run held the lock); waiting for it, then firing once more"
       if unit_busy_wait backup "$BUSY_BOUND"; then prove_run 2; return; fi
-      echo "   that run is still going after 10 min; nothing proven — re-run later" >&2
+      if [ "$BUSY_BOUND" -eq 0 ]; then
+        echo "   not waiting for it under --deploy; nothing proven — run this installer by itself later" >&2
+      else
+        echo "   that run is still going after $((BUSY_BOUND / 60)) min; nothing proven — re-run later" >&2
+      fi
     else
       echo "   stepped aside twice; nothing proven — re-run later" >&2
     fi

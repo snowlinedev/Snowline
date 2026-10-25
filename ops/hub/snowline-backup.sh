@@ -33,7 +33,7 @@ set -uo pipefail
 # The command line. A query (--print-dest, --check) is quiet: it never logs
 # a "run start" / "run exit" line, even when it dies on a refused
 # configuration before reaching the dispatch.
-ARG1="${1:-}"; ARG2="${2:-}"
+ARG1="${1:-}"; ARG2="${2:-}"; ARGC=$#
 case "$ARG1" in --print-dest|--check) QUIET_EXIT=yes ;; *) QUIET_EXIT=no ;; esac
 export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 umask 077
@@ -210,6 +210,7 @@ dest_state() {
 #                       (UNREADABLE) or does not exist at all (MISSING)
 case "$ARG1" in
     --print-dest)
+        [ "$ARGC" -eq 1 ] || die "--print-dest takes no further argument"
         printf '%s\n' "$DEST"
         exit 0
         ;;
@@ -221,15 +222,20 @@ case "$ARG1" in
         # compare as strings against one cutoff stamp — no fork per file.
         # Prints OK / NONE / UNREADABLE on stdout as well as exiting 0 / 1 /
         # 2, so a caller can tell "no dump" from "could not even run".
+        [ "$ARGC" -eq 2 ] || die "--check takes exactly one argument, a number of minutes"
         mins="$ARG2"
         case "$mins" in ''|*[!0-9]*) echo "--check needs a number of minutes" >&2; exit 2 ;; esac
         # Same destination rule as a run (dest_state): a leaf that does not
         # exist yet under a present iCloud root is "no dump yet" (NONE); a
         # missing root or non-iCloud destination is "cannot run here".
+        # (under the iCloud root this caller's context may simply be denied
+        # the stat — ssh without Full Disk Access — which the agent in its
+        # login session is not: that is UNREADABLE, to be judged from the
+        # log; only a non-iCloud destination that is not there is MISSING)
         case "$(dest_state)" in
             ok) ;;
             no-leaf) echo NONE; exit 1 ;;
-            *) echo MISSING; exit 2 ;;   # a run would exit 2 too: nothing to read, not "unreadable from here"
+            *) case "$DEST" in "$ICLOUD_ROOT"/*) echo UNREADABLE ;; *) echo MISSING ;; esac; exit 2 ;;
         esac
         # (a cutoff that cannot be computed is a refused argument — a die,
         # nothing on stdout — not "the destination is unreadable")
@@ -254,7 +260,7 @@ EOF_Z
         [ "$found" = yes ] && { echo OK; exit 0; }
         echo NONE; exit 1
         ;;
-    "") ;;   # no arguments: a real run
+    "") [ "$ARGC" -eq 0 ] || die "an empty argument is not a run (this script takes no arguments except --print-dest and --check <minutes>); refusing to run" ;;
     *) die "unknown argument '$ARG1' (this script takes no arguments except --print-dest and --check <minutes>); refusing to run" ;;
 esac
 # --- run lock: a flock on $BACKUP_LOCK, held for the whole run ---
@@ -409,9 +415,11 @@ PRUNE_CUTOFF="$(date -u -v-"${RETENTION_DAYS}"d +%Y%m%d-%H%M%S 2>/dev/null)" || 
 KEEP_MIN=3
 prune_all() {
     [ -n "$PRUNE_CUTOFF" ] || return 0   # no cutoff, no pruning (never over-delete; warned above)
+    # only Snowline's own stores (STORE_RE): a destination shared with
+    # another project's dumps is not this job's to prune
     z_dumps '*' all | sort -t "$TAB" -k1,1 -k2,2r \
-    | awk -F"$TAB" -v cutoff="$PRUNE_CUTOFF" -v keep="$KEEP_MIN" '
-        $1 == "snowline_dev" { next }
+    | awk -F"$TAB" -v cutoff="$PRUNE_CUTOFF" -v keep="$KEEP_MIN" -v store="$STORE_RE" '
+        $1 !~ store || $1 == "snowline_dev" { next }
         $1 != store { store = $1; n = 0 }
         { n++; if (n > keep && $2 < cutoff) print $3 }' \
     | while IFS= read -r pa_f; do rm -f "$pa_f"; done
