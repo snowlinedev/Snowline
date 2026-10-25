@@ -228,14 +228,18 @@ case "$ARG1" in
         # Same destination rule as a run (dest_state): a leaf that does not
         # exist yet under a present iCloud root is "no dump yet" (NONE); a
         # missing root or non-iCloud destination is "cannot run here".
-        # (under the iCloud root this caller's context may simply be denied
-        # the stat — ssh without Full Disk Access — which the agent in its
-        # login session is not: that is UNREADABLE, to be judged from the
-        # log; only a non-iCloud destination that is not there is MISSING)
+        # (under the iCloud root the errno decides: this caller's context
+        # may be DENIED the stat — ssh without Full Disk Access, which the
+        # agent in its login session is not — and that is UNREADABLE, to be
+        # judged from the log; a path that is not there at all — iCloud
+        # Drive signed out — is MISSING, like any other absent destination)
         case "$(dest_state)" in
             ok) ;;
             no-leaf) echo NONE; exit 1 ;;
-            *) case "$DEST" in "$ICLOUD_ROOT"/*) echo UNREADABLE ;; *) echo MISSING ;; esac; exit 2 ;;
+            *) case "$(ls -d "$DEST" 2>&1 >/dev/null)" in
+                   *"Operation not permitted"*) echo UNREADABLE ;;
+                   *) echo MISSING ;;
+               esac; exit 2 ;;
         esac
         # (a cutoff that cannot be computed is a refused argument — a die,
         # nothing on stdout — not "the destination is unreadable")
@@ -312,8 +316,11 @@ PROBE="$DEST/.probe.$$"
 rm -f "$PROBE"; PROBE=""
 # Owner-only posture for the folder and for every dump in it: new dumps are
 # written under umask 077; older ones (0644 before this script enforced it)
-# and dumps that iCloud re-materialises are tightened each run — a few
-# hundred stats an hour. Best effort on an iCloud folder, but say so.
+# and dumps that iCloud re-materialises are tightened each run. (This walk,
+# the prune's and the .partial sweep's each stat every entry: at steady
+# state ~4,300 files, so some 13,000 stats an hour — fine for a local
+# folder, worth knowing before adding a fourth.) Best effort on an iCloud
+# folder, but say so.
 chmod 700 "$DEST" 2>/dev/null || log "WARNING: could not chmod 700 $DEST" >&2
 # (`-exec … {} +` runs nothing when nothing matches: one walk, no chmod
 # unless a loose file exists)
@@ -439,6 +446,12 @@ prune_all || true
 # inside an hour), so it is swept here, before the dumps, and a full
 # destination frees itself.
 find "$DEST" -maxdepth 1 -name '*.partial' -type f -mmin +120 -delete 2>/dev/null || true
+# Files outside the dump grammar (an iCloud conflict copy "NAME 2.dump", a
+# hand-made .bak) are neither counted nor pruned: say so once a run, or the
+# bounded folder grows unbounded unnoticed.
+UNREC="$(find "$DEST" -maxdepth 1 -type f ! -name '*.partial' ! -name '.DS_Store' 2>/dev/null \
+    | while IFS= read -r uf; do parse_dump_name "$uf" || printf '%s\n' "${uf##*/}"; done)"
+[ -z "$UNREC" ] || log "WARNING: $(printf '%s\n' "$UNREC" | wc -l | tr -d ' ') file(s) in $DEST outside the dump name grammar — neither counted nor pruned, tidy by hand: $(printf '%s\n' "$UNREC" | head -n 3 | tr '\n' ' ')" >&2
 set -f
 for DB in $DBS; do
     set +f

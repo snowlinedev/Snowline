@@ -11,7 +11,7 @@
 # evidence; 1 = something needs the operator (message says what).
 # --deploy (what install-daemons.sh passes): called from a service rollout,
 # so never wait long on the backup — a dump in progress is skipped (re-run
-# later) and the proof is bounded to 5 minutes instead of 15.
+# later) and the proof is bounded to 10 minutes instead of 15.
 
 # shellcheck disable=SC1091
 . "$(cd "$(dirname "$0")" && pwd)/launchdaemons/lib.sh"
@@ -26,7 +26,9 @@ case "${1:-}" in
   "") DEPLOY=no ;;
   *) echo "unknown argument '$1' (only --deploy is accepted)" >&2; exit 64 ;;
 esac
-if [ "$DEPLOY" = yes ]; then BUSY_BOUND=0; PROVE_BOUND=300; else BUSY_BOUND=600; PROVE_BOUND=900; fi
+# (the proof bound covers the script's own worst case: 120 s Postgres wait
+# + 60 s lock wait per store + the dumps)
+if [ "$DEPLOY" = yes ]; then BUSY_BOUND=0; PROVE_BOUND=600; DEPLOY_NOTE=" (a --deploy call does not wait longer)"; else BUSY_BOUND=600; PROVE_BOUND=900; DEPLOY_NOTE=""; fi
 
 label="dev.snowline.backup"
 domain="gui/$(id -u)"
@@ -70,10 +72,10 @@ dest="$(query --print-dest 2>/dev/null)" || dest="(unknown: --print-dest failed)
 # ssh without Full Disk Access — so LOGSAYS, from a log_verdict the caller
 # ran first, stands in), or UNKNOWN; EVIDENCE_MSG carries the --check reason.
 dump_evidence() {
-  de_err="$(mktemp -t snowline-install-check)"
+  de_err="$(mktemp -t snowline-install-check)" || { EVIDENCE=UNKNOWN; EVIDENCE_MSG="cannot create a temp file (TMPDIR unwritable?)"; return; }
   de_out="$(query --check "$1" 2>"$de_err")"; de_rc=$?
   # (the last stderr line, without the script's own stamp)
-  EVIDENCE_MSG="$(tail -n 1 "$de_err" | sed 's/^[0-9][0-9-]*T[0-9:]*Z //')"; rm -f "$de_err"
+  EVIDENCE_MSG="$(tail -n 1 "$de_err" | strip_stamp)"; rm -f "$de_err"
   case $de_rc in
     0) EVIDENCE=OK; return ;;
     1) EVIDENCE=NONE; return ;;
@@ -111,8 +113,10 @@ dump_evidence() {
 # <stamp> (pg_dump's unstamped stderr shares the file and is dropped): the
 # ONE reader of the log format, for log_verdict and the in-flight start.
 log_lines_since() {
-  awk -v s="$1" '$1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ && $1 >= s' "$log_file" 2>/dev/null
+  awk -v s="$1" -v re="$LOG_STAMP_RE" '$1 ~ re && $1 >= s' "$log_file" 2>/dev/null
 }
+# strip_stamp — a stamped line without its stamp (lib.sh's grammar)
+strip_stamp() { sed -E "s/${LOG_STAMP_RE%\$} //"; }
 log_verdict() {
   LOGSAYS=NONE
   for lv_code in $(log_lines_since "$1" | awk '$2 == "run" && $3 == "exit" { print $4 }' | tail -r); do
@@ -138,10 +142,10 @@ log_verdict() {
 # exit code alone is no evidence either — a stopped unit still shows its
 # old 0). Otherwise LEAVE ALONE.
 action=leave; why=""
-if ! unit_unchanged "$label" "$domain" "$plist_src" "$plist_dst"; then
-  action=reload; why="$UNIT_UNCHANGED_WHY"
-elif ! unit_snapshot "$domain/$label"; then
-  action=reload; why="not loaded"
+# (the snapshot can only fail in the instant after unit_unchanged saw the
+# unit loaded; its values are needed below)
+if ! unit_unchanged "$label" "$domain" "$plist_src" "$plist_dst" || ! unit_snapshot "$domain/$label"; then
+  action=reload; why="${UNIT_UNCHANGED_WHY:-not loaded}"
 else
   # an empty exit code with runs > 0 and nothing running is a run that
   # ended by a signal (launchd's "never exited"): not fine. (A first run
@@ -270,7 +274,11 @@ prove_run() {
       *)        echo "   exit 0, UNCONFIRMED: could not check $dest ($EVIDENCE_MSG) and the log shows no run — verify by hand: ls -t '$dest' | head" >&2; fail=1 ;;
     esac
   elif [ -z "$code" ]; then
-    echo "   no result after ${i}s (still running, never spawned, or killed by a signal) — check $log_file and 'launchctl print $domain/$label'" >&2
+    if unit_snapshot "$domain/$label" && [ "$UNIT_RUNNING" = yes ]; then
+      echo "   still running after ${i}s; not proven${DEPLOY_NOTE:-} — check $log_file later, or run this installer by itself" >&2
+    else
+      echo "   no result after ${i}s (never spawned, or killed by a signal) — check $log_file and 'launchctl print $domain/$label'" >&2
+    fi
     fail=1
   else
     echo "   FAILED (exit $code) — see $log_file (1: a store failed; 2: cannot run here)" >&2

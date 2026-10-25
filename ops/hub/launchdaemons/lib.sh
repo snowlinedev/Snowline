@@ -47,6 +47,9 @@ backup_script() {
 # Helpers and callers log through `log`: one UTC-stamped line. (A shell
 # function, so it shadows macOS's /usr/bin/log for everything sourcing this.)
 log() { echo "$(date -u +%FT%TZ) $*"; }
+# The stamp's grammar, for whoever reads those lines back (awk ERE, no
+# interval expressions: macOS awk).
+LOG_STAMP_RE='^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z$'
 
 # ---- waits ----
 # wait_for_postgres — bounded wait (120 s, 5 s steps) for pg_isready on the
@@ -296,22 +299,26 @@ load_unit() {
 # together.
 restore_agent() {
   label="dev.snowline.$1"
+  # something to restore FIRST: with neither a live agent plist nor a
+  # .disabled-* one, the daemon stays — tearing it down would leave the
+  # service with nothing loaded anywhere
+  disabled="$(ls -1 "$AGENTS/$label.plist.disabled-"* 2>/dev/null | sort | tail -n 1)"
+  if [ ! -f "$AGENTS/$label.plist" ] && [ -z "$disabled" ]; then
+    echo "   no agent plist to restore for $label (neither $AGENTS/$label.plist nor a .disabled-* copy); leaving the daemon in place" >&2
+    return 1
+  fi
   launchctl bootout "system/$label" 2>/dev/null || true
   if ! wait_unloaded "system/$label"; then
     echo "   daemon $label still registered after 30s; NOT starting the agent on top of it — re-run" >&2
     return 1
   fi
   rm -f "${DAEMONS_DIR:?}/${label:?}.plist"
-  disabled="$(ls -1 "$AGENTS/$label.plist.disabled-"* 2>/dev/null | sort | tail -n 1)"
   if [ -f "$AGENTS/$label.plist" ]; then
     [ -z "$disabled" ] || echo "   keeping the live $AGENTS/$label.plist (leaving $disabled aside)"
-  elif [ -n "$disabled" ]; then
+  else
     mv "$disabled" "$AGENTS/$label.plist"
     chown "$OWNER_UID" "$AGENTS/$label.plist"
     echo "   restored $AGENTS/$label.plist"
-  else
-    echo "   no .disabled-* agent plist found for $label; daemon removed, nothing loaded" >&2
-    return 1
   fi
   if launchctl print "gui/$OWNER_UID/$label" >/dev/null 2>&1; then
     echo "   agent $label already loaded in gui/$OWNER_UID"
