@@ -458,7 +458,7 @@ RunAtLoad; the first timed run is an hour after loading). The script:
   stamp in the name (the same rule `--check` uses; an
   iCloud placeholder's mtime is eviction time), including evicted
   `.NAME.icloud` placeholders; the legacy `snowline_dev-*` dumps are never
-  touched. Any argument other than `--print-dest` / `--check` is refused
+  pruned (their permissions are tightened like every `snowline_*` dump's). Any argument other than `--print-dest` / `--check` is refused
   (exit 2) so a typo cannot start a real run.
 
 Dumps land in `~/Library/Mobile Documents/com~apple~CloudDocs/Snowline/db-backups/`

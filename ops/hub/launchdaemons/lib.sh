@@ -163,13 +163,12 @@ flock_fd() {
 # callers treat it like held — but without waiting on it.
 lock_state() {
   [ -e "$1" ] || { echo free; return; }
-  # a file this user cannot open is "unknown" (a root-owned lock, say) —
-  # decided here, because under /bin/sh a failed `exec 8<` on the special
-  # builtin exits the shell with status 1, which would read as "held"
-  [ -r "$1" ] || { echo unknown; return; }
-  # one flock implementation: flock_fd on a read fd opened in a SUBSHELL,
-  # so even that exec failure could only end the subshell
-  ( { exec 8<"$1"; } 2>/dev/null || exit 2; flock_fd 8 sh 1 )
+  # one flock implementation: flock_fd on a read fd opened in a subshell.
+  # `command exec`: under /bin/sh a failed redirection on the special
+  # builtin `exec` exits the (sub)shell with status 1 — which would read as
+  # "held" — unless `command` strips the special-builtin status, so that
+  # `|| exit 2` runs and any open failure (EACCES, ELOOP, EMFILE) is "unknown"
+  ( command exec 8<"$1" 2>/dev/null || exit 2; flock_fd 8 sh 1 )
   case $? in 0) echo free ;; 1) echo held ;; *) echo unknown ;; esac
 }
 # lock_held <path> — true unless the lock is known to be free.

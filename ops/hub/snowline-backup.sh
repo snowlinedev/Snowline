@@ -121,9 +121,12 @@ if [ -f "$BACKUP_ENV" ]; then
     # step-aside into exit 1 and a failed store into an aborted run.
     # A file that EXITS (an `exit` line, or `set -e` plus a failing command)
     # would end this shell mid-source with no reason logged: it is sourced
-    # in a throwaway subshell first, so that case is a refusal with a reason.
-    ( set +u; . "$BACKUP_ENV" ) >/dev/null 2>&1 \
-        || die "cannot source $BACKUP_ENV: it fails or exits when sourced (a syntax error? an exit line? set -e with a failing command?); refusing to run half-configured"
+    # in a throwaway subshell first and must come out the other side — its
+    # last command's status is NOT the test (`[ -d /Volumes/X ] && ...` with
+    # the volume away returns 1 and is fine). The file therefore runs twice
+    # a run; it is meant to hold assignments, not side effects.
+    [ "$( ( set +u; . "$BACKUP_ENV" >/dev/null 2>&1; echo SOURCED ) 2>/dev/null )" = SOURCED ] \
+        || die "cannot source $BACKUP_ENV: it exits when sourced (a syntax error? an exit line? set -e with a failing command?); refusing to run half-configured"
     saved_opts="$(set +o)"
     set -a; set +u   # +u: the file may reference variables this shell does not have
     # shellcheck disable=SC1090

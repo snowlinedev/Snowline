@@ -23,6 +23,7 @@ for timer in $TIMERS; do
   if timer_skip "$timer" "the uninstall"; then fail=1; continue; fi
   launchctl bootout "system/$label" 2>/dev/null || true
   rm -f "${DAEMONS_DIR:?}/${label:?}.plist"
+  rm -f "$LOCKS_DIR/$label.loaded"   # the marker vouches for what launchd has; it has nothing now
 done
 
 # Services: restore_agent (lib.sh) removes the daemon, puts the newest
