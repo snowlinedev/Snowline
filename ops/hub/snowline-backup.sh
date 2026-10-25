@@ -172,7 +172,7 @@ DEST="${SNOWLINE_BACKUP_DIR:-$BACKUP_DIR}"
 case "$DEST" in /*) ;; *) die "SNOWLINE_BACKUP_DIR must be an absolute path: '$DEST'" ;; esac
 # (the listings below are tab-separated rows, one per line: a tab or a
 # newline in the path would split them and point the prune elsewhere)
-case "$DEST" in *"$(printf '\t')"*|*"$(printf '\n')"*) die "SNOWLINE_BACKUP_DIR must not contain a tab or a newline" ;; esac
+case "$DEST" in *$'\t'*|*$'\n'*) die "SNOWLINE_BACKUP_DIR must not contain a tab or a newline" ;; esac   # (ANSI-C quoting: a $(printf) would lose the newline)
 RETENTION_DAYS="${SNOWLINE_BACKUP_RETENTION_DAYS:-30}"
 case "$RETENTION_DAYS" in ''|*[!0-9]*) die "SNOWLINE_BACKUP_RETENTION_DAYS must be a whole number of days, at least 1: '$RETENTION_DAYS'" ;; esac
 [ "$RETENTION_DAYS" -ge 1 ] || die "SNOWLINE_BACKUP_RETENTION_DAYS must be at least 1: '$RETENTION_DAYS'"

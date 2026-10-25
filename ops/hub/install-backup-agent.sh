@@ -127,12 +127,14 @@ log_verdict() {
   # exit-code rendering is not relied on for that
   # one pass: the last marker's kind, and the last exit code that is a
   # verdict (3, a step-aside, is not one)
-  set -- $(log_lines_since "$1" | awk '$2 == "run" && $3 == "start" { l = "start"; st = $1 } $2 == "run" && $3 == "exit" { l = "exit"; if ($4 != 3) v = $4 } END { print l, (v == "" ? "-" : v), (st == "" ? "-" : st) }')
+  set -- $(log_lines_since "$1" | awk '$2 == "run" && $3 == "start" { l = "start"; st = $1 } $2 == "run" && $3 == "exit" { l = "exit"; if ($4 != 3) v = $4 } END { print (l == "" ? "-" : l), (v == "" ? "-" : v), (st == "" ? "-" : st) }')
+  # (three fields, "-" for an empty one so they never shift)
+  lv_last="${1:-}"; [ "$lv_last" != - ] || lv_last=""
   LOG_LAST_EXIT="${2:-}"; [ "$LOG_LAST_EXIT" != - ] || LOG_LAST_EXIT=""   # the last verdict code in the window, OPEN or not
   LOG_LAST_START="${3:-}"; [ "$LOG_LAST_START" != - ] || LOG_LAST_START=""   # the last "run start" stamp in the window
-  if [ "${1:-}" = start ]; then LOGSAYS=OPEN
-  elif [ -z "${2:-}" ]; then LOGSAYS=NONE
-  elif [ "$2" = 0 ]; then LOGSAYS=OK
+  if [ "$lv_last" = start ]; then LOGSAYS=OPEN
+  elif [ -z "$LOG_LAST_EXIT" ]; then LOGSAYS=NONE
+  elif [ "$LOG_LAST_EXIT" = 0 ]; then LOGSAYS=OK
   else LOGSAYS=FAIL; fi
 }
 
