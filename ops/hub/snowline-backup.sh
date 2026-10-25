@@ -120,42 +120,43 @@ BACKUP_ENV="$HOME/.config/snowline/backup.env"
 # (BACKUP_ENV_VARS, from lib.sh, is the whole list of overrides;
 # install-backup-agent.sh clears the same list from its environment before
 # querying this script)
+# the pg tools' connection settings the file may set (exported to them)
+PG_ENV_VARS="PGHOST PGPORT PGUSER PGPASSWORD PGPASSFILE PGSERVICE PGDATABASE PGSSLMODE"
 if [ -f "$BACKUP_ENV" ]; then
-    for ev in $BACKUP_ENV_VARS; do printf -v "pre_$ev" '%s' "${!ev:-}"; done
-    # A shell file, sourced under `set -a` like the services' and autocut's
-    # env files, so a `PGPORT=5433` line there reaches pg_isready, psql and
-    # pg_dump as it does for them (it CAN do anything: a PATH= line there
-    # does retarget pg_dump — the operator's call). Stdout is sent to
-    # stderr, so a stray echo cannot corrupt the --print-dest / --check
-    # protocol the installer parses. The shell options in force before are
-    # restored afterwards: a `set -e` in the file would otherwise turn a
-    # step-aside into exit 1 and a failed store into an aborted run.
-    # A file that EXITS (an `exit` line, or `set -e` plus a failing command)
-    # would end this shell mid-source with no reason logged: it is sourced
-    # in a throwaway subshell first and must come out the other side — its
-    # last command's status is NOT the test (`[ -d /Volumes/X ] && ...` with
-    # the volume away returns 1 and is fine). The file therefore runs twice
-    # a run; it is meant to hold assignments, not side effects.
-    # (and a syntax error first: bash would apply the lines before it and
-    # drop the rest — the half-configured run this refuses)
+    # A shell file, sourced in a SUBSHELL under `set -a` (so a plain
+    # `PGPORT=5433` line reaches the pg tools, as in the services' env
+    # files). Only the override variables (BACKUP_ENV_VARS) and the pg
+    # tools' connection settings (PG_ENV_VARS) come back into this script:
+    # a line assigning anything else (QUIET_EXIT, SCRATCH_RE, IFS, a shell
+    # option) cannot reach it, and nothing the file prints can corrupt the
+    # --print-dest / --check protocol. A syntax error is refused first
+    # (bash would apply the lines before it and drop the rest); a file that
+    # EXITS (an `exit` line, `set -e` plus a failing command) never prints
+    # the marker and is refused with a reason — its last command's status
+    # is not the test (`[ -d /Volumes/X ] && ...` with the volume away is
+    # fine).
     bash -n "$BACKUP_ENV" 2>/dev/null || die "cannot source $BACKUP_ENV: syntax error (bash -n); refusing to run half-configured"
-    [ "$( ( set +u; . "$BACKUP_ENV" >/dev/null 2>&1; echo SOURCED ) 2>/dev/null )" = SOURCED ] \
-        || die "cannot source $BACKUP_ENV: it exits when sourced (an exit line? set -e with a failing command?); refusing to run half-configured"
-    saved_opts="$(set +o)"; saved_ifs="$IFS"
-    set -a; set +u   # +u: the file may reference variables this shell does not have
-    # shellcheck disable=SC1090
-    . "$BACKUP_ENV" >&2
-    eval "$saved_opts"; IFS="$saved_ifs"   # (an IFS= line in the file must not reshape every word split below)
-    # the environment's value wins — and says so when the file's lost (the
-    # hub's pre-#319 agent plist exported SNOWLINE_BACKUP_DIR itself until
-    # install-backup-agent.sh replaced it, which made a backup.env value look
-    # ignored)
-    for ev in $BACKUP_ENV_VARS; do
-        pre="pre_$ev"; pre="${!pre}"
-        [ -n "$pre" ] || continue
-        [ "$pre" = "${!ev:-}" ] || log "note: $ev from the environment ($pre) overrides $BACKUP_ENV (${!ev:-})" >&2
-        printf -v "$ev" '%s' "$pre"
-    done
+    imports="$( ( set +u; set -a; . "$BACKUP_ENV" >/dev/null 2>&1; for iv in $BACKUP_ENV_VARS $PG_ENV_VARS; do [ -z "${!iv:-}" ] || printf '%s=%q\n' "$iv" "${!iv}"; done; echo SOURCED ) 2>/dev/null )"
+    case "$imports" in
+        *SOURCED) ;;
+        *) die "cannot source $BACKUP_ENV: it exits when sourced (an exit line? set -e with a failing command?); refusing to run half-configured" ;;
+    esac
+    # the environment's value wins over the file's — and says so when the
+    # file's lost (the hub's pre-#319 agent plist exported
+    # SNOWLINE_BACKUP_DIR itself until install-backup-agent.sh replaced it,
+    # which made a backup.env value look ignored)
+    while IFS= read -r il; do
+        case "$il" in SOURCED|"") continue ;; esac
+        iv="${il%%=*}"
+        if [ -n "${!iv:-}" ]; then
+            fv="$(eval "printf '%s' ${il#*=}")"
+            [ "${!iv}" = "$fv" ] || log "note: $iv from the environment (${!iv}) overrides $BACKUP_ENV ($fv)" >&2
+            continue
+        fi
+        eval "$il"; export "$iv"
+    done <<EOF_IMPORTS
+$imports
+EOF_IMPORTS
 fi
 # Off-machine by default: iCloud Drive replicates the dumps off this host, so a
 # disk failure / theft doesn't take the backups with it. The default lives in
@@ -204,7 +205,11 @@ walk_bounded() {
 z_dumps() {
     if [ "${1:-}" = all ]; then zd_tail=''; else zd_tail='Z'; fi   # all: Z names and pre-#319 names alike
     walk_bounded \( -name "*-[0-9]*${zd_tail}.dump" -o -name ".*-[0-9]*${zd_tail}.dump.icloud" \) -type f || true
+    # (one row per LINE of find's output: a name containing a newline would
+    # split into a second, cwd-relative "path" — anything not under $DEST/
+    # is dropped, so the prune's rm can never leave the destination)
     while IFS= read -r zf; do
+        case "$zf" in "$DEST"/*) ;; *) continue ;; esac
         parse_dump_name "$zf" || continue
         printf '%s\t%s\t%s\n' "$NAME_STORE" "$NAME_STAMP" "$zf"
     done < "$Z_LIST" > "$Z_ROWS"
@@ -436,7 +441,7 @@ CATALOG_OK=yes
 # dumps, so a bootout mid-read still gets its "run exit" line.
 PGCONNECT_TIMEOUT=15 PGOPTIONS='-c statement_timeout=30000' \
     run_bounded 120 psql -X -At -d postgres -c "select datname, (datallowconn and has_database_privilege(datname, 'CONNECT')), (datname ~ '^[A-Za-z0-9_]+\$') from pg_database where not datistemplate and datname <> 'postgres' order by 1" > "$CATALOG_OUT" 2>"$CATALOG_ERR" \
-    || CATALOG_OK=no
+    || { cat_rc=$?; CATALOG_OK=no; [ "$cat_rc" -ne 124 ] || echo "the catalog read timed out after 120s (a server that accepts connections but stalls the query?)" >> "$CATALOG_ERR"; }
 # One pass over the rows: the store rule (store_wanted) applied once per
 # name, connectable names to LIVE, the others to UNCONNECTABLE; a wanted
 # name that is not a plain identifier (a quoted name with a dash, say) is

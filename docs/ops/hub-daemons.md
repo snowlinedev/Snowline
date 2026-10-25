@@ -73,8 +73,10 @@ each of platform / pm / governance / memory:
    exit 3 (a manual run held the lock; launchd runs one instance per label,
    so the hourly fire itself never can) is waited out and
    judged by the same evidence. An unchanged, loaded agent is left alone
-   only when its last run was fine (exit 0, or 3) AND a dump landed in the
-   last two hours (by the same two sources).
+   only when its last run was fine — exit 0, 3 (stepped aside), 2 (cannot
+   run here: judged by the evidence, a refused configuration is reported)
+   or no code yet — AND a dump landed in the last two hours (by the same
+   two sources); 78 reloads, anything else re-proves.
 
 The daemons run as `UserName=seanlynch`, `GroupName=staff`, so the mode-600
 env files in `~/.config/snowline/` stay readable. Logs are unchanged
@@ -484,8 +486,10 @@ script resolves and `--check <minutes>` reports (OK / NONE / UNREADABLE / MISSIN
 whether a dump newer than that many minutes exists there, judged by the
 UTC stamp in the file name (an iCloud placeholder's mtime is eviction
 time); the install runs both as the owner, so root never reads the owner's
-iCloud folder. The file is sourced under `set -a`, like the services' env files, so a
-plain `PGPORT=5433` line there reaches the pg tools.
+iCloud folder. The file is sourced in a subshell under `set -a`, like the services'
+env files, so a plain `PGPORT=5433` line there reaches the pg tools; only
+the `SNOWLINE_BACKUP_*` overrides and the `PG*` connection settings are
+imported into the script — nothing else in the file can change how it runs.
 
 **Rolling out this change on the hub.** The hub checkout had an untracked
 hand-restored copy of `ops/hub/snowline-backup.sh` from 2026-10-23 (the
