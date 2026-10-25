@@ -172,8 +172,8 @@ lock_state() {
   ( command exec 8<"$1" 2>/dev/null || exit 2; flock_fd 8 sh 1 )
   case $? in 0) echo free ;; 1) echo held ;; *) echo unknown ;; esac
 }
-# lock_held <path> — true unless the lock is known to be free.
-lock_held() { [ "$(lock_state "$1")" != free ]; }
+# lock_state <path> — true unless the lock is known to be free.
+lock_state() { [ "$(lock_state "$1")" != free ]; }
 
 # unit_busy_wait <name> [bound_s] [step_s] — wait (default up to 10 min, in
 # 5 s steps) while <name>.lock is held; the ops scripts call it right before
