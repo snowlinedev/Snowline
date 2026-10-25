@@ -199,23 +199,29 @@ unit_busy_wait() {
 }
 # run_bounded <seconds> <command...> — the command in the background with
 # fd 9 closed (the backup script's run lock: a child orphaned by a SIGKILL
-# of the caller must not hold it), bounded by a perl alarm set in the SAME
-# process before the exec (SIGALRM survives exec; the default disposition
-# ends the program, status 142, reported here as 124). One process, no
-# watchdog: a two-process shell watchdog races its own parent on bash 3.2
-# (orphaned sleeps, a pending TERM missed before `wait`). Returns the
-# command's status, 124 on timeout, 127 when it could not be started.
-# Sets DUMP_PID while running, for a caller's TERM trap to kill. (The
-# caller's `wait` itself is not interruptible by a TERM that lands between
-# the fork and the wait on bash 3.2 — a short window; launchd's exit
-# timeout and process-group kill cover it.)
+# of the caller must not hold it), bounded by ONE perl process that forks
+# it, waits with an alarm, and on the alarm kills it (TERM, then KILL) and
+# exits 124 — whatever the child does with SIGALRM itself. A TERM to the
+# perl is passed to the child (the caller's trap kills DUMP_PID). Returns
+# the child's status (128+signal when it died by one), 124 on timeout, 127
+# when it could not be started. (A two-process shell watchdog raced its
+# parent on bash 3.2; the caller's own `wait` is still not interruptible
+# by a TERM landing between fork and wait — launchd's exit timeout and
+# process-group kill cover that short window.)
 run_bounded() {
   rb_bound="$1"; shift
-  /usr/bin/perl -e 'alarm shift @ARGV; exec @ARGV or exit 127' "$rb_bound" "$@" 9>&- &
+  /usr/bin/perl -e '
+    my $t = shift @ARGV;
+    my $pid = fork; defined $pid or exit 127;
+    if (!$pid) { exec @ARGV or exit 127 }
+    $SIG{ALRM} = sub { kill TERM => $pid; sleep 2; kill KILL => $pid; waitpid($pid, 0); exit 124 };
+    $SIG{TERM} = sub { kill TERM => $pid; waitpid($pid, 0); exit 143 };
+    alarm $t; waitpid($pid, 0); my $s = $?;
+    exit(($s & 127) ? 128 + ($s & 127) : $s >> 8);
+  ' "$rb_bound" "$@" 9>&- &
   DUMP_PID=$!
   wait "$DUMP_PID" 2>/dev/null; rb_rc=$?
   DUMP_PID=""
-  [ "$rb_rc" -ne 142 ] || return 124
   return "$rb_rc"
 }
 # timer_skip <name> <what> — when <name>'s lock is held (or cannot be
@@ -228,6 +234,18 @@ timer_skip() {
 }
 
 # ---- autocut guard ----
+# platform_cut_recheck <verb> — right before the platform service is torn
+# down (it hosts the in-process autocut): a cut that began since
+# autocut_guard, or a lock that cannot be probed, means "do not touch it";
+# prints why, returns 1. <verb> names what is not being done.
+platform_cut_recheck() {
+  case "$(lock_state "$AUTOCUT_LOCK")" in
+    free) return 0 ;;
+    held) echo "   an autocut started since the guard; NOT $1 dev.snowline.platform mid-cut — re-run once it is done" >&2 ;;
+    *) echo "   cannot probe $AUTOCUT_LOCK (perl missing? unreadable?); NOT $1 dev.snowline.platform blind — fix that and re-run" >&2 ;;
+  esac
+  return 1
+}
 # autocut_guard [--wait] — refuse (exit 75) while an autocut is running: a
 # `launchctl bootout system/dev.snowline.autocut` SIGTERMs a running cut (~6
 # min, hourly). The cut holds a flock on AUTOCUT_LOCK for its whole run, so

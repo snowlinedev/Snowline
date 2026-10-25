@@ -42,12 +42,9 @@ for svc in $SERVICES; do
   # the platform service hosts the in-process autocut: a cut that began in
   # the moments since autocut_guard must not be killed by this restart —
   # re-check right before touching it; skip and say which case it is
-  if [ "$svc" = platform ]; then
-    case "$(lock_state "$AUTOCUT_LOCK")" in
-      free) ;;
-      held) echo "   an autocut started since the guard; NOT restarting $label mid-cut, nor the other services on top of the old platform — re-run once it is done" >&2; fail=1; svc_fail=1; break ;;
-      *) echo "   cannot probe $AUTOCUT_LOCK (perl missing? unreadable?); NOT restarting $label blind, nor the other services — fix that and re-run" >&2; fail=1; svc_fail=1; break ;;
-    esac
+  if [ "$svc" = platform ] && ! platform_cut_recheck "restarting"; then
+    echo "   (nor are the other services restarted on top of the old platform)" >&2
+    fail=1; svc_fail=1; break
   fi
   place_unit "$LAUNCHDAEMONS_SRC/$label.plist" "$DAEMONS_DIR/$label.plist" root:wheel || { fail=1; svc_fail=1; continue; }
   # stop the agent (ignore: it may not be loaded) and wait for it to be

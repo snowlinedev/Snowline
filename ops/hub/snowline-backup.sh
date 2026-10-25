@@ -97,6 +97,7 @@ trap on_exit EXIT
 # line and the first fork, so a run never vanishes without a log line.
 OUT=""; DUMP_PID=""
 DUMP_BOUND_S=1800   # per store; the largest store dumps in well under a minute today
+WALK_BOUND_S=600    # per folder walk (a stalled iCloud readdir must not hold the lock for ever)
 trap 'log "interrupted (SIGTERM/SIGINT/SIGHUP)${OUT:+; removing $OUT.partial}" >&2; [ -z "$DUMP_PID" ] || kill "$DUMP_PID" 2>/dev/null; [ -z "$OUT" ] || rm -f "$OUT.partial"; exit 143' TERM INT HUP
 [ "$QUIET_EXIT" = yes ] || log "run start"   # the run's real start, for the installer
 CATALOG_ERR="$(mktemp -t snowline-backup-psql)" || die "cannot create a temp file (TMPDIR unwritable?)"
@@ -184,7 +185,7 @@ parse_dump_name() {
 TAB=$'\t'
 z_dumps() {
     if [ "${1:-}" = all ]; then zd_tail=''; else zd_tail='Z'; fi   # all: Z names and pre-#319 names alike
-    find "$DEST" -maxdepth 1 \( -name "*-[0-9]*${zd_tail}.dump" -o -name ".*-[0-9]*${zd_tail}.dump.icloud" \) -type f 2>"$Z_DUMPS_ERR" \
+    run_bounded "$WALK_BOUND_S" find "$DEST" -maxdepth 1 \( -name "*-[0-9]*${zd_tail}.dump" -o -name ".*-[0-9]*${zd_tail}.dump.icloud" \) -type f 2>"$Z_DUMPS_ERR" \
     | while IFS= read -r zf; do
         parse_dump_name "$zf" || continue
         printf '%s\t%s\t%s\n' "$NAME_STORE" "$NAME_STAMP" "$zf"
@@ -381,8 +382,9 @@ rm -f "$PROBE"; PROBE=""
 # and dumps that iCloud re-materialises are tightened each run. (This walk,
 # the prune's and the sweep's each stat every entry: at steady state
 # ~4,300 files, so some 13,000 stats an hour — fine for a local folder,
-# worth knowing before adding a fourth.) Best effort on an iCloud folder,
-# but say so.
+# worth knowing before adding a fourth. Each walk runs under run_bounded,
+# WALK_BOUND_S: a stalled iCloud readdir must not hold the run lock for
+# ever.) Best effort on an iCloud folder, but say so.
 chmod 700 "$DEST" 2>/dev/null || log "WARNING: could not chmod 700 $DEST" >&2
 # (`-exec … {} +` runs nothing when nothing matches: one walk, no chmod
 # unless a loose file exists)
@@ -394,7 +396,7 @@ for db in $DBS_EXPLICIT; do
     own_names+=(-o -name "$db-*.dump")
     own_stale+=(-o -name "$db-[0-9]*.dump.partial" -o -name ".$db-[0-9]*.dump.partial.icloud")
 done
-find "$DEST" -maxdepth 1 \( "${own_names[@]}" \) -type f -perm +044 -exec chmod 600 {} + 2>"$Z_DUMPS_ERR" \
+run_bounded "$WALK_BOUND_S" find "$DEST" -maxdepth 1 \( "${own_names[@]}" \) -type f -perm +044 -exec chmod 600 {} + 2>"$Z_DUMPS_ERR" \
     || log "WARNING: the permission sweep of $DEST hit an error ($(tail -n 1 "$Z_DUMPS_ERR")); a loose dump may remain" >&2
 
 # --- wait for Postgres (bounded; see lib.sh) ---
@@ -557,7 +559,7 @@ prune_all || true
 # unbounded unnoticed.
 # (holding the lock, this run is the only one: every such file is an
 # orphan now, whatever its age)
-UNREC="$(find "$DEST" -maxdepth 1 \( -type f \( "${own_stale[@]}" -o -name '.probe.*' -o -name '..probe.*.icloud' \) -delete \) \
+UNREC="$(run_bounded "$WALK_BOUND_S" find "$DEST" -maxdepth 1 \( -type f \( "${own_stale[@]}" -o -name '.probe.*' -o -name '..probe.*.icloud' \) -delete \) \
              -o \( -type f ! -name '*.partial' ! -name '.probe.*' ! -name '.*.partial.icloud' ! -name '..probe.*.icloud' ! -name '.DS_Store' -print \) 2>"$Z_DUMPS_ERR" \
     | while IFS= read -r uf; do parse_dump_name "$uf" || printf '%s\n' "${uf##*/}"; done)"
 [ -s "$Z_DUMPS_ERR" ] && log "WARNING: the stale-file sweep in $DEST hit an error ($(tail -n 1 "$Z_DUMPS_ERR"))" >&2
@@ -596,7 +598,7 @@ for DB in $DBS; do
         if mv "$LANDED.partial" "$LANDED"; then
             # Size is best-effort (an iCloud file can be evicted to a
             # placeholder the instant it lands, making du error).
-            SIZE="$(du -h "$LANDED" 2>/dev/null | awk '{ print $1 }' || true)"
+            SIZE="$(run_bounded 60 du -h "$LANDED" 2>/dev/null | awk '{ print $1 }' || true)"
             log "backed up ${DB} -> ${LANDED} (${SIZE:-size unknown})"
         else
             rm -f "$LANDED.partial"
