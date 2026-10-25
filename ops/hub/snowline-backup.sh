@@ -83,10 +83,15 @@ die() { log "$*" >&2; exit 2; }
 # destination itself. Queries (--print-dest, --check) do not log one
 # (QUIET_EXIT, decided with the command line above).
 CATALOG_ERR=""; CATALOG_OUT=""; Z_DUMPS_ERR=""; Z_LIST=""; Z_ROWS=""; PROBE=""   # temp files, set below; removed on every exit
+# The two lines that must reach the log whatever is in progress are written
+# to COPIES of the original stdout/stderr (fd 7 and 6): a trap fires inside
+# whatever redirection the interrupted command had — a walk's output file,
+# say — and would otherwise log into that file.
+exec 7>&1 6>&2
 on_exit() {
     oe_rc=$?
     rm -f ${CATALOG_ERR:+"$CATALOG_ERR"} ${CATALOG_OUT:+"$CATALOG_OUT"} ${Z_DUMPS_ERR:+"$Z_DUMPS_ERR"} ${Z_LIST:+"$Z_LIST"} ${Z_ROWS:+"$Z_ROWS"} ${PROBE:+"$PROBE"}
-    [ "$QUIET_EXIT" = yes ] || log "run exit $oe_rc"
+    [ "$QUIET_EXIT" = yes ] || log "run exit $oe_rc" >&7
 }
 trap on_exit EXIT
 # A SIGTERM/SIGINT/SIGHUP at ANY point (a bootout during the Postgres wait,
@@ -99,7 +104,7 @@ trap on_exit EXIT
 OUT=""; DUMP_PID=""
 DUMP_BOUND_S=1800   # per store; the largest store dumps in well under a minute today
 WALK_BOUND_S=600    # per folder walk (a stalled iCloud readdir must not hold the lock for ever)
-trap 'log "interrupted (SIGTERM/SIGINT/SIGHUP)${OUT:+; removing $OUT.partial}" >&2; [ -z "$DUMP_PID" ] || kill "$DUMP_PID" 2>/dev/null; [ -z "$OUT" ] || rm -f "$OUT.partial"; exit 143' TERM INT HUP
+trap 'log "interrupted (SIGTERM/SIGINT/SIGHUP)${OUT:+; removing $OUT.partial}" >&6; [ -z "$DUMP_PID" ] || kill "$DUMP_PID" 2>/dev/null; [ -z "$OUT" ] || rm -f "$OUT.partial"; exit 143' TERM INT HUP
 [ "$QUIET_EXIT" = yes ] || log "run start"   # the run's real start, for the installer
 CATALOG_ERR="$(mktemp -t snowline-backup-psql)" || die "cannot create a temp file (TMPDIR unwritable?)"
 CATALOG_OUT="$(mktemp -t snowline-backup-catalog)" || die "cannot create a temp file (TMPDIR unwritable?)"
@@ -408,7 +413,7 @@ for db in $DBS_EXPLICIT; do
     own_names+=(-o -name "$db-*.dump")
     own_stale+=(-o -name "$db-[0-9]*.dump.partial" -o -name ".$db-[0-9]*.dump.partial.icloud")
 done
-run_bounded "$WALK_BOUND_S" find "$DEST" -maxdepth 1 \( "${own_names[@]}" \) -type f -perm +044 -exec chmod 600 {} + 2>"$Z_DUMPS_ERR" \
+walk_bounded \( "${own_names[@]}" \) -type f -perm +044 -exec chmod 600 {} + \
     || log "WARNING: the permission sweep of $DEST hit an error ($(tail -n 1 "$Z_DUMPS_ERR")); a loose dump may remain" >&2
 
 # --- wait for Postgres (bounded; see lib.sh) ---
