@@ -147,16 +147,16 @@ parse_dump_name() {
     [[ $1 =~ $DUMP_NAME_RE ]] || return 1
     NAME_STORE="${BASH_REMATCH[2]}"; NAME_STAMP="${BASH_REMATCH[3]}"
 }
-# z_dumps <name-prefix> [all] — one "<store>\t<stamp>\t<path>" line per dump
-# or placeholder of that prefix in DEST (`*` for every store): Z-named
+# z_dumps [all] — one "<store>\t<stamp>\t<path>" line per dump or
+# placeholder in DEST, every store: Z-named
 # (UTC) ones by default, pre-#319 local-time names too with `all`. The ONE
 # listing --check (evidence: Z names only, written by this script) and the
 # prune (retention: every name) share. find's stderr goes to Z_DUMPS_ERR
 # for the caller to inspect.
 TAB=$'\t'
 z_dumps() {
-    if [ "${2:-}" = all ]; then zd_tail=''; else zd_tail='Z'; fi   # all: Z names and pre-#319 names alike
-    find "$DEST" -maxdepth 1 \( -name "$1-[0-9]*${zd_tail}.dump" -o -name ".$1-[0-9]*${zd_tail}.dump.icloud" \) -type f 2>"$Z_DUMPS_ERR" \
+    if [ "${1:-}" = all ]; then zd_tail=''; else zd_tail='Z'; fi   # all: Z names and pre-#319 names alike
+    find "$DEST" -maxdepth 1 \( -name "*-[0-9]*${zd_tail}.dump" -o -name ".*-[0-9]*${zd_tail}.dump.icloud" \) -type f 2>"$Z_DUMPS_ERR" \
     | while IFS= read -r zf; do
         parse_dump_name "$zf" || continue
         printf '%s\t%s\t%s\n' "$NAME_STORE" "$NAME_STAMP" "$zf"
@@ -166,14 +166,17 @@ z_dumps() {
 # has_word <word> <list...> — is <word> one of the space-separated words?
 has_word() { hw="$1"; shift; case " $* " in *" $hw "*) return 0 ;; esac; return 1; }
 
-# SNOWLINE_BACKUP_DBS, normalised ONCE (split on any whitespace with
-# globbing off, re-joined with single spaces; the positional parameters are
-# never touched) so --check and the run agree on membership; validated just
-# below, before anything side-effecting.
-DBS_EXPLICIT=""
+# SNOWLINE_BACKUP_DBS, normalised ONCE (split on any whitespace, re-joined
+# with single spaces; the positional parameters are never touched) so
+# --check and the run agree on membership; validated just below, before
+# anything side-effecting.
+# No globbing from here on, for the WHOLE script: every unquoted expansion
+# below is a store list, and a `*` in one must never expand against the
+# caller's cwd (launchd's is /, an operator's is anywhere) — the accepted
+# set and the dumped set would depend on where the script was started.
 set -f
+DBS_EXPLICIT=""
 for vn in ${SNOWLINE_BACKUP_DBS:-}; do DBS_EXPLICIT="$DBS_EXPLICIT $vn"; done
-set +f
 DBS_EXPLICIT="${DBS_EXPLICIT# }"
 # ... and validated here, cheap and side-effect free, so a query and a run
 # refuse the same bad value: each name must be a plain identifier (the
@@ -214,7 +217,7 @@ dest_state() {
     # login session is not denied) is unreadable whether or not the root
     # above it happens to be visible; only a path that is NOT THERE is then
     # a leaf to create (under a present iCloud root) or missing
-    case "$(ls -d "$DEST" 2>&1 >/dev/null)" in
+    case "$(LC_ALL=C ls -d "$DEST" 2>&1 >/dev/null)" in
         *"Operation not permitted"*|*"Permission denied"*) echo unreadable; return ;;   # EPERM (TCC) or EACCES
     esac
     # something that is not a directory in the way (a file, a dangling
@@ -280,7 +283,7 @@ case "$ARG1" in
             fi
             [ "$s" \< "$cutoff" ] || found=yes
         done <<EOF_Z
-$(z_dumps '*')
+$(z_dumps)
 EOF_Z
         # (a dump found is evidence whatever else find tripped over — an
         # entry iCloud evicted between readdir and stat; only an EMPTY
@@ -459,7 +462,7 @@ prune_all() {
     # SCRATCH_RE, which spares the legacy snowline_dev history) or a name on
     # the explicit list — and no other: a scratch store's dumps or another
     # project's in a shared destination are not this job's to prune
-    PRUNE_STUCK="$(z_dumps '*' all | sort -t "$TAB" -k1,1 -k2,2r \
+    PRUNE_STUCK="$(z_dumps all | sort -t "$TAB" -k1,1 -k2,2r \
     | awk -F"$TAB" -v cutoff="$PRUNE_CUTOFF" -v keep="$KEEP_MIN" -v re="$STORE_RE" -v scratch="$SCRATCH_RE" -v explicit=" $DBS_EXPLICIT " '
         index(explicit, " " $1 " ") == 0 && ($1 !~ re || $1 ~ scratch) { next }
         $1 != store { store = $1; n = 0 }
@@ -486,19 +489,18 @@ prune_all || true
 # died without its trap (SIGKILL, power loss): no live run owns it (a run
 # is bounded well inside an hour), so it is swept here, before the dumps,
 # and a full destination frees itself — only THIS script's names
-# (<store>-<stamp>Z.dump.partial): another job's staging file in a shared
-# destination is left alone, and not nagged about. And files outside the dump grammar
+# (<store>-<stamp>.dump.partial, the pre-#319 local-time stamp included:
+# the old script's last staging file is swept too): another job's staging
+# file in a shared destination is left alone, and not nagged about. And files outside the dump grammar
 # (an iCloud conflict copy "NAME 2.dump", a hand-made .bak) are neither
 # counted nor pruned: say so once a run, or the bounded folder grows
 # unbounded unnoticed.
-UNREC="$(find "$DEST" -maxdepth 1 \( -type f \( -name '*Z.dump.partial' -o -name '.probe.*' -o -name '.*Z.dump.partial.icloud' -o -name '..probe.*.icloud' \) -mmin +120 -delete \) \
+UNREC="$(find "$DEST" -maxdepth 1 \( -type f \( -name '*-[0-9]*.dump.partial' -o -name '.probe.*' -o -name '.*-[0-9]*.dump.partial.icloud' -o -name '..probe.*.icloud' \) -mmin +120 -delete \) \
              -o \( -type f ! -name '*.partial' ! -name '.probe.*' ! -name '.*.partial.icloud' ! -name '..probe.*.icloud' ! -name '.DS_Store' -print \) 2>"$Z_DUMPS_ERR" \
     | while IFS= read -r uf; do parse_dump_name "$uf" || printf '%s\n' "${uf##*/}"; done)"
 [ -s "$Z_DUMPS_ERR" ] && log "WARNING: the stale-file sweep in $DEST hit an error ($(tail -n 1 "$Z_DUMPS_ERR"))" >&2
 [ -z "$UNREC" ] || log "WARNING: $(printf '%s\n' "$UNREC" | wc -l | tr -d ' ') file(s) in $DEST outside the dump name grammar — neither counted nor pruned, tidy by hand: $(printf '%s\n' "$UNREC" | head -n 3 | tr '\n' ' ')" >&2
-set -f
 for DB in $DBS; do
-    set +f
     STORES=$((STORES + 1))
     OUT="$DEST/${DB}-${STAMP}.dump"
     # Dump to a .partial name, verify the archive is readable, then atomically
@@ -512,23 +514,28 @@ for DB in $DBS; do
     DUMP_PID=$!
     wait "$DUMP_PID"; dump_rc=$?
     DUMP_PID=""
-    if [ "$dump_rc" -eq 0 ] \
-        && pg_restore -l "$OUT.partial" > /dev/null \
-        && mv "$OUT.partial" "$OUT" && { LANDED="$OUT"; OUT=""; }; then
-        # (OUT is cleared in the same breath as the rename: a signal between
-        # the two must not make the trap report a landed dump as removed.)
-        # Size is best-effort (an iCloud file can be evicted to a placeholder
-        # the instant it lands, making du error).
-        SIZE="$(du -h "$LANDED" 2>/dev/null | awk '{ print $1 }' || true)"
-        log "backed up ${DB} -> ${LANDED} (${SIZE:-size unknown})"
+    if [ "$dump_rc" -eq 0 ] && pg_restore -l "$OUT.partial" > /dev/null; then
+        # The archive is good: from here the trap must not remove it, so OUT
+        # is cleared BEFORE the rename — a signal between the two leaves a
+        # complete .partial for the sweep, never a landed dump reported as
+        # removed.
+        LANDED="$OUT"; OUT=""
+        if mv "$LANDED.partial" "$LANDED"; then
+            # Size is best-effort (an iCloud file can be evicted to a
+            # placeholder the instant it lands, making du error).
+            SIZE="$(du -h "$LANDED" 2>/dev/null | awk '{ print $1 }' || true)"
+            log "backed up ${DB} -> ${LANDED} (${SIZE:-size unknown})"
+        else
+            rm -f "$LANDED.partial"
+            log "FAILED to back up ${DB} (the rename of its verified archive failed)" >&2
+            FAILED="$FAILED $DB"
+        fi
     else
         rm -f "$OUT.partial"; OUT=""
-        log "FAILED to back up ${DB} (pg_dump, archive check, or rename failed)" >&2
+        log "FAILED to back up ${DB} (pg_dump or the archive check failed)" >&2
         FAILED="$FAILED $DB"
     fi
-    set -f
 done
-set +f
 
 
 # One summary line per run — what install-backup-agent.sh reads back when
