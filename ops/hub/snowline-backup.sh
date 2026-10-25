@@ -529,8 +529,11 @@ prune_all || true
 # (holding the lock, this run is the only one: every such file is an
 # orphan now, whatever its age — the two-hour guard is for the lockless,
 # perl-less path only)
-if [ "$LOCKED" = yes ]; then sweep_age=(); else sweep_age=(-mmin +120); fi
-UNREC="$(find "$DEST" -maxdepth 1 \( -type f \( -name '*-[0-9]*.dump.partial' -o -name '.probe.*' -o -name '.*-[0-9]*.dump.partial.icloud' -o -name '..probe.*.icloud' \) "${sweep_age[@]}" -delete \) \
+# (`-mmin +0` is "older than a minute", near enough to every file; it is
+# spelled as an age test because bash 3.2's `set -u` rejects an empty
+# array expansion, which the "no age test" case would otherwise be)
+if [ "$LOCKED" = yes ]; then sweep_age="+0"; else sweep_age="+120"; fi
+UNREC="$(find "$DEST" -maxdepth 1 \( -type f \( -name '*-[0-9]*.dump.partial' -o -name '.probe.*' -o -name '.*-[0-9]*.dump.partial.icloud' -o -name '..probe.*.icloud' \) -mmin "$sweep_age" -delete \) \
              -o \( -type f ! -name '*.partial' ! -name '.probe.*' ! -name '.*.partial.icloud' ! -name '..probe.*.icloud' ! -name '.DS_Store' -print \) 2>"$Z_DUMPS_ERR" \
     | while IFS= read -r uf; do parse_dump_name "$uf" || printf '%s\n' "${uf##*/}"; done)"
 [ -s "$Z_DUMPS_ERR" ] && log "WARNING: the stale-file sweep in $DEST hit an error ($(tail -n 1 "$Z_DUMPS_ERR"))" >&2
