@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.snowline.backup</string>
+
+    <!-- Hourly dump of every live Snowline store (ops/hub/snowline-backup.sh).
+         A per-user agent on purpose: Postgres is the owner's agent and iCloud
+         Drive syncs in the owner's session. One-shot, not KeepAlive.
+         Install: ops/hub/install-backup-agent.sh (as the owner, no sudo). -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/seanlynch/Projects/snowline-platform/ops/hub/snowline-backup.sh</string>
+    </array>
+
+    <!-- Hourly: caps losable work at about an hour. No RunAtLoad: a login
+         must not fire a dump into the services' boot migrations; the
+         installer fires one run itself to prove the unit. -->
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <!-- Time for the TERM handler to remove a partial before SIGKILL. -->
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/seanlynch/Library/Logs/snowline-backup.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/seanlynch/Library/Logs/snowline-backup.log</string>
+</dict>
+</plist>
