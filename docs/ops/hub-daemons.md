@@ -333,3 +333,40 @@ first test the flock on `~/Library/Application Support/Snowline/autocut.lock`.
 While a cut holds it they refuse with exit 75, naming the lock and the log.
 `--wait` polls every 15s for up to 15 minutes instead. A fire that starts in
 the few seconds between the check and the bootout is not covered.
+
+## DB backups
+
+`dev.snowline.backup` dumps every live Snowline store hourly
+(`ops/hub/snowline-backup.sh`). It is a **per-user LaunchAgent** on purpose,
+not one of the system daemons above: Postgres is the owner's agent and iCloud
+Drive syncs in the owner's session, so a dump needs that session anyway.
+
+- **Stores.** Every `snowline_*` database in the server catalog except
+  scratch names (`_test`, `_dryrun`, `_e2e`, `_restore`, `snowline_dev`),
+  so a new service's store is covered from its first hour.
+  `SNOWLINE_BACKUP_DBS` replaces the list.
+- **Destination.** `~/Library/Mobile Documents/com~apple~CloudDocs/Snowline/db-backups/`
+  (off-machine via iCloud), as `<store>-<YYYYMMDD-HHMMSS>Z.dump` (UTC,
+  owner-only). `SNOWLINE_BACKUP_DIR` overrides it. `.env` secrets are not
+  backed up (decision e4578136).
+- **Each run** takes a lock (a second run steps aside, exit 75), waits up to
+  120 s for Postgres, dumps each store to a `.partial`, checks it with
+  `pg_restore -l`, then renames it. One store failing does not skip the
+  others; the run exits 1. Retention is 30 days
+  (`SNOWLINE_BACKUP_RETENTION_DAYS`), always keeping a store's newest three.
+  Every run logs `run start` and `run exit <code>` to
+  `~/Library/Logs/snowline-backup.log`.
+- **Install or reload**, as the owner from the canonical checkout, no sudo:
+  `ops/hub/install-backup-agent.sh`. It copies the tracked plist into
+  `~/Library/LaunchAgents/`, reloads the agent, fires one run through
+  launchd and exits 0 only when that run logged `run exit 0`.
+- **Is it alive?** `tail ~/Library/Logs/snowline-backup.log` shows a
+  `run exit 0` within the last hour, and `ls -t` of the destination shows
+  fresh dumps.
+- **Restore** one store: `pg_restore --clean --if-exists --no-owner -d snowline_pm <dump>`
+  (destructive), or into a scratch DB first:
+  `createdb snowline_restore && pg_restore --no-owner -d snowline_restore <dump>`.
+
+The script runs in place from the checkout, so moving or deleting the
+checkout stops the backups (launchd logs EX_CONFIG). Re-run the installer
+after moving it.
