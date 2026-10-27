@@ -21,21 +21,21 @@ set -uo pipefail
 export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 log() { echo "$(date -u +%FT%TZ) $*"; }
+# Every run ends with one "run exit <code>" line, whatever the path; the
+# installer reads it.
+trap 'log "run exit $?"' EXIT
 
-# One run at a time: a lock directory holding the owner's pid. A lock whose
-# pid is gone (a run killed by SIGKILL or power loss) is taken over.
-LOCK="$HOME/Library/Application Support/Snowline/backup.lock.d"
-mkdir -p "$(dirname "$LOCK")"
-if ! mkdir "$LOCK" 2>/dev/null; then
-    holder="$(cat "$LOCK/pid" 2>/dev/null)"
-    if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
-        log "another backup run (pid $holder) holds the lock; stepping aside"; exit 75
-    fi
-    rm -rf "$LOCK"; mkdir "$LOCK" || { log "cannot take the lock $LOCK" >&2; exit 2; }
-fi
-echo $$ > "$LOCK/pid"
-# Every run ends with one "run exit <code>" line; the installer reads it.
-trap 'rc=$?; rm -rf "$LOCK"; log "run exit $rc"' EXIT
+# One run at a time: a kernel flock on fd 9, which this shell keeps open for
+# its whole life (perl only takes the lock on it). The kernel drops the lock
+# when the process dies, however it dies: no stale lock, no takeover race.
+LOCK="$HOME/Library/Application Support/Snowline/backup.lock"
+mkdir -p "$(dirname "$LOCK")" && exec 9>>"$LOCK" || { log "cannot open the lock $LOCK" >&2; exit 2; }
+/usr/bin/perl -e 'use Fcntl ":flock"; open(my $fh, ">&=", 9) or exit 2; exit(flock($fh, LOCK_EX | LOCK_NB) ? 0 : 1)'
+case $? in
+    0) ;;
+    1) log "another backup run holds the lock; stepping aside"; exit 75 ;;
+    *) log "cannot take the lock $LOCK" >&2; exit 2 ;;
+esac
 # bash runs a trap only when the foreground command returns, so each dump runs
 # in the background and is waited for; a TERM (bootout, logout) then removes
 # the partial at once.
@@ -81,7 +81,7 @@ for DB in $DBS; do
     # interrupted or truncated dump never looks like a complete backup.
     # --lock-wait-timeout: a migration holding ACCESS EXCLUSIVE must not be
     # blocked by the dump; better a failed store this hour.
-    pg_dump -Fc --lock-wait-timeout=60000 "$DB" > "$OUT.partial" &
+    pg_dump -Fc --lock-wait-timeout=60000 "$DB" > "$OUT.partial" 9>&- &   # (the dump does not inherit the lock fd)
     CHILD=$!; wait "$CHILD"; rc=$?; CHILD=""
     if [ "$rc" -eq 0 ] && pg_restore -l "$OUT.partial" > /dev/null && mv "$OUT.partial" "$OUT"; then
         OUT=""
